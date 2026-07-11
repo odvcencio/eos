@@ -5962,12 +5962,59 @@ func TestEvalMetricsPayloadIncludesRetrievalMetrics(t *testing.T) {
 		RetrievalNDCGAt10:    0.14,
 		RetrievalMAPAt100:    0.22,
 		RetrievalRecallAt100: 0.31,
+		RetrievalEval: &eosruntime.RetrievalEvalMetrics{
+			Schema:  eosruntime.RetrievalEvalMetricsSchema,
+			Dataset: "tiny",
+			Backend: "cpu",
+			Inputs: eosruntime.RetrievalEvalInputMetrics{
+				Documents:     3,
+				Queries:       2,
+				RelevantPairs: 2,
+				ScoredPairs:   6,
+			},
+			Throughput: eosruntime.RetrievalEvalThroughput{
+				ElapsedSeconds:       1.25,
+				DocumentEmbedSeconds: 0.5,
+				QueryEmbedSeconds:    0.25,
+				ScoreSeconds:         0.1,
+				DocumentsPerSecond:   6,
+				QueriesPerSecond:     8,
+				ScoresPerSecond:      60,
+			},
+		},
 	})
 	if payload == nil {
 		t.Fatal("eval metrics payload missing")
 	}
 	if payload.RetrievalNDCGAt10 != 0.14 || payload.RetrievalMAPAt100 != 0.22 || payload.RetrievalRecallAt100 != 0.31 {
 		t.Fatalf("retrieval payload = %+v", payload)
+	}
+	if payload.RetrievalEval == nil || payload.RetrievalEval.Backend != "cpu" || payload.RetrievalEval.Inputs.Documents != 3 || payload.RetrievalEval.Throughput.ScoresPerSecond != 60 {
+		t.Fatalf("retrieval eval payload = %+v", payload.RetrievalEval)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	var got struct {
+		RetrievalEval *struct {
+			Backend string `json:"backend"`
+			Inputs  struct {
+				Documents   int   `json:"documents"`
+				Queries     int   `json:"queries"`
+				ScoredPairs int64 `json:"scored_pairs"`
+			} `json:"inputs"`
+			Throughput struct {
+				ElapsedSeconds  float64 `json:"elapsed_seconds"`
+				ScoresPerSecond float64 `json:"scores_per_second"`
+			} `json:"throughput"`
+		} `json:"retrieval_eval"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal payload: %v\n%s", err, string(data))
+	}
+	if got.RetrievalEval == nil || got.RetrievalEval.Backend != "cpu" || got.RetrievalEval.Inputs.ScoredPairs != 6 || got.RetrievalEval.Throughput.ElapsedSeconds != 1.25 {
+		t.Fatalf("json retrieval eval = %+v", got.RetrievalEval)
 	}
 }
 
@@ -5989,6 +6036,22 @@ func TestTrainMetricsPayloadIncludesEvalHistoryRetrievalMetrics(t *testing.T) {
 						RetrievalNDCGAt10:    0.41,
 						RetrievalMAPAt100:    0.32,
 						RetrievalRecallAt100: 0.73,
+						RetrievalEval: &eosruntime.RetrievalEvalMetrics{
+							Schema:  eosruntime.RetrievalEvalMetricsSchema,
+							Dataset: "tiny",
+							Backend: "cpu",
+							Inputs: eosruntime.RetrievalEvalInputMetrics{
+								Documents:   4,
+								Queries:     2,
+								ScoredPairs: 8,
+							},
+							Throughput: eosruntime.RetrievalEvalThroughput{
+								ElapsedSeconds:     2,
+								ScoresPerSecond:    4,
+								QueriesPerSecond:   1,
+								DocumentsPerSecond: 2,
+							},
+						},
 					},
 				},
 			},
@@ -6022,6 +6085,17 @@ func TestTrainMetricsPayloadIncludesEvalHistoryRetrievalMetrics(t *testing.T) {
 				RetrievalNDCG   float32 `json:"retrieval_ndcg_at_10"`
 				RetrievalMAP    float32 `json:"retrieval_map_at_100"`
 				RetrievalRecall float32 `json:"retrieval_recall_at_100"`
+				RetrievalEval   *struct {
+					Backend string `json:"backend"`
+					Inputs  struct {
+						Documents   int   `json:"documents"`
+						Queries     int   `json:"queries"`
+						ScoredPairs int64 `json:"scored_pairs"`
+					} `json:"inputs"`
+					Throughput struct {
+						ScoresPerSecond float64 `json:"scores_per_second"`
+					} `json:"throughput"`
+				} `json:"retrieval_eval"`
 			} `json:"eval"`
 		} `json:"eval_history"`
 	}
@@ -6030,6 +6104,44 @@ func TestTrainMetricsPayloadIncludesEvalHistoryRetrievalMetrics(t *testing.T) {
 	}
 	if len(got.EvalHistory) != 1 || got.EvalHistory[0].Eval.RetrievalNDCG != 0.41 || got.EvalHistory[0].Eval.RetrievalMAP != 0.32 || got.EvalHistory[0].Eval.RetrievalRecall != 0.73 {
 		t.Fatalf("json eval history = %+v", got.EvalHistory)
+	}
+	if got.EvalHistory[0].Eval.RetrievalEval == nil || got.EvalHistory[0].Eval.RetrievalEval.Backend != "cpu" || got.EvalHistory[0].Eval.RetrievalEval.Inputs.ScoredPairs != 8 {
+		t.Fatalf("json eval history retrieval eval = %+v", got.EvalHistory[0].Eval.RetrievalEval)
+	}
+}
+
+func TestPrintFinalRetrievalEvalIncludesBackendCountsAndThroughput(t *testing.T) {
+	output := captureStdout(t, func() {
+		printFinalRetrievalEval(&eosruntime.EmbeddingEvalMetrics{
+			RetrievalEval: &eosruntime.RetrievalEvalMetrics{
+				Dataset: "tiny",
+				Backend: "cpu",
+				Inputs: eosruntime.RetrievalEvalInputMetrics{
+					Documents:     3,
+					Queries:       2,
+					RelevantPairs: 2,
+					ScoredPairs:   6,
+				},
+				Throughput: eosruntime.RetrievalEvalThroughput{
+					ElapsedSeconds:       1.25,
+					DocumentEmbedSeconds: 0.5,
+					QueryEmbedSeconds:    0.25,
+					ScoreSeconds:         0.1,
+					DocumentsPerSecond:   6,
+					QueriesPerSecond:     8,
+					ScoresPerSecond:      60,
+				},
+			},
+		})
+	})
+	for _, want := range []string{
+		"final retrieval eval: dataset=tiny backend=cpu docs=3 queries=2 relevant_pairs=2 scored_pairs=6",
+		"elapsed=1.250s doc_embed=0.500s query_embed=0.250s score=0.100s",
+		"docs_per_sec=6.00 queries_per_sec=8.00 scores_per_sec=60.00",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("output missing %q\noutput:\n%s", want, output)
+		}
 	}
 }
 
@@ -7634,6 +7746,31 @@ func captureRunOutputAndError(t *testing.T, args []string) (string, error) {
 		t.Fatalf("close stdout reader: %v", err)
 	}
 	return string(data), runErr
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	origStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create stdout pipe: %v", err)
+	}
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = origStdout
+	}()
+	fn()
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close stdout writer: %v", err)
+	}
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read stdout capture: %v", err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatalf("close stdout reader: %v", err)
+	}
+	return string(data)
 }
 
 // captureRunStderrAndOutput runs args and returns both the stdout and stderr

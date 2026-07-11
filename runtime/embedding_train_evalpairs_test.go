@@ -111,12 +111,24 @@ func TestFitContrastiveRetrievalGateSurvivesRestore(t *testing.T) {
 	if summary.FinalEval.RetrievalMAPAt100 <= 0 || summary.FinalEval.RetrievalRecallAt100 <= 0 {
 		t.Fatalf("final eval retrieval MAP/recall = %+v, want > 0 after restore", summary.FinalEval)
 	}
+	if summary.FinalEval.RetrievalEval == nil {
+		t.Fatalf("final eval retrieval detail missing: %+v", summary.FinalEval)
+	}
+	if got := summary.FinalEval.RetrievalEval; got.Backend == "" || got.Inputs.Documents != 2 || got.Inputs.Queries != 1 || got.Inputs.ScoredPairs != 2 {
+		t.Fatalf("final eval retrieval detail = %+v, want backend and counts", got)
+	}
+	if got := summary.FinalEval.RetrievalEval.Throughput; got.ElapsedSeconds <= 0 || got.DocumentEmbedSeconds <= 0 || got.QueryEmbedSeconds <= 0 || got.ScoreSeconds <= 0 || got.DocumentsPerSecond <= 0 || got.QueriesPerSecond <= 0 || got.ScoresPerSecond <= 0 {
+		t.Fatalf("final eval retrieval throughput = %+v, want positive timings/rates", got)
+	}
 	for _, record := range summary.History {
 		if record.Eval == nil || record.Eval.RetrievalNDCGAt10 <= 0 {
 			t.Fatalf("epoch %d retrieval nDCG missing: %+v", record.Epoch, record.Eval)
 		}
 		if record.Eval.RetrievalMAPAt100 <= 0 || record.Eval.RetrievalRecallAt100 <= 0 {
 			t.Fatalf("epoch %d retrieval MAP/recall missing: %+v", record.Epoch, record.Eval)
+		}
+		if record.Eval.RetrievalEval == nil {
+			t.Fatalf("epoch %d retrieval detail missing: %+v", record.Epoch, record.Eval)
 		}
 	}
 }

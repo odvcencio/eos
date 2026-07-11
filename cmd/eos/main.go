@@ -5807,6 +5807,7 @@ func runTrainEmbed(args []string) error {
 	fmt.Printf("final train: loss=%.6f avg_score=%.6f batch=%d\n", summary.FinalTrain.Loss, summary.FinalTrain.AverageScore, summary.FinalTrain.BatchSize)
 	if summary.FinalEval != nil {
 		fmt.Printf("final eval: loss=%.6f margin=%.6f accuracy=%.6f threshold_accuracy=%.6f threshold=%.6f auc=%.6f top1=%.6f top5=%.6f top10=%.6f mrr=%.6f mean_rank=%.3f retrieval_ndcg=%.6f retrieval_map=%.6f retrieval_recall=%.6f pairs=%d\n", summary.FinalEval.Loss, summary.FinalEval.ScoreMargin, summary.FinalEval.PairAccuracy, summary.FinalEval.ThresholdAccuracy, summary.FinalEval.ScoreThreshold, summary.FinalEval.ROCAUC, summary.FinalEval.Top1Accuracy, summary.FinalEval.Top5Accuracy, summary.FinalEval.Top10Accuracy, summary.FinalEval.MeanReciprocalRank, summary.FinalEval.MeanPositiveRank, summary.FinalEval.RetrievalNDCGAt10, summary.FinalEval.RetrievalMAPAt100, summary.FinalEval.RetrievalRecallAt100, summary.FinalEval.PairCount)
+		printFinalRetrievalEval(summary.FinalEval)
 	}
 	if summary.FinalScoreSpectrumEval != nil {
 		fmt.Printf("final score-spectrum eval: loss=%.6f any_positive_top1=%.6f original_positive_top1=%.6f alternate_recovery=%.6f best_positive_hardest_negative_margin=%.6f rows=%d candidates=%d\n", summary.FinalScoreSpectrumEval.Loss, summary.FinalScoreSpectrumEval.AnyPositiveTop1, summary.FinalScoreSpectrumEval.OriginalPositiveTop1, summary.FinalScoreSpectrumEval.AlternateRelevantRecovery, summary.FinalScoreSpectrumEval.BestPositiveHardestNegativeMargin, summary.FinalScoreSpectrumEval.RowCount, summary.FinalScoreSpectrumEval.CandidateCount)
@@ -6755,6 +6756,7 @@ func runTrainCorpus(args []string) error {
 	fmt.Printf("final train: loss=%.6f avg_score=%.6f batch=%d\n", summary.FinalTrain.Loss, summary.FinalTrain.AverageScore, summary.FinalTrain.BatchSize)
 	if summary.FinalEval != nil {
 		fmt.Printf("final eval: loss=%.6f margin=%.6f accuracy=%.6f threshold_accuracy=%.6f threshold=%.6f auc=%.6f top1=%.6f top5=%.6f top10=%.6f mrr=%.6f mean_rank=%.3f retrieval_ndcg=%.6f retrieval_map=%.6f retrieval_recall=%.6f pairs=%d\n", summary.FinalEval.Loss, summary.FinalEval.ScoreMargin, summary.FinalEval.PairAccuracy, summary.FinalEval.ThresholdAccuracy, summary.FinalEval.ScoreThreshold, summary.FinalEval.ROCAUC, summary.FinalEval.Top1Accuracy, summary.FinalEval.Top5Accuracy, summary.FinalEval.Top10Accuracy, summary.FinalEval.MeanReciprocalRank, summary.FinalEval.MeanPositiveRank, summary.FinalEval.RetrievalNDCGAt10, summary.FinalEval.RetrievalMAPAt100, summary.FinalEval.RetrievalRecallAt100, summary.FinalEval.PairCount)
+		printFinalRetrievalEval(summary.FinalEval)
 	}
 	fmt.Printf("workload: %s\n", formatTrainWorkload(summary.Workload))
 	fmt.Printf("throughput: %s\n", formatTrainThroughput(summary))
@@ -6914,26 +6916,27 @@ type trainStatMetricsJSON struct {
 }
 
 type evalMetricsJSON struct {
-	Loss                 float32 `json:"loss"`
-	AverageScore         float32 `json:"average_score"`
-	PositiveMeanScore    float32 `json:"positive_mean_score"`
-	NegativeMeanScore    float32 `json:"negative_mean_score"`
-	PairAccuracy         float32 `json:"pair_accuracy"`
-	ThresholdAccuracy    float32 `json:"threshold_accuracy"`
-	ScoreThreshold       float32 `json:"score_threshold"`
-	ROCAUC               float32 `json:"roc_auc"`
-	ScoreMargin          float32 `json:"score_margin"`
-	Top1Accuracy         float32 `json:"top1_accuracy"`
-	Top5Accuracy         float32 `json:"top5_accuracy"`
-	Top10Accuracy        float32 `json:"top10_accuracy"`
-	MeanReciprocalRank   float32 `json:"mean_reciprocal_rank"`
-	MeanPositiveRank     float32 `json:"mean_positive_rank"`
-	RetrievalNDCGAt10    float32 `json:"retrieval_ndcg_at_10"`
-	RetrievalMAPAt100    float32 `json:"retrieval_map_at_100"`
-	RetrievalRecallAt100 float32 `json:"retrieval_recall_at_100"`
-	PairCount            int     `json:"pair_count"`
-	PositiveCount        int     `json:"positive_count"`
-	NegativeCount        int     `json:"negative_count"`
+	Loss                 float32                          `json:"loss"`
+	AverageScore         float32                          `json:"average_score"`
+	PositiveMeanScore    float32                          `json:"positive_mean_score"`
+	NegativeMeanScore    float32                          `json:"negative_mean_score"`
+	PairAccuracy         float32                          `json:"pair_accuracy"`
+	ThresholdAccuracy    float32                          `json:"threshold_accuracy"`
+	ScoreThreshold       float32                          `json:"score_threshold"`
+	ROCAUC               float32                          `json:"roc_auc"`
+	ScoreMargin          float32                          `json:"score_margin"`
+	Top1Accuracy         float32                          `json:"top1_accuracy"`
+	Top5Accuracy         float32                          `json:"top5_accuracy"`
+	Top10Accuracy        float32                          `json:"top10_accuracy"`
+	MeanReciprocalRank   float32                          `json:"mean_reciprocal_rank"`
+	MeanPositiveRank     float32                          `json:"mean_positive_rank"`
+	RetrievalNDCGAt10    float32                          `json:"retrieval_ndcg_at_10"`
+	RetrievalMAPAt100    float32                          `json:"retrieval_map_at_100"`
+	RetrievalRecallAt100 float32                          `json:"retrieval_recall_at_100"`
+	RetrievalEval        *eosruntime.RetrievalEvalMetrics `json:"retrieval_eval,omitempty"`
+	PairCount            int                              `json:"pair_count"`
+	PositiveCount        int                              `json:"positive_count"`
+	NegativeCount        int                              `json:"negative_count"`
 }
 
 type scoreSpectrumEvalMetricsJSON struct {
@@ -7207,10 +7210,45 @@ func evalMetricsPayload(metrics *eosruntime.EmbeddingEvalMetrics) *evalMetricsJS
 		RetrievalNDCGAt10:    metrics.RetrievalNDCGAt10,
 		RetrievalMAPAt100:    metrics.RetrievalMAPAt100,
 		RetrievalRecallAt100: metrics.RetrievalRecallAt100,
+		RetrievalEval:        cloneRetrievalEvalMetrics(metrics.RetrievalEval),
 		PairCount:            metrics.PairCount,
 		PositiveCount:        metrics.PositiveCount,
 		NegativeCount:        metrics.NegativeCount,
 	}
+}
+
+func cloneRetrievalEvalMetrics(metrics *eosruntime.RetrievalEvalMetrics) *eosruntime.RetrievalEvalMetrics {
+	if metrics == nil {
+		return nil
+	}
+	out := *metrics
+	if metrics.SparseLexical != nil {
+		sparse := *metrics.SparseLexical
+		out.SparseLexical = &sparse
+	}
+	return &out
+}
+
+func printFinalRetrievalEval(eval *eosruntime.EmbeddingEvalMetrics) {
+	if eval == nil || eval.RetrievalEval == nil {
+		return
+	}
+	retrieval := eval.RetrievalEval
+	fmt.Printf("final retrieval eval: dataset=%s backend=%s docs=%d queries=%d relevant_pairs=%d scored_pairs=%d elapsed=%.3fs doc_embed=%.3fs query_embed=%.3fs score=%.3fs docs_per_sec=%.2f queries_per_sec=%.2f scores_per_sec=%.2f\n",
+		retrieval.Dataset,
+		retrieval.Backend,
+		retrieval.Inputs.Documents,
+		retrieval.Inputs.Queries,
+		retrieval.Inputs.RelevantPairs,
+		retrieval.Inputs.ScoredPairs,
+		retrieval.Throughput.ElapsedSeconds,
+		retrieval.Throughput.DocumentEmbedSeconds,
+		retrieval.Throughput.QueryEmbedSeconds,
+		retrieval.Throughput.ScoreSeconds,
+		retrieval.Throughput.DocumentsPerSecond,
+		retrieval.Throughput.QueriesPerSecond,
+		retrieval.Throughput.ScoresPerSecond,
+	)
 }
 
 func scoreSpectrumEvalMetricsPayload(metrics *eosruntime.EmbeddingScoreSpectrumEvalMetrics) *scoreSpectrumEvalMetricsJSON {

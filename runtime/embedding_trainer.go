@@ -118,6 +118,7 @@ type EmbeddingEvalMetrics struct {
 	RetrievalNDCGAt10    float32
 	RetrievalMAPAt100    float32
 	RetrievalRecallAt100 float32
+	RetrievalEval        *RetrievalEvalMetrics `json:"retrieval_eval,omitempty"`
 	PairCount            int
 	PositiveCount        int
 	NegativeCount        int
@@ -1060,6 +1061,7 @@ func (t *EmbeddingTrainer) augmentRetrievalMetrics(metrics *EmbeddingEvalMetrics
 	metrics.RetrievalNDCGAt10 = float32(result.Quality.NDCGAt10)
 	metrics.RetrievalMAPAt100 = float32(result.Quality.MAPAt100)
 	metrics.RetrievalRecallAt100 = float32(result.Quality.RecallAt100)
+	metrics.RetrievalEval = &result
 	return nil
 }
 
