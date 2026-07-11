@@ -1662,6 +1662,185 @@ func TestEmbedRetrievalTextsGroupsByTokenLengthAndPreservesOrder(t *testing.T) {
 	}
 }
 
+func TestRetrievalEvalRoPEBatchSizeInvariant(t *testing.T) {
+	model := loadTinyRoPERetrievalEvalModel(t)
+	dir := t.TempDir()
+	datasetDir := filepath.Join(dir, "dataset")
+	if err := os.MkdirAll(filepath.Join(datasetDir, "qrels"), 0o755); err != nil {
+		t.Fatalf("mkdir dataset: %v", err)
+	}
+	corpusPath := filepath.Join(datasetDir, "corpus.jsonl")
+	queriesPath := filepath.Join(datasetDir, "queries.jsonl")
+	qrelsPath := filepath.Join(datasetDir, "qrels", "test.tsv")
+	if err := os.WriteFile(corpusPath, []byte(
+		`{"_id":"d1","text":"a"}`+"\n"+
+			`{"_id":"d2","text":"bb"}`+"\n"+
+			`{"_id":"d3","text":"ccc"}`+"\n"+
+			`{"_id":"d4","text":"dddd"}`+"\n"+
+			`{"_id":"d5","text":"eeeee"}`+"\n"+
+			`{"_id":"d6","text":"ffffff"}`+"\n"+
+			`{"_id":"d7","text":"ggggggg"}`+"\n"+
+			`{"_id":"d8","text":"aaaaaaaa"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write corpus: %v", err)
+	}
+	if err := os.WriteFile(queriesPath, []byte(
+		`{"_id":"q1","text":"ccc"}`+"\n"+
+			`{"_id":"q2","text":"aaaaaaaa"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write queries: %v", err)
+	}
+	if err := os.WriteFile(qrelsPath, []byte("query-id\tcorpus-id\tscore\nq1\td3\t1\nq2\td8\t1\n"), 0o644); err != nil {
+		t.Fatalf("write qrels: %v", err)
+	}
+
+	corpus := []retrievalTextRecord{
+		{ID: "d1", Text: "a"},
+		{ID: "d2", Text: "bb"},
+		{ID: "d3", Text: "ccc"},
+		{ID: "d4", Text: "dddd"},
+		{ID: "d5", Text: "eeeee"},
+		{ID: "d6", Text: "ffffff"},
+		{ID: "d7", Text: "ggggggg"},
+		{ID: "d8", Text: "aaaaaaaa"},
+	}
+	baseVectors, err := embedRetrievalTexts(context.Background(), model, corpus, 1, EmbeddingRoleRaw)
+	if err != nil {
+		t.Fatalf("embed batch size 1: %v", err)
+	}
+	for _, batchSize := range []int{2, 4, 8} {
+		got, err := embedRetrievalTexts(context.Background(), model, corpus, batchSize, EmbeddingRoleRaw)
+		if err != nil {
+			t.Fatalf("embed batch size %d: %v", batchSize, err)
+		}
+		assertRetrievalVectorsClose(t, fmt.Sprintf("batch-size-%d", batchSize), got, baseVectors, 5e-3)
+	}
+
+	var baseline RetrievalEvalMetrics
+	for _, batchSize := range []int{1, 2, 4, 8} {
+		metrics, err := EvaluateEmbeddingRetrieval(context.Background(), model, RetrievalEvalConfig{
+			DatasetName: "tiny-rope",
+			CorpusPath:  corpusPath,
+			QueriesPath: queriesPath,
+			QrelsPath:   qrelsPath,
+			BatchSize:   batchSize,
+			TopK:        100,
+			RoleMode:    EmbeddingRoleModeRaw,
+		})
+		if err != nil {
+			t.Fatalf("eval batch size %d: %v", batchSize, err)
+		}
+		if batchSize == 1 {
+			baseline = metrics
+			continue
+		}
+		assertRetrievalQualityClose(t, fmt.Sprintf("batch-size-%d", batchSize), metrics.Quality, baseline.Quality, 1e-12)
+	}
+}
+
+func loadTinyRoPERetrievalEvalModel(t *testing.T) *EmbeddingModel {
+	t.Helper()
+	src := []byte(`
+param token_embedding: f16[V, D] @weight("weights/token_embedding")
+param attn_q: f16[D, D] @weight("weights/attn_q")
+param attn_k: f16[D, D] @weight("weights/attn_k")
+param attn_v: f16[D, D] @weight("weights/attn_v")
+param attn_o: f16[D, D] @weight("weights/attn_o")
+param projection: f16[D, E] @weight("weights/projection")
+
+pipeline embed_pooled(tokens: i32[T], attention_mask: i32[T]) -> f16[E] {
+    let hidden_raw = gather(token_embedding, tokens)
+    let hidden = rope(hidden_raw)
+    let q = @matmul(hidden, attn_q)
+    let k = @matmul(hidden, attn_k)
+    let v = @matmul(hidden, attn_v)
+    let kt = transpose(k)
+    let scores = @matmul(q, kt)
+    let probs = softmax(scores)
+    let mixed = @matmul(probs, v)
+    let attended = @matmul(mixed, attn_o)
+    let projected = @matmul(attended, projection)
+    let normalized = normalize(projected)
+    return mean_pool(normalized, attention_mask)
+}
+
+pipeline embed_pooled_batch(tokens: i32[B, T], attention_mask: i32[B, T]) -> f16[B, E] {
+    let hidden_raw = gather(token_embedding, tokens)
+    let hidden = rope(hidden_raw)
+    let q = @matmul(hidden, attn_q)
+    let k = @matmul(hidden, attn_k)
+    let v = @matmul(hidden, attn_v)
+    let kt = transpose(k)
+    let scores = @matmul(q, kt)
+    let probs = softmax(scores)
+    let mixed = @matmul(probs, v)
+    let attended = @matmul(mixed, attn_o)
+    let projected = @matmul(attended, projection)
+    let normalized = normalize(projected)
+    return mean_pool(normalized, attention_mask)
+}
+`)
+	bundle, err := compiler.Build(src, compiler.Options{ModuleName: "tiny_rope_retrieval_eval_embed"})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	rt := New(cuda.New(), metal.New())
+	model, err := rt.LoadEmbedding(context.Background(), bundle.Artifact, tinyRoPEAttentionEmbeddingManifest(), tinyRoPEAttentionEmbedWeights()...)
+	if err != nil {
+		t.Fatalf("load embedding: %v", err)
+	}
+	tokenizer := TokenizerFile{
+		Version:      TokenizerFileVersion,
+		Tokens:       []string{"[PAD]", "[UNK]", "a", "b", "c", "d", "e", "f", "g"},
+		UnknownToken: "[UNK]",
+	}
+	if err := model.attachTokenizer(tokenizer); err != nil {
+		t.Fatalf("attach tokenizer: %v", err)
+	}
+	return model
+}
+
+func assertRetrievalVectorsClose(t *testing.T, label string, got, want []retrievalVectorRecord, tol float64) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: vectors = %d, want %d", label, len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i].ID {
+			t.Fatalf("%s: row %d id = %q, want %q", label, i, got[i].ID, want[i].ID)
+		}
+		if len(got[i].Vector) != len(want[i].Vector) {
+			t.Fatalf("%s: row %d vector dim = %d, want %d", label, i, len(got[i].Vector), len(want[i].Vector))
+		}
+		for j, wantValue := range want[i].Vector {
+			if diff := math.Abs(float64(got[i].Vector[j] - wantValue)); diff > tol {
+				t.Fatalf("%s: row %d vector[%d] = %v, want %v (diff %v)", label, i, j, got[i].Vector[j], wantValue, diff)
+			}
+		}
+	}
+}
+
+func assertRetrievalQualityClose(t *testing.T, label string, got, want RetrievalEvalQualityMetrics, tol float64) {
+	t.Helper()
+	assertClose := func(name string, got, want float64) {
+		t.Helper()
+		if diff := math.Abs(got - want); diff > tol {
+			t.Fatalf("%s: %s = %.15g, want %.15g (diff %.15g)", label, name, got, want, diff)
+		}
+	}
+	assertClose("ndcg_at_10", got.NDCGAt10, want.NDCGAt10)
+	assertClose("ndcg_at_100", got.NDCGAt100, want.NDCGAt100)
+	assertClose("mrr_at_10", got.MRRAt10, want.MRRAt10)
+	assertClose("precision_at_1", got.PrecisionAt1, want.PrecisionAt1)
+	assertClose("precision_at_5", got.PrecisionAt5, want.PrecisionAt5)
+	assertClose("precision_at_10", got.PrecisionAt10, want.PrecisionAt10)
+	assertClose("hit_at_1", got.HitAt1, want.HitAt1)
+	assertClose("hit_at_5", got.HitAt5, want.HitAt5)
+	assertClose("hit_at_10", got.HitAt10, want.HitAt10)
+	assertClose("map_at_10", got.MAPAt10, want.MAPAt10)
+	assertClose("map_at_100", got.MAPAt100, want.MAPAt100)
+	assertClose("recall_at_10", got.RecallAt10, want.RecallAt10)
+	assertClose("recall_at_100", got.RecallAt100, want.RecallAt100)
+}
+
 func TestReadBEIRRetrievalFiles(t *testing.T) {
 	dir := t.TempDir()
 	corpusPath := filepath.Join(dir, "corpus.jsonl")
