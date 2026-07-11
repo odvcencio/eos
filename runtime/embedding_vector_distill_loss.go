@@ -20,6 +20,10 @@ type VectorDistillLossResult struct {
 // Returns the scalar loss and d_loss/d_proj so the caller can back-propagate
 // through the linear distillation projection.
 func VectorDistillLossAndGrad(proj, teacher []float32) (VectorDistillLossResult, error) {
+	return vectorDistillLossAndGradInto(proj, teacher, nil)
+}
+
+func vectorDistillLossAndGradInto(proj, teacher, gradScratch []float32) (VectorDistillLossResult, error) {
 	if len(proj) == 0 || len(teacher) == 0 {
 		return VectorDistillLossResult{}, fmt.Errorf("vector_distill: embeddings must be non-empty")
 	}
@@ -47,16 +51,17 @@ func VectorDistillLossAndGrad(proj, teacher []float32) (VectorDistillLossResult,
 	teacherNorm := float32(math.Sqrt(teacherSqNorm))
 
 	var cosine float32
-	var cosineGradProj []float32
+	hasCosineGrad := false
 	if projNorm > 0 && teacherNorm > 0 {
 		denom := projNorm * teacherNorm
 		cosine = float32(dot) / denom
 		// d(cosine)/d(proj[k]) = teacher[k]/denom − proj[k]*cosine/projNorm²
 		projScale := cosine / (projNorm * projNorm)
-		cosineGradProj = make([]float32, d)
+		gradScratch = ensureFloat32Scratch(gradScratch, d)
 		for k := range proj {
-			cosineGradProj[k] = teacher[k]/denom - proj[k]*projScale
+			gradScratch[k] = teacher[k]/denom - proj[k]*projScale
 		}
+		hasCosineGrad = true
 	}
 
 	// --- combined ---
@@ -65,18 +70,30 @@ func VectorDistillLossAndGrad(proj, teacher []float32) (VectorDistillLossResult,
 	//   = 0.5 * d_mse/d_proj[k]  + 0.5 * d(1−cosine)/d_proj[k]
 	//   = 0.5 * (2/d)*(proj[k]−teacher[k]) − 0.5 * d_cosine/d_proj[k]
 	totalLoss := 0.5*mseLoss + 0.5*(1-cosine)
-	gradProj := make([]float32, d)
+	gradProj := gradScratch
+	if !hasCosineGrad {
+		gradProj = ensureFloat32Scratch(gradScratch, d)
+	}
 	cosineLossScale := float32(0.5)
 	for k := range proj {
 		mseGrad := float32(1) / float32(d) * (proj[k] - teacher[k]) // 0.5 * 2/d * diff
 		var cosGrad float32
-		if cosineGradProj != nil {
-			cosGrad = -cosineLossScale * cosineGradProj[k] // -0.5 * d_cosine/d_proj
+		if hasCosineGrad {
+			cosGrad = -cosineLossScale * gradProj[k] // -0.5 * d_cosine/d_proj
 		}
 		gradProj[k] = mseGrad + cosGrad
 	}
 
 	return VectorDistillLossResult{Loss: totalLoss, GradProj: gradProj}, nil
+}
+
+func ensureFloat32Scratch(s []float32, n int) []float32 {
+	if cap(s) < n {
+		return make([]float32, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
 }
 
 // accumulateVectorDistillProjectionGrads back-propagates through the linear

@@ -94,6 +94,43 @@ func TestVectorDistillLossAndGradRejectsLengthMismatch(t *testing.T) {
 	}
 }
 
+func TestVectorDistillLossAndGradScratchMatchesPublicExact(t *testing.T) {
+	cases := []struct {
+		name    string
+		proj    []float32
+		teacher []float32
+	}{
+		{name: "cosine", proj: []float32{0.7, -0.2, 0.1, 0.5}, teacher: []float32{-0.3, 0.4, 0.8, -0.1}},
+		{name: "zero_proj", proj: []float32{0, 0, 0, 0}, teacher: []float32{-0.3, 0.4, 0.8, -0.1}},
+		{name: "zero_teacher", proj: []float32{0.7, -0.2, 0.1, 0.5}, teacher: []float32{0, 0, 0, 0}},
+	}
+	scratch := make([]float32, 0, 8)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := VectorDistillLossAndGrad(tc.proj, tc.teacher)
+			if err != nil {
+				t.Fatalf("VectorDistillLossAndGrad: %v", err)
+			}
+			got, err := vectorDistillLossAndGradInto(tc.proj, tc.teacher, scratch)
+			if err != nil {
+				t.Fatalf("vectorDistillLossAndGradInto: %v", err)
+			}
+			if got.Loss != want.Loss {
+				t.Fatalf("loss = %v, want exact %v", got.Loss, want.Loss)
+			}
+			if len(got.GradProj) != len(want.GradProj) {
+				t.Fatalf("grad length = %d, want %d", len(got.GradProj), len(want.GradProj))
+			}
+			for i := range got.GradProj {
+				if got.GradProj[i] != want.GradProj[i] {
+					t.Fatalf("grad[%d] = %v, want exact %v", i, got.GradProj[i], want.GradProj[i])
+				}
+			}
+			scratch = got.GradProj
+		})
+	}
+}
+
 // TestAccumulateVectorDistillProjectionGradsBackpropIsCorrect verifies that
 // the projection back-propagation computes correct d_loss/d_student and d_loss/d_W
 // against a finite-difference approximation.
@@ -324,4 +361,32 @@ func cloneVectorBatch(batch [][]float32) [][]float32 {
 		out[i] = append([]float32(nil), v...)
 	}
 	return out
+}
+
+func BenchmarkVectorDistillLossAndGradScratch(b *testing.B) {
+	proj := make([]float32, 384)
+	teacher := make([]float32, 384)
+	for i := range proj {
+		proj[i] = float32(i%17-8) * 0.01
+		teacher[i] = float32(i%23-11) * 0.008
+	}
+	b.Run("public", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := VectorDistillLossAndGrad(proj, teacher); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("scratch", func(b *testing.B) {
+		b.ReportAllocs()
+		scratch := make([]float32, 0, len(proj))
+		for i := 0; i < b.N; i++ {
+			result, err := vectorDistillLossAndGradInto(proj, teacher, scratch)
+			if err != nil {
+				b.Fatal(err)
+			}
+			scratch = result.GradProj
+		}
+	})
 }

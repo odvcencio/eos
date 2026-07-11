@@ -21,6 +21,17 @@ type vectorDistillProjectionState struct {
 	Step     int // AdamW step counter (separate from student step)
 }
 
+type vectorDistillBatchScratch struct {
+	batch       []EmbeddingTokenizedVectorDistillExample
+	inputs      []embeddingSequenceInput
+	students    [][]float32
+	teachers    [][]float32
+	gradW       []float32
+	projVec     []float32
+	gradProj    []float32
+	gradStudent []float32
+}
+
 // newVectorDistillProjectionState allocates and Kaiming-initialises a fresh
 // projection matrix.
 func newVectorDistillProjectionState(inputDim, outDim int, rng *rand.Rand) *vectorDistillProjectionState {
@@ -283,16 +294,18 @@ func (t *EmbeddingTrainer) runVectorDistillEpoch(
 	totalExamples := 0
 	totalBatches := batchCount(len(order), batchSize, 1)
 	batchIndex := 0
+	var scratch vectorDistillBatchScratch
 
 	for start := 0; start < len(order); start += batchSize {
 		end := start + batchSize
 		if end > len(order) {
 			end = len(order)
 		}
-		batch := make([]EmbeddingTokenizedVectorDistillExample, 0, end-start)
+		batch := ensureVectorDistillExampleScratch(scratch.batch, end-start)
 		for _, idx := range order[start:end] {
 			batch = append(batch, trainSet[idx])
 		}
+		scratch.batch = batch
 
 		maybeReportTrainProgress(cfg, EmbeddingTrainProgress{
 			Phase:              "train_start",
@@ -308,7 +321,7 @@ func (t *EmbeddingTrainer) runVectorDistillEpoch(
 			Elapsed:            time.Since(runStart),
 		})
 
-		metrics, updatedProj, err := t.trainVectorDistillBatch(batch, proj, teacherDim, cfg.VectorDistillDefaultRole, cfg.VectorDistillRelationalWeight)
+		metrics, updatedProj, err := t.trainVectorDistillBatchWithScratch(batch, proj, teacherDim, cfg.VectorDistillDefaultRole, cfg.VectorDistillRelationalWeight, &scratch)
 		if err != nil {
 			return EmbeddingTrainMetrics{}, proj, err
 		}
@@ -384,6 +397,17 @@ func (t *EmbeddingTrainer) trainVectorDistillBatch(
 	defaultRole string,
 	relationalWeight float32,
 ) (EmbeddingTrainMetrics, *vectorDistillProjectionState, error) {
+	return t.trainVectorDistillBatchWithScratch(batch, proj, teacherDim, defaultRole, relationalWeight, nil)
+}
+
+func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
+	batch []EmbeddingTokenizedVectorDistillExample,
+	proj *vectorDistillProjectionState,
+	teacherDim int,
+	defaultRole string,
+	relationalWeight float32,
+	scratch *vectorDistillBatchScratch,
+) (EmbeddingTrainMetrics, *vectorDistillProjectionState, error) {
 	if !t.isCompactTrainer() {
 		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("vector distillation requires compact_transformer_v1")
 	}
@@ -396,7 +420,12 @@ func (t *EmbeddingTrainer) trainVectorDistillBatch(
 
 	// Build sequence inputs, resolving each example's own role (falling back
 	// to defaultRole for legacy rows without an explicit "role" field).
-	inputs := make([]embeddingSequenceInput, len(batch))
+	var inputs []embeddingSequenceInput
+	if scratch != nil {
+		inputs = ensureVectorDistillInputScratch(scratch.inputs, len(batch))
+	} else {
+		inputs = make([]embeddingSequenceInput, len(batch))
+	}
 	for i, ex := range batch {
 		roleIndex, usedFallback, rerr := t.vectorDistillRoleIndex(ex.Role, defaultRole)
 		if rerr != nil {
@@ -412,6 +441,9 @@ func (t *EmbeddingTrainer) trainVectorDistillBatch(
 			role:   roleIndex,
 			label:  fmt.Sprintf("batch %d", i),
 		}
+	}
+	if scratch != nil {
+		scratch.inputs = inputs
 	}
 	forward := t.prepareForwardWeights()
 	if forward == nil || forward.compact == nil {
@@ -438,11 +470,22 @@ func (t *EmbeddingTrainer) trainVectorDistillBatch(
 	var relationalLoss float32
 	var relationalGrads [][]float32
 	if relationalWeight > 0 {
-		students := make([][]float32, len(encoded))
-		teachers := make([][]float32, len(encoded))
+		var students [][]float32
+		var teachers [][]float32
+		if scratch != nil {
+			students = ensureVectorDistillFloat32SlicesScratch(scratch.students, len(encoded))
+			teachers = ensureVectorDistillFloat32SlicesScratch(scratch.teachers, len(encoded))
+		} else {
+			students = make([][]float32, len(encoded))
+			teachers = make([][]float32, len(encoded))
+		}
 		for i, enc := range encoded {
 			students[i] = enc.pooled
 			teachers[i] = batch[i].TeacherVector
+		}
+		if scratch != nil {
+			scratch.students = students
+			scratch.teachers = teachers
 		}
 		relationalLoss, relationalGrads, err = VectorDistillRelationalLossAndGrad(students, teachers, relationalWeight)
 		if err != nil {
@@ -450,7 +493,7 @@ func (t *EmbeddingTrainer) trainVectorDistillBatch(
 		}
 	}
 
-	grads, gradW, totalLoss, err := t.computeVectorDistillBatchGradients(batch, encoded, proj, forward, relationalGrads)
+	grads, gradW, totalLoss, err := t.computeVectorDistillBatchGradientsWithScratch(batch, encoded, proj, forward, relationalGrads, scratch)
 	if err != nil {
 		return EmbeddingTrainMetrics{}, proj, err
 	}
@@ -496,8 +539,25 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradients(
 	forward *embeddingForwardWeights,
 	relationalGrads [][]float32,
 ) (*compactEmbeddingGradState, []float32, float32, error) {
+	return t.computeVectorDistillBatchGradientsWithScratch(batch, encoded, proj, forward, relationalGrads, nil)
+}
+
+func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
+	batch []EmbeddingTokenizedVectorDistillExample,
+	encoded []*embeddingEncodedSequence,
+	proj *vectorDistillProjectionState,
+	forward *embeddingForwardWeights,
+	relationalGrads [][]float32,
+	scratch *vectorDistillBatchScratch,
+) (*compactEmbeddingGradState, []float32, float32, error) {
 	grads := newCompactEmbeddingGradState(t.compactState)
-	gradW := make([]float32, proj.InputDim*proj.OutDim)
+	var gradW []float32
+	if scratch != nil {
+		gradW = ensureFloat32Scratch(scratch.gradW, proj.InputDim*proj.OutDim)
+		scratch.gradW = gradW
+	} else {
+		gradW = make([]float32, proj.InputDim*proj.OutDim)
+	}
 	totalLoss := float32(0)
 
 	for i, enc := range encoded {
@@ -505,7 +565,13 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradients(
 		teacher := batch[i].TeacherVector
 
 		// Forward through projection: proj_vec = W @ student
-		projVec := make([]float32, proj.OutDim)
+		var projVec []float32
+		if scratch != nil {
+			projVec = ensureFloat32Scratch(scratch.projVec, proj.OutDim)
+			scratch.projVec = projVec
+		} else {
+			projVec = make([]float32, proj.OutDim)
+		}
 		for si := 0; si < proj.InputDim; si++ {
 			base := si * proj.OutDim
 			sv := student[si]
@@ -515,14 +581,27 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradients(
 		}
 
 		// Loss and gradient w.r.t. projected vector
-		lossResult, lerr := VectorDistillLossAndGrad(projVec, teacher)
+		var lossResult VectorDistillLossResult
+		var lerr error
+		if scratch != nil {
+			lossResult, lerr = vectorDistillLossAndGradInto(projVec, teacher, scratch.gradProj)
+			scratch.gradProj = lossResult.GradProj
+		} else {
+			lossResult, lerr = VectorDistillLossAndGrad(projVec, teacher)
+		}
 		if lerr != nil {
 			return nil, nil, 0, fmt.Errorf("example %d: %w", i, lerr)
 		}
 		totalLoss += lossResult.Loss
 
 		// Backprop through projection → gradStudent and gradW
-		gradStudent := make([]float32, proj.InputDim)
+		var gradStudent []float32
+		if scratch != nil {
+			gradStudent = ensureFloat32Scratch(scratch.gradStudent, proj.InputDim)
+			scratch.gradStudent = gradStudent
+		} else {
+			gradStudent = make([]float32, proj.InputDim)
+		}
 		accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj.W, gradStudent, gradW)
 
 		// Merge in the relational term's gradient w.r.t. the same raw student
@@ -552,6 +631,31 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradients(
 	}
 
 	return grads, gradW, totalLoss, nil
+}
+
+func ensureVectorDistillExampleScratch(s []EmbeddingTokenizedVectorDistillExample, n int) []EmbeddingTokenizedVectorDistillExample {
+	if cap(s) < n {
+		return make([]EmbeddingTokenizedVectorDistillExample, 0, n)
+	}
+	return s[:0]
+}
+
+func ensureVectorDistillInputScratch(s []embeddingSequenceInput, n int) []embeddingSequenceInput {
+	if cap(s) < n {
+		return make([]embeddingSequenceInput, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
+}
+
+func ensureVectorDistillFloat32SlicesScratch(s [][]float32, n int) [][]float32 {
+	if cap(s) < n {
+		return make([][]float32, n)
+	}
+	s = s[:n]
+	clear(s)
+	return s
 }
 
 // EstimateVectorDistillTrainWorkload returns a planned-work summary for

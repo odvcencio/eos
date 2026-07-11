@@ -229,6 +229,67 @@ func TestVectorDistillRelationalGradientMergeIsBatchSizeInvariant(t *testing.T) 
 	}
 }
 
+func TestComputeVectorDistillBatchGradientsScratchMatchesUnscratchedExact(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	batch := []EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+		vectorDistillTestExample("b", EmbeddingRoleDocument, []int32{3, 2, 1}, []float32{-0.1, 0.4, 0.2, -0.05}),
+	}
+
+	inputs := make([]embeddingSequenceInput, len(batch))
+	for i, ex := range batch {
+		roleIndex, _, err := trainer.vectorDistillRoleIndex(ex.Role, EmbeddingRoleQuery)
+		if err != nil {
+			t.Fatalf("vectorDistillRoleIndex: %v", err)
+		}
+		inputs[i] = embeddingSequenceInput{tokens: ex.Tokens, mask: ex.Mask, role: roleIndex, label: fmt.Sprintf("batch %d", i)}
+	}
+	forward := trainer.prepareForwardWeights()
+	if forward == nil || forward.compact == nil {
+		t.Fatal("missing compact forward weights")
+	}
+	encoded, err := trainer.encodeSequenceInputs(inputs, forward, true)
+	if err != nil {
+		t.Fatalf("encodeSequenceInputs: %v", err)
+	}
+	defer trainer.releaseEncodedSequences(encoded)
+
+	students := make([][]float32, len(encoded))
+	teachers := make([][]float32, len(encoded))
+	for i, enc := range encoded {
+		students[i] = enc.pooled
+		teachers[i] = batch[i].TeacherVector
+	}
+	_, relationalGrads, err := VectorDistillRelationalLossAndGrad(students, teachers, 0.5)
+	if err != nil {
+		t.Fatalf("VectorDistillRelationalLossAndGrad: %v", err)
+	}
+
+	proj := newVectorDistillProjectionState(len(encoded[0].pooled), 4, rand.New(rand.NewSource(42)))
+	wantGrads, wantGradW, wantLoss, err := trainer.computeVectorDistillBatchGradients(batch, encoded, proj, forward, relationalGrads)
+	if err != nil {
+		t.Fatalf("computeVectorDistillBatchGradients: %v", err)
+	}
+	var scratch vectorDistillBatchScratch
+	gotGrads, gotGradW, gotLoss, err := trainer.computeVectorDistillBatchGradientsWithScratch(batch, encoded, proj, forward, relationalGrads, &scratch)
+	if err != nil {
+		t.Fatalf("computeVectorDistillBatchGradientsWithScratch: %v", err)
+	}
+	if gotLoss != wantLoss {
+		t.Fatalf("totalLoss = %v, want exact %v", gotLoss, wantLoss)
+	}
+	assertExactFloat32Slice(t, "gradW", gotGradW, wantGradW)
+
+	gotSlices := compactEmbeddingGradSlices(gotGrads)
+	wantSlices := compactEmbeddingGradSlices(wantGrads)
+	if len(gotSlices) != len(wantSlices) {
+		t.Fatalf("gradient slice count = %d, want %d", len(gotSlices), len(wantSlices))
+	}
+	for i := range gotSlices {
+		assertExactFloat32Slice(t, fmt.Sprintf("grad slice %d", i), gotSlices[i], wantSlices[i])
+	}
+}
+
 // relationalOnlyEncoderGradNorm drives the real production merge path
 // (computeVectorDistillBatchGradients) to compute the L2 norm of the RAW
 // (pre-batchScale, pre-AdamW) encoder gradient contributed solely by the
@@ -310,4 +371,16 @@ func relationalOnlyEncoderGradNorm(t *testing.T, batch []EmbeddingTokenizedVecto
 		}
 	}
 	return math.Sqrt(sumSq)
+}
+
+func assertExactFloat32Slice(t *testing.T, name string, got, want []float32) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s length = %d, want %d", name, len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("%s[%d] = %v, want exact %v", name, i, got[i], want[i])
+		}
+	}
 }
