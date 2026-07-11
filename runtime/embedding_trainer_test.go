@@ -2255,7 +2255,7 @@ func TestCompactEmbeddingTrainerEvaluatePairsSkipsLegacyBatchedForwardWithAccele
 	if !compactTestFinite(metrics.Loss) || !compactTestFinite(metrics.AverageScore) || metrics.PairCount != len(batch) {
 		t.Fatalf("compact eval metrics = %+v, want finite pair metrics", metrics)
 	}
-	if fake.bindCalls != 0 || fake.runCalls != 0 || fake.boundRightRuns != 0 || fake.multiBoundRuns != 0 || fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
+	if fake.bindCalls != 0 || fake.boundRightRuns != 0 || fake.multiBoundRuns != 0 || fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
 		t.Fatalf("compact eval used legacy batched accelerator path: %+v", fake)
 	}
 }
@@ -2278,8 +2278,91 @@ func TestCompactEmbeddingTrainerEncodeSequenceInputsSkipsLegacyBatchedForwardWit
 	if len(seqs) != 2 || len(seqs[0].pooled) != 3 || len(seqs[1].pooled) != 3 {
 		t.Fatalf("encoded compact sequences = %+v, want two pooled dim-3 sequences", seqs)
 	}
-	if fake.bindCalls != 0 || fake.runCalls != 0 || fake.boundRightRuns != 0 || fake.multiBoundRuns != 0 || fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
+	if fake.bindCalls != 0 || fake.boundRightRuns != 0 || fake.multiBoundRuns != 0 || fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
 		t.Fatalf("compact encodeSequenceInputs used legacy batched accelerator path: %+v", fake)
+	}
+}
+
+func TestCompactEmbeddingTrainerConstructorReportsHostOrDeviceAccelerators(t *testing.T) {
+	checkpoint := compactTrainStateTestCheckpoint(3)
+	state, err := LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint, checkpoint.Manifest)
+	if err != nil {
+		t.Fatalf("load compact state: %v", err)
+	}
+	trainer, err := newCompactEmbeddingTrainerFromTrainState(&eosartifact.Module{Name: "compact"}, state)
+	if err != nil {
+		t.Fatalf("new compact trainer: %v", err)
+	}
+	t.Cleanup(trainer.Close)
+	profile := trainer.TrainProfile()
+	if trainer.forwardMatMul == nil {
+		if profile.ForwardBackend != eosartifact.BackendKind("host") {
+			t.Fatalf("host-only compact forward backend = %q, want host", profile.ForwardBackend)
+		}
+	} else if profile.ForwardBackend != trainer.forwardMatMul.Backend() {
+		t.Fatalf("compact forward backend = %q, want accelerator backend %q", profile.ForwardBackend, trainer.forwardMatMul.Backend())
+	}
+	if trainer.optimizerAccel == nil {
+		if profile.OptimizerBackend != eosartifact.BackendKind("host") {
+			t.Fatalf("host-only compact optimizer backend = %q, want host", profile.OptimizerBackend)
+		}
+	} else if profile.OptimizerBackend != trainer.optimizerAccel.Backend() {
+		t.Fatalf("compact optimizer backend = %q, want accelerator backend %q", profile.OptimizerBackend, trainer.optimizerAccel.Backend())
+	}
+}
+
+func TestCompactEmbeddingTrainerUsesMatMulAcceleratorForForwardAndBackward(t *testing.T) {
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	host.forwardMatMul = nil
+	host.forwardBackend = eosartifact.BackendKind("host")
+	accelerated := newCompactEmbeddingTrainerForTest(t, 3)
+	fake := &countingMatMulAccelerator{}
+	accelerated.forwardMatMul = fake
+	accelerated.forwardBackend = eosartifact.BackendCUDA
+
+	tokens := []int32{1, 2, 3}
+	mask, err := host.prepareMask(tokens, nil)
+	if err != nil {
+		t.Fatalf("prepare host mask: %v", err)
+	}
+	hostSeq, err := host.encodeCompactSequence(tokens, mask, host.rawRoleIndex(), host.prepareCompactForwardWeights())
+	if err != nil {
+		t.Fatalf("host compact encode: %v", err)
+	}
+	accelMask, err := accelerated.prepareMask(tokens, nil)
+	if err != nil {
+		t.Fatalf("prepare accelerated mask: %v", err)
+	}
+	accelSeq, err := accelerated.encodeCompactSequence(tokens, accelMask, accelerated.rawRoleIndex(), accelerated.prepareCompactForwardWeights())
+	if err != nil {
+		t.Fatalf("accelerated compact encode: %v", err)
+	}
+	assertTensorClose(t, backend.NewTensorF32([]int{len(hostSeq.pooled)}, accelSeq.pooled), []int{len(hostSeq.pooled)}, hostSeq.pooled)
+	forwardCalls := fake.runCalls
+	if forwardCalls == 0 {
+		t.Fatal("compact forward did not use trainer matmul accelerator helper")
+	}
+
+	grads := newCompactEmbeddingGradState(accelerated.compactState)
+	gradPooled := make([]float32, len(accelSeq.pooled))
+	for i := range gradPooled {
+		gradPooled[i] = 0.01 * float32(i+1)
+	}
+	if err := accelerated.backpropCompactEncodedSequence(accelSeq, gradPooled, accelerated.prepareCompactForwardWeights(), grads); err != nil {
+		t.Fatalf("accelerated compact backprop: %v", err)
+	}
+	if fake.runCalls <= forwardCalls {
+		t.Fatalf("compact backward did not use trainer matmul accelerator helper: before=%d after=%d", forwardCalls, fake.runCalls)
+	}
+	if len(grads.outputProjection) != len(accelerated.compactState.OutputProjection.Tensor.F32) {
+		t.Fatalf("output projection grad len = %d, want %d", len(grads.outputProjection), len(accelerated.compactState.OutputProjection.Tensor.F32))
+	}
+	for _, grad := range compactEmbeddingGradSlices(grads) {
+		for _, value := range grad {
+			if !compactTestFinite(value) {
+				t.Fatalf("compact accelerated gradient contains non-finite value: %v", value)
+			}
+		}
 	}
 }
 

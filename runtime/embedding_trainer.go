@@ -517,12 +517,33 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 	}
 	cfg := state.Config
 	cfg = normalizedTrainConfig(cfg)
+	accel, accelBackend, err := newTrainerMatMulAccelerator()
+	if err != nil {
+		return nil, err
+	}
+	optimizerAccel, optimizerBackend, err := newTrainerOptimizerAccelerator()
+	if err != nil {
+		if accel != nil {
+			accel.Close()
+		}
+		return nil, err
+	}
+	if accelBackend == "" {
+		accelBackend = eosartifact.BackendKind("host")
+	}
+	if optimizerBackend == "" {
+		optimizerBackend = eosartifact.BackendKind("host")
+	}
 	return &EmbeddingTrainer{
 		module:           mod,
 		manifest:         manifest,
 		config:           cfg,
 		step:             state.Step,
 		compactState:     state,
+		forwardMatMul:    accel,
+		forwardBackend:   accelBackend,
+		optimizerAccel:   optimizerAccel,
+		optimizerBackend: optimizerBackend,
 		forwardDirty:     true,
 		forwardNeedsBind: true,
 	}, nil
@@ -866,7 +887,11 @@ func (t *EmbeddingTrainer) TrainProfile() EmbeddingTrainProfile {
 	if t.optimizerAccel != nil {
 		profile.Optimizer = t.optimizerAccel.Stats()
 	}
-	profile.Optimizer.UpdateCalls += t.compactOptimizerUpdates
+	if t.isCompactTrainer() {
+		profile.Optimizer.UpdateCalls = t.compactOptimizerUpdates
+	} else {
+		profile.Optimizer.UpdateCalls += t.compactOptimizerUpdates
+	}
 	if t.activationAccel != nil {
 		profile.Activation = t.activationAccel.Stats()
 	}
@@ -3041,12 +3066,12 @@ func (t *EmbeddingTrainer) backpropCompactEncodedSequence(seq *embeddingEncodedS
 	if forward == nil || len(forward.layers) != len(seq.layers) {
 		return fmt.Errorf("compact forward layer count %d does not match encoded layer count %d", compactForwardLayerCount(forward), len(seq.layers))
 	}
-	gradHidden, err := backpropCompactFinalOutput(seq, gradPooled, forward.outputProjection, grads.outputProjection)
+	gradHidden, err := t.backpropCompactFinalOutput(seq, gradPooled, forward.outputProjection, grads.outputProjection)
 	if err != nil {
 		return err
 	}
 	for layerIndex := len(seq.layers) - 1; layerIndex >= 0; layerIndex-- {
-		gradHidden = backpropCompactLayer(seq.layers[layerIndex], gradHidden, forward.layers[layerIndex], &grads.layers[layerIndex])
+		gradHidden = t.backpropCompactLayer(seq.layers[layerIndex], gradHidden, forward.layers[layerIndex], &grads.layers[layerIndex])
 	}
 	t.accumulateCompactInputGrads(seq.tokens, seq.role, gradHidden, grads)
 	return nil
@@ -3059,7 +3084,7 @@ func compactForwardLayerCount(forward *compactEmbeddingForwardWeights) int {
 	return len(forward.layers)
 }
 
-func backpropCompactFinalOutput(seq *embeddingEncodedSequence, gradPooled []float32, outputProjection *backend.Tensor, gradOutputProjection []float32) ([]float32, error) {
+func (t *EmbeddingTrainer) backpropCompactFinalOutput(seq *embeddingEncodedSequence, gradPooled []float32, outputProjection *backend.Tensor, gradOutputProjection []float32) ([]float32, error) {
 	last := seq.finalLayer()
 	if last == nil || len(last.tokens) == 0 {
 		return nil, fmt.Errorf("compact final output requires a non-empty final layer")
@@ -3112,10 +3137,18 @@ func backpropCompactFinalOutput(seq *embeddingEncodedSequence, gradPooled []floa
 	gradNormalized := gradOutputRows
 	if outputProjection != nil {
 		gradProjStep := make([]float32, modelDim*outDim)
-		fillHostMatMulTranspose(normalized, seqLen, modelDim, gradOutputRows, seqLen, outDim, true, false, gradProjStep)
+		if out, ok := t.tryTrainerMatMul(normalized, seqLen, modelDim, gradOutputRows, seqLen, outDim, true, false); ok {
+			copy(gradProjStep, out)
+		} else {
+			fillHostMatMulTranspose(normalized, seqLen, modelDim, gradOutputRows, seqLen, outDim, true, false, gradProjStep)
+		}
 		addFloat32Slice(gradOutputProjection, gradProjStep)
 		gradNormalized = make([]float32, seqLen*modelDim)
-		fillHostMatMulTranspose(gradOutputRows, seqLen, outDim, outputProjection.F32, modelDim, outDim, false, true, gradNormalized)
+		if out, ok := t.tryTrainerMatMul(gradOutputRows, seqLen, outDim, outputProjection.F32, modelDim, outDim, false, true); ok {
+			copy(gradNormalized, out)
+		} else {
+			fillHostMatMulTranspose(gradOutputRows, seqLen, outDim, outputProjection.F32, modelDim, outDim, false, true, gradNormalized)
+		}
 	}
 
 	gradHidden := make([]float32, seqLen*modelDim)
@@ -3136,7 +3169,7 @@ func backpropCompactFinalOutput(seq *embeddingEncodedSequence, gradPooled []floa
 	return gradHidden, nil
 }
 
-func backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32, layer compactEmbeddingForwardLayer, gradLayer *compactEmbeddingGradLayer) []float32 {
+func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32, layer compactEmbeddingForwardLayer, gradLayer *compactEmbeddingGradLayer) []float32 {
 	if state == nil || len(state.tokens) == 0 {
 		return nil
 	}
@@ -3168,20 +3201,36 @@ func backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32
 	gradHidden := append([]float32(nil), gradFFNResidual...)
 
 	gradFFNDownStep := make([]float32, h*d)
-	fillHostMatMulTranspose(state.activated, seqLen, h, gradFFNOutput, seqLen, d, true, false, gradFFNDownStep)
+	if out, ok := t.tryTrainerMatMul(state.activated, seqLen, h, gradFFNOutput, seqLen, d, true, false); ok {
+		copy(gradFFNDownStep, out)
+	} else {
+		fillHostMatMulTranspose(state.activated, seqLen, h, gradFFNOutput, seqLen, d, true, false, gradFFNDownStep)
+	}
 	addFloat32Slice(gradLayer.ffnDown, gradFFNDownStep)
 	gradActivatedPre := make([]float32, seqLen*h)
-	fillHostMatMulTranspose(gradFFNOutput, seqLen, d, forwardMatMulHostData(layer.ffnDown), h, d, false, true, gradActivatedPre)
+	if out, ok := t.tryTrainerMatMul(gradFFNOutput, seqLen, d, forwardMatMulHostData(layer.ffnDown), h, d, false, true); ok {
+		copy(gradActivatedPre, out)
+	} else {
+		fillHostMatMulTranspose(gradFFNOutput, seqLen, d, forwardMatMulHostData(layer.ffnDown), h, d, false, true, gradActivatedPre)
+	}
 	gradActivated := make([]float32, seqLen*h)
 	for row := 0; row < seqLen; row++ {
 		base := row * h
 		fillGELUBackwardMul(gradActivated[base:base+h], gradActivatedPre[base:base+h], state.ffnHidden[base:base+h], fastGELUEnabled())
 	}
 	gradFFNUpStep := make([]float32, d*h)
-	fillHostMatMulTranspose(state.hidden, seqLen, d, gradActivated, seqLen, h, true, false, gradFFNUpStep)
+	if out, ok := t.tryTrainerMatMul(state.hidden, seqLen, d, gradActivated, seqLen, h, true, false); ok {
+		copy(gradFFNUpStep, out)
+	} else {
+		fillHostMatMulTranspose(state.hidden, seqLen, d, gradActivated, seqLen, h, true, false, gradFFNUpStep)
+	}
 	addFloat32Slice(gradLayer.ffnUp, gradFFNUpStep)
 	gradHiddenFromFFN := make([]float32, seqLen*d)
-	fillHostMatMulTranspose(gradActivated, seqLen, h, forwardMatMulHostData(layer.ffnUp), d, h, false, true, gradHiddenFromFFN)
+	if out, ok := t.tryTrainerMatMul(gradActivated, seqLen, h, forwardMatMulHostData(layer.ffnUp), d, h, false, true); ok {
+		copy(gradHiddenFromFFN, out)
+	} else {
+		fillHostMatMulTranspose(gradActivated, seqLen, h, forwardMatMulHostData(layer.ffnUp), d, h, false, true, gradHiddenFromFFN)
+	}
 	addFloat32Slice(gradHidden, gradHiddenFromFFN)
 
 	gradAttnResidual := make([]float32, seqLen*d)
@@ -3198,10 +3247,18 @@ func backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32
 	gradInput := append([]float32(nil), gradAttnResidual...)
 
 	gradAttnOStep := make([]float32, d*d)
-	fillHostMatMulTranspose(state.attnMixed, seqLen, d, gradAttnOutput, seqLen, d, true, false, gradAttnOStep)
+	if out, ok := t.tryTrainerMatMul(state.attnMixed, seqLen, d, gradAttnOutput, seqLen, d, true, false); ok {
+		copy(gradAttnOStep, out)
+	} else {
+		fillHostMatMulTranspose(state.attnMixed, seqLen, d, gradAttnOutput, seqLen, d, true, false, gradAttnOStep)
+	}
 	addFloat32Slice(gradLayer.attnO, gradAttnOStep)
 	gradMixed := make([]float32, seqLen*d)
-	fillHostMatMulTranspose(gradAttnOutput, seqLen, d, forwardMatMulHostData(layer.attnO), d, d, false, true, gradMixed)
+	if out, ok := t.tryTrainerMatMul(gradAttnOutput, seqLen, d, forwardMatMulHostData(layer.attnO), d, d, false, true); ok {
+		copy(gradMixed, out)
+	} else {
+		fillHostMatMulTranspose(gradAttnOutput, seqLen, d, forwardMatMulHostData(layer.attnO), d, d, false, true, gradMixed)
+	}
 
 	gradV := make([]float32, seqLen*d)
 	gradQ := make([]float32, seqLen*d)
@@ -3247,27 +3304,51 @@ func backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32
 	}
 
 	gradAttnQStep := make([]float32, d*d)
-	fillHostMatMulTranspose(state.input, seqLen, d, gradQ, seqLen, d, true, false, gradAttnQStep)
+	if out, ok := t.tryTrainerMatMul(state.input, seqLen, d, gradQ, seqLen, d, true, false); ok {
+		copy(gradAttnQStep, out)
+	} else {
+		fillHostMatMulTranspose(state.input, seqLen, d, gradQ, seqLen, d, true, false, gradAttnQStep)
+	}
 	addFloat32Slice(gradLayer.attnQ, gradAttnQStep)
 	gradAttnKStep := make([]float32, d*d)
-	fillHostMatMulTranspose(state.input, seqLen, d, gradK, seqLen, d, true, false, gradAttnKStep)
+	if out, ok := t.tryTrainerMatMul(state.input, seqLen, d, gradK, seqLen, d, true, false); ok {
+		copy(gradAttnKStep, out)
+	} else {
+		fillHostMatMulTranspose(state.input, seqLen, d, gradK, seqLen, d, true, false, gradAttnKStep)
+	}
 	addFloat32Slice(gradLayer.attnK, gradAttnKStep)
 	gradAttnVStep := make([]float32, d*d)
-	fillHostMatMulTranspose(state.input, seqLen, d, gradV, seqLen, d, true, false, gradAttnVStep)
+	if out, ok := t.tryTrainerMatMul(state.input, seqLen, d, gradV, seqLen, d, true, false); ok {
+		copy(gradAttnVStep, out)
+	} else {
+		fillHostMatMulTranspose(state.input, seqLen, d, gradV, seqLen, d, true, false, gradAttnVStep)
+	}
 	addFloat32Slice(gradLayer.attnV, gradAttnVStep)
 
 	gradInputStep := make([]float32, seqLen*d)
-	fillHostMatMulTranspose(gradQ, seqLen, d, forwardMatMulHostData(layer.attnQ), d, d, false, true, gradInputStep)
+	if out, ok := t.tryTrainerMatMul(gradQ, seqLen, d, forwardMatMulHostData(layer.attnQ), d, d, false, true); ok {
+		copy(gradInputStep, out)
+	} else {
+		fillHostMatMulTranspose(gradQ, seqLen, d, forwardMatMulHostData(layer.attnQ), d, d, false, true, gradInputStep)
+	}
 	addFloat32Slice(gradInput, gradInputStep)
 	for i := range gradInputStep {
 		gradInputStep[i] = 0
 	}
-	fillHostMatMulTranspose(gradK, seqLen, d, forwardMatMulHostData(layer.attnK), d, d, false, true, gradInputStep)
+	if out, ok := t.tryTrainerMatMul(gradK, seqLen, d, forwardMatMulHostData(layer.attnK), d, d, false, true); ok {
+		copy(gradInputStep, out)
+	} else {
+		fillHostMatMulTranspose(gradK, seqLen, d, forwardMatMulHostData(layer.attnK), d, d, false, true, gradInputStep)
+	}
 	addFloat32Slice(gradInput, gradInputStep)
 	for i := range gradInputStep {
 		gradInputStep[i] = 0
 	}
-	fillHostMatMulTranspose(gradV, seqLen, d, forwardMatMulHostData(layer.attnV), d, d, false, true, gradInputStep)
+	if out, ok := t.tryTrainerMatMul(gradV, seqLen, d, forwardMatMulHostData(layer.attnV), d, d, false, true); ok {
+		copy(gradInputStep, out)
+	} else {
+		fillHostMatMulTranspose(gradV, seqLen, d, forwardMatMulHostData(layer.attnV), d, d, false, true, gradInputStep)
+	}
 	addFloat32Slice(gradInput, gradInputStep)
 	return gradInput
 }
@@ -6953,7 +7034,7 @@ func (t *EmbeddingTrainer) encodeCompactSequence(tokens, mask []int32, role int3
 	if len(encoded.layers) == 0 {
 		return nil, fmt.Errorf("encoder produced zero layers")
 	}
-	outputRows, err := compactFinalOutputRows(current, len(tokens), d, forward.outputProjection)
+	outputRows, err := t.compactFinalOutputRows(current, len(tokens), d, forward.outputProjection)
 	if err != nil {
 		return nil, err
 	}
@@ -7004,11 +7085,27 @@ func (t *EmbeddingTrainer) encodeCompactLayer(tokens, mask []int32, input []floa
 		normalized:   make([]float32, len(tokens)*d),
 		pooled:       make([]float32, d),
 	}
-	fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnQ), d, state.attnQ)
-	fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnK), d, state.attnK)
-	fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnV), d, state.attnV)
+	if out, ok := t.tryForwardMatMul(input, len(tokens), d, layer.attnQ, d); ok {
+		copy(state.attnQ, out)
+	} else {
+		fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnQ), d, state.attnQ)
+	}
+	if out, ok := t.tryForwardMatMul(input, len(tokens), d, layer.attnK, d); ok {
+		copy(state.attnK, out)
+	} else {
+		fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnK), d, state.attnK)
+	}
+	if out, ok := t.tryForwardMatMul(input, len(tokens), d, layer.attnV, d); ok {
+		copy(state.attnV, out)
+	} else {
+		fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnV), d, state.attnV)
+	}
 	fillCompactMultiHeadAttention(state, len(tokens), d, heads, headDim, mask)
-	fillHostMatMul(state.attnMixed, len(tokens), d, forwardMatMulHostData(layer.attnO), d, state.attnOutput)
+	if out, ok := t.tryForwardMatMul(state.attnMixed, len(tokens), d, layer.attnO, d); ok {
+		copy(state.attnOutput, out)
+	} else {
+		fillHostMatMul(state.attnMixed, len(tokens), d, forwardMatMulHostData(layer.attnO), d, state.attnOutput)
+	}
 	for i := range state.attnOutput {
 		state.attnResidual[i] = state.attnOutput[i] + input[i]
 	}
@@ -7016,9 +7113,17 @@ func (t *EmbeddingTrainer) encodeCompactLayer(tokens, mask []int32, input []floa
 		base := row * d
 		layerNormRow(state.hidden[base:base+d], state.attnResidual[base:base+d])
 	}
-	fillHostMatMul(state.hidden, len(tokens), d, forwardMatMulHostData(layer.ffnUp), h, state.ffnHidden)
+	if out, ok := t.tryForwardMatMul(state.hidden, len(tokens), d, layer.ffnUp, h); ok {
+		copy(state.ffnHidden, out)
+	} else {
+		fillHostMatMul(state.hidden, len(tokens), d, forwardMatMulHostData(layer.ffnUp), h, state.ffnHidden)
+	}
 	fillGELUForward(state.activated, state.ffnHidden, fastGELUEnabled())
-	fillHostMatMul(state.activated, len(tokens), h, forwardMatMulHostData(layer.ffnDown), d, state.ffnOutput)
+	if out, ok := t.tryForwardMatMul(state.activated, len(tokens), h, layer.ffnDown, d); ok {
+		copy(state.ffnOutput, out)
+	} else {
+		fillHostMatMul(state.activated, len(tokens), h, forwardMatMulHostData(layer.ffnDown), d, state.ffnOutput)
+	}
 	for i := range state.ffnOutput {
 		state.ffnResidual[i] = state.ffnOutput[i] + state.hidden[i]
 	}
@@ -7130,7 +7235,7 @@ func compactOutputWidth(modelDim int, outputProjection *backend.Tensor) int {
 	return modelDim
 }
 
-func compactFinalOutputRows(hidden []float32, rows, modelDim int, outputProjection *backend.Tensor) ([]float32, error) {
+func (t *EmbeddingTrainer) compactFinalOutputRows(hidden []float32, rows, modelDim int, outputProjection *backend.Tensor) ([]float32, error) {
 	if len(hidden) != rows*modelDim {
 		return nil, fmt.Errorf("compact final hidden size %d does not match rows=%d width=%d", len(hidden), rows, modelDim)
 	}
@@ -7153,7 +7258,11 @@ func compactFinalOutputRows(hidden []float32, rows, modelDim int, outputProjecti
 		return nil, fmt.Errorf("output_projection shape %v, want [%d O]", outputProjection.Shape, modelDim)
 	}
 	out := make([]float32, rows*outputProjection.Shape[1])
-	fillHostMatMul(normalized, rows, modelDim, forwardMatMulHostData(outputProjection), outputProjection.Shape[1], out)
+	if accelerated, ok := t.tryForwardMatMul(normalized, rows, modelDim, outputProjection, outputProjection.Shape[1]); ok {
+		copy(out, accelerated)
+	} else {
+		fillHostMatMul(normalized, rows, modelDim, forwardMatMulHostData(outputProjection), outputProjection.Shape[1], out)
+	}
 	return out, nil
 }
 
