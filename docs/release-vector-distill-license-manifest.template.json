@@ -1,0 +1,59 @@
+{
+  "schema": "eos.release_vector_distill_license_manifest.template.v1",
+  "review": {
+    "status": "review_required_not_approved",
+    "owner": "LEGAL_REVIEW_OWNER_REQUIRED",
+    "approval_note": "Template only. Do not use as approval or release clearance until each dataset license, source URL, raw SHA256, and grant flag has been reviewed and replaced/confirmed by the owner."
+  },
+  "source_metadata": {
+    "source": "BEIR public dataset zips",
+    "source_url_documented_in": "datasets/manta-embed-v1/manifest.json",
+    "source_url_base": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/",
+    "local_raw_root": "datasets/manta-embed-v1/raw",
+    "local_raw_layout": "datasets/manta-embed-v1/raw/{dataset}.zip plus datasets/manta-embed-v1/raw/{dataset}/{dataset}/"
+  },
+  "teacher_embeddings_release_cleared": false,
+  "legal_gates": {
+    "train_allowed": false,
+    "release_train_allowed": false,
+    "commercial_use_allowed": false
+  },
+  "datasets": [
+    {
+      "dataset": "scifact",
+      "license": "REVIEW_REQUIRED",
+      "source_url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+      "raw_sha256": "REVIEW_REQUIRED: compute sha256 of datasets/manta-embed-v1/raw/scifact.zip and have reviewer confirm source identity",
+      "raw_sha256_status": "placeholder_not_reviewed",
+      "local_raw_asset": "datasets/manta-embed-v1/raw/scifact.zip",
+      "train_allowed": false,
+      "release_train_allowed": false,
+      "commercial_use_allowed": false,
+      "review_note": "No grant asserted by this template."
+    },
+    {
+      "dataset": "nfcorpus",
+      "license": "REVIEW_REQUIRED",
+      "source_url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/nfcorpus.zip",
+      "raw_sha256": "REVIEW_REQUIRED: compute sha256 of datasets/manta-embed-v1/raw/nfcorpus.zip and have reviewer confirm source identity",
+      "raw_sha256_status": "placeholder_not_reviewed",
+      "local_raw_asset": "datasets/manta-embed-v1/raw/nfcorpus.zip",
+      "train_allowed": false,
+      "release_train_allowed": false,
+      "commercial_use_allowed": false,
+      "review_note": "No grant asserted by this template."
+    },
+    {
+      "dataset": "fiqa",
+      "license": "REVIEW_REQUIRED",
+      "source_url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/fiqa.zip",
+      "raw_sha256": "REVIEW_REQUIRED: compute sha256 of datasets/manta-embed-v1/raw/fiqa.zip and have reviewer confirm source identity",
+      "raw_sha256_status": "placeholder_not_reviewed",
+      "local_raw_asset": "datasets/manta-embed-v1/raw/fiqa.zip",
+      "train_allowed": false,
+      "release_train_allowed": false,
+      "commercial_use_allowed": false,
+      "review_note": "No grant asserted by this template."
+    }
+  ]
+}
