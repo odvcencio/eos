@@ -7,6 +7,8 @@ import (
 	"os"
 	"runtime/debug"
 	"time"
+
+	"m31labs.dev/eos/runtime/backend"
 )
 
 // vectorDistillProjectionState holds the train-time-only 128→384 distillation
@@ -449,7 +451,9 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 	if forward == nil || forward.compact == nil {
 		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("missing compact forward weights")
 	}
+	encodeStart := time.Now()
 	encoded, err := t.encodeSequenceInputs(inputs, forward, true)
+	t.vectorDistillPhases.EncodeNanos += time.Since(encodeStart).Nanoseconds()
 	if err != nil {
 		return EmbeddingTrainMetrics{}, proj, err
 	}
@@ -506,11 +510,9 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 
 	// Update projection with its own AdamW (same LR/hyper-params as student)
 	proj.Step++
-	applyVectorDistillProjectionAdamW(
-		proj.W, proj.Mom1, proj.Mom2, gradW,
-		t.config.LearningRate, t.config.Beta1, t.config.Beta2, t.config.Epsilon, t.config.WeightDecay,
-		proj.Step,
-	)
+	optimizerStart := time.Now()
+	t.applyVectorDistillProjectionAdamW(proj, gradW)
+	t.vectorDistillPhases.OptimizerNanos += time.Since(optimizerStart).Nanoseconds()
 
 	return EmbeddingTrainMetrics{
 		// relationalLoss is already a batch-level mean (not per-example), so
@@ -565,6 +567,7 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 		teacher := batch[i].TeacherVector
 
 		// Forward through projection: proj_vec = W @ student
+		projectionLossStart := time.Now()
 		var projVec []float32
 		if scratch != nil {
 			projVec = ensureFloat32Scratch(scratch.projVec, proj.OutDim)
@@ -572,13 +575,7 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 		} else {
 			projVec = make([]float32, proj.OutDim)
 		}
-		for si := 0; si < proj.InputDim; si++ {
-			base := si * proj.OutDim
-			sv := student[si]
-			for k := 0; k < proj.OutDim; k++ {
-				projVec[k] += proj.W[base+k] * sv
-			}
-		}
+		t.projectVectorDistillStudent(student, proj, projVec)
 
 		// Loss and gradient w.r.t. projected vector
 		var lossResult VectorDistillLossResult
@@ -593,8 +590,10 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 			return nil, nil, 0, fmt.Errorf("example %d: %w", i, lerr)
 		}
 		totalLoss += lossResult.Loss
+		t.vectorDistillPhases.ProjectionLossNanos += time.Since(projectionLossStart).Nanoseconds()
 
 		// Backprop through projection → gradStudent and gradW
+		backwardStart := time.Now()
 		var gradStudent []float32
 		if scratch != nil {
 			gradStudent = ensureFloat32Scratch(scratch.gradStudent, proj.InputDim)
@@ -602,7 +601,7 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 		} else {
 			gradStudent = make([]float32, proj.InputDim)
 		}
-		accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj.W, gradStudent, gradW)
+		t.accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj, gradStudent, gradW)
 
 		// Merge in the relational term's gradient w.r.t. the same raw student
 		// vector (computed directly, not through the projection).
@@ -623,6 +622,7 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 				gradStudent[k] += g * n
 			}
 		}
+		t.vectorDistillPhases.BackwardNanos += time.Since(backwardStart).Nanoseconds()
 
 		// Backprop gradStudent through the encoder
 		if berr := t.backpropCompactEncodedSequence(enc, gradStudent, forward.compact, grads); berr != nil {
@@ -631,6 +631,111 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 	}
 
 	return grads, gradW, totalLoss, nil
+}
+
+func (t *EmbeddingTrainer) projectVectorDistillStudent(student []float32, proj *vectorDistillProjectionState, out []float32) {
+	if proj == nil || len(student) == 0 || len(out) != proj.OutDim {
+		return
+	}
+	if accelerated, ok := t.tryTrainerMatMul(student, 1, proj.InputDim, proj.W, proj.InputDim, proj.OutDim, false, false); ok && len(accelerated) == proj.OutDim {
+		copy(out, accelerated)
+		return
+	}
+	for si := 0; si < proj.InputDim; si++ {
+		base := si * proj.OutDim
+		sv := student[si]
+		for k := 0; k < proj.OutDim; k++ {
+			out[k] += proj.W[base+k] * sv
+		}
+	}
+}
+
+func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
+	student []float32,
+	gradProj []float32,
+	proj *vectorDistillProjectionState,
+	gradStudent []float32,
+	gradW []float32,
+) {
+	if proj == nil || len(gradProj) == 0 || len(student) == 0 {
+		return
+	}
+	studentGradOK := false
+	if accelerated, ok := t.tryTrainerMatMul(gradProj, 1, proj.OutDim, proj.W, proj.InputDim, proj.OutDim, false, true); ok && len(accelerated) == proj.InputDim {
+		for i, v := range accelerated {
+			gradStudent[i] += v
+		}
+		studentGradOK = true
+	}
+	weightGradOK := false
+	if accelerated, ok := t.tryTrainerMatMul(student, 1, proj.InputDim, gradProj, 1, proj.OutDim, true, false); ok && len(accelerated) == len(gradW) {
+		for i, v := range accelerated {
+			gradW[i] += v
+		}
+		weightGradOK = true
+	}
+	if studentGradOK && weightGradOK {
+		return
+	}
+	if studentGradOK {
+		for i := 0; i < proj.InputDim; i++ {
+			si := student[i]
+			base := i * proj.OutDim
+			for k := 0; k < proj.OutDim; k++ {
+				gradW[base+k] += si * gradProj[k]
+			}
+		}
+		return
+	}
+	if weightGradOK {
+		for i := 0; i < proj.InputDim; i++ {
+			base := i * proj.OutDim
+			var gs float32
+			for k := 0; k < proj.OutDim; k++ {
+				gs += proj.W[base+k] * gradProj[k]
+			}
+			gradStudent[i] += gs
+		}
+		return
+	}
+	accumulateVectorDistillProjectionGrads(student, gradProj, proj.W, gradStudent, gradW)
+}
+
+func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistillProjectionState, gradW []float32) {
+	if proj == nil || len(proj.W) == 0 || proj.Step <= 0 {
+		return
+	}
+	if t != nil && t.optimizerAccel != nil && len(gradW) == len(proj.W) {
+		shape := []int{proj.InputDim, proj.OutDim}
+		weights := backend.NewTensorF32(shape, proj.W)
+		mom1 := backend.NewTensorF32(shape, proj.Mom1)
+		mom2 := backend.NewTensorF32(shape, proj.Mom2)
+		cfg := backend.OptimizerUpdateConfig{
+			Optimizer:    t.config.Optimizer,
+			Step:         proj.Step,
+			LearningRate: t.config.LearningRate,
+			WeightDecay:  t.config.WeightDecay,
+			Beta1:        t.config.Beta1,
+			Beta2:        t.config.Beta2,
+			Epsilon:      t.config.Epsilon,
+			Scale:        1,
+		}
+		name := fmt.Sprintf("vector_distill_projection_%p", proj)
+		if err := t.optimizerAccel.ApplyUpdate(name, cfg, weights, mom1, mom2, backend.NewTensorF32(shape, gradW)); err == nil {
+			if err := t.optimizerAccel.SyncState(name, weights, mom1, mom2, true); err == nil {
+				copy(proj.W, weights.F32)
+				copy(proj.Mom1, mom1.F32)
+				copy(proj.Mom2, mom2.F32)
+				t.momentsDirty = true
+				return
+			}
+		}
+	}
+	applyVectorDistillProjectionAdamW(
+		proj.W, proj.Mom1, proj.Mom2, gradW,
+		t.config.LearningRate, t.config.Beta1, t.config.Beta2, t.config.Epsilon, t.config.WeightDecay,
+		proj.Step,
+	)
 }
 
 func ensureVectorDistillExampleScratch(s []EmbeddingTokenizedVectorDistillExample, n int) []EmbeddingTokenizedVectorDistillExample {

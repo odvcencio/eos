@@ -245,6 +245,7 @@ type EmbeddingTrainer struct {
 	forwardDirty            bool
 	forwardNeedsBind        bool
 	forwardBindSkips        int64
+	vectorDistillPhases     EmbeddingVectorDistillPhaseTimers
 	scratchF32              [][]float32
 	// vectorDistillDefaultRoleWarned tracks whether FitVectorDistill has already
 	// logged the one-time warning about rows falling back to the default role.
@@ -893,13 +894,14 @@ func (t *EmbeddingTrainer) TrainProfile() EmbeddingTrainProfile {
 		return EmbeddingTrainProfile{Version: EmbeddingTrainProfileVersion}
 	}
 	profile := EmbeddingTrainProfile{
-		Version:            EmbeddingTrainProfileVersion,
-		Step:               t.step,
-		ForwardBackend:     t.forwardBackend,
-		OptimizerBackend:   t.optimizerBackend,
-		ActivationBackend:  t.activationBackend,
-		ContrastiveBackend: t.contrastiveBackend,
-		ForwardResidency:   t.ForwardResidencyStats(),
+		Version:             EmbeddingTrainProfileVersion,
+		Step:                t.step,
+		ForwardBackend:      t.forwardBackend,
+		OptimizerBackend:    t.optimizerBackend,
+		ActivationBackend:   t.activationBackend,
+		ContrastiveBackend:  t.contrastiveBackend,
+		ForwardResidency:    t.ForwardResidencyStats(),
+		VectorDistillPhases: t.vectorDistillPhases,
 	}
 	if t.optimizerAccel != nil {
 		profile.Optimizer = t.optimizerAccel.Stats()

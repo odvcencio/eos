@@ -17,16 +17,25 @@ var tagXTPR = [4]byte{'X', 'T', 'P', 'R'}
 
 // EmbeddingTrainProfile captures trainer-side residency and backend prep activity at a point in time.
 type EmbeddingTrainProfile struct {
-	Version            string                              `json:"version"`
-	Step               int                                 `json:"step"`
-	ForwardBackend     eosartifact.BackendKind             `json:"forward_backend,omitempty"`
-	OptimizerBackend   eosartifact.BackendKind             `json:"optimizer_backend,omitempty"`
-	ActivationBackend  eosartifact.BackendKind             `json:"activation_backend,omitempty"`
-	ContrastiveBackend eosartifact.BackendKind             `json:"contrastive_backend,omitempty"`
-	ForwardResidency   EmbeddingForwardResidencyStats      `json:"forward_residency"`
-	Optimizer          backend.OptimizerAcceleratorStats   `json:"optimizer"`
-	Activation         backend.ActivationAcceleratorStats  `json:"activation"`
-	Contrastive        backend.ContrastiveAcceleratorStats `json:"contrastive"`
+	Version             string                              `json:"version"`
+	Step                int                                 `json:"step"`
+	ForwardBackend      eosartifact.BackendKind             `json:"forward_backend,omitempty"`
+	OptimizerBackend    eosartifact.BackendKind             `json:"optimizer_backend,omitempty"`
+	ActivationBackend   eosartifact.BackendKind             `json:"activation_backend,omitempty"`
+	ContrastiveBackend  eosartifact.BackendKind             `json:"contrastive_backend,omitempty"`
+	ForwardResidency    EmbeddingForwardResidencyStats      `json:"forward_residency"`
+	VectorDistillPhases EmbeddingVectorDistillPhaseTimers   `json:"vector_distill_phases,omitempty"`
+	Optimizer           backend.OptimizerAcceleratorStats   `json:"optimizer"`
+	Activation          backend.ActivationAcceleratorStats  `json:"activation"`
+	Contrastive         backend.ContrastiveAcceleratorStats `json:"contrastive"`
+}
+
+// EmbeddingVectorDistillPhaseTimers captures host-observed compact vector-distill phase time.
+type EmbeddingVectorDistillPhaseTimers struct {
+	EncodeNanos         int64 `json:"encode_nanos,omitempty"`
+	ProjectionLossNanos int64 `json:"projection_loss_nanos,omitempty"`
+	BackwardNanos       int64 `json:"backward_nanos,omitempty"`
+	OptimizerNanos      int64 `json:"optimizer_nanos,omitempty"`
 }
 
 // DefaultEmbeddingTrainProfilePath returns the conventional sibling training-profile path for a .mll artifact.
@@ -232,6 +241,15 @@ func diffForwardResidencyStats(start, end EmbeddingForwardResidencyStats) Embedd
 	}
 }
 
+func diffVectorDistillPhaseTimers(start, end EmbeddingVectorDistillPhaseTimers) EmbeddingVectorDistillPhaseTimers {
+	return EmbeddingVectorDistillPhaseTimers{
+		EncodeNanos:         end.EncodeNanos - start.EncodeNanos,
+		ProjectionLossNanos: end.ProjectionLossNanos - start.ProjectionLossNanos,
+		BackwardNanos:       end.BackwardNanos - start.BackwardNanos,
+		OptimizerNanos:      end.OptimizerNanos - start.OptimizerNanos,
+	}
+}
+
 func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 	return profile.Step != 0 ||
 		profile.ForwardResidency.BindSkips != 0 ||
@@ -247,6 +265,10 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 		profile.ForwardResidency.MatMul.RunUploadedBytes != 0 ||
 		profile.ForwardResidency.MatMul.RunDownloadedBytes != 0 ||
 		profile.ForwardResidency.MatMul.RunNanos != 0 ||
+		profile.VectorDistillPhases.EncodeNanos != 0 ||
+		profile.VectorDistillPhases.ProjectionLossNanos != 0 ||
+		profile.VectorDistillPhases.BackwardNanos != 0 ||
+		profile.VectorDistillPhases.OptimizerNanos != 0 ||
 		profile.Optimizer.UpdateCalls != 0 ||
 		profile.Optimizer.SyncCalls != 0 ||
 		profile.Optimizer.UploadedBytes != 0 ||
@@ -292,6 +314,12 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 				RunDownloadedBytes: left.ForwardResidency.MatMul.RunDownloadedBytes + right.ForwardResidency.MatMul.RunDownloadedBytes,
 				RunNanos:           left.ForwardResidency.MatMul.RunNanos + right.ForwardResidency.MatMul.RunNanos,
 			},
+		},
+		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
+			EncodeNanos:         left.VectorDistillPhases.EncodeNanos + right.VectorDistillPhases.EncodeNanos,
+			ProjectionLossNanos: left.VectorDistillPhases.ProjectionLossNanos + right.VectorDistillPhases.ProjectionLossNanos,
+			BackwardNanos:       left.VectorDistillPhases.BackwardNanos + right.VectorDistillPhases.BackwardNanos,
+			OptimizerNanos:      left.VectorDistillPhases.OptimizerNanos + right.VectorDistillPhases.OptimizerNanos,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			UpdateCalls:     left.Optimizer.UpdateCalls + right.Optimizer.UpdateCalls,
@@ -365,6 +393,12 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 				RunNanos:           base.ForwardResidency.MatMul.RunNanos + delta.ForwardResidency.MatMul.RunNanos,
 			},
 		},
+		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
+			EncodeNanos:         base.VectorDistillPhases.EncodeNanos + delta.VectorDistillPhases.EncodeNanos,
+			ProjectionLossNanos: base.VectorDistillPhases.ProjectionLossNanos + delta.VectorDistillPhases.ProjectionLossNanos,
+			BackwardNanos:       base.VectorDistillPhases.BackwardNanos + delta.VectorDistillPhases.BackwardNanos,
+			OptimizerNanos:      base.VectorDistillPhases.OptimizerNanos + delta.VectorDistillPhases.OptimizerNanos,
+		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			UpdateCalls:     base.Optimizer.UpdateCalls + delta.Optimizer.UpdateCalls,
 			SyncCalls:       base.Optimizer.SyncCalls + delta.Optimizer.SyncCalls,
@@ -413,13 +447,14 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 
 func diffTrainProfile(start, end EmbeddingTrainProfile) EmbeddingTrainProfile {
 	return EmbeddingTrainProfile{
-		Version:            EmbeddingTrainProfileVersion,
-		Step:               end.Step - start.Step,
-		ForwardBackend:     end.ForwardBackend,
-		OptimizerBackend:   end.OptimizerBackend,
-		ActivationBackend:  end.ActivationBackend,
-		ContrastiveBackend: end.ContrastiveBackend,
-		ForwardResidency:   diffForwardResidencyStats(start.ForwardResidency, end.ForwardResidency),
+		Version:             EmbeddingTrainProfileVersion,
+		Step:                end.Step - start.Step,
+		ForwardBackend:      end.ForwardBackend,
+		OptimizerBackend:    end.OptimizerBackend,
+		ActivationBackend:   end.ActivationBackend,
+		ContrastiveBackend:  end.ContrastiveBackend,
+		ForwardResidency:    diffForwardResidencyStats(start.ForwardResidency, end.ForwardResidency),
+		VectorDistillPhases: diffVectorDistillPhaseTimers(start.VectorDistillPhases, end.VectorDistillPhases),
 		Optimizer: backend.OptimizerAcceleratorStats{
 			UpdateCalls:     end.Optimizer.UpdateCalls - start.Optimizer.UpdateCalls,
 			SyncCalls:       end.Optimizer.SyncCalls - start.Optimizer.SyncCalls,

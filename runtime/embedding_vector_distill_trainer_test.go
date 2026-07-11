@@ -5,6 +5,9 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+
+	eosartifact "m31labs.dev/eos/artifact/eos"
+	"m31labs.dev/eos/runtime/backend"
 )
 
 // TestVectorDistillRoleIndexResolvesExplicitAndFallbackRoles verifies the
@@ -290,6 +293,101 @@ func TestComputeVectorDistillBatchGradientsScratchMatchesUnscratchedExact(t *tes
 	}
 }
 
+func TestVectorDistillHostFallbackRecordsPhaseTimers(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	trainer.forwardMatMul = nil
+	trainer.optimizerAccel = nil
+	batch := []EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+		vectorDistillTestExample("b", EmbeddingRoleDocument, []int32{3, 2, 1}, []float32{-0.1, 0.4, 0.2, -0.05}),
+	}
+
+	start := trainer.TrainProfile()
+	metrics, proj, err := trainer.trainVectorDistillBatch(batch, nil, 4, EmbeddingRoleQuery, 0)
+	if err != nil {
+		t.Fatalf("trainVectorDistillBatch host fallback: %v", err)
+	}
+	if proj == nil {
+		t.Fatal("expected projection state")
+	}
+	if !compactTestFinite(metrics.Loss) {
+		t.Fatalf("loss is not finite: %v", metrics.Loss)
+	}
+	delta := diffTrainProfile(start, trainer.TrainProfile())
+	if delta.VectorDistillPhases.EncodeNanos <= 0 {
+		t.Fatalf("encode timer = %d, want > 0", delta.VectorDistillPhases.EncodeNanos)
+	}
+	if delta.VectorDistillPhases.ProjectionLossNanos <= 0 {
+		t.Fatalf("projection/loss timer = %d, want > 0", delta.VectorDistillPhases.ProjectionLossNanos)
+	}
+	if delta.VectorDistillPhases.BackwardNanos <= 0 {
+		t.Fatalf("backward timer = %d, want > 0", delta.VectorDistillPhases.BackwardNanos)
+	}
+	if delta.VectorDistillPhases.OptimizerNanos <= 0 {
+		t.Fatalf("optimizer timer = %d, want > 0", delta.VectorDistillPhases.OptimizerNanos)
+	}
+}
+
+func TestVectorDistillProjectionRoutesMatMulsAndOptimizerThroughAccelerators(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	matmulAccel := &fakeVectorDistillMatMulAccelerator{}
+	optimizerAccel := &fakeVectorDistillOptimizerAccelerator{}
+	trainer.forwardMatMul = matmulAccel
+	trainer.optimizerAccel = optimizerAccel
+
+	proj := &vectorDistillProjectionState{
+		W:        []float32{0.2, -0.1, 0.05, 0.3, -0.4, 0.25},
+		Mom1:     []float32{0.01, -0.02, 0.03, -0.01, 0.02, -0.03},
+		Mom2:     []float32{0.001, 0.002, 0.003, 0.004, 0.005, 0.006},
+		InputDim: 2,
+		OutDim:   3,
+		Step:     2,
+	}
+	student := []float32{0.7, -0.2}
+	gradProj := []float32{0.4, -0.3, 0.1}
+
+	gotProj := make([]float32, proj.OutDim)
+	trainer.projectVectorDistillStudent(student, proj, gotProj)
+	wantProj := make([]float32, proj.OutDim)
+	fillHostMatMul(student, 1, proj.InputDim, proj.W, proj.OutDim, wantProj)
+	assertTensorClose(t, backend.NewTensorF32([]int{1, proj.OutDim}, gotProj), []int{1, proj.OutDim}, wantProj)
+	if matmulAccel.stats.RunCalls != 1 {
+		t.Fatalf("matmul run calls after projection forward = %d, want 1", matmulAccel.stats.RunCalls)
+	}
+
+	gotGradStudent := make([]float32, proj.InputDim)
+	gotGradW := make([]float32, len(proj.W))
+	trainer.accumulateVectorDistillProjectionGrads(student, gradProj, proj, gotGradStudent, gotGradW)
+	wantGradStudent := make([]float32, proj.InputDim)
+	wantGradW := make([]float32, len(proj.W))
+	accumulateVectorDistillProjectionGrads(student, gradProj, proj.W, wantGradStudent, wantGradW)
+	assertTensorClose(t, backend.NewTensorF32([]int{1, proj.InputDim}, gotGradStudent), []int{1, proj.InputDim}, wantGradStudent)
+	assertTensorClose(t, backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, gotGradW), []int{proj.InputDim, proj.OutDim}, wantGradW)
+	if matmulAccel.stats.RunCalls != 3 {
+		t.Fatalf("matmul run calls after projection backward = %d, want 3", matmulAccel.stats.RunCalls)
+	}
+
+	hostProj := &vectorDistillProjectionState{
+		W:        append([]float32(nil), proj.W...),
+		Mom1:     append([]float32(nil), proj.Mom1...),
+		Mom2:     append([]float32(nil), proj.Mom2...),
+		InputDim: proj.InputDim,
+		OutDim:   proj.OutDim,
+		Step:     proj.Step,
+	}
+	trainer.applyVectorDistillProjectionAdamW(proj, gotGradW)
+	applyVectorDistillProjectionAdamW(hostProj.W, hostProj.Mom1, hostProj.Mom2, gotGradW, trainer.config.LearningRate, trainer.config.Beta1, trainer.config.Beta2, trainer.config.Epsilon, trainer.config.WeightDecay, hostProj.Step)
+	assertTensorClose(t, backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.W), []int{proj.InputDim, proj.OutDim}, hostProj.W)
+	assertTensorClose(t, backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.Mom1), []int{proj.InputDim, proj.OutDim}, hostProj.Mom1)
+	assertTensorClose(t, backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.Mom2), []int{proj.InputDim, proj.OutDim}, hostProj.Mom2)
+	if optimizerAccel.stats.UpdateCalls != 1 {
+		t.Fatalf("optimizer update calls = %d, want 1", optimizerAccel.stats.UpdateCalls)
+	}
+	if optimizerAccel.stats.SyncCalls != 1 {
+		t.Fatalf("optimizer sync calls = %d, want 1", optimizerAccel.stats.SyncCalls)
+	}
+}
+
 // relationalOnlyEncoderGradNorm drives the real production merge path
 // (computeVectorDistillBatchGradients) to compute the L2 norm of the RAW
 // (pre-batchScale, pre-AdamW) encoder gradient contributed solely by the
@@ -384,3 +482,96 @@ func assertExactFloat32Slice(t *testing.T, name string, got, want []float32) {
 		}
 	}
 }
+
+type fakeVectorDistillMatMulAccelerator struct {
+	stats backend.MatMulAcceleratorStats
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendKind("mock")
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) RunMatMul(inputs []*backend.Tensor, outputType eosartifact.ValueType) (backend.StepDispatchResult, error) {
+	return a.RunMatMulWithTranspose(inputs, outputType, false, false)
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) RunMatMulWithTranspose(inputs []*backend.Tensor, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
+	if len(inputs) != 2 || inputs[0] == nil || inputs[1] == nil {
+		return backend.StepDispatchResult{}, fmt.Errorf("fake matmul expects two inputs")
+	}
+	lhs := inputs[0]
+	rhs := inputs[1]
+	if len(lhs.Shape) != 2 || len(rhs.Shape) != 2 {
+		return backend.StepDispatchResult{}, fmt.Errorf("fake matmul expects rank-2 inputs")
+	}
+	rows, _, cols, ok := trainerMatMulDims(lhs.Shape[0], lhs.Shape[1], rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight)
+	if !ok {
+		return backend.StepDispatchResult{}, fmt.Errorf("fake matmul shape mismatch")
+	}
+	out := make([]float32, rows*cols)
+	fillHostMatMulTranspose(lhs.F32, lhs.Shape[0], lhs.Shape[1], rhs.F32, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight, out)
+	a.stats.RunCalls++
+	a.stats.RunUploadedBytes += int64((len(lhs.F32) + len(rhs.F32)) * 4)
+	a.stats.RunDownloadedBytes += int64(len(out) * 4)
+	return backend.StepDispatchResult{Outputs: []*backend.Tensor{backend.NewTensorF32([]int{rows, cols}, out)}, VariantEntry: "fake_matmul"}, nil
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) BindMatrix(name string, tensor *backend.Tensor) error {
+	a.stats.BindCalls++
+	return nil
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) UnbindMatrix(name string) error {
+	return nil
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) RunMatMulWithBoundLeft(leftName string, rhs *backend.Tensor, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
+	return backend.StepDispatchResult{}, fmt.Errorf("fake bound-left matmul is not implemented")
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) RunMatMulWithBoundRight(lhs *backend.Tensor, rightName string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
+	return backend.StepDispatchResult{}, fmt.Errorf("fake bound-right matmul is not implemented")
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) Stats() backend.MatMulAcceleratorStats {
+	return a.stats
+}
+
+func (a *fakeVectorDistillMatMulAccelerator) Close() {}
+
+type fakeVectorDistillOptimizerAccelerator struct {
+	stats backend.OptimizerAcceleratorStats
+}
+
+func (a *fakeVectorDistillOptimizerAccelerator) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendKind("mock")
+}
+
+func (a *fakeVectorDistillOptimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
+	if tensor == nil || mom1 == nil || mom2 == nil || grad == nil {
+		return fmt.Errorf("fake optimizer expects tensors")
+	}
+	applyOptimizerUpdate(EmbeddingTrainConfig{
+		Optimizer:    cfg.Optimizer,
+		LearningRate: cfg.LearningRate,
+		WeightDecay:  cfg.WeightDecay,
+		Beta1:        cfg.Beta1,
+		Beta2:        cfg.Beta2,
+		Epsilon:      cfg.Epsilon,
+	}, cfg.Step, tensor, mom1, mom2, grad.F32, cfg.Scale)
+	a.stats.UpdateCalls++
+	a.stats.UploadedBytes += int64((len(tensor.F32) + len(mom1.F32) + len(mom2.F32) + len(grad.F32)) * 4)
+	a.stats.DownloadedBytes += int64((len(tensor.F32) + len(mom1.F32) + len(mom2.F32)) * 4)
+	return nil
+}
+
+func (a *fakeVectorDistillOptimizerAccelerator) SyncState(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool) error {
+	a.stats.SyncCalls++
+	return nil
+}
+
+func (a *fakeVectorDistillOptimizerAccelerator) Stats() backend.OptimizerAcceleratorStats {
+	return a.stats
+}
+
+func (a *fakeVectorDistillOptimizerAccelerator) Close() {}
