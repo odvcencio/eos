@@ -2309,6 +2309,13 @@ func TestCompactEmbeddingTrainerConstructorReportsHostOrDeviceAccelerators(t *te
 	} else if profile.OptimizerBackend != trainer.optimizerAccel.Backend() {
 		t.Fatalf("compact optimizer backend = %q, want accelerator backend %q", profile.OptimizerBackend, trainer.optimizerAccel.Backend())
 	}
+	if trainer.activationAccel == nil {
+		if profile.ActivationBackend != eosartifact.BackendKind("host") {
+			t.Fatalf("host-only compact activation backend = %q, want host", profile.ActivationBackend)
+		}
+	} else if profile.ActivationBackend != trainer.activationAccel.Backend() {
+		t.Fatalf("compact activation backend = %q, want accelerator backend %q", profile.ActivationBackend, trainer.activationAccel.Backend())
+	}
 }
 
 func TestCompactEmbeddingTrainerUsesMatMulAcceleratorForForwardAndBackward(t *testing.T) {
@@ -2363,6 +2370,161 @@ func TestCompactEmbeddingTrainerUsesMatMulAcceleratorForForwardAndBackward(t *te
 				t.Fatalf("compact accelerated gradient contains non-finite value: %v", value)
 			}
 		}
+	}
+}
+
+func TestCompactEmbeddingTrainerUsesActivationAcceleratorForBackward(t *testing.T) {
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	host.forwardMatMul = nil
+	host.forwardBackend = eosartifact.BackendKind("host")
+	accelerated := newCompactEmbeddingTrainerForTest(t, 3)
+	accelerated.forwardMatMul = nil
+	accelerated.forwardBackend = eosartifact.BackendKind("host")
+	activation := &countingActivationAccelerator{}
+	accelerated.activationAccel = activation
+	accelerated.activationBackend = eosartifact.BackendCUDA
+	accelerated.activationAccelFull = true
+	accelerated.softmaxBackwardAccel = true
+
+	tokens := []int32{1, 2, 3}
+	hostSeq := compactEncodeForBackwardTest(t, host, tokens)
+	accelSeq := compactEncodeForBackwardTest(t, accelerated, tokens)
+	gradPooled := compactPooledGradForTest(accelSeq)
+	hostGrads := newCompactEmbeddingGradState(host.compactState)
+	if err := host.backpropCompactEncodedSequence(hostSeq, gradPooled, host.prepareCompactForwardWeights(), hostGrads); err != nil {
+		t.Fatalf("host compact backprop: %v", err)
+	}
+	accelGrads := newCompactEmbeddingGradState(accelerated.compactState)
+	if err := accelerated.backpropCompactEncodedSequence(accelSeq, gradPooled, accelerated.prepareCompactForwardWeights(), accelGrads); err != nil {
+		t.Fatalf("accelerated compact backprop: %v", err)
+	}
+
+	compactAssertGradSlicesClose(t, accelGrads, hostGrads)
+	wantLayerNorm, wantGELU, wantSoftmax := compactActivationBackwardCallCounts(accelSeq)
+	if activation.layerNormBackwardCalls != wantLayerNorm {
+		t.Fatalf("compact layernorm backward calls = %d, want %d", activation.layerNormBackwardCalls, wantLayerNorm)
+	}
+	if activation.geluBackwardCalls != wantGELU {
+		t.Fatalf("compact gelu backward calls = %d, want %d", activation.geluBackwardCalls, wantGELU)
+	}
+	if activation.softmaxBackwardCalls != wantSoftmax {
+		t.Fatalf("compact softmax backward calls = %d, want %d", activation.softmaxBackwardCalls, wantSoftmax)
+	}
+	profile := accelerated.TrainProfile()
+	if profile.Activation.LayerNormBackwardCalls != int64(wantLayerNorm) ||
+		profile.Activation.GELUBackwardCalls != int64(wantGELU) ||
+		profile.Activation.SoftmaxBackwardCalls != int64(wantSoftmax) {
+		t.Fatalf("compact activation profile = %+v, want layernorm=%d gelu=%d softmax=%d", profile.Activation, wantLayerNorm, wantGELU, wantSoftmax)
+	}
+}
+
+func TestCompactEmbeddingTrainerSkipsGELUActivationAcceleratorForFastGELU(t *testing.T) {
+	t.Setenv("EOS_TRAIN_ENABLE_FAST_GELU", "1")
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	host.forwardMatMul = nil
+	host.forwardBackend = eosartifact.BackendKind("host")
+	accelerated := newCompactEmbeddingTrainerForTest(t, 3)
+	accelerated.forwardMatMul = nil
+	accelerated.forwardBackend = eosartifact.BackendKind("host")
+	activation := &countingActivationAccelerator{}
+	accelerated.activationAccel = activation
+	accelerated.activationBackend = eosartifact.BackendCUDA
+	accelerated.activationAccelFull = true
+	accelerated.softmaxBackwardAccel = true
+
+	tokens := []int32{1, 2, 3}
+	hostSeq := compactEncodeForBackwardTest(t, host, tokens)
+	accelSeq := compactEncodeForBackwardTest(t, accelerated, tokens)
+	gradPooled := compactPooledGradForTest(accelSeq)
+	hostGrads := newCompactEmbeddingGradState(host.compactState)
+	if err := host.backpropCompactEncodedSequence(hostSeq, gradPooled, host.prepareCompactForwardWeights(), hostGrads); err != nil {
+		t.Fatalf("host compact fast-gelu backprop: %v", err)
+	}
+	accelGrads := newCompactEmbeddingGradState(accelerated.compactState)
+	if err := accelerated.backpropCompactEncodedSequence(accelSeq, gradPooled, accelerated.prepareCompactForwardWeights(), accelGrads); err != nil {
+		t.Fatalf("accelerated compact fast-gelu backprop: %v", err)
+	}
+
+	compactAssertGradSlicesClose(t, accelGrads, hostGrads)
+	wantLayerNorm, _, wantSoftmax := compactActivationBackwardCallCounts(accelSeq)
+	if activation.geluBackwardCalls != 0 {
+		t.Fatalf("compact fast-gelu gelu backward calls = %d, want 0", activation.geluBackwardCalls)
+	}
+	if activation.layerNormBackwardCalls != wantLayerNorm {
+		t.Fatalf("compact fast-gelu layernorm backward calls = %d, want %d", activation.layerNormBackwardCalls, wantLayerNorm)
+	}
+	if activation.softmaxBackwardCalls != wantSoftmax {
+		t.Fatalf("compact fast-gelu softmax backward calls = %d, want %d", activation.softmaxBackwardCalls, wantSoftmax)
+	}
+}
+
+func TestCompactEmbeddingTrainerActivationAcceleratorHonorsElementLimit(t *testing.T) {
+	t.Setenv("EOS_TRAIN_ACTIVATION_ACCEL_MAX_ELEMENTS", "1")
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	trainer.forwardMatMul = nil
+	trainer.forwardBackend = eosartifact.BackendKind("host")
+	activation := &countingActivationAccelerator{}
+	trainer.activationAccel = activation
+	trainer.activationBackend = eosartifact.BackendCUDA
+	trainer.activationAccelFull = true
+	trainer.softmaxBackwardAccel = true
+
+	seq := compactEncodeForBackwardTest(t, trainer, []int32{1, 2, 3})
+	grads := newCompactEmbeddingGradState(trainer.compactState)
+	if err := trainer.backpropCompactEncodedSequence(seq, compactPooledGradForTest(seq), trainer.prepareCompactForwardWeights(), grads); err != nil {
+		t.Fatalf("compact limited activation backprop: %v", err)
+	}
+	if activation.layerNormBackwardCalls != 0 || activation.geluBackwardCalls != 0 || activation.softmaxBackwardCalls != 0 {
+		t.Fatalf("compact activation calls with element limit = layernorm %d gelu %d softmax %d, want all zero",
+			activation.layerNormBackwardCalls, activation.geluBackwardCalls, activation.softmaxBackwardCalls)
+	}
+}
+
+func compactEncodeForBackwardTest(t *testing.T, trainer *EmbeddingTrainer, tokens []int32) *embeddingEncodedSequence {
+	t.Helper()
+	mask, err := trainer.prepareMask(tokens, nil)
+	if err != nil {
+		t.Fatalf("prepare compact mask: %v", err)
+	}
+	seq, err := trainer.encodeCompactSequence(tokens, mask, trainer.rawRoleIndex(), trainer.prepareCompactForwardWeights())
+	if err != nil {
+		t.Fatalf("encode compact sequence: %v", err)
+	}
+	return seq
+}
+
+func compactPooledGradForTest(seq *embeddingEncodedSequence) []float32 {
+	gradPooled := make([]float32, len(seq.pooled))
+	for i := range gradPooled {
+		gradPooled[i] = 0.01 * float32(i+1)
+	}
+	return gradPooled
+}
+
+func compactActivationBackwardCallCounts(seq *embeddingEncodedSequence) (layerNorm, gelu, softmax int) {
+	for _, layer := range seq.layers {
+		if len(layer.tokens) == 0 {
+			continue
+		}
+		layerNorm += 2
+		gelu++
+		softmax += len(layer.attnScores) / (len(layer.tokens) * len(layer.tokens))
+	}
+	return layerNorm, gelu, softmax
+}
+
+func compactAssertGradSlicesClose(t *testing.T, got, want *compactEmbeddingGradState) {
+	t.Helper()
+	gotSlices := compactEmbeddingGradSlices(got)
+	wantSlices := compactEmbeddingGradSlices(want)
+	if len(gotSlices) != len(wantSlices) {
+		t.Fatalf("compact grad slice count = %d, want %d", len(gotSlices), len(wantSlices))
+	}
+	for i := range gotSlices {
+		if len(gotSlices[i]) != len(wantSlices[i]) {
+			t.Fatalf("compact grad slice %d len = %d, want %d", i, len(gotSlices[i]), len(wantSlices[i]))
+		}
+		assertTensorClose(t, backend.NewTensorF32([]int{len(gotSlices[i])}, gotSlices[i]), []int{len(wantSlices[i])}, wantSlices[i])
 	}
 }
 

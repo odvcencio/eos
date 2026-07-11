@@ -528,24 +528,41 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 		}
 		return nil, err
 	}
+	activationAccel, activationBackend, activationMode, err := newTrainerActivationAccelerator()
+	if err != nil {
+		if accel != nil {
+			accel.Close()
+		}
+		if optimizerAccel != nil {
+			optimizerAccel.Close()
+		}
+		return nil, err
+	}
 	if accelBackend == "" {
 		accelBackend = eosartifact.BackendKind("host")
 	}
 	if optimizerBackend == "" {
 		optimizerBackend = eosartifact.BackendKind("host")
 	}
+	if activationBackend == "" {
+		activationBackend = eosartifact.BackendKind("host")
+	}
 	return &EmbeddingTrainer{
-		module:           mod,
-		manifest:         manifest,
-		config:           cfg,
-		step:             state.Step,
-		compactState:     state,
-		forwardMatMul:    accel,
-		forwardBackend:   accelBackend,
-		optimizerAccel:   optimizerAccel,
-		optimizerBackend: optimizerBackend,
-		forwardDirty:     true,
-		forwardNeedsBind: true,
+		module:               mod,
+		manifest:             manifest,
+		config:               cfg,
+		step:                 state.Step,
+		compactState:         state,
+		forwardMatMul:        accel,
+		forwardBackend:       accelBackend,
+		optimizerAccel:       optimizerAccel,
+		optimizerBackend:     optimizerBackend,
+		activationAccel:      activationAccel,
+		activationBackend:    activationBackend,
+		activationAccelFull:  activationMode.fullBackward,
+		softmaxBackwardAccel: activationMode.softmaxBackward,
+		forwardDirty:         true,
+		forwardNeedsBind:     true,
 	}, nil
 }
 
@@ -3188,14 +3205,18 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 	}
 
 	gradFFNResidual := make([]float32, seqLen*d)
-	for row := 0; row < seqLen; row++ {
-		base := row * d
-		backwardLayerNormRow(
-			gradFFNResidual[base:base+d],
-			gradProjected[base:base+d],
-			state.projected[base:base+d],
-			state.ffnResidual[base:base+d],
-		)
+	if out, ok := t.tryLayerNormBackwardRows(gradProjected, state.projected, state.ffnResidual, seqLen, d, state.projectedBinding, state.ffnResidualBinding); ok {
+		copy(gradFFNResidual, out)
+	} else {
+		for row := 0; row < seqLen; row++ {
+			base := row * d
+			backwardLayerNormRow(
+				gradFFNResidual[base:base+d],
+				gradProjected[base:base+d],
+				state.projected[base:base+d],
+				state.ffnResidual[base:base+d],
+			)
+		}
 	}
 	gradFFNOutput := gradFFNResidual
 	gradHidden := append([]float32(nil), gradFFNResidual...)
@@ -3214,9 +3235,19 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 		fillHostMatMulTranspose(gradFFNOutput, seqLen, d, forwardMatMulHostData(layer.ffnDown), h, d, false, true, gradActivatedPre)
 	}
 	gradActivated := make([]float32, seqLen*h)
-	for row := 0; row < seqLen; row++ {
-		base := row * h
-		fillGELUBackwardMul(gradActivated[base:base+h], gradActivatedPre[base:base+h], state.ffnHidden[base:base+h], fastGELUEnabled())
+	fastGELU := fastGELUEnabled()
+	usedGELUAccel := false
+	if !fastGELU {
+		if out, ok := t.tryGELUBackwardMul(gradActivatedPre, state.ffnHidden, seqLen, h, state.ffnHiddenBinding); ok {
+			copy(gradActivated, out)
+			usedGELUAccel = true
+		}
+	}
+	if !usedGELUAccel {
+		for row := 0; row < seqLen; row++ {
+			base := row * h
+			fillGELUBackwardMul(gradActivated[base:base+h], gradActivatedPre[base:base+h], state.ffnHidden[base:base+h], fastGELU)
+		}
 	}
 	gradFFNUpStep := make([]float32, d*h)
 	if out, ok := t.tryTrainerMatMul(state.hidden, seqLen, d, gradActivated, seqLen, h, true, false); ok {
@@ -3234,14 +3265,18 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 	addFloat32Slice(gradHidden, gradHiddenFromFFN)
 
 	gradAttnResidual := make([]float32, seqLen*d)
-	for row := 0; row < seqLen; row++ {
-		base := row * d
-		backwardLayerNormRow(
-			gradAttnResidual[base:base+d],
-			gradHidden[base:base+d],
-			state.hidden[base:base+d],
-			state.attnResidual[base:base+d],
-		)
+	if out, ok := t.tryLayerNormBackwardRows(gradHidden, state.hidden, state.attnResidual, seqLen, d, state.hiddenBinding, state.attnResidualBinding); ok {
+		copy(gradAttnResidual, out)
+	} else {
+		for row := 0; row < seqLen; row++ {
+			base := row * d
+			backwardLayerNormRow(
+				gradAttnResidual[base:base+d],
+				gradHidden[base:base+d],
+				state.hidden[base:base+d],
+				state.attnResidual[base:base+d],
+			)
+		}
 	}
 	gradAttnOutput := gradAttnResidual
 	gradInput := append([]float32(nil), gradAttnResidual...)
@@ -3282,9 +3317,13 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 			}
 		}
 		gradPreSoftmax := make([]float32, seqLen*seqLen)
-		for row := 0; row < seqLen; row++ {
-			base := row * seqLen
-			backwardSoftmaxRow(gradPreSoftmax[base:base+seqLen], gradScores[base:base+seqLen], probs[base:base+seqLen])
+		if out, ok := t.trySoftmaxBackwardRows(gradScores, probs, seqLen, seqLen, state.attnScoresBinding); ok {
+			copy(gradPreSoftmax, out)
+		} else {
+			for row := 0; row < seqLen; row++ {
+				base := row * seqLen
+				backwardSoftmaxRow(gradPreSoftmax[base:base+seqLen], gradScores[base:base+seqLen], probs[base:base+seqLen])
+			}
 		}
 		scaleFloat32Slice(gradPreSoftmax, scale)
 		for query := 0; query < seqLen; query++ {
