@@ -166,6 +166,15 @@ ferrous-wheel run scripts/smoke_eos_default_embedder_serving.fw
 
 This smoke uses the in-repo TurboQuant evaluator as CorkScrewDB-relevant vector-index and serving proxy evidence. It is not an actual CorkScrewDB API load/index/search smoke. The promoted narrow release artifact at `runs/eos-s40-nfcorpus-compact-mined-narrow-candidate-v1-20260623T032556Z/candidate/eos-embed-v1.sealed.mll`, sealed SHA256 `e0eca16ff34ebb88ca96862d58c3ac7f02dbf4b124599fdf96f25344ac02e408`, passed strict seeded q4/fp16/o200 compact non-regression against the s40 compact anchor: macro nDCG@10 `+0.000118345582923`, recall@100 `+0.000259403173951`, total compression `1.5900621118x`. The capped serving smoke in `runs/eos-default-embedder-serving-smoke-20260620T161633Z/` selected q4/fp16/o200 with SciFact nDCG@10 `0.7846268033`, recall@100 `0.95`, total compression `1.5900621118x`, and p95 `0.984950ms`; keep it as s40-era predecessor proxy evidence until refreshed for the new default. The formal reproducible predecessor q4/fp16/o200 compact gate anchor is `runs/eos-nf005-compact-anchor-provenance-repair-v1-20260619T091223Z/anchor-q4-fp16-overfetch200-scoreboard/scoreboard.json`; its selected rows carry `quantizer_seed=5581486560434873699`. For the local flat CorkScrewDB API path, run `scripts/smoke_corkscrewdb_child_vectors.fw`; by default it creates or consumes child-vector caches, loads child vectors with CorkScrewDB `PutVector`, queries with `SearchVector`, rolls child hits up to parent IDs by max score, and records storage, latency, nDCG@10, and recall@100:
 
+Use `scripts/bench_eos_default_embedder_serving_energy.fw` beside the serving smoke when a promotion packet needs measured power/energy:
+
+```bash
+EOS_REPO_ROOT=$PWD \
+ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
+```
+
+The gate writes `summary.tsv`, `manifest.json`, `power-samples.jsonl`, and command logs under `runs/eos-default-embedder-serving-energy-<timestamp>/`. It distinguishes encoder-only work (`eos export-retrieval-vectors`) from index/scoring work (`eos eval-retrieval-turboquant`). Encoder-only export encodes documents + queries and reports `workload_item_count` plus `energy_joules_per_workload_item`; index/scoring reports `energy_joules_per_query`. If `nvidia-smi` power telemetry is missing or too sparse, the artifact records `unsupported` or `indeterminate` and leaves denominator-specific energy costs blank; set `EOS_ENERGY_BENCH_REQUIRE_POWER=1` to make missing telemetry fail on known-good measurement hosts.
+
 ```bash
 EOS_REPO_ROOT=$PWD \
 ferrous-wheel run scripts/smoke_corkscrewdb_child_vectors.fw

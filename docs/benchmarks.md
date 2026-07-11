@@ -397,6 +397,15 @@ ferrous-wheel run scripts/smoke_eos_default_embedder_serving.fw
 
 It selects q4/fp16/rerank-overfetch=200 and writes `summary.tsv` plus `manifest.json` under `runs/eos-default-embedder-serving-smoke-<timestamp>/`. This is not an actual CorkScrewDB API smoke; it is the in-repo TurboQuant serving proxy. For the promoted narrow release artifact, strict seeded compact gating against the s40 q4/fp16/o200 anchor passed: SciFact unchanged; NFCorpus nDCG delta `+0.000174802593872`, recall delta `+0.000006604583581`; FiQA nDCG delta `+0.000180234154897`, recall delta `+0.000771604938272`; macro nDCG delta `+0.000118345582923`, recall delta `+0.000259403173951`; total compression `1.5900621118x`. The s40 capped serving smoke in `runs/eos-default-embedder-serving-smoke-20260620T161633Z/` remains predecessor proxy evidence. Treat this as compact promotion evidence tied to release sealed SHA256 `e0eca16ff34ebb88ca96862d58c3ac7f02dbf4b124599fdf96f25344ac02e408`, not CorkScrewDB API smoke or hosted-model parity. The formal seeded s40 q4/fp16/o200 anchor remains predecessor provenance.
 
+Attach energy/cost evidence with the bounded power gate:
+
+```bash
+EOS_REPO_ROOT=$PWD \
+ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
+```
+
+The energy gate runs two local phases under the same caps: encoder-only vector export with `eos export-retrieval-vectors`, then the TurboQuant serving proxy with `eos eval-retrieval-turboquant`. It samples GPU power through `nvidia-smi` and writes `manifest.json`, `summary.tsv`, `power-samples.jsonl`, command logs, encoder vector-export manifest, and TurboQuant metrics under `runs/eos-default-embedder-serving-energy-<timestamp>/`. Encoder-only export measures both documents and queries, so its cost denominator is `workload_item_count = documents + queries` and `energy_joules_per_workload_item`; it does not report `energy_joules_per_query`. The index/scoring phase reports query-denominated `energy_joules_per_query`. When power telemetry is unavailable or insufficient, the manifest records `overall_status=unsupported` or `indeterminate` and omits denominator-specific energy costs rather than inventing them. Set `EOS_ENERGY_BENCH_REQUIRE_POWER=1` only for machines where GPU power telemetry is expected and missing telemetry should fail the gate.
+
 For the local flat CorkScrewDB child-vector API path, run:
 
 ```bash

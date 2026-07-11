@@ -1,0 +1,696 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+const schema = "eos.default_embedder_serving_energy.v1"
+
+type commandRecord struct {
+	Label     string   `json:"label"`
+	Args      []string `json:"args"`
+	Log       string   `json:"log"`
+	StartedAt string   `json:"started_at"`
+	EndedAt   string   `json:"ended_at"`
+	ExitOK    bool     `json:"exit_ok"`
+}
+
+type powerSample struct {
+	Time       string  `json:"time"`
+	UnixNano   int64   `json:"unix_nano"`
+	GPUIndex   string  `json:"gpu_index"`
+	PowerWatts float64 `json:"power_watts"`
+	Source     string  `json:"source"`
+}
+
+type phaseResult struct {
+	Phase                         string        `json:"phase"`
+	Workload                      string        `json:"workload"`
+	Command                       commandRecord `json:"command"`
+	TelemetryStatus               string        `json:"telemetry_status"`
+	TelemetryReason               string        `json:"telemetry_reason,omitempty"`
+	TelemetrySource               string        `json:"telemetry_source"`
+	GPUIndex                      string        `json:"gpu_index,omitempty"`
+	WallSeconds                   float64       `json:"wall_seconds"`
+	QueryCount                    int           `json:"query_count"`
+	DocumentCount                 int           `json:"document_count,omitempty"`
+	WorkloadItemCount             int           `json:"workload_item_count,omitempty"`
+	SampleCount                   int           `json:"sample_count"`
+	AveragePowerWatts             float64       `json:"average_power_watts,omitempty"`
+	EnergyJoules                  float64       `json:"energy_joules,omitempty"`
+	EnergyJoulesPerQuery          *float64      `json:"energy_joules_per_query,omitempty"`
+	EnergyJoulesPerWorkloadItem   *float64      `json:"energy_joules_per_workload_item,omitempty"`
+	OutputJSON                    string        `json:"output_json,omitempty"`
+	OutputTSV                     string        `json:"output_tsv,omitempty"`
+}
+
+type manifest struct {
+	Schema           string        `json:"schema"`
+	GeneratedAt      string        `json:"generated_at"`
+	RunDir           string        `json:"run_dir"`
+	Artifact         string        `json:"artifact"`
+	Dataset          string        `json:"dataset"`
+	DatasetDir       string        `json:"dataset_dir"`
+	MaxDocs          string        `json:"max_docs"`
+	MaxQueries       string        `json:"max_queries"`
+	SampleIntervalMS int           `json:"sample_interval_ms"`
+	RequirePower     bool          `json:"require_power"`
+	SummaryTSV        string        `json:"summary_tsv"`
+	PowerSamplesJSONL string       `json:"power_samples_jsonl"`
+	Phases           []phaseResult `json:"phases"`
+	OverallStatus    string        `json:"overall_status"`
+	UnsupportedReason string       `json:"unsupported_reason,omitempty"`
+}
+
+type turboQuantMetrics struct {
+	Rows []struct {
+		QueryLatency struct {
+			Count int `json:"count"`
+		} `json:"query_latency"`
+	} `json:"rows"`
+}
+
+type vectorExportManifest struct {
+	Documents int `json:"documents"`
+	Queries   int `json:"queries"`
+}
+
+type telemetrySampler struct {
+	mu          sync.Mutex
+	samples     []powerSample
+	source      string
+	gpuIndex    string
+	nvidiaSMI   string
+	fakeWatts   []float64
+	fakeCursor  int
+	firstErr     string
+}
+
+func usage() {
+	fmt.Println(`Measure bounded default-embedder serving energy.
+
+The benchmark emits auditable JSON/TSV and separates encoder-only work from
+TurboQuant index/scoring work. GPU power telemetry is sampled through
+nvidia-smi when available; when unavailable, the manifest records unsupported
+or indeterminate status instead of inventing energy costs. Encoder-only export
+reports energy per workload item (documents + queries); index/scoring reports
+energy per query.
+
+Run:
+  EOS_REPO_ROOT=$PWD ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
+
+Environment:
+  EOS_ENERGY_BENCH_ARTIFACT=/path/to/eos-embed-v1.sealed.mll
+  EOS_ENERGY_BENCH_DATASET_ROOT=datasets/eos-embed-v1
+  EOS_ENERGY_BENCH_DATASET=scifact
+  EOS_ENERGY_BENCH_SPLIT=test
+  EOS_ENERGY_BENCH_RUN_ROOT=runs/eos-default-embedder-serving-energy-<timestamp>
+  EOS_ENERGY_BENCH_MAX_DOCS=300
+  EOS_ENERGY_BENCH_MAX_QUERIES=20
+  EOS_ENERGY_BENCH_BATCH_SIZE=512
+  EOS_ENERGY_BENCH_BITS=4
+  EOS_ENERGY_BENCH_RERANK_OVERFETCH=200
+  EOS_ENERGY_BENCH_RERANK_STORAGE=fp16
+  EOS_ENERGY_BENCH_GPU_INDEX=0
+  EOS_ENERGY_BENCH_SAMPLE_MS=200
+  EOS_ENERGY_BENCH_REQUIRE_POWER=0   # set 1 to fail when power telemetry is unavailable`)
+}
+
+func getenv(name string, fallback string) string {
+	value := os.Getenv(name)
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
+func getenvBool(name string, fallback bool) bool {
+	value := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	if value == "" {
+		return fallback
+	}
+	return value == "1" || value == "true" || value == "yes"
+}
+
+func parseIntEnv(name string, fallback int) (int, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
+	}
+	return parsed, nil
+}
+
+func hasRepoRoot(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
+		return false
+	}
+	if _, err := os.Stat(filepath.Join(dir, ".git")); err != nil {
+		return false
+	}
+	return true
+}
+
+func findRoot() (string, error) {
+	if explicit := os.Getenv("EOS_REPO_ROOT"); hasRepoRoot(explicit) {
+		return filepath.Abs(explicit)
+	}
+	if pwd := os.Getenv("PWD"); hasRepoRoot(pwd) {
+		return filepath.Abs(pwd)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	if hasRepoRoot(cwd) {
+		return filepath.Abs(cwd)
+	}
+	return "", fmt.Errorf("could not find repo root; set EOS_REPO_ROOT")
+}
+
+func firstExistingDir(paths []string, fallback string) string {
+	for _, path := range paths {
+		if info, err := os.Stat(path); err == nil && info.IsDir() {
+			return path
+		}
+	}
+	return fallback
+}
+
+func retrievalDatasetDir(root string, dataset string) string {
+	candidate := filepath.Join(root, "raw", dataset, dataset)
+	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+		return candidate
+	}
+	return filepath.Join(root, dataset)
+}
+
+func shellQuote(value string) string {
+	if value == "" {
+		return "''"
+	}
+	if strings.ContainsAny(value, " \t\n'\"\\$`!*?[]{}()<>|&;") {
+		return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+	}
+	return value
+}
+
+func renderCommand(args []string) string {
+	parts := []string{}
+	for _, arg := range args {
+		parts = append(parts, shellQuote(arg))
+	}
+	return strings.Join(parts, " ")
+}
+
+func writeJSON(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func readJSON(path string, target any) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(data, target)
+}
+
+func parseFakeWatts(raw string) ([]float64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, nil
+	}
+	values := []float64{}
+	for _, part := range strings.Split(raw, ",") {
+		value, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		if err != nil {
+			return nil, fmt.Errorf("EOS_ENERGY_BENCH_FAKE_POWER_WATTS must be comma-separated floats: %w", err)
+		}
+		values = append(values, value)
+	}
+	return values, nil
+}
+
+func newTelemetrySampler() (*telemetrySampler, error) {
+	fake, err := parseFakeWatts(os.Getenv("EOS_ENERGY_BENCH_FAKE_POWER_WATTS"))
+	if err != nil {
+		return nil, err
+	}
+	source := "nvidia-smi"
+	if len(fake) > 0 {
+		source = "fake"
+	}
+	return &telemetrySampler{
+		source:    source,
+		gpuIndex:  getenv("EOS_ENERGY_BENCH_GPU_INDEX", "0"),
+		nvidiaSMI: getenv("EOS_ENERGY_BENCH_NVIDIA_SMI", "nvidia-smi"),
+		fakeWatts: fake,
+	}, nil
+}
+
+func (s *telemetrySampler) sample() {
+	now := time.Now().UTC()
+	watts, gpu, err := s.readWatts()
+	if err != nil {
+		s.mu.Lock()
+		if s.firstErr == "" {
+			s.firstErr = err.Error()
+		}
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Lock()
+	s.samples = append(s.samples, powerSample{
+		Time:       now.Format(time.RFC3339Nano),
+		UnixNano:   now.UnixNano(),
+		GPUIndex:   gpu,
+		PowerWatts: watts,
+		Source:     s.source,
+	})
+	s.mu.Unlock()
+}
+
+func (s *telemetrySampler) readWatts() (float64, string, error) {
+	if len(s.fakeWatts) > 0 {
+		idx := s.fakeCursor
+		if idx >= len(s.fakeWatts) {
+			idx = len(s.fakeWatts) - 1
+		}
+		s.fakeCursor++
+		return s.fakeWatts[idx], s.gpuIndex, nil
+	}
+	args := []string{
+		"--query-gpu=index,power.draw",
+		"--format=csv,noheader,nounits",
+		"--id=" + s.gpuIndex,
+	}
+	output, err := exec.Command(s.nvidiaSMI, args...).CombinedOutput()
+	if err != nil {
+		return 0, "", fmt.Errorf("nvidia-smi power query failed: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return 0, "", fmt.Errorf("nvidia-smi power query returned no rows")
+	}
+	fields := strings.Split(lines[0], ",")
+	if len(fields) < 2 {
+		return 0, "", fmt.Errorf("unexpected nvidia-smi power row: %q", lines[0])
+	}
+	watts, err := strconv.ParseFloat(strings.TrimSpace(fields[1]), 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("could not parse nvidia-smi power.draw %q: %w", fields[1], err)
+	}
+	return watts, strings.TrimSpace(fields[0]), nil
+}
+
+func (s *telemetrySampler) snapshot() ([]powerSample, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := append([]powerSample(nil), s.samples...)
+	return out, s.firstErr
+}
+
+func runMeasuredCommand(root string, logDir string, label string, args []string, sampler *telemetrySampler, interval time.Duration) (commandRecord, []powerSample, float64, error) {
+	fmt.Println("\n== " + label + " ==")
+	fmt.Println("+ " + renderCommand(args))
+	logPath := filepath.Join(logDir, label+".log")
+	start := time.Now().UTC()
+	sampler.sample()
+	done := make(chan error, 1)
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = root
+	go func() {
+		output, err := cmd.CombinedOutput()
+		body := append([]byte(renderCommand(args)+"\n\n"), output...)
+		if writeErr := os.WriteFile(logPath, body, 0o644); writeErr != nil && err == nil {
+			err = writeErr
+		}
+		fmt.Print(string(output))
+		done <- err
+	}()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var err error
+	for {
+		select {
+		case err = <-done:
+			sampler.sample()
+			end := time.Now().UTC()
+			samples, _ := sampler.snapshot()
+			return commandRecord{
+				Label:     label,
+				Args:      args,
+				Log:       logPath,
+				StartedAt: start.Format(time.RFC3339Nano),
+				EndedAt:   end.Format(time.RFC3339Nano),
+				ExitOK:    err == nil,
+			}, samples, end.Sub(start).Seconds(), err
+		case <-ticker.C:
+			sampler.sample()
+		}
+	}
+}
+
+func phaseEnergy(samples []powerSample, wallSeconds float64) (string, string, int, float64, float64) {
+	if len(samples) < 2 {
+		return "unsupported", "fewer than two usable GPU power samples", len(samples), 0, 0
+	}
+	energy := 0.0
+	weightedPower := 0.0
+	for i := 1; i < len(samples); i++ {
+		dt := float64(samples[i].UnixNano-samples[i-1].UnixNano) / 1e9
+		if dt <= 0 {
+			continue
+		}
+		avg := (samples[i-1].PowerWatts + samples[i].PowerWatts) / 2
+		energy += avg * dt
+		weightedPower += avg * dt
+	}
+	if energy <= 0 || wallSeconds <= 0 {
+		return "indeterminate", "power samples did not span positive elapsed time", len(samples), 0, 0
+	}
+	return "measured", "", len(samples), weightedPower / wallSeconds, energy
+}
+
+func energyCost(energy float64, count int) *float64 {
+	if energy <= 0 || count <= 0 {
+		return nil
+	}
+	value := energy / float64(count)
+	return &value
+}
+
+func formatOptionalFloat(value *float64) string {
+	if value == nil {
+		return ""
+	}
+	return fmt.Sprintf("%.6f", *value)
+}
+
+func writeSamples(path string, samples []powerSample) error {
+	var b strings.Builder
+	for _, sample := range samples {
+		data, err := json.Marshal(sample)
+		if err != nil {
+			return err
+		}
+		b.Write(data)
+		b.WriteByte('\n')
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func writeSummaryTSV(path string, phases []phaseResult) error {
+	var b strings.Builder
+	b.WriteString("phase\tworkload\ttelemetry_status\ttelemetry_source\tgpu_index\twall_seconds\tquery_count\tdocument_count\tworkload_item_count\tsample_count\taverage_power_watts\tenergy_joules\tenergy_joules_per_query\tenergy_joules_per_workload_item\toutput_json\toutput_tsv\n")
+	for _, phase := range phases {
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\t%.6f\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%s\t%s\t%s\t%s\n",
+			phase.Phase,
+			phase.Workload,
+			phase.TelemetryStatus,
+			phase.TelemetrySource,
+			phase.GPUIndex,
+			phase.WallSeconds,
+			phase.QueryCount,
+			phase.DocumentCount,
+			phase.WorkloadItemCount,
+			phase.SampleCount,
+			phase.AveragePowerWatts,
+			phase.EnergyJoules,
+			formatOptionalFloat(phase.EnergyJoulesPerQuery),
+			formatOptionalFloat(phase.EnergyJoulesPerWorkloadItem),
+			phase.OutputJSON,
+			phase.OutputTSV)
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func queryCountFromTurboQuant(path string, fallback int) int {
+	var metrics turboQuantMetrics
+	if err := readJSON(path, &metrics); err != nil {
+		return fallback
+	}
+	best := 0
+	for _, row := range metrics.Rows {
+		if row.QueryLatency.Count > best {
+			best = row.QueryLatency.Count
+		}
+	}
+	if best == 0 {
+		return fallback
+	}
+	return best
+}
+
+func vectorCountsFromManifest(path string, fallbackQueries int) (int, int) {
+	var out vectorExportManifest
+	if err := readJSON(path, &out); err != nil {
+		return 0, fallbackQueries
+	}
+	if out.Queries == 0 {
+		out.Queries = fallbackQueries
+	}
+	return out.Documents, out.Queries
+}
+
+func statusForManifest(phases []phaseResult, firstErr string) (string, string) {
+	anyMeasured := false
+	reasons := []string{}
+	for _, phase := range phases {
+		if phase.TelemetryStatus == "measured" {
+			anyMeasured = true
+		} else if phase.TelemetryReason != "" {
+			reasons = append(reasons, phase.Phase+": "+phase.TelemetryReason)
+		}
+	}
+	if anyMeasured && len(reasons) == 0 {
+		return "measured", ""
+	}
+	if anyMeasured {
+		return "partial", strings.Join(reasons, "; ")
+	}
+	if firstErr != "" {
+		return "unsupported", firstErr
+	}
+	if len(reasons) > 0 {
+		return "unsupported", strings.Join(reasons, "; ")
+	}
+	return "indeterminate", "no GPU power telemetry was recorded"
+}
+
+func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "-h" || os.Args[1] == "--help") {
+		usage()
+		return
+	}
+	root, err := findRoot()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	defaultArtifact := filepath.Join(root, "assets", "corkscrewdb-default-embedder", "corkscrewdb-default-embedder.mll")
+	artifact := getenv("EOS_ENERGY_BENCH_ARTIFACT", defaultArtifact)
+	if info, err := os.Stat(artifact); err != nil || info.IsDir() {
+		fmt.Fprintf(os.Stderr, "artifact does not exist or is not a file: %s\n", artifact)
+		os.Exit(1)
+	}
+	defaultDatasetRoot := firstExistingDir([]string{
+		filepath.Join(root, "datasets", "eos-embed-v1"),
+		filepath.Join(root, "datasets", "manta-embed-v1"),
+	}, filepath.Join(root, "datasets", "eos-embed-v1"))
+	datasetRoot := getenv("EOS_ENERGY_BENCH_DATASET_ROOT", defaultDatasetRoot)
+	dataset := getenv("EOS_ENERGY_BENCH_DATASET", "scifact")
+	datasetDir := retrievalDatasetDir(datasetRoot, dataset)
+	if info, err := os.Stat(datasetDir); err != nil || !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "dataset directory does not exist: %s\n", datasetDir)
+		os.Exit(1)
+	}
+	runRoot := getenv("EOS_ENERGY_BENCH_RUN_ROOT", filepath.Join(root, "runs", "eos-default-embedder-serving-energy-"+time.Now().UTC().Format("20060102T150405Z")))
+	if err := os.MkdirAll(filepath.Join(runRoot, "logs"), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	maxDocs := getenv("EOS_ENERGY_BENCH_MAX_DOCS", "300")
+	maxQueries := getenv("EOS_ENERGY_BENCH_MAX_QUERIES", "20")
+	maxQueriesInt, _ := strconv.Atoi(maxQueries)
+	sampleMS, err := parseIntEnv("EOS_ENERGY_BENCH_SAMPLE_MS", 200)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if sampleMS < 50 {
+		fmt.Fprintln(os.Stderr, "EOS_ENERGY_BENCH_SAMPLE_MS must be >= 50")
+		os.Exit(1)
+	}
+	requirePower := getenvBool("EOS_ENERGY_BENCH_REQUIRE_POWER", false)
+	sampler, err := newTelemetrySampler()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	split := getenv("EOS_ENERGY_BENCH_SPLIT", "test")
+	batchSize := getenv("EOS_ENERGY_BENCH_BATCH_SIZE", "512")
+	vectorDir := filepath.Join(runRoot, "encoder-vectors")
+	vectorManifest := filepath.Join(runRoot, "encoder-vectors.manifest.json")
+	encoderArgs := []string{
+		"go", "run", "./cmd/eos", "export-retrieval-vectors",
+		"--dataset", dataset,
+		"--split", split,
+		"--batch-size", batchSize,
+		"--max-docs", maxDocs,
+		"--max-queries", maxQueries,
+		"--manifest-json", vectorManifest,
+		artifact,
+		datasetDir,
+		vectorDir,
+	}
+	encoderCommand, encoderSamples, encoderWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "encoder-only", encoderArgs, sampler, time.Duration(sampleMS)*time.Millisecond)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "encoder-only workload failed: %v\n", err)
+		os.Exit(1)
+	}
+	encoderDocs, encoderQueries := vectorCountsFromManifest(vectorManifest, maxQueriesInt)
+	encoderStatus, encoderReason, encoderSampleCount, encoderAvgPower, encoderEnergy := phaseEnergy(encoderSamples, encoderWall)
+	encoderWorkloadItems := encoderDocs + encoderQueries
+	encoderPhase := phaseResult{
+		Phase:                       "encoder_only",
+		Workload:                    "eos export-retrieval-vectors",
+		Command:                     encoderCommand,
+		TelemetryStatus:             encoderStatus,
+		TelemetryReason:             encoderReason,
+		TelemetrySource:             sampler.source,
+		GPUIndex:                    sampler.gpuIndex,
+		WallSeconds:                 encoderWall,
+		QueryCount:                  encoderQueries,
+		DocumentCount:               encoderDocs,
+		WorkloadItemCount:           encoderWorkloadItems,
+		SampleCount:                 encoderSampleCount,
+		AveragePowerWatts:           encoderAvgPower,
+		EnergyJoules:                encoderEnergy,
+		EnergyJoulesPerWorkloadItem: energyCost(encoderEnergy, encoderWorkloadItems),
+		OutputJSON:                  vectorManifest,
+	}
+
+	metricsJSON := filepath.Join(runRoot, dataset+".turboquant-serving.metrics.json")
+	metricsTSV := filepath.Join(runRoot, dataset+".turboquant-serving.metrics.tsv")
+	scoringArgs := []string{
+		"go", "run", "./cmd/eos", "eval-retrieval-turboquant",
+		"--dataset", dataset,
+		"--split", split,
+		"--top-k", getenv("EOS_ENERGY_BENCH_TOP_K", "100"),
+		"--batch-size", batchSize,
+		"--bits", getenv("EOS_ENERGY_BENCH_BITS", "4"),
+		"--rerank-overfetch", getenv("EOS_ENERGY_BENCH_RERANK_OVERFETCH", "200"),
+		"--rerank-storage", getenv("EOS_ENERGY_BENCH_RERANK_STORAGE", "fp16"),
+		"--metrics-json", metricsJSON,
+		"--metrics-tsv", metricsTSV,
+	}
+	if maxDocs != "0" {
+		scoringArgs = append(scoringArgs, "--max-docs", maxDocs)
+	}
+	if maxQueries != "0" {
+		scoringArgs = append(scoringArgs, "--max-queries", maxQueries)
+	}
+	scoringArgs = append(scoringArgs, artifact, datasetDir)
+	beforeScoringSamples, _ := sampler.snapshot()
+	scoringCommand, allScoringSamples, scoringWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "index-scoring", scoringArgs, sampler, time.Duration(sampleMS)*time.Millisecond)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "index/scoring workload failed: %v\n", err)
+		os.Exit(1)
+	}
+	scoringSamples := allScoringSamples[len(beforeScoringSamples):]
+	scoringQueries := queryCountFromTurboQuant(metricsJSON, maxQueriesInt)
+	scoringStatus, scoringReason, scoringSampleCount, scoringAvgPower, scoringEnergy := phaseEnergy(scoringSamples, scoringWall)
+	scoringPhase := phaseResult{
+		Phase:                "index_scoring",
+		Workload:             "eos eval-retrieval-turboquant",
+		Command:              scoringCommand,
+		TelemetryStatus:      scoringStatus,
+		TelemetryReason:      scoringReason,
+		TelemetrySource:      sampler.source,
+		GPUIndex:             sampler.gpuIndex,
+		WallSeconds:          scoringWall,
+		QueryCount:           scoringQueries,
+		WorkloadItemCount:    scoringQueries,
+		SampleCount:          scoringSampleCount,
+		AveragePowerWatts:    scoringAvgPower,
+		EnergyJoules:         scoringEnergy,
+		EnergyJoulesPerQuery: energyCost(scoringEnergy, scoringQueries),
+		OutputJSON:           metricsJSON,
+		OutputTSV:            metricsTSV,
+	}
+
+	samples, firstErr := sampler.snapshot()
+	samplesPath := filepath.Join(runRoot, "power-samples.jsonl")
+	summaryTSV := filepath.Join(runRoot, "summary.tsv")
+	manifestJSON := filepath.Join(runRoot, "manifest.json")
+	phases := []phaseResult{encoderPhase, scoringPhase}
+	overallStatus, unsupportedReason := statusForManifest(phases, firstErr)
+	if err := writeSamples(samplesPath, samples); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := writeSummaryTSV(summaryTSV, phases); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	out := manifest{
+		Schema:            schema,
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		RunDir:            runRoot,
+		Artifact:          artifact,
+		Dataset:           dataset,
+		DatasetDir:        datasetDir,
+		MaxDocs:           maxDocs,
+		MaxQueries:        maxQueries,
+		SampleIntervalMS:  sampleMS,
+		RequirePower:      requirePower,
+		SummaryTSV:        summaryTSV,
+		PowerSamplesJSONL: samplesPath,
+		Phases:            phases,
+		OverallStatus:     overallStatus,
+		UnsupportedReason: unsupportedReason,
+	}
+	if err := writeJSON(manifestJSON, out); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	fmt.Printf("\nsummary_tsv: %s\n", summaryTSV)
+	fmt.Printf("manifest: %s\n", manifestJSON)
+	fmt.Printf("power_samples: %s\n", samplesPath)
+	for _, phase := range phases {
+		fmt.Printf("%s: status=%s wall_seconds=%.6f queries=%d documents=%d workload_items=%d energy_joules=%.6f energy_joules_per_query=%s energy_joules_per_workload_item=%s samples=%d\n",
+			phase.Phase,
+			phase.TelemetryStatus,
+			phase.WallSeconds,
+			phase.QueryCount,
+			phase.DocumentCount,
+			phase.WorkloadItemCount,
+			phase.EnergyJoules,
+			formatOptionalFloat(phase.EnergyJoulesPerQuery),
+			formatOptionalFloat(phase.EnergyJoulesPerWorkloadItem),
+			phase.SampleCount)
+	}
+	if requirePower && overallStatus != "measured" {
+		fmt.Fprintf(os.Stderr, "required GPU power telemetry unavailable: %s\n", unsupportedReason)
+		os.Exit(1)
+	}
+}
