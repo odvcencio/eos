@@ -143,6 +143,10 @@ func accumulateVectorDistillProjectionGrads(
 // (loss=0, nil grads, nil error) when weight <= 0 or fewer than 2 students are
 // given, since an in-batch similarity matrix needs at least 2 rows.
 func VectorDistillRelationalLossAndGrad(students, teachers [][]float32, weight float32) (float32, [][]float32, error) {
+	return vectorDistillRelationalLossAndGradWithScores(students, teachers, weight, nil, nil)
+}
+
+func vectorDistillRelationalLossAndGradWithScores(students, teachers [][]float32, weight float32, studentScores, teacherScores []float32) (float32, [][]float32, error) {
 	n := len(students)
 	if weight <= 0 || n < 2 {
 		return 0, nil, nil
@@ -172,8 +176,8 @@ func VectorDistillRelationalLossAndGrad(students, teachers [][]float32, weight f
 	var sumSq float32
 	for i := 0; i < n; i++ {
 		for j := i + 1; j < n; j++ {
-			sStudent := cosineScoreWithNorms(students[i], students[j], normS[i], normS[j])
-			sTeacher := cosineScoreWithNorms(teachers[i], teachers[j], normT[i], normT[j])
+			sStudent := vectorDistillRelationalScore(students[i], students[j], normS[i], normS[j], studentScores, n, i, j)
+			sTeacher := vectorDistillRelationalScore(teachers[i], teachers[j], normT[i], normT[j], teacherScores, n, i, j)
 			diff := sStudent - sTeacher
 			sumSq += 2 * diff * diff
 
@@ -183,6 +187,13 @@ func VectorDistillRelationalLossAndGrad(students, teachers [][]float32, weight f
 	}
 	loss := weight * sumSq / m
 	return loss, grads, nil
+}
+
+func vectorDistillRelationalScore(left, right []float32, leftNorm, rightNorm float32, scores []float32, rows, i, j int) float32 {
+	if len(scores) == rows*rows && rows > 0 && i >= 0 && i < rows && j >= 0 && j < rows && len(left) == len(right) && len(left) > 0 && leftNorm != 0 && rightNorm != 0 {
+		return scores[i*rows+j] / (leftNorm * rightNorm)
+	}
+	return cosineScoreWithNorms(left, right, leftNorm, rightNorm)
 }
 
 // applyVectorDistillProjectionAdamW applies an AdamW step to the distillation

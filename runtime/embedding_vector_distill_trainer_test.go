@@ -388,6 +388,45 @@ func TestVectorDistillProjectionRoutesMatMulsAndOptimizerThroughAccelerators(t *
 	}
 }
 
+func TestVectorDistillRelationalLossRoutesSimilarityMatricesThroughMatMul(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	matmulAccel := &fakeVectorDistillMatMulAccelerator{}
+	trainer.forwardMatMul = matmulAccel
+
+	students := [][]float32{
+		{0.6, -0.3, 0.2},
+		{0.1, 0.8, -0.4},
+		{-0.5, 0.2, 0.9},
+	}
+	teachers := [][]float32{
+		{0.2, 0.5, -0.1, 0.4},
+		{-0.3, 0.4, 0.6, -0.2},
+		{0.7, -0.2, 0.1, 0.3},
+	}
+	const weight = float32(0.7)
+
+	wantLoss, wantGrads, err := VectorDistillRelationalLossAndGrad(students, teachers, weight)
+	if err != nil {
+		t.Fatalf("host VectorDistillRelationalLossAndGrad: %v", err)
+	}
+	gotLoss, gotGrads, err := trainer.vectorDistillRelationalLossAndGrad(students, teachers, weight)
+	if err != nil {
+		t.Fatalf("accelerated vectorDistillRelationalLossAndGrad: %v", err)
+	}
+	if matmulAccel.stats.RunCalls != 2 {
+		t.Fatalf("matmul run calls = %d, want 2", matmulAccel.stats.RunCalls)
+	}
+	if gotLoss != wantLoss {
+		t.Fatalf("loss = %v, want exact %v", gotLoss, wantLoss)
+	}
+	if len(gotGrads) != len(wantGrads) {
+		t.Fatalf("grad rows = %d, want %d", len(gotGrads), len(wantGrads))
+	}
+	for i := range gotGrads {
+		assertExactFloat32Slice(t, fmt.Sprintf("grad row %d", i), gotGrads[i], wantGrads[i])
+	}
+}
+
 // relationalOnlyEncoderGradNorm drives the real production merge path
 // (computeVectorDistillBatchGradients) to compute the L2 norm of the RAW
 // (pre-batchScale, pre-AdamW) encoder gradient contributed solely by the

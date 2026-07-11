@@ -491,7 +491,7 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 			scratch.students = students
 			scratch.teachers = teachers
 		}
-		relationalLoss, relationalGrads, err = VectorDistillRelationalLossAndGrad(students, teachers, relationalWeight)
+		relationalLoss, relationalGrads, err = t.vectorDistillRelationalLossAndGrad(students, teachers, relationalWeight)
 		if err != nil {
 			return EmbeddingTrainMetrics{}, proj, fmt.Errorf("relational loss: %w", err)
 		}
@@ -736,6 +736,45 @@ func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistill
 		t.config.LearningRate, t.config.Beta1, t.config.Beta2, t.config.Epsilon, t.config.WeightDecay,
 		proj.Step,
 	)
+}
+
+func (t *EmbeddingTrainer) vectorDistillRelationalLossAndGrad(students, teachers [][]float32, weight float32) (float32, [][]float32, error) {
+	n := len(students)
+	if weight <= 0 || n < 2 {
+		return 0, nil, nil
+	}
+	if len(teachers) != n {
+		return 0, nil, fmt.Errorf("vector_distill_relational: student count %d != teacher count %d", n, len(teachers))
+	}
+	studentData, studentDim, studentOK := flattenVectorDistillRelationalRows(students)
+	teacherData, teacherDim, teacherOK := flattenVectorDistillRelationalRows(teachers)
+	var studentScores, teacherScores []float32
+	if studentOK {
+		if out, ok := t.tryTrainerMatMul(studentData, n, studentDim, studentData, n, studentDim, false, true); ok && len(out) == n*n {
+			studentScores = out
+		}
+	}
+	if teacherOK {
+		if out, ok := t.tryTrainerMatMul(teacherData, n, teacherDim, teacherData, n, teacherDim, false, true); ok && len(out) == n*n {
+			teacherScores = out
+		}
+	}
+	return vectorDistillRelationalLossAndGradWithScores(students, teachers, weight, studentScores, teacherScores)
+}
+
+func flattenVectorDistillRelationalRows(rows [][]float32) ([]float32, int, bool) {
+	if len(rows) == 0 || len(rows[0]) == 0 {
+		return nil, 0, false
+	}
+	width := len(rows[0])
+	data := make([]float32, 0, len(rows)*width)
+	for _, row := range rows {
+		if len(row) != width {
+			return nil, 0, false
+		}
+		data = append(data, row...)
+	}
+	return data, width, true
 }
 
 func ensureVectorDistillExampleScratch(s []EmbeddingTokenizedVectorDistillExample, n int) []EmbeddingTokenizedVectorDistillExample {
