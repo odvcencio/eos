@@ -18,7 +18,12 @@ The imported BGE package for `BAAI/bge-small-en-v1.5` is a first-class
 non-default candidate only after the exact selected-package full gate passes.
 It remains separate from the `corkscrewdb-default-embedder` alias: the package
 uses an imported BERT/WordPiece runtime, 384d vectors, CLS pooling, L2
-normalization, and the BGE query prefix role contract. The candidate package
+normalization, and the BGE query prefix role contract. Current imported BGE
+vector export is `pretrained_bert_host_reference`; CUDA matmul or layer-level
+acceleration evidence is not a full device encoder contract. Use
+`eos export-pretrained-bert-retrieval-vectors --require-device-encoder` for
+energy/readiness gates that must fail unless manifest `encoder_execution`
+provenance validates full device-side encoder execution. The candidate package
 SHA256 is `841b0d851c06290daeeab4bf4d25cb1dd7bb87920316dac950e1b556a3bae763`,
 the identity SHA256 is
 `a356a4b7dc29a8d0f0a7b7bd45e7a9d2afbfa651c1a5bfaa05008c7157ba9637`,
@@ -184,7 +189,7 @@ EOS_ENERGY_BENCH_ARTIFACT=/path/to/imported-bge-small-en-v1.5.mll \
 ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
 ```
 
-Imported mode exports caches with `eos export-pretrained-bert-retrieval-vectors --package <artifact> --use-package-role-contract`, then scores those exact `doc-vectors.jsonl` and `query-vectors.jsonl` caches with `eos eval-retrieval-vectors-turboquant`. The manifest records `workload_mode` and command provenance. Energy denominators stay the same: encoder-only uses documents + queries, and index/scoring uses queries.
+Imported mode exports caches with `eos export-pretrained-bert-retrieval-vectors --package <artifact> --use-package-role-contract`, then scores those exact `doc-vectors.jsonl` and `query-vectors.jsonl` caches with `eos eval-retrieval-vectors-turboquant`. The vector export manifest records `encoder_execution`, including selected backend, configured `EOS_BERT_DENSE_ACCEL` policy, observed CUDA dense matmul counters, whether a full device encoder contract was validated, and the explicit host-reference/device boundary. CUDA dense counters are opportunistic partial acceleration evidence, not a full-device encoder claim. Set `EOS_ENERGY_REQUIRE_DEVICE_ENCODER=1` on the energy wrapper, or add `--require-device-encoder` directly, only for readiness or energy gates that must fail closed when imported BGE is still host-reference. Energy denominators stay the same: encoder-only uses documents + queries, and index/scoring uses queries.
 
 ```bash
 EOS_REPO_ROOT=$PWD \

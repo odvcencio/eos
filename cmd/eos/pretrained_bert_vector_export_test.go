@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 
 	eosruntime "m31labs.dev/eos/runtime"
+	"m31labs.dev/eos/runtime/backends/cuda"
 )
 
 func TestRunExportPretrainedBERTRetrievalVectorsRequiresArtifacts(t *testing.T) {
@@ -18,7 +20,7 @@ func TestRunExportPretrainedBERTRetrievalVectorsRequiresArtifacts(t *testing.T) 
 }
 
 func TestRunExportPretrainedBERTRetrievalVectorsAcceptsResumeProgressFlags(t *testing.T) {
-	err := runExportPretrainedBERTRetrievalVectors([]string{"--resume", "--progress-every", "7", "--projection-head", "head.mll", "--use-package-role-contract"})
+	err := runExportPretrainedBERTRetrievalVectors([]string{"--resume", "--progress-every", "7", "--projection-head", "head.mll", "--use-package-role-contract", "--require-device-encoder"})
 	if err == nil {
 		t.Fatal("runExportPretrainedBERTRetrievalVectors succeeded without positional args, want usage error")
 	}
@@ -27,6 +29,47 @@ func TestRunExportPretrainedBERTRetrievalVectorsAcceptsResumeProgressFlags(t *te
 	}
 	if !strings.Contains(err.Error(), "usage: eos export-pretrained-bert-retrieval-vectors") {
 		t.Fatalf("err = %v, want usage error after parsing flags", err)
+	}
+}
+
+func TestRunExportPretrainedBERTRetrievalVectorsRequireDeviceEncoderFailsClosedThroughCLI(t *testing.T) {
+	packagePath := writeCommandPretrainedBERTPackageFixture(t, "intfloat/e5-small-v2", true)
+	if commandPretrainedBERTPackageCanLoadWithRequiredCUDA(t, packagePath) {
+		t.Setenv(eosruntime.EnvRequireBackend, "cuda")
+	} else {
+		t.Setenv(eosruntime.EnvRequireBackend, "")
+	}
+	datasetDir := writeCommandPretrainedBERTBEIRFixture(t)
+	outputDir := filepath.Join(t.TempDir(), "vectors")
+	manifestPath := filepath.Join(outputDir, "manifest.json")
+
+	err := runExportPretrainedBERTRetrievalVectors([]string{
+		"--package", packagePath,
+		"--use-package-role-contract",
+		"--require-device-encoder",
+		"--dataset", "tiny-bert",
+		"--batch-size", "1",
+		"--max-length", "4",
+		"--manifest-json", manifestPath,
+		datasetDir,
+		outputDir,
+	})
+	if err == nil {
+		t.Fatal("runExportPretrainedBERTRetrievalVectors succeeded with --require-device-encoder, want fail-closed error")
+	}
+	for _, want := range []string{"--require-device-encoder requested", "pretrained_bert_host_reference", "full_device_execution=false", "full device encoder"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want substring %q", err, want)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(outputDir, "doc-vectors.jsonl"),
+		filepath.Join(outputDir, "query-vectors.jsonl"),
+		manifestPath,
+	} {
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("%s stat err = %v, want not exist", path, statErr)
+		}
 	}
 }
 
@@ -139,4 +182,34 @@ func TestRunExportPretrainedBERTRetrievalVectorsRejectsMismatchedDocumentPrefixA
 	if err == nil || !strings.Contains(err.Error(), "--document-prefix and --doc-prefix differ") {
 		t.Fatalf("err = %v, want mismatch error", err)
 	}
+}
+
+func commandPretrainedBERTPackageCanLoadWithRequiredCUDA(t *testing.T, packagePath string) bool {
+	t.Helper()
+	t.Setenv(eosruntime.EnvRequireBackend, "cuda")
+	_, err := eosruntime.LoadPretrainedBERTTextEmbedder(context.Background(), eosruntime.PretrainedBERTTextEmbedderConfig{
+		PackagePath: packagePath,
+		MaxLength:   4,
+		Runtime:     eosruntime.New(cuda.New()),
+	})
+	return err == nil
+}
+
+func writeCommandPretrainedBERTBEIRFixture(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	qrelsDir := filepath.Join(dir, "qrels")
+	if err := os.MkdirAll(qrelsDir, 0o755); err != nil {
+		t.Fatalf("mkdir qrels: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "corpus.jsonl"), []byte(`{"_id":"d1","title":"Doc","text":"hello world"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write corpus: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "queries.jsonl"), []byte(`{"_id":"q1","text":"hello"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write queries: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(qrelsDir, "test.tsv"), []byte("query-id\tcorpus-id\tscore\nq1\td1\t1\n"), 0o644); err != nil {
+		t.Fatalf("write qrels: %v", err)
+	}
+	return dir
 }

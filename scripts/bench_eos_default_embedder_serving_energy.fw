@@ -130,7 +130,8 @@ Environment:
   EOS_ENERGY_BENCH_RERANK_STORAGE=fp16
   EOS_ENERGY_BENCH_GPU_INDEX=0
   EOS_ENERGY_BENCH_SAMPLE_MS=200
-  EOS_ENERGY_BENCH_REQUIRE_POWER=0   # set 1 to fail when power telemetry is unavailable`)
+  EOS_ENERGY_BENCH_REQUIRE_POWER=0   # set 1 to fail when power telemetry is unavailable
+  EOS_ENERGY_REQUIRE_DEVICE_ENCODER=0 # imported_bert only: append --require-device-encoder`)
 }
 
 func getenv(name string, fallback string) string {
@@ -548,7 +549,7 @@ func buildEncoderArgs(eosBin string, mode string, artifact string, dataset strin
 		}, "eos export-retrieval-vectors", nil
 	}
 	if mode == "imported_bert" {
-		return []string{
+		args := []string{
 			eosBin, "export-pretrained-bert-retrieval-vectors",
 			"--package", artifact,
 			"--use-package-role-contract",
@@ -558,9 +559,12 @@ func buildEncoderArgs(eosBin string, mode string, artifact string, dataset strin
 			"--max-docs", maxDocs,
 			"--max-queries", maxQueries,
 			"--manifest-json", vectorManifest,
-			datasetDir,
-			vectorDir,
-		}, "eos export-pretrained-bert-retrieval-vectors", nil
+		}
+		if getenvBool("EOS_ENERGY_REQUIRE_DEVICE_ENCODER", false) {
+			args = append(args, "--require-device-encoder")
+		}
+		args = append(args, datasetDir, vectorDir)
+		return args, "eos export-pretrained-bert-retrieval-vectors", nil
 	}
 	return nil, "", fmt.Errorf("unsupported workload mode: %s", mode)
 }

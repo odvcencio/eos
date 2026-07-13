@@ -11,7 +11,9 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -39,6 +41,8 @@ type PretrainedBERTTextEmbedder struct {
 	packageIdentity       string
 	packageFileSHA        map[string]string
 	retrievalRoleContract *PretrainedBERTRetrievalRoleContract
+	executionMu           sync.Mutex
+	executionStats        pretrainedBERTEncoderExecutionStats
 }
 
 type PretrainedBERTTextEmbedderConfig struct {
@@ -75,66 +79,93 @@ type PretrainedBERTRetrievalVectorExportConfig struct {
 	Runtime                *Runtime
 	ManifestJSONPath       string
 	ProjectionHeadPath     string
+	RequireDeviceEncoder   bool
 	Resume                 bool
 	ProgressEvery          int
 	Progress               PretrainedBERTRetrievalVectorExportProgressFunc
 }
 
+type PretrainedBERTEncoderExecutionProvenance struct {
+	ExecutionMode                      string `json:"execution_mode"`
+	SelectedBackend                    string `json:"selected_backend,omitempty"`
+	FullDeviceExecution                bool   `json:"full_device_execution"`
+	ValidatedDeviceEncoder             bool   `json:"validated_device_encoder"`
+	HostReference                      bool   `json:"host_reference"`
+	OpportunisticDeviceOpsIgnored      bool   `json:"opportunistic_device_ops_ignored"`
+	OpportunisticDeviceOpsUsed         bool   `json:"opportunistic_device_ops_used"`
+	DenseAccelerationPolicy            string `json:"dense_acceleration_policy"`
+	CUDADenseAccelerationObserved      bool   `json:"cuda_dense_acceleration_observed"`
+	CUDADenseMatMulRuns                int64  `json:"cuda_dense_matmul_runs"`
+	CUDADenseMatMulUploadedBytes       int64  `json:"cuda_dense_matmul_uploaded_bytes"`
+	HostReferenceExecutionStatus       string `json:"host_reference_execution_status,omitempty"`
+	DeviceEncoderContract              string `json:"device_encoder_contract"`
+	DeviceEncoderContractSatisfied     bool   `json:"device_encoder_contract_satisfied"`
+	DeviceEncoderContractMissingReason string `json:"device_encoder_contract_missing_reason,omitempty"`
+	DeviceEncoderValidationFailureHint string `json:"device_encoder_validation_failure_hint,omitempty"`
+}
+
+type pretrainedBERTEncoderExecutionStats struct {
+	cudaDenseMatMulRuns          int64
+	cudaDenseMatMulUploadedBytes int64
+	hostReferenceExecutionStatus string
+}
+
 type PretrainedBERTRetrievalVectorExportSummary struct {
-	Schema                            string    `json:"schema"`
-	Dataset                           string    `json:"dataset"`
-	SourceDir                         string    `json:"source_dir"`
-	ModulePath                        string    `json:"module_path"`
-	WeightsPath                       string    `json:"weights_path"`
-	PackagePath                       string    `json:"package_path,omitempty"`
-	PackageSHA256                     string    `json:"package_sha256,omitempty"`
-	PackageIdentitySHA256             string    `json:"package_identity_sha256,omitempty"`
-	ExecutionMode                     string    `json:"execution_mode"`
-	QualityClaim                      bool      `json:"quality_claim"`
-	EmbeddingSpaceID                  string    `json:"embedding_space_id,omitempty"`
-	ProjectionHeadPath                string    `json:"projection_head_path,omitempty"`
-	ProjectionHeadSHA256              string    `json:"projection_head_sha256,omitempty"`
-	ProjectionHeadIdentity            string    `json:"projection_head_identity,omitempty"`
-	ProjectionHeadSchema              string    `json:"projection_head_schema,omitempty"`
-	ProjectionHeadSourceModel         string    `json:"projection_head_source_model,omitempty"`
-	ModuleSHA256                      string    `json:"module_sha256,omitempty"`
-	WeightsSHA256                     string    `json:"weights_sha256,omitempty"`
-	ConfigSHA256                      string    `json:"config_sha256,omitempty"`
-	VocabSHA256                       string    `json:"vocab_sha256,omitempty"`
-	TokenizerJSONSHA256               string    `json:"tokenizer_json_sha256,omitempty"`
-	TokenizerConfigSHA256             string    `json:"tokenizer_config_sha256,omitempty"`
-	SpecialTokensMapSHA256            string    `json:"special_tokens_map_sha256,omitempty"`
-	SentenceTransformersPoolingSHA256 string    `json:"sentence_transformers_pooling_sha256,omitempty"`
-	SentenceTransformersConfigSHA256  string    `json:"sentence_transformers_config_sha256,omitempty"`
-	Normalization                     string    `json:"normalization,omitempty"`
-	Documents                         int       `json:"documents"`
-	Queries                           int       `json:"queries"`
-	NativeDim                         int       `json:"native_dim"`
-	OutputDim                         int       `json:"output_dim"`
-	DocVectorPath                     string    `json:"doc_vector_path"`
-	QueryVectorPath                   string    `json:"query_vector_path"`
-	QueryPrefix                       string    `json:"query_prefix"`
-	DocumentPrefix                    string    `json:"document_prefix"`
-	LegacyDocPrefix                   string    `json:"doc_prefix"`
-	DocumentRoleApplied               bool      `json:"document_role_applied"`
-	QueryRoleApplied                  bool      `json:"query_role_applied"`
-	Resume                            bool      `json:"resume"`
-	ProgressEvery                     int       `json:"progress_every,omitempty"`
-	ReusedDocuments                   int       `json:"reused_documents,omitempty"`
-	ReusedQueries                     int       `json:"reused_queries,omitempty"`
-	WrittenDocuments                  int       `json:"written_documents"`
-	WrittenQueries                    int       `json:"written_queries"`
-	MaxLength                         int       `json:"max_length"`
-	MaxLengthSource                   string    `json:"max_length_source,omitempty"`
-	Pooling                           string    `json:"pooling,omitempty"`
-	BatchSize                         int       `json:"batch_size"`
-	MaxDocs                           int       `json:"max_docs,omitempty"`
-	MaxQueries                        int       `json:"max_queries,omitempty"`
-	CorpusPath                        string    `json:"corpus_path,omitempty"`
-	QueriesPath                       string    `json:"queries_path,omitempty"`
-	QrelsPath                         string    `json:"qrels_path,omitempty"`
-	ElapsedSeconds                    float64   `json:"elapsed_seconds"`
-	CreatedAt                         time.Time `json:"created_at"`
+	Schema                            string                                   `json:"schema"`
+	Dataset                           string                                   `json:"dataset"`
+	SourceDir                         string                                   `json:"source_dir"`
+	ModulePath                        string                                   `json:"module_path"`
+	WeightsPath                       string                                   `json:"weights_path"`
+	PackagePath                       string                                   `json:"package_path,omitempty"`
+	PackageSHA256                     string                                   `json:"package_sha256,omitempty"`
+	PackageIdentitySHA256             string                                   `json:"package_identity_sha256,omitempty"`
+	ExecutionMode                     string                                   `json:"execution_mode"`
+	EncoderExecution                  PretrainedBERTEncoderExecutionProvenance `json:"encoder_execution"`
+	QualityClaim                      bool                                     `json:"quality_claim"`
+	EmbeddingSpaceID                  string                                   `json:"embedding_space_id,omitempty"`
+	ProjectionHeadPath                string                                   `json:"projection_head_path,omitempty"`
+	ProjectionHeadSHA256              string                                   `json:"projection_head_sha256,omitempty"`
+	ProjectionHeadIdentity            string                                   `json:"projection_head_identity,omitempty"`
+	ProjectionHeadSchema              string                                   `json:"projection_head_schema,omitempty"`
+	ProjectionHeadSourceModel         string                                   `json:"projection_head_source_model,omitempty"`
+	ModuleSHA256                      string                                   `json:"module_sha256,omitempty"`
+	WeightsSHA256                     string                                   `json:"weights_sha256,omitempty"`
+	ConfigSHA256                      string                                   `json:"config_sha256,omitempty"`
+	VocabSHA256                       string                                   `json:"vocab_sha256,omitempty"`
+	TokenizerJSONSHA256               string                                   `json:"tokenizer_json_sha256,omitempty"`
+	TokenizerConfigSHA256             string                                   `json:"tokenizer_config_sha256,omitempty"`
+	SpecialTokensMapSHA256            string                                   `json:"special_tokens_map_sha256,omitempty"`
+	SentenceTransformersPoolingSHA256 string                                   `json:"sentence_transformers_pooling_sha256,omitempty"`
+	SentenceTransformersConfigSHA256  string                                   `json:"sentence_transformers_config_sha256,omitempty"`
+	Normalization                     string                                   `json:"normalization,omitempty"`
+	Documents                         int                                      `json:"documents"`
+	Queries                           int                                      `json:"queries"`
+	NativeDim                         int                                      `json:"native_dim"`
+	OutputDim                         int                                      `json:"output_dim"`
+	DocVectorPath                     string                                   `json:"doc_vector_path"`
+	QueryVectorPath                   string                                   `json:"query_vector_path"`
+	QueryPrefix                       string                                   `json:"query_prefix"`
+	DocumentPrefix                    string                                   `json:"document_prefix"`
+	LegacyDocPrefix                   string                                   `json:"doc_prefix"`
+	DocumentRoleApplied               bool                                     `json:"document_role_applied"`
+	QueryRoleApplied                  bool                                     `json:"query_role_applied"`
+	Resume                            bool                                     `json:"resume"`
+	ProgressEvery                     int                                      `json:"progress_every,omitempty"`
+	ReusedDocuments                   int                                      `json:"reused_documents,omitempty"`
+	ReusedQueries                     int                                      `json:"reused_queries,omitempty"`
+	WrittenDocuments                  int                                      `json:"written_documents"`
+	WrittenQueries                    int                                      `json:"written_queries"`
+	MaxLength                         int                                      `json:"max_length"`
+	MaxLengthSource                   string                                   `json:"max_length_source,omitempty"`
+	Pooling                           string                                   `json:"pooling,omitempty"`
+	BatchSize                         int                                      `json:"batch_size"`
+	MaxDocs                           int                                      `json:"max_docs,omitempty"`
+	MaxQueries                        int                                      `json:"max_queries,omitempty"`
+	CorpusPath                        string                                   `json:"corpus_path,omitempty"`
+	QueriesPath                       string                                   `json:"queries_path,omitempty"`
+	QrelsPath                         string                                   `json:"qrels_path,omitempty"`
+	ElapsedSeconds                    float64                                  `json:"elapsed_seconds"`
+	CreatedAt                         time.Time                                `json:"created_at"`
 }
 
 type PretrainedBERTRetrievalVectorExportProgressFunc func(PretrainedBERTRetrievalVectorExportProgress)
@@ -345,6 +376,46 @@ func (e *PretrainedBERTTextEmbedder) PackageIdentitySHA256() string {
 	return e.packageIdentity
 }
 
+func (e *PretrainedBERTTextEmbedder) EncoderExecutionProvenance() PretrainedBERTEncoderExecutionProvenance {
+	policy := pretrainedBERTDenseAccelerationPolicy()
+	provenance := PretrainedBERTEncoderExecutionProvenance{
+		ExecutionMode:                      "pretrained_bert_host_reference",
+		FullDeviceExecution:                false,
+		ValidatedDeviceEncoder:             false,
+		HostReference:                      true,
+		OpportunisticDeviceOpsIgnored:      true,
+		DenseAccelerationPolicy:            policy,
+		DeviceEncoderContract:              "full_device_pretrained_bert_encoder",
+		DeviceEncoderContractSatisfied:     false,
+		DeviceEncoderContractMissingReason: "no validated full-device StepBERTEmbedder/pretrained BERT encoder contract is present; imported BERT embedding uses the host-reference full stack",
+		DeviceEncoderValidationFailureHint: "do not treat requested backends or observed opportunistic CUDA matmul/dense helper use as proof of full device encoder execution",
+	}
+	if e != nil && e.program != nil {
+		provenance.SelectedBackend = string(e.program.Backend())
+	}
+	if e != nil {
+		e.executionMu.Lock()
+		stats := e.executionStats
+		e.executionMu.Unlock()
+		provenance.CUDADenseMatMulRuns = stats.cudaDenseMatMulRuns
+		provenance.CUDADenseMatMulUploadedBytes = stats.cudaDenseMatMulUploadedBytes
+		provenance.CUDADenseAccelerationObserved = stats.cudaDenseMatMulRuns > 0 || stats.cudaDenseMatMulUploadedBytes > 0
+		provenance.OpportunisticDeviceOpsUsed = provenance.CUDADenseAccelerationObserved
+		provenance.HostReferenceExecutionStatus = stats.hostReferenceExecutionStatus
+	}
+	return provenance
+}
+
+func pretrainedBERTDenseAccelerationPolicy() string {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("EOS_BERT_DENSE_ACCEL")))
+	switch value {
+	case "0", "false", "off", "disabled":
+		return "disabled"
+	default:
+		return "enabled"
+	}
+}
+
 func (e *PretrainedBERTTextEmbedder) NativeDim() int {
 	if e == nil {
 		return 0
@@ -454,6 +525,7 @@ func (e *PretrainedBERTTextEmbedder) EmbedTextBatch(ctx context.Context, texts [
 	if err != nil {
 		return nil, err
 	}
+	e.recordEncoderExecutionResult(result)
 	value, ok := result.Outputs["embeddings"]
 	if !ok {
 		return nil, fmt.Errorf("bert_embed output missing embeddings")
@@ -481,6 +553,39 @@ func (e *PretrainedBERTTextEmbedder) EmbedTextBatch(ctx context.Context, texts [
 		out[row] = vec
 	}
 	return out, nil
+}
+
+func (e *PretrainedBERTTextEmbedder) recordEncoderExecutionResult(result backend.Result) {
+	if e == nil {
+		return
+	}
+	stats := pretrainedBERTEncoderExecutionStats{
+		cudaDenseMatMulRuns:          parsePretrainedBERTMetadataInt64(result.Metadata["cuda_matmul_bound_right_runs"]),
+		cudaDenseMatMulUploadedBytes: parsePretrainedBERTMetadataInt64(result.Metadata["cuda_matmul_run_uploaded_bytes"]),
+	}
+	if value, ok := result.Outputs["embeddings"]; ok && value.Metadata != nil {
+		if status, ok := value.Metadata["execution_status"].(string); ok {
+			stats.hostReferenceExecutionStatus = status
+		}
+	}
+	e.executionMu.Lock()
+	e.executionStats.cudaDenseMatMulRuns += stats.cudaDenseMatMulRuns
+	e.executionStats.cudaDenseMatMulUploadedBytes += stats.cudaDenseMatMulUploadedBytes
+	if stats.hostReferenceExecutionStatus != "" {
+		e.executionStats.hostReferenceExecutionStatus = stats.hostReferenceExecutionStatus
+	}
+	e.executionMu.Unlock()
+}
+
+func parsePretrainedBERTMetadataInt64(value string) int64 {
+	if value == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || parsed < 0 {
+		return 0
+	}
+	return parsed
 }
 
 func padPretrainedBERTBatchEncodings(tokenizer *HFWordPieceTokenizer, rows []HFWordPieceEncoding, length int) ([]int32, []int32, []int32, error) {
@@ -573,6 +678,12 @@ func ExportPretrainedBERTRetrievalVectors(ctx context.Context, cfg PretrainedBER
 	if err != nil {
 		return PretrainedBERTRetrievalVectorExportSummary{}, err
 	}
+	encoderExecution := embedder.EncoderExecutionProvenance()
+	if cfg.RequireDeviceEncoder {
+		if err := validatePretrainedBERTDeviceEncoderRequired(encoderExecution); err != nil {
+			return PretrainedBERTRetrievalVectorExportSummary{}, err
+		}
+	}
 	queryPrefix, documentPrefix, err := resolvePretrainedBERTRetrievalPrefixes(cfg, embedder)
 	if err != nil {
 		return PretrainedBERTRetrievalVectorExportSummary{}, err
@@ -664,6 +775,7 @@ func ExportPretrainedBERTRetrievalVectors(ctx context.Context, cfg PretrainedBER
 	if docDim != queryDim {
 		return PretrainedBERTRetrievalVectorExportSummary{}, fmt.Errorf("document vectors have dimension %d but query vectors have dimension %d", docDim, queryDim)
 	}
+	encoderExecution = embedder.EncoderExecutionProvenance()
 	summary := PretrainedBERTRetrievalVectorExportSummary{
 		Schema:                            PretrainedBERTRetrievalVectorExportManifestSchema,
 		Dataset:                           cfg.DatasetName,
@@ -673,7 +785,8 @@ func ExportPretrainedBERTRetrievalVectors(ctx context.Context, cfg PretrainedBER
 		PackagePath:                       cfg.PackagePath,
 		PackageSHA256:                     identity.PackageSHA256,
 		PackageIdentitySHA256:             identity.PackageIdentitySHA256,
-		ExecutionMode:                     "pretrained_bert_host_reference",
+		ExecutionMode:                     encoderExecution.ExecutionMode,
+		EncoderExecution:                  encoderExecution,
 		QualityClaim:                      false,
 		EmbeddingSpaceID:                  identity.EmbeddingSpaceID,
 		ProjectionHeadPath:                cfg.ProjectionHeadPath,
@@ -724,6 +837,22 @@ func ExportPretrainedBERTRetrievalVectors(ctx context.Context, cfg PretrainedBER
 		return PretrainedBERTRetrievalVectorExportSummary{}, err
 	}
 	return summary, nil
+}
+
+func validatePretrainedBERTDeviceEncoderRequired(provenance PretrainedBERTEncoderExecutionProvenance) error {
+	if provenance.FullDeviceExecution && provenance.ValidatedDeviceEncoder && provenance.DeviceEncoderContractSatisfied {
+		return nil
+	}
+	return fmt.Errorf("--require-device-encoder requested, but pretrained BERT encoder execution is not fully device-backed: execution_mode=%s selected_backend=%s full_device_execution=%t validated_device_encoder=%t contract=%s satisfied=%t; %s; %s",
+		provenance.ExecutionMode,
+		provenance.SelectedBackend,
+		provenance.FullDeviceExecution,
+		provenance.ValidatedDeviceEncoder,
+		provenance.DeviceEncoderContract,
+		provenance.DeviceEncoderContractSatisfied,
+		provenance.DeviceEncoderContractMissingReason,
+		provenance.DeviceEncoderValidationFailureHint,
+	)
 }
 
 func resolvePretrainedBERTRetrievalPrefixes(cfg PretrainedBERTRetrievalVectorExportConfig, embedder *PretrainedBERTTextEmbedder) (string, string, error) {

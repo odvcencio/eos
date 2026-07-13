@@ -32,6 +32,7 @@ func runExportPretrainedBERTRetrievalVectors(args []string) error {
 	batchSize := fs.Int("batch-size", 64, "embedding batch size")
 	outputDim := fs.Int("output-dim", 0, "when positive, prefix-truncate embeddings to this dimension and L2-renormalize before writing")
 	projectionHeadPath := fs.String("projection-head", "", "MLL projection head sidecar to apply to native embeddings before writing")
+	requireDeviceEncoder := fs.Bool("require-device-encoder", false, "fail unless validated execution provenance proves the imported BERT encoder runs fully on device")
 	maxDocs := fs.Int("max-docs", 0, "limit corpus documents for smoke exports")
 	maxQueries := fs.Int("max-queries", 0, "limit queries for smoke exports")
 	maxLength := fs.Int("max-length", 0, "WordPiece max sequence length; default uses config max_position_embeddings")
@@ -88,6 +89,7 @@ func runExportPretrainedBERTRetrievalVectors(args []string) error {
 		Runtime:                rt,
 		ManifestJSONPath:       *manifestPath,
 		Resume:                 *resume,
+		RequireDeviceEncoder:   *requireDeviceEncoder,
 		ProgressEvery:          *progressEvery,
 		Progress:               printPretrainedBERTVectorExportProgress,
 	})

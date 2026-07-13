@@ -78,6 +78,7 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
         self.assertIn("summary.tsv", source)
         self.assertIn("manifest.json", source)
         self.assertIn("EOS_ENERGY_BENCH_REQUIRE_POWER", source)
+        self.assertIn("EOS_ENERGY_REQUIRE_DEVICE_ENCODER", source)
         self.assertIn("EOS_ENERGY_BENCH_FAKE_POWER_WATTS", source)
         self.assertIn('"unsupported"', source)
         self.assertIn('"indeterminate"', source)
@@ -133,7 +134,9 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
         self.assertIn('eosBin, "export-pretrained-bert-retrieval-vectors"', source)
         self.assertIn('"--package", artifact', source)
         self.assertIn('"--use-package-role-contract"', source)
-        self.assertIn('}, "eos export-pretrained-bert-retrieval-vectors", nil', source)
+        self.assertIn('getenvBool("EOS_ENERGY_REQUIRE_DEVICE_ENCODER", false)', source)
+        self.assertIn('args = append(args, "--require-device-encoder")', source)
+        self.assertIn('return args, "eos export-pretrained-bert-retrieval-vectors", nil', source)
         self.assertIn('[]string{eosBin, "eval-retrieval-vectors-turboquant"}', source)
         self.assertIn('"--doc-vectors", filepath.Join(vectorDir, "doc-vectors.jsonl")', source)
         self.assertIn('"--query-vectors", filepath.Join(vectorDir, "query-vectors.jsonl")', source)
@@ -158,9 +161,10 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
                 '"--max-docs", maxDocs',
                 '"--max-queries", maxQueries',
                 '"--manifest-json", vectorManifest',
-                "datasetDir",
-                "vectorDir",
-                '}, "eos export-pretrained-bert-retrieval-vectors", nil',
+                'if getenvBool("EOS_ENERGY_REQUIRE_DEVICE_ENCODER", false)',
+                'args = append(args, "--require-device-encoder")',
+                "args = append(args, datasetDir, vectorDir)",
+                'return args, "eos export-pretrained-bert-retrieval-vectors", nil',
             ],
         )
         _assert_ordered(
@@ -283,6 +287,7 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
 
         self.assertIn("scripts/bench_eos_default_embedder_serving_energy.fw", docs)
         self.assertIn("EOS_ENERGY_BENCH_WORKLOAD_MODE=imported_bert", docs)
+        self.assertIn("EOS_ENERGY_REQUIRE_DEVICE_ENCODER=1", docs)
         self.assertIn("power-samples.jsonl", docs)
         self.assertIn("encoder-only", docs)
         self.assertIn("index/scoring", docs)

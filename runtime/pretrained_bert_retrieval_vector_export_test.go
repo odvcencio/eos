@@ -46,6 +46,13 @@ func TestPretrainedBERTRetrievalVectorExportWritesEvaluatorCompatibleCaches(t *t
 	if summary.ExecutionMode != "pretrained_bert_host_reference" || summary.QualityClaim {
 		t.Fatalf("summary mode/quality = %+v", summary)
 	}
+	if summary.EncoderExecution.ExecutionMode != "pretrained_bert_host_reference" ||
+		summary.EncoderExecution.FullDeviceExecution ||
+		summary.EncoderExecution.ValidatedDeviceEncoder ||
+		!summary.EncoderExecution.HostReference ||
+		!summary.EncoderExecution.OpportunisticDeviceOpsIgnored {
+		t.Fatalf("summary encoder execution provenance = %+v", summary.EncoderExecution)
+	}
 	if summary.QueryPrefix != "query " || summary.DocumentPrefix != "doc " || summary.LegacyDocPrefix != "doc " || summary.MaxLength != 4 || summary.BatchSize != 1 {
 		t.Fatalf("summary config = %+v", summary)
 	}
@@ -94,6 +101,12 @@ func TestPretrainedBERTRetrievalVectorExportWritesEvaluatorCompatibleCaches(t *t
 	if manifest.Normalization != "l2" {
 		t.Fatalf("manifest normalization = %q, want l2", manifest.Normalization)
 	}
+	if manifest.EncoderExecution.ExecutionMode != "pretrained_bert_host_reference" ||
+		manifest.EncoderExecution.SelectedBackend == "" ||
+		manifest.EncoderExecution.DeviceEncoderContract != "full_device_pretrained_bert_encoder" ||
+		manifest.EncoderExecution.DeviceEncoderContractSatisfied {
+		t.Fatalf("manifest encoder execution provenance = %+v", manifest.EncoderExecution)
+	}
 	var manifestJSON map[string]any
 	if err := json.Unmarshal(manifestData, &manifestJSON); err != nil {
 		t.Fatalf("parse manifest json object: %v", err)
@@ -103,6 +116,15 @@ func TestPretrainedBERTRetrievalVectorExportWritesEvaluatorCompatibleCaches(t *t
 	}
 	if manifestJSON["document_role_applied"] != true || manifestJSON["query_role_applied"] != true {
 		t.Fatalf("manifest json role flags = doc:%v query:%v", manifestJSON["document_role_applied"], manifestJSON["query_role_applied"])
+	}
+	encoderExecutionJSON, ok := manifestJSON["encoder_execution"].(map[string]any)
+	if !ok || encoderExecutionJSON["execution_mode"] != "pretrained_bert_host_reference" ||
+		encoderExecutionJSON["full_device_execution"] != false ||
+		encoderExecutionJSON["opportunistic_device_ops_ignored"] != true {
+		t.Fatalf("manifest json encoder_execution = %#v", manifestJSON["encoder_execution"])
+	}
+	if _, ok := encoderExecutionJSON["cuda_dense_acceleration_available"]; ok {
+		t.Fatalf("manifest json encoder_execution must not infer cuda availability from policy/backend: %#v", encoderExecutionJSON)
 	}
 
 	_, _, qrelsPath := BEIRRetrievalPaths(datasetDir, "test")
@@ -122,6 +144,116 @@ func TestPretrainedBERTRetrievalVectorExportWritesEvaluatorCompatibleCaches(t *t
 	}
 	if metrics.Inputs.Documents != 1 || metrics.Inputs.Queries != 1 || metrics.Quality.HitAt1 != 1 {
 		t.Fatalf("metrics = %+v", metrics)
+	}
+}
+
+func TestPretrainedBERTEncoderExecutionProvenanceDoesNotInferCUDAAvailability(t *testing.T) {
+	t.Setenv("EOS_BERT_DENSE_ACCEL", "")
+	embedder := &PretrainedBERTTextEmbedder{
+		program: &Program{executor: stubExecutor{kind: eosartifact.BackendCUDA}},
+	}
+
+	provenance := embedder.EncoderExecutionProvenance()
+	if provenance.SelectedBackend != "cuda" || provenance.DenseAccelerationPolicy != "enabled" {
+		t.Fatalf("backend/policy provenance = %+v, want cuda/enabled", provenance)
+	}
+	if provenance.CUDADenseAccelerationObserved || provenance.OpportunisticDeviceOpsUsed ||
+		provenance.CUDADenseMatMulRuns != 0 || provenance.CUDADenseMatMulUploadedBytes != 0 {
+		t.Fatalf("host-only provenance inferred CUDA acceleration from selected backend: %+v", provenance)
+	}
+	if provenance.FullDeviceExecution || provenance.ValidatedDeviceEncoder || provenance.DeviceEncoderContractSatisfied {
+		t.Fatalf("host reference provenance satisfied device contract: %+v", provenance)
+	}
+	data, err := json.Marshal(provenance)
+	if err != nil {
+		t.Fatalf("marshal provenance: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatalf("parse provenance json: %v", err)
+	}
+	if fields["selected_backend"] != "cuda" || fields["dense_acceleration_policy"] != "enabled" {
+		t.Fatalf("provenance json backend/policy = %#v", fields)
+	}
+	if _, ok := fields["cuda_dense_acceleration_available"]; ok {
+		t.Fatalf("provenance json must not include inferred availability field: %#v", fields)
+	}
+	if fields["cuda_dense_acceleration_observed"] != false || fields["opportunistic_device_ops_used"] != false {
+		t.Fatalf("provenance json inferred observed acceleration: %#v", fields)
+	}
+}
+
+func TestPretrainedBERTEncoderExecutionProvenanceRecordsObservedCUDACounters(t *testing.T) {
+	t.Setenv("EOS_BERT_DENSE_ACCEL", "disabled")
+	embedder := &PretrainedBERTTextEmbedder{
+		program: &Program{executor: stubExecutor{kind: eosartifact.BackendCUDA}},
+	}
+	embedder.recordEncoderExecutionResult(backend.Result{
+		Metadata: map[string]string{
+			"cuda_matmul_bound_right_runs":   "2",
+			"cuda_matmul_run_uploaded_bytes": "128",
+		},
+		Outputs: map[string]backend.Value{
+			"embeddings": {
+				Metadata: map[string]any{"execution_status": "host_reference_with_cuda_dense_matmul"},
+			},
+		},
+	})
+	embedder.recordEncoderExecutionResult(backend.Result{
+		Metadata: map[string]string{
+			"cuda_matmul_bound_right_runs":   "-7",
+			"cuda_matmul_run_uploaded_bytes": "not-an-int",
+		},
+	})
+
+	provenance := embedder.EncoderExecutionProvenance()
+	if provenance.DenseAccelerationPolicy != "disabled" || provenance.SelectedBackend != "cuda" {
+		t.Fatalf("backend/policy provenance = %+v, want cuda/disabled", provenance)
+	}
+	if !provenance.CUDADenseAccelerationObserved || !provenance.OpportunisticDeviceOpsUsed {
+		t.Fatalf("observed counters did not mark opportunistic CUDA use: %+v", provenance)
+	}
+	if provenance.CUDADenseMatMulRuns != 2 || provenance.CUDADenseMatMulUploadedBytes != 128 {
+		t.Fatalf("observed counters = runs:%d bytes:%d, want 2/128", provenance.CUDADenseMatMulRuns, provenance.CUDADenseMatMulUploadedBytes)
+	}
+	if provenance.HostReferenceExecutionStatus != "host_reference_with_cuda_dense_matmul" {
+		t.Fatalf("host reference execution status = %q", provenance.HostReferenceExecutionStatus)
+	}
+	if provenance.FullDeviceExecution || provenance.ValidatedDeviceEncoder || provenance.DeviceEncoderContractSatisfied {
+		t.Fatalf("opportunistic CUDA counters satisfied full device contract: %+v", provenance)
+	}
+}
+
+func TestPretrainedBERTRetrievalVectorExportRequireDeviceEncoderFailsClosedForHostReference(t *testing.T) {
+	sourceDir, modulePath, weightsPath := writeTinyPretrainedBERTExportFixture(t)
+	datasetDir := writeTinyPretrainedBERTBEIRFixture(t)
+	outputDir := filepath.Join(t.TempDir(), "vectors")
+
+	_, err := ExportPretrainedBERTRetrievalVectors(context.Background(), PretrainedBERTRetrievalVectorExportConfig{
+		DatasetName:          "tiny-bert",
+		DatasetDir:           datasetDir,
+		OutputDir:            outputDir,
+		SourceDir:            sourceDir,
+		ModulePath:           modulePath,
+		WeightsPath:          weightsPath,
+		BatchSize:            1,
+		MaxLength:            4,
+		Runtime:              New(cuda.New()),
+		RequireDeviceEncoder: true,
+	})
+	if err == nil {
+		t.Fatal("export succeeded with RequireDeviceEncoder=true, want fail-closed error")
+	}
+	for _, want := range []string{"--require-device-encoder requested", "pretrained_bert_host_reference", "full_device_execution=false", "opportunistic CUDA matmul"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want substring %q", err, want)
+		}
+	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, "doc-vectors.jsonl")); !os.IsNotExist(statErr) {
+		t.Fatalf("doc vectors stat err = %v, want not exist", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(outputDir, "manifest.json")); !os.IsNotExist(statErr) {
+		t.Fatalf("manifest stat err = %v, want not exist", statErr)
 	}
 }
 
