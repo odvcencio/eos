@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,11 +37,43 @@ SUMMARY_COLUMNS = [
 ]
 
 
+def _function_body(source: str, name: str) -> str:
+    match = re.search(rf"\bfunc\s+{re.escape(name)}\s*\(", source)
+    if not match:
+        raise AssertionError(f"function not found: {name}")
+    start = source.find("{", match.end())
+    if start < 0:
+        raise AssertionError(f"function body not found: {name}")
+    depth = 0
+    for index in range(start, len(source)):
+        char = source[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start + 1 : index]
+    raise AssertionError(f"unterminated function body: {name}")
+
+
+def _assert_ordered(testcase: unittest.TestCase, haystack: str, needles: list[str]) -> None:
+    cursor = 0
+    for needle in needles:
+        found = haystack.find(needle, cursor)
+        testcase.assertNotEqual(found, -1, f"missing or out-of-order token: {needle!r}")
+        cursor = found + len(needle)
+
+
 class EmbedderServingEnergyContractTest(unittest.TestCase):
     def test_script_declares_auditable_artifact_contract(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn('const schema = "eos.default_embedder_serving_energy.v1"', source)
+        self.assertIn("WorkloadMode", source)
+        self.assertIn("CommandProvenance", source)
+        self.assertIn("EosBinarySHA256", source)
+        self.assertIn("BuildCommand", source)
+        self.assertIn("EOS_ENERGY_BENCH_WORKLOAD_MODE", source)
         self.assertIn("power-samples.jsonl", source)
         self.assertIn("summary.tsv", source)
         self.assertIn("manifest.json", source)
@@ -54,12 +87,104 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
 
         self.assertIn('"export-retrieval-vectors"', source)
         self.assertIn('"eval-retrieval-turboquant"', source)
+        self.assertIn('"export-pretrained-bert-retrieval-vectors"', source)
+        self.assertIn('"eval-retrieval-vectors-turboquant"', source)
         self.assertIn('Phase:                       "encoder_only"', source)
         self.assertIn('Phase:                "index_scoring"', source)
         self.assertIn("encoderWorkloadItems := encoderDocs + encoderQueries", source)
         self.assertIn("EnergyJoulesPerWorkloadItem: energyCost(encoderEnergy, encoderWorkloadItems)", source)
         self.assertIn("EnergyJoulesPerQuery: energyCost(scoringEnergy, scoringQueries)", source)
         self.assertNotIn("EnergyJoulesPerQuery: encoder", source)
+
+    def test_measured_phases_use_run_local_binary_not_go_run(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('buildArgs := []string{"go", "build", "-o", eosBin, "./cmd/eos"}', source)
+        self.assertIn('EosBinary:         eosBin', source)
+        self.assertIn('EosBinarySHA256:   eosBinarySHA256', source)
+        self.assertIn('BuildCommand:      buildCommand', source)
+        self.assertIn('CommandProvenance: []commandRecord{buildCommand, encoderCommand, scoringCommand}', source)
+        self.assertNotIn('"go", "run", "./cmd/eos", "export-retrieval-vectors"', source)
+        self.assertNotIn('"go", "run", "./cmd/eos", "export-pretrained-bert-retrieval-vectors"', source)
+        self.assertNotIn('"go", "run", "./cmd/eos", "eval-retrieval-turboquant"', source)
+        self.assertNotIn('"go", "run", "./cmd/eos", "eval-retrieval-vectors-turboquant"', source)
+
+    def test_workload_mode_validation_is_strict_and_default_native(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('return "native", nil', source)
+        self.assertIn('case "native":', source)
+        self.assertIn('case "imported_bert":', source)
+        self.assertIn('EOS_ENERGY_BENCH_WORKLOAD_MODE must be native or imported_bert', source)
+
+    def test_native_command_shape_stays_current_artifact_path(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('eosBin, "export-retrieval-vectors"', source)
+        self.assertIn('}, "eos export-retrieval-vectors", nil', source)
+        self.assertIn('[]string{eosBin, "eval-retrieval-turboquant"}', source)
+        self.assertIn('args = append(args, "--batch-size", batchSize)', source)
+        self.assertIn('args = append(args, artifact, datasetDir)', source)
+        self.assertIn('return args, "eos eval-retrieval-turboquant", nil', source)
+
+    def test_imported_bert_command_shape_uses_package_role_contract_and_cache_eval(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('eosBin, "export-pretrained-bert-retrieval-vectors"', source)
+        self.assertIn('"--package", artifact', source)
+        self.assertIn('"--use-package-role-contract"', source)
+        self.assertIn('}, "eos export-pretrained-bert-retrieval-vectors", nil', source)
+        self.assertIn('[]string{eosBin, "eval-retrieval-vectors-turboquant"}', source)
+        self.assertIn('"--doc-vectors", filepath.Join(vectorDir, "doc-vectors.jsonl")', source)
+        self.assertIn('"--query-vectors", filepath.Join(vectorDir, "query-vectors.jsonl")', source)
+        self.assertIn('return args, "eos eval-retrieval-vectors-turboquant", nil', source)
+
+    def test_imported_bert_generated_argv_order_is_structural(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        encoder_body = _function_body(source, "buildEncoderArgs")
+        scoring_body = _function_body(source, "buildScoringArgs")
+
+        _assert_ordered(
+            self,
+            encoder_body,
+            [
+                'if mode == "imported_bert"',
+                'eosBin, "export-pretrained-bert-retrieval-vectors"',
+                '"--package", artifact',
+                '"--use-package-role-contract"',
+                '"--dataset", dataset',
+                '"--split", split',
+                '"--batch-size", batchSize',
+                '"--max-docs", maxDocs',
+                '"--max-queries", maxQueries',
+                '"--manifest-json", vectorManifest',
+                "datasetDir",
+                "vectorDir",
+                '}, "eos export-pretrained-bert-retrieval-vectors", nil',
+            ],
+        )
+        _assert_ordered(
+            self,
+            scoring_body,
+            [
+                'if mode == "imported_bert"',
+                'args := []string{eosBin, "eval-retrieval-vectors-turboquant"}',
+                "args = append(args, commonFlags...)",
+                "args = append(args,",
+                '"--backend", "imported-pretrained-bert-turboquant"',
+                '"--artifact", artifact',
+                '"--doc-vectors", filepath.Join(vectorDir, "doc-vectors.jsonl")',
+                '"--query-vectors", filepath.Join(vectorDir, "query-vectors.jsonl")',
+                "datasetDir",
+                'return args, "eos eval-retrieval-vectors-turboquant", nil',
+            ],
+        )
+
+        self.assertRegex(
+            scoring_body,
+            r'"--query-vectors", filepath\.Join\(vectorDir, "query-vectors\.jsonl"\),\s+datasetDir,\s+\)\s+'
+            r'return args, "eos eval-retrieval-vectors-turboquant", nil',
+        )
 
     def test_summary_tsv_contract_accepts_measured_and_unsupported_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -121,6 +246,15 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
     def test_manifest_contract_records_partial_or_unsupported_power_status(self) -> None:
         manifest = {
             "schema": "eos.default_embedder_serving_energy.v1",
+            "workload_mode": "imported_bert",
+            "eos_binary": "runs/example/bin/eos",
+            "eos_binary_sha256": "abc123",
+            "build_command": {"label": "build-eos", "args": ["go", "build", "-o", "runs/example/bin/eos", "./cmd/eos"]},
+            "command_provenance": [
+                {"label": "build-eos", "args": ["go", "build", "-o", "runs/example/bin/eos", "./cmd/eos"]},
+                {"label": "encoder-only", "args": ["eos", "export-pretrained-bert-retrieval-vectors"]},
+                {"label": "index-scoring", "args": ["eos", "eval-retrieval-vectors-turboquant"]},
+            ],
             "overall_status": "partial",
             "unsupported_reason": "index_scoring: fewer than two usable GPU power samples",
             "phases": [
@@ -132,6 +266,11 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
         decoded = json.loads(encoded)
 
         self.assertEqual(decoded["schema"], "eos.default_embedder_serving_energy.v1")
+        self.assertEqual(decoded["workload_mode"], "imported_bert")
+        self.assertEqual(decoded["build_command"]["label"], "build-eos")
+        self.assertEqual(decoded["eos_binary"], "runs/example/bin/eos")
+        self.assertEqual(decoded["eos_binary_sha256"], "abc123")
+        self.assertEqual(len(decoded["command_provenance"]), 3)
         self.assertEqual(decoded["overall_status"], "partial")
         self.assertIn("unsupported_reason", decoded)
         self.assertEqual(
@@ -143,6 +282,7 @@ class EmbedderServingEnergyContractTest(unittest.TestCase):
         docs = BENCHMARKS.read_text(encoding="utf-8") + PRODUCTION.read_text(encoding="utf-8")
 
         self.assertIn("scripts/bench_eos_default_embedder_serving_energy.fw", docs)
+        self.assertIn("EOS_ENERGY_BENCH_WORKLOAD_MODE=imported_bert", docs)
         self.assertIn("power-samples.jsonl", docs)
         self.assertIn("encoder-only", docs)
         self.assertIn("index/scoring", docs)

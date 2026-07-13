@@ -1,8 +1,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,6 +58,7 @@ type manifest struct {
 	Schema           string        `json:"schema"`
 	GeneratedAt      string        `json:"generated_at"`
 	RunDir           string        `json:"run_dir"`
+	WorkloadMode     string        `json:"workload_mode"`
 	Artifact         string        `json:"artifact"`
 	Dataset          string        `json:"dataset"`
 	DatasetDir       string        `json:"dataset_dir"`
@@ -63,6 +66,10 @@ type manifest struct {
 	MaxQueries       string        `json:"max_queries"`
 	SampleIntervalMS int           `json:"sample_interval_ms"`
 	RequirePower     bool          `json:"require_power"`
+	EosBinary        string        `json:"eos_binary"`
+	EosBinarySHA256  string        `json:"eos_binary_sha256"`
+	BuildCommand     commandRecord `json:"build_command"`
+	CommandProvenance []commandRecord `json:"command_provenance"`
 	SummaryTSV        string        `json:"summary_tsv"`
 	PowerSamplesJSONL string       `json:"power_samples_jsonl"`
 	Phases           []phaseResult `json:"phases"`
@@ -102,13 +109,15 @@ TurboQuant index/scoring work. GPU power telemetry is sampled through
 nvidia-smi when available; when unavailable, the manifest records unsupported
 or indeterminate status instead of inventing energy costs. Encoder-only export
 reports energy per workload item (documents + queries); index/scoring reports
-energy per query.
+energy per query. A run-local eos binary is built once before power sampling;
+that build is recorded in the manifest but excluded from phase energy.
 
 Run:
   EOS_REPO_ROOT=$PWD ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
 
 Environment:
   EOS_ENERGY_BENCH_ARTIFACT=/path/to/eos-embed-v1.sealed.mll
+  EOS_ENERGY_BENCH_WORKLOAD_MODE=native   # native or imported_bert
   EOS_ENERGY_BENCH_DATASET_ROOT=datasets/eos-embed-v1
   EOS_ENERGY_BENCH_DATASET=scifact
   EOS_ENERGY_BENCH_SPLIT=test
@@ -150,6 +159,22 @@ func parseIntEnv(name string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s must be an integer: %w", name, err)
 	}
 	return parsed, nil
+}
+
+func workloadModeFromEnv() (string, error) {
+	mode := strings.TrimSpace(strings.ToLower(os.Getenv("EOS_ENERGY_BENCH_WORKLOAD_MODE")))
+	if mode == "" {
+		return "native", nil
+	}
+	mode = strings.ReplaceAll(mode, "-", "_")
+	switch mode {
+	case "native":
+		return mode, nil
+	case "imported_bert":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("EOS_ENERGY_BENCH_WORKLOAD_MODE must be native or imported_bert, got %q", mode)
+	}
 }
 
 func hasRepoRoot(dir string) bool {
@@ -223,6 +248,19 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
+func sha256File(path string) (string, error) {
+	handle, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer handle.Close()
+	sum := sha256.New()
+	if _, err := io.Copy(sum, handle); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sum.Sum(nil)), nil
 }
 
 func readJSON(path string, target any) error {
@@ -368,6 +406,30 @@ func runMeasuredCommand(root string, logDir string, label string, args []string,
 	}
 }
 
+func runUnmeasuredCommand(root string, logDir string, label string, args []string) (commandRecord, error) {
+	fmt.Println("\n== " + label + " ==")
+	fmt.Println("+ " + renderCommand(args))
+	logPath := filepath.Join(logDir, label+".log")
+	start := time.Now().UTC()
+	cmd := exec.Command(args[0], args[1:]...)
+	cmd.Dir = root
+	output, err := cmd.CombinedOutput()
+	body := append([]byte(renderCommand(args)+"\n\n"), output...)
+	if writeErr := os.WriteFile(logPath, body, 0o644); writeErr != nil && err == nil {
+		err = writeErr
+	}
+	fmt.Print(string(output))
+	end := time.Now().UTC()
+	return commandRecord{
+		Label:     label,
+		Args:      args,
+		Log:       logPath,
+		StartedAt: start.Format(time.RFC3339Nano),
+		EndedAt:   end.Format(time.RFC3339Nano),
+		ExitOK:    err == nil,
+	}, err
+}
+
 func phaseEnergy(samples []powerSample, wallSeconds float64) (string, string, int, float64, float64) {
 	if len(samples) < 2 {
 		return "unsupported", "fewer than two usable GPU power samples", len(samples), 0, 0
@@ -470,6 +532,78 @@ func vectorCountsFromManifest(path string, fallbackQueries int) (int, int) {
 	return out.Documents, out.Queries
 }
 
+func buildEncoderArgs(eosBin string, mode string, artifact string, dataset string, split string, batchSize string, maxDocs string, maxQueries string, vectorManifest string, datasetDir string, vectorDir string) ([]string, string, error) {
+	if mode == "native" {
+		return []string{
+			eosBin, "export-retrieval-vectors",
+			"--dataset", dataset,
+			"--split", split,
+			"--batch-size", batchSize,
+			"--max-docs", maxDocs,
+			"--max-queries", maxQueries,
+			"--manifest-json", vectorManifest,
+			artifact,
+			datasetDir,
+			vectorDir,
+		}, "eos export-retrieval-vectors", nil
+	}
+	if mode == "imported_bert" {
+		return []string{
+			eosBin, "export-pretrained-bert-retrieval-vectors",
+			"--package", artifact,
+			"--use-package-role-contract",
+			"--dataset", dataset,
+			"--split", split,
+			"--batch-size", batchSize,
+			"--max-docs", maxDocs,
+			"--max-queries", maxQueries,
+			"--manifest-json", vectorManifest,
+			datasetDir,
+			vectorDir,
+		}, "eos export-pretrained-bert-retrieval-vectors", nil
+	}
+	return nil, "", fmt.Errorf("unsupported workload mode: %s", mode)
+}
+
+func buildScoringArgs(eosBin string, mode string, artifact string, dataset string, split string, batchSize string, maxDocs string, maxQueries string, metricsJSON string, metricsTSV string, datasetDir string, vectorDir string) ([]string, string, error) {
+	commonFlags := []string{
+		"--dataset", dataset,
+		"--split", split,
+		"--top-k", getenv("EOS_ENERGY_BENCH_TOP_K", "100"),
+		"--bits", getenv("EOS_ENERGY_BENCH_BITS", "4"),
+		"--rerank-overfetch", getenv("EOS_ENERGY_BENCH_RERANK_OVERFETCH", "200"),
+		"--rerank-storage", getenv("EOS_ENERGY_BENCH_RERANK_STORAGE", "fp16"),
+		"--metrics-json", metricsJSON,
+		"--metrics-tsv", metricsTSV,
+	}
+	if maxDocs != "0" {
+		commonFlags = append(commonFlags, "--max-docs", maxDocs)
+	}
+	if maxQueries != "0" {
+		commonFlags = append(commonFlags, "--max-queries", maxQueries)
+	}
+	if mode == "native" {
+		args := []string{eosBin, "eval-retrieval-turboquant"}
+		args = append(args, commonFlags...)
+		args = append(args, "--batch-size", batchSize)
+		args = append(args, artifact, datasetDir)
+		return args, "eos eval-retrieval-turboquant", nil
+	}
+	if mode == "imported_bert" {
+		args := []string{eosBin, "eval-retrieval-vectors-turboquant"}
+		args = append(args, commonFlags...)
+		args = append(args,
+			"--backend", "imported-pretrained-bert-turboquant",
+			"--artifact", artifact,
+			"--doc-vectors", filepath.Join(vectorDir, "doc-vectors.jsonl"),
+			"--query-vectors", filepath.Join(vectorDir, "query-vectors.jsonl"),
+			datasetDir,
+		)
+		return args, "eos eval-retrieval-vectors-turboquant", nil
+	}
+	return nil, "", fmt.Errorf("unsupported workload mode: %s", mode)
+}
+
 func statusForManifest(phases []phaseResult, firstErr string) (string, string) {
 	anyMeasured := false
 	reasons := []string{}
@@ -511,6 +645,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "artifact does not exist or is not a file: %s\n", artifact)
 		os.Exit(1)
 	}
+	workloadMode, err := workloadModeFromEnv()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	defaultDatasetRoot := firstExistingDir([]string{
 		filepath.Join(root, "datasets", "eos-embed-v1"),
 		filepath.Join(root, "datasets", "manta-embed-v1"),
@@ -525,6 +664,22 @@ func main() {
 	runRoot := getenv("EOS_ENERGY_BENCH_RUN_ROOT", filepath.Join(root, "runs", "eos-default-embedder-serving-energy-"+time.Now().UTC().Format("20060102T150405Z")))
 	if err := os.MkdirAll(filepath.Join(runRoot, "logs"), 0o755); err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if err := os.MkdirAll(filepath.Join(runRoot, "bin"), 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	eosBin := filepath.Join(runRoot, "bin", "eos")
+	buildArgs := []string{"go", "build", "-o", eosBin, "./cmd/eos"}
+	buildCommand, err := runUnmeasuredCommand(root, filepath.Join(runRoot, "logs"), "build-eos", buildArgs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "build eos binary failed: %v\n", err)
+		os.Exit(1)
+	}
+	eosBinarySHA256, err := sha256File(eosBin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hash eos binary failed: %v\n", err)
 		os.Exit(1)
 	}
 	maxDocs := getenv("EOS_ENERGY_BENCH_MAX_DOCS", "300")
@@ -550,17 +705,10 @@ func main() {
 	batchSize := getenv("EOS_ENERGY_BENCH_BATCH_SIZE", "512")
 	vectorDir := filepath.Join(runRoot, "encoder-vectors")
 	vectorManifest := filepath.Join(runRoot, "encoder-vectors.manifest.json")
-	encoderArgs := []string{
-		"go", "run", "./cmd/eos", "export-retrieval-vectors",
-		"--dataset", dataset,
-		"--split", split,
-		"--batch-size", batchSize,
-		"--max-docs", maxDocs,
-		"--max-queries", maxQueries,
-		"--manifest-json", vectorManifest,
-		artifact,
-		datasetDir,
-		vectorDir,
+	encoderArgs, encoderWorkload, err := buildEncoderArgs(eosBin, workloadMode, artifact, dataset, split, batchSize, maxDocs, maxQueries, vectorManifest, datasetDir, vectorDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 	encoderCommand, encoderSamples, encoderWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "encoder-only", encoderArgs, sampler, time.Duration(sampleMS)*time.Millisecond)
 	if err != nil {
@@ -572,7 +720,7 @@ func main() {
 	encoderWorkloadItems := encoderDocs + encoderQueries
 	encoderPhase := phaseResult{
 		Phase:                       "encoder_only",
-		Workload:                    "eos export-retrieval-vectors",
+		Workload:                    encoderWorkload,
 		Command:                     encoderCommand,
 		TelemetryStatus:             encoderStatus,
 		TelemetryReason:             encoderReason,
@@ -591,25 +739,11 @@ func main() {
 
 	metricsJSON := filepath.Join(runRoot, dataset+".turboquant-serving.metrics.json")
 	metricsTSV := filepath.Join(runRoot, dataset+".turboquant-serving.metrics.tsv")
-	scoringArgs := []string{
-		"go", "run", "./cmd/eos", "eval-retrieval-turboquant",
-		"--dataset", dataset,
-		"--split", split,
-		"--top-k", getenv("EOS_ENERGY_BENCH_TOP_K", "100"),
-		"--batch-size", batchSize,
-		"--bits", getenv("EOS_ENERGY_BENCH_BITS", "4"),
-		"--rerank-overfetch", getenv("EOS_ENERGY_BENCH_RERANK_OVERFETCH", "200"),
-		"--rerank-storage", getenv("EOS_ENERGY_BENCH_RERANK_STORAGE", "fp16"),
-		"--metrics-json", metricsJSON,
-		"--metrics-tsv", metricsTSV,
+	scoringArgs, scoringWorkload, err := buildScoringArgs(eosBin, workloadMode, artifact, dataset, split, batchSize, maxDocs, maxQueries, metricsJSON, metricsTSV, datasetDir, vectorDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
-	if maxDocs != "0" {
-		scoringArgs = append(scoringArgs, "--max-docs", maxDocs)
-	}
-	if maxQueries != "0" {
-		scoringArgs = append(scoringArgs, "--max-queries", maxQueries)
-	}
-	scoringArgs = append(scoringArgs, artifact, datasetDir)
 	beforeScoringSamples, _ := sampler.snapshot()
 	scoringCommand, allScoringSamples, scoringWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "index-scoring", scoringArgs, sampler, time.Duration(sampleMS)*time.Millisecond)
 	if err != nil {
@@ -621,7 +755,7 @@ func main() {
 	scoringStatus, scoringReason, scoringSampleCount, scoringAvgPower, scoringEnergy := phaseEnergy(scoringSamples, scoringWall)
 	scoringPhase := phaseResult{
 		Phase:                "index_scoring",
-		Workload:             "eos eval-retrieval-turboquant",
+		Workload:             scoringWorkload,
 		Command:              scoringCommand,
 		TelemetryStatus:      scoringStatus,
 		TelemetryReason:      scoringReason,
@@ -656,6 +790,7 @@ func main() {
 		Schema:            schema,
 		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
 		RunDir:            runRoot,
+		WorkloadMode:      workloadMode,
 		Artifact:          artifact,
 		Dataset:           dataset,
 		DatasetDir:        datasetDir,
@@ -663,6 +798,10 @@ func main() {
 		MaxQueries:        maxQueries,
 		SampleIntervalMS:  sampleMS,
 		RequirePower:      requirePower,
+		EosBinary:         eosBin,
+		EosBinarySHA256:   eosBinarySHA256,
+		BuildCommand:      buildCommand,
+		CommandProvenance: []commandRecord{buildCommand, encoderCommand, scoringCommand},
 		SummaryTSV:        summaryTSV,
 		PowerSamplesJSONL: samplesPath,
 		Phases:            phases,

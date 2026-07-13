@@ -173,7 +173,18 @@ EOS_REPO_ROOT=$PWD \
 ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
 ```
 
-The gate writes `summary.tsv`, `manifest.json`, `power-samples.jsonl`, and command logs under `runs/eos-default-embedder-serving-energy-<timestamp>/`. It distinguishes encoder-only work (`eos export-retrieval-vectors`) from index/scoring work (`eos eval-retrieval-turboquant`). Encoder-only export encodes documents + queries and reports `workload_item_count` plus `energy_joules_per_workload_item`; index/scoring reports `energy_joules_per_query`. If `nvidia-smi` power telemetry is missing or too sparse, the artifact records `unsupported` or `indeterminate` and leaves denominator-specific energy costs blank; set `EOS_ENERGY_BENCH_REQUIRE_POWER=1` to make missing telemetry fail on known-good measurement hosts.
+The gate writes `summary.tsv`, `manifest.json`, `power-samples.jsonl`, and command logs under `runs/eos-default-embedder-serving-energy-<timestamp>/`. It builds a run-local `eos` binary once before power sampling, records the build command, binary path, and binary SHA256 in `manifest.json`, then excludes that build from phase wall/power/energy. It distinguishes encoder-only work (`eos export-retrieval-vectors`) from index/scoring work (`eos eval-retrieval-turboquant`). Encoder-only export encodes documents + queries and reports `workload_item_count` plus `energy_joules_per_workload_item`; index/scoring reports `energy_joules_per_query`. If `nvidia-smi` power telemetry is missing or too sparse, the artifact records `unsupported` or `indeterminate` and leaves denominator-specific energy costs blank; set `EOS_ENERGY_BENCH_REQUIRE_POWER=1` to make missing telemetry fail on known-good measurement hosts.
+
+To measure the imported `BAAI/bge-small-en-v1.5` package path instead of the native Eos artifact path, pass the package as the artifact and select imported-BERT workload mode:
+
+```bash
+EOS_REPO_ROOT=$PWD \
+EOS_ENERGY_BENCH_WORKLOAD_MODE=imported_bert \
+EOS_ENERGY_BENCH_ARTIFACT=/path/to/imported-bge-small-en-v1.5.mll \
+ferrous-wheel run scripts/bench_eos_default_embedder_serving_energy.fw
+```
+
+Imported mode exports caches with `eos export-pretrained-bert-retrieval-vectors --package <artifact> --use-package-role-contract`, then scores those exact `doc-vectors.jsonl` and `query-vectors.jsonl` caches with `eos eval-retrieval-vectors-turboquant`. The manifest records `workload_mode` and command provenance. Energy denominators stay the same: encoder-only uses documents + queries, and index/scoring uses queries.
 
 ```bash
 EOS_REPO_ROOT=$PWD \
