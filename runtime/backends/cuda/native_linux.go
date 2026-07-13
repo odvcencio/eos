@@ -493,6 +493,26 @@ static int eosCudaLaunchLayerNormBackwardRows(EosCudaRuntime* rt, EosCudaKernel*
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
 }
 
+static int eosCudaLaunchBERTEmbeddingAffineLayerNorm(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr tokenEmb, CUdeviceptr positionEmb, CUdeviceptr tokenTypeEmb, CUdeviceptr gamma, CUdeviceptr beta, CUdeviceptr inputIDs, CUdeviceptr tokenTypeIDs, CUdeviceptr out0, CUdeviceptr status, int rows, int tokens, int hidden, int vocab, int maxPositions, int typeVocab, double epsilon, char** err) {
+	void* args[] = {&tokenEmb, &positionEmb, &tokenTypeEmb, &gamma, &beta, &inputIDs, &tokenTypeIDs, &out0, &status, &rows, &tokens, &hidden, &vocab, &maxPositions, &typeVocab, &epsilon};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchBERTExactGELU(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr src, CUdeviceptr dst, int elements, char** err) {
+	void* args[] = {&src, &dst, &elements};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchBERTResidualAffineLayerNorm(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr src, CUdeviceptr residual, CUdeviceptr gamma, CUdeviceptr beta, CUdeviceptr out0, int rows, int hidden, double epsilon, char** err) {
+	void* args[] = {&src, &residual, &gamma, &beta, &out0, &rows, &hidden, &epsilon};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchBERTCLSL2(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr hiddenStates, CUdeviceptr out0, int batch, int tokens, int hidden, char** err) {
+	void* args[] = {&hiddenStates, &out0, &batch, &tokens, &hidden};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
 static int eosCudaLaunchQuantizeInPlace(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr data, int elements, float levels, float scale, char** err) {
 	void* args[] = {&data, &elements, &levels, &scale};
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
@@ -1868,25 +1888,169 @@ extern "C" __global__ void manta_cross_entropy_partials(
 }
 `
 
+const bertEmbeddingAffineLayerNormKernelSource = `
+extern "C" __global__ void manta_bert_embedding_affine_layernorm(
+    const float* token_embeddings,
+    const float* position_embeddings,
+    const float* token_type_embeddings,
+    const float* gamma,
+    const float* beta,
+    const int* input_ids,
+    const int* token_type_ids,
+    float* out0,
+    int* status,
+    int rows,
+    int tokens,
+    int hidden,
+    int vocab,
+    int max_positions,
+    int type_vocab,
+    double epsilon
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int token_id = input_ids[row];
+    int position_id = row % tokens;
+    int token_type_id = token_type_ids[row];
+    if (token_id < 0 || token_id >= vocab || position_id < 0 || position_id >= max_positions || token_type_id < 0 || token_type_id >= type_vocab) {
+        atomicExch(status, 1);
+        return;
+    }
+    int out_base = row * hidden;
+    int token_base = token_id * hidden;
+    int position_base = position_id * hidden;
+    int type_base = token_type_id * hidden;
+    double mean = 0.0;
+    for (int d = 0; d < hidden; ++d) {
+        float value = token_embeddings[token_base + d] + position_embeddings[position_base + d] + token_type_embeddings[type_base + d];
+        out0[out_base + d] = value;
+        mean += (double)value;
+    }
+    mean /= (double)hidden;
+    double variance = 0.0;
+    for (int d = 0; d < hidden; ++d) {
+        double centered = (double)out0[out_base + d] - mean;
+        variance += centered * centered;
+    }
+    variance /= (double)hidden;
+    double inv_std = rsqrt(variance + epsilon);
+    for (int d = 0; d < hidden; ++d) {
+        double normalized = ((double)out0[out_base + d] - mean) * inv_std;
+        out0[out_base + d] = (float)(normalized * (double)gamma[d] + (double)beta[d]);
+    }
+}
+`
+
+const bertExactGELUKernelSource = `
+extern "C" __global__ void manta_bert_exact_gelu(
+    const float* src,
+    float* dst,
+    int elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements) {
+        return;
+    }
+    double x = (double)src[idx];
+    dst[idx] = (float)(0.5 * x * (1.0 + erf(x * 0.70710678118654752440)));
+}
+`
+
+const bertResidualAffineLayerNormKernelSource = `
+extern "C" __global__ void manta_bert_residual_affine_layernorm(
+    const float* src,
+    const float* residual,
+    const float* gamma,
+    const float* beta,
+    float* out0,
+    int rows,
+    int hidden,
+    double epsilon
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int base = row * hidden;
+    double mean = 0.0;
+    for (int d = 0; d < hidden; ++d) {
+        float value = src[base + d] + residual[base + d];
+        out0[base + d] = value;
+        mean += (double)value;
+    }
+    mean /= (double)hidden;
+    double variance = 0.0;
+    for (int d = 0; d < hidden; ++d) {
+        double centered = (double)out0[base + d] - mean;
+        variance += centered * centered;
+    }
+    variance /= (double)hidden;
+    double inv_std = rsqrt(variance + epsilon);
+    for (int d = 0; d < hidden; ++d) {
+        double normalized = ((double)out0[base + d] - mean) * inv_std;
+        out0[base + d] = (float)(normalized * (double)gamma[d] + (double)beta[d]);
+    }
+}
+`
+
+const bertCLSL2KernelSource = `
+extern "C" __global__ void manta_bert_cls_l2(
+    const float* hidden_states,
+    float* out0,
+    int batch,
+    int tokens,
+    int hidden
+) {
+    int b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch) {
+        return;
+    }
+    int src_base = b * tokens * hidden;
+    int out_base = b * hidden;
+    double norm2 = 0.0;
+    for (int d = 0; d < hidden; ++d) {
+        float value = hidden_states[src_base + d];
+        out0[out_base + d] = value;
+        norm2 += (double)value * (double)value;
+    }
+    if (norm2 == 0.0) {
+        for (int d = 0; d < hidden; ++d) {
+            out0[out_base + d] = 0.0f;
+        }
+        return;
+    }
+    double inv_norm = rsqrt(norm2);
+    for (int d = 0; d < hidden; ++d) {
+        out0[out_base + d] = (float)((double)out0[out_base + d] * inv_norm);
+    }
+}
+`
+
 type deviceRuntime struct {
-	ptr                *C.EosCudaRuntime
-	residentMatrices   map[string]residentMatrix
-	matMulScratch      map[string]deviceScratchBuffer
-	quantizeKernel     *auxKernel
-	gdnKernel          *auxKernel
-	conv2DKernel       *auxKernel
-	conv2DTransKernel  *auxKernel
-	turboQEncodeKernel *auxKernel
-	turboQDecodeKernel *auxKernel
-	sparseAttnKernel   *auxKernel
-	turboSparseKernel  *auxKernel
-	mseLossKernel      *auxKernel
-	msssimLossKernel   *auxKernel
-	scalarAddKernel    *auxKernel
-	rdLossKernel       *auxKernel
-	crossEntropyKernel *auxKernel
-	matMulStats        backend.MatMulAcceleratorStats
-	graphCache         map[string]*cudaGraph
+	ptr                         *C.EosCudaRuntime
+	residentMatrices            map[string]residentMatrix
+	matMulScratch               map[string]deviceScratchBuffer
+	quantizeKernel              *auxKernel
+	gdnKernel                   *auxKernel
+	conv2DKernel                *auxKernel
+	conv2DTransKernel           *auxKernel
+	turboQEncodeKernel          *auxKernel
+	turboQDecodeKernel          *auxKernel
+	sparseAttnKernel            *auxKernel
+	turboSparseKernel           *auxKernel
+	mseLossKernel               *auxKernel
+	msssimLossKernel            *auxKernel
+	scalarAddKernel             *auxKernel
+	rdLossKernel                *auxKernel
+	crossEntropyKernel          *auxKernel
+	bertEmbeddingKernel         *auxKernel
+	bertExactGELUKernel         *auxKernel
+	bertResidualLayerNormKernel *auxKernel
+	bertCLSL2Kernel             *auxKernel
+	matMulStats                 backend.MatMulAcceleratorStats
+	graphCache                  map[string]*cudaGraph
 }
 
 type residentMatrix struct {
@@ -1972,6 +2136,14 @@ func (rt *deviceRuntime) close() {
 	rt.rdLossKernel = nil
 	rt.destroyAuxKernel(rt.crossEntropyKernel)
 	rt.crossEntropyKernel = nil
+	rt.destroyAuxKernel(rt.bertEmbeddingKernel)
+	rt.bertEmbeddingKernel = nil
+	rt.destroyAuxKernel(rt.bertExactGELUKernel)
+	rt.bertExactGELUKernel = nil
+	rt.destroyAuxKernel(rt.bertResidualLayerNormKernel)
+	rt.bertResidualLayerNormKernel = nil
+	rt.destroyAuxKernel(rt.bertCLSL2Kernel)
+	rt.bertCLSL2Kernel = nil
 	for sig, g := range rt.graphCache {
 		g.destroy()
 		delete(rt.graphCache, sig)
@@ -2389,10 +2561,128 @@ func newOutputTensor(kernel eosartifact.Kernel, shape []int, data []float32) *ba
 	}
 }
 
+func checkedCUDABytes(label string, elements, bytesPerElement int) (C.size_t, error) {
+	if elements < 0 {
+		return 0, fmt.Errorf("%s element count %d is negative", label, elements)
+	}
+	if bytesPerElement <= 0 {
+		return 0, fmt.Errorf("%s byte width %d is invalid", label, bytesPerElement)
+	}
+	maxInt := int(^uint(0) >> 1)
+	if elements > maxInt/bytesPerElement {
+		return 0, fmt.Errorf("%s byte size overflows int: elements=%d bytes_per_element=%d", label, elements, bytesPerElement)
+	}
+	return C.size_t(elements * bytesPerElement), nil
+}
+
+func checkedCInt(label string, value int) (C.int, error) {
+	const minCInt = -1 << 31
+	const maxCInt = 1<<31 - 1
+	if value < minCInt || value > maxCInt {
+		return 0, fmt.Errorf("%s=%d overflows C.int", label, value)
+	}
+	return C.int(value), nil
+}
+
+func checkedCUint(label string, value uint) (C.uint, error) {
+	if uint64(value) > uint64(^uint32(0)) {
+		return 0, fmt.Errorf("%s=%d overflows C.uint", label, value)
+	}
+	return C.uint(value), nil
+}
+
+func checkedLaunch1D(label string, elements int, block uint) (C.uint, C.uint, error) {
+	if elements <= 0 {
+		return 0, 0, fmt.Errorf("%s launch requires positive element count, got %d", label, elements)
+	}
+	if block == 0 {
+		return 0, 0, fmt.Errorf("%s launch block size must be positive", label)
+	}
+	grid64 := (uint64(elements) + uint64(block) - 1) / uint64(block)
+	if grid64 == 0 || grid64 > uint64(^uint32(0)) {
+		return 0, 0, fmt.Errorf("%s launch grid %d overflows C.uint", label, grid64)
+	}
+	blockArg, err := checkedCUint(label+" block", block)
+	if err != nil {
+		return 0, 0, err
+	}
+	return C.uint(grid64), blockArg, nil
+}
+
+func checkedProduct(label string, dims ...int) (int, error) {
+	product := 1
+	maxInt := int(^uint(0) >> 1)
+	for _, dim := range dims {
+		if dim < 0 {
+			return 0, fmt.Errorf("%s dimension %d is negative", label, dim)
+		}
+		if dim != 0 && product > maxInt/dim {
+			return 0, fmt.Errorf("%s product overflows int for dimensions %v", label, dims)
+		}
+		product *= dim
+	}
+	return product, nil
+}
+
+func checkedInt32Product(label string, dims ...int) error {
+	const maxInt32 = int64(1<<31 - 1)
+	product := int64(1)
+	for _, dim := range dims {
+		if dim < 0 {
+			return fmt.Errorf("%s dimension %d is negative", label, dim)
+		}
+		if dim == 0 {
+			product = 0
+			continue
+		}
+		if product > maxInt32/int64(dim) {
+			return fmt.Errorf("%s product overflows int32 index range for dimensions %v", label, dims)
+		}
+		product *= int64(dim)
+	}
+	return nil
+}
+
+func validateCUDAF32CompatibleDType(t *backend.Tensor, label string) error {
+	if t == nil {
+		return fmt.Errorf("%s tensor is nil", label)
+	}
+	if t.DType != "f32" && t.DType != "f16" {
+		return fmt.Errorf("%s dtype %q is not f32-compatible", label, t.DType)
+	}
+	return nil
+}
+
+func validateCUDAF32CompatibleTensor(t *backend.Tensor, label string) error {
+	if err := validateCUDAF32CompatibleDType(t, label); err != nil {
+		return err
+	}
+	if t.Elements() != len(t.F32) {
+		return fmt.Errorf("%s tensor backing length mismatch", label)
+	}
+	return nil
+}
+
 func (rt *deviceRuntime) allocFloat32(elements int) (C.CUdeviceptr, error) {
 	var ptr C.CUdeviceptr
 	var errStr *C.char
-	bytes := C.size_t(elements * 4)
+	bytes, err := checkedCUDABytes("cuda float32 allocation", elements, 4)
+	if err != nil {
+		return 0, err
+	}
+	if C.eosCudaMemAlloc(rt.ptr, &ptr, bytes, &errStr) != 0 {
+		return 0, cStringError(errStr)
+	}
+	return ptr, nil
+}
+
+func (rt *deviceRuntime) allocInt32(elements int) (C.CUdeviceptr, error) {
+	var ptr C.CUdeviceptr
+	var errStr *C.char
+	bytes, err := checkedCUDABytes("cuda int32 allocation", elements, 4)
+	if err != nil {
+		return 0, err
+	}
 	if C.eosCudaMemAlloc(rt.ptr, &ptr, bytes, &errStr) != 0 {
 		return 0, cStringError(errStr)
 	}
@@ -2405,6 +2695,18 @@ func (rt *deviceRuntime) uploadFloat32(data []float32) (C.CUdeviceptr, error) {
 		return 0, err
 	}
 	if err := rt.copyFloat32ToBuffer(ptr, data); err != nil {
+		_ = rt.freeBuffer(ptr)
+		return 0, err
+	}
+	return ptr, nil
+}
+
+func (rt *deviceRuntime) uploadInt32(data []int32) (C.CUdeviceptr, error) {
+	ptr, err := rt.allocInt32(len(data))
+	if err != nil {
+		return 0, err
+	}
+	if err := rt.copyInt32ToBuffer(ptr, data); err != nil {
 		_ = rt.freeBuffer(ptr)
 		return 0, err
 	}
@@ -2452,8 +2754,28 @@ func (rt *deviceRuntime) copyFloat32ToBuffer(ptr C.CUdeviceptr, data []float32) 
 	if len(data) > 0 {
 		src = unsafe.Pointer(&data[0])
 	}
+	bytes, err := checkedCUDABytes("cuda float32 upload", len(data), 4)
+	if err != nil {
+		return err
+	}
 	var errStr *C.char
-	if C.eosCudaMemcpyHtoD(rt.ptr, ptr, src, C.size_t(len(data)*4), &errStr) != 0 {
+	if C.eosCudaMemcpyHtoD(rt.ptr, ptr, src, bytes, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) copyInt32ToBuffer(ptr C.CUdeviceptr, data []int32) error {
+	var src unsafe.Pointer
+	if len(data) > 0 {
+		src = unsafe.Pointer(&data[0])
+	}
+	bytes, err := checkedCUDABytes("cuda int32 upload", len(data), 4)
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaMemcpyHtoD(rt.ptr, ptr, src, bytes, &errStr) != 0 {
 		return cStringError(errStr)
 	}
 	return nil
@@ -2463,8 +2785,27 @@ func (rt *deviceRuntime) downloadFloat32(dst []float32, src C.CUdeviceptr) error
 	if len(dst) == 0 {
 		return nil
 	}
+	bytes, err := checkedCUDABytes("cuda float32 download", len(dst), 4)
+	if err != nil {
+		return err
+	}
 	var errStr *C.char
-	if C.eosCudaMemcpyDtoH(rt.ptr, unsafe.Pointer(&dst[0]), src, C.size_t(len(dst)*4), &errStr) != 0 {
+	if C.eosCudaMemcpyDtoH(rt.ptr, unsafe.Pointer(&dst[0]), src, bytes, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) downloadInt32(dst []int32, src C.CUdeviceptr) error {
+	if len(dst) == 0 {
+		return nil
+	}
+	bytes, err := checkedCUDABytes("cuda int32 download", len(dst), 4)
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaMemcpyDtoH(rt.ptr, unsafe.Pointer(&dst[0]), src, bytes, &errStr) != 0 {
 		return cStringError(errStr)
 	}
 	return nil
@@ -4058,6 +4399,375 @@ func (g *cudaGraph) destroy() {
 	}
 	C.eosCudaGraphDestroy(g.ptr)
 	g.ptr = nil
+}
+
+func (rt *deviceRuntime) runBERTEmbeddingAffineLayerNorm(tokenEmbeddings, positionEmbeddings, tokenTypeEmbeddings, gamma, beta, inputIDs, tokenTypeIDs *backend.Tensor, epsilon float64) (*backend.Tensor, error) {
+	if rt == nil || rt.ptr == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if tokenEmbeddings == nil || positionEmbeddings == nil || tokenTypeEmbeddings == nil || gamma == nil || beta == nil || inputIDs == nil || tokenTypeIDs == nil {
+		return nil, fmt.Errorf("cuda bert embedding layernorm expects non-nil tensors")
+	}
+	if len(inputIDs.Shape) != 2 || !inputIDs.EqualShape(tokenTypeIDs) || inputIDs.DType != "i32" || tokenTypeIDs.DType != "i32" {
+		return nil, fmt.Errorf("cuda bert embedding layernorm expects i32 input_ids/token_type_ids with matching [B,T] shape")
+	}
+	if len(tokenEmbeddings.Shape) != 2 || len(positionEmbeddings.Shape) != 2 || len(tokenTypeEmbeddings.Shape) != 2 {
+		return nil, fmt.Errorf("cuda bert embedding layernorm expects rank-2 embedding tables")
+	}
+	for _, item := range []struct {
+		name   string
+		tensor *backend.Tensor
+	}{
+		{"cuda bert embedding layernorm token_embeddings", tokenEmbeddings},
+		{"cuda bert embedding layernorm position_embeddings", positionEmbeddings},
+		{"cuda bert embedding layernorm token_type_embeddings", tokenTypeEmbeddings},
+		{"cuda bert embedding layernorm gamma", gamma},
+		{"cuda bert embedding layernorm beta", beta},
+	} {
+		if err := validateCUDAF32CompatibleDType(item.tensor, item.name); err != nil {
+			return nil, err
+		}
+	}
+	batch, tokens := inputIDs.Shape[0], inputIDs.Shape[1]
+	vocab, hidden := tokenEmbeddings.Shape[0], tokenEmbeddings.Shape[1]
+	if batch <= 0 || tokens <= 0 || vocab <= 0 || hidden <= 0 {
+		return nil, fmt.Errorf("cuda bert embedding layernorm shape must be positive")
+	}
+	if positionEmbeddings.Shape[1] != hidden || tokenTypeEmbeddings.Shape[1] != hidden || len(gamma.Shape) != 1 || gamma.Shape[0] != hidden || len(beta.Shape) != 1 || beta.Shape[0] != hidden {
+		return nil, fmt.Errorf("cuda bert embedding layernorm hidden size mismatch")
+	}
+	rows, err := checkedProduct("cuda bert embedding layernorm rows", batch, tokens)
+	if err != nil {
+		return nil, err
+	}
+	outElements, err := checkedProduct("cuda bert embedding layernorm output", rows, hidden)
+	if err != nil {
+		return nil, err
+	}
+	for _, guard := range []struct {
+		label string
+		dims  []int
+	}{
+		{"cuda bert embedding layernorm row-hidden offset", []int{rows, hidden}},
+		{"cuda bert embedding layernorm token embedding offset", []int{vocab, hidden}},
+		{"cuda bert embedding layernorm position embedding offset", []int{positionEmbeddings.Shape[0], hidden}},
+		{"cuda bert embedding layernorm token type embedding offset", []int{tokenTypeEmbeddings.Shape[0], hidden}},
+	} {
+		if err := checkedInt32Product(guard.label, guard.dims...); err != nil {
+			return nil, err
+		}
+	}
+	grid, block, err := checkedLaunch1D("cuda bert embedding layernorm", rows, 128)
+	if err != nil {
+		return nil, err
+	}
+	rowsArg, err := checkedCInt("cuda bert embedding layernorm rows", rows)
+	if err != nil {
+		return nil, err
+	}
+	tokensArg, err := checkedCInt("cuda bert embedding layernorm tokens", tokens)
+	if err != nil {
+		return nil, err
+	}
+	hiddenArg, err := checkedCInt("cuda bert embedding layernorm hidden", hidden)
+	if err != nil {
+		return nil, err
+	}
+	vocabArg, err := checkedCInt("cuda bert embedding layernorm vocab", vocab)
+	if err != nil {
+		return nil, err
+	}
+	positionsArg, err := checkedCInt("cuda bert embedding layernorm max positions", positionEmbeddings.Shape[0])
+	if err != nil {
+		return nil, err
+	}
+	typeVocabArg, err := checkedCInt("cuda bert embedding layernorm type vocab", tokenTypeEmbeddings.Shape[0])
+	if err != nil {
+		return nil, err
+	}
+	if inputIDs.Elements() != len(inputIDs.I32) || tokenTypeIDs.Elements() != len(tokenTypeIDs.I32) ||
+		tokenEmbeddings.Elements() != len(tokenEmbeddings.F32) || positionEmbeddings.Elements() != len(positionEmbeddings.F32) ||
+		tokenTypeEmbeddings.Elements() != len(tokenTypeEmbeddings.F32) || gamma.Elements() != len(gamma.F32) || beta.Elements() != len(beta.F32) {
+		return nil, fmt.Errorf("cuda bert embedding layernorm tensor backing length mismatch")
+	}
+	if rt.bertEmbeddingKernel == nil {
+		kernel, err := rt.compileAuxKernel(bertEmbeddingAffineLayerNormKernelSource, "manta_bert_embedding_affine_layernorm")
+		if err != nil {
+			return nil, err
+		}
+		rt.bertEmbeddingKernel = kernel
+	}
+	tokenEmbBuf, err := rt.uploadFloat32(tokenEmbeddings.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(tokenEmbBuf)
+	positionEmbBuf, err := rt.uploadFloat32(positionEmbeddings.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(positionEmbBuf)
+	tokenTypeEmbBuf, err := rt.uploadFloat32(tokenTypeEmbeddings.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(tokenTypeEmbBuf)
+	gammaBuf, err := rt.uploadFloat32(gamma.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(gammaBuf)
+	betaBuf, err := rt.uploadFloat32(beta.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(betaBuf)
+	inputBuf, err := rt.uploadInt32(inputIDs.I32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(inputBuf)
+	tokenTypeBuf, err := rt.uploadInt32(tokenTypeIDs.I32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(tokenTypeBuf)
+	outBuf, err := rt.allocFloat32(outElements)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(outBuf)
+	statusBuf, err := rt.uploadInt32([]int32{0})
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(statusBuf)
+	var errStr *C.char
+	if C.eosCudaLaunchBERTEmbeddingAffineLayerNorm(rt.ptr, rt.bertEmbeddingKernel.ptr, grid, block, tokenEmbBuf, positionEmbBuf, tokenTypeEmbBuf, gammaBuf, betaBuf, inputBuf, tokenTypeBuf, outBuf, statusBuf, rowsArg, tokensArg, hiddenArg, vocabArg, positionsArg, typeVocabArg, C.double(epsilon), &errStr) != 0 {
+		return nil, cStringError(errStr)
+	}
+	status := []int32{0}
+	if err := rt.downloadInt32(status, statusBuf); err != nil {
+		return nil, err
+	}
+	if status[0] != 0 {
+		return nil, fmt.Errorf("cuda bert embedding layernorm input id out of range")
+	}
+	out := make([]float32, outElements)
+	if err := rt.downloadFloat32(out, outBuf); err != nil {
+		return nil, err
+	}
+	return backend.NewTensorF32([]int{batch, tokens, hidden}, out), nil
+}
+
+func (rt *deviceRuntime) runBERTExactGELU(src *backend.Tensor) (*backend.Tensor, error) {
+	if rt == nil || rt.ptr == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if err := validateCUDAF32CompatibleDType(src, "cuda bert exact gelu src"); err != nil {
+		return nil, err
+	}
+	elements, err := checkedProduct("cuda bert exact gelu elements", src.Shape...)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkedInt32Product("cuda bert exact gelu element offset", elements); err != nil {
+		return nil, err
+	}
+	elementsArg, err := checkedCInt("cuda bert exact gelu elements", elements)
+	if err != nil {
+		return nil, err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert exact gelu", elements, 256)
+	if err != nil {
+		return nil, err
+	}
+	if elements != len(src.F32) {
+		return nil, fmt.Errorf("cuda bert exact gelu src tensor backing length mismatch")
+	}
+	if rt.bertExactGELUKernel == nil {
+		kernel, err := rt.compileAuxKernel(bertExactGELUKernelSource, "manta_bert_exact_gelu")
+		if err != nil {
+			return nil, err
+		}
+		rt.bertExactGELUKernel = kernel
+	}
+	srcBuf, err := rt.uploadFloat32(src.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(srcBuf)
+	outBuf, err := rt.allocFloat32(elements)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(outBuf)
+	var errStr *C.char
+	if C.eosCudaLaunchBERTExactGELU(rt.ptr, rt.bertExactGELUKernel.ptr, grid, block, srcBuf, outBuf, elementsArg, &errStr) != 0 {
+		return nil, cStringError(errStr)
+	}
+	out := make([]float32, elements)
+	if err := rt.downloadFloat32(out, outBuf); err != nil {
+		return nil, err
+	}
+	return backend.NewTensorF32(src.Shape, out), nil
+}
+
+func (rt *deviceRuntime) runBERTResidualAffineLayerNorm(src, residual, gamma, beta *backend.Tensor, epsilon float64) (*backend.Tensor, error) {
+	if rt == nil || rt.ptr == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if src == nil || residual == nil || gamma == nil || beta == nil || !src.EqualShape(residual) || len(src.Shape) < 2 {
+		return nil, fmt.Errorf("cuda bert residual layernorm expects matching tensors with row shape")
+	}
+	for _, item := range []struct {
+		name   string
+		tensor *backend.Tensor
+	}{
+		{"cuda bert residual layernorm src", src},
+		{"cuda bert residual layernorm residual", residual},
+		{"cuda bert residual layernorm gamma", gamma},
+		{"cuda bert residual layernorm beta", beta},
+	} {
+		if err := validateCUDAF32CompatibleDType(item.tensor, item.name); err != nil {
+			return nil, err
+		}
+	}
+	hidden := src.Shape[len(src.Shape)-1]
+	if hidden <= 0 {
+		return nil, fmt.Errorf("cuda bert residual layernorm hidden size must be positive")
+	}
+	elements, err := checkedProduct("cuda bert residual layernorm elements", src.Shape...)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkedInt32Product("cuda bert residual layernorm row-hidden offset", src.Shape...); err != nil {
+		return nil, err
+	}
+	rows := elements / hidden
+	if rows <= 0 || elements != len(src.F32) || residual.Elements() != len(residual.F32) ||
+		len(gamma.Shape) != 1 || gamma.Shape[0] != hidden || gamma.Elements() != len(gamma.F32) ||
+		len(beta.Shape) != 1 || beta.Shape[0] != hidden || beta.Elements() != len(beta.F32) {
+		return nil, fmt.Errorf("cuda bert residual layernorm shape mismatch")
+	}
+	rowsArg, err := checkedCInt("cuda bert residual layernorm rows", rows)
+	if err != nil {
+		return nil, err
+	}
+	hiddenArg, err := checkedCInt("cuda bert residual layernorm hidden", hidden)
+	if err != nil {
+		return nil, err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert residual layernorm", rows, 128)
+	if err != nil {
+		return nil, err
+	}
+	if rt.bertResidualLayerNormKernel == nil {
+		kernel, err := rt.compileAuxKernel(bertResidualAffineLayerNormKernelSource, "manta_bert_residual_affine_layernorm")
+		if err != nil {
+			return nil, err
+		}
+		rt.bertResidualLayerNormKernel = kernel
+	}
+	srcBuf, err := rt.uploadFloat32(src.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(srcBuf)
+	residualBuf, err := rt.uploadFloat32(residual.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(residualBuf)
+	gammaBuf, err := rt.uploadFloat32(gamma.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(gammaBuf)
+	betaBuf, err := rt.uploadFloat32(beta.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(betaBuf)
+	outBuf, err := rt.allocFloat32(len(src.F32))
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(outBuf)
+	var errStr *C.char
+	if C.eosCudaLaunchBERTResidualAffineLayerNorm(rt.ptr, rt.bertResidualLayerNormKernel.ptr, grid, block, srcBuf, residualBuf, gammaBuf, betaBuf, outBuf, rowsArg, hiddenArg, C.double(epsilon), &errStr) != 0 {
+		return nil, cStringError(errStr)
+	}
+	out := make([]float32, len(src.F32))
+	if err := rt.downloadFloat32(out, outBuf); err != nil {
+		return nil, err
+	}
+	return backend.NewTensorF32(src.Shape, out), nil
+}
+
+func (rt *deviceRuntime) runBERTCLSL2(hiddenStates *backend.Tensor) (*backend.Tensor, error) {
+	if rt == nil || rt.ptr == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if hiddenStates == nil || (hiddenStates.DType != "f32" && hiddenStates.DType != "f16") || len(hiddenStates.Shape) != 3 || hiddenStates.Elements() != len(hiddenStates.F32) {
+		return nil, fmt.Errorf("cuda bert cls l2 expects f32-compatible hidden_states [B,T,H]")
+	}
+	batch, tokens, hidden := hiddenStates.Shape[0], hiddenStates.Shape[1], hiddenStates.Shape[2]
+	if batch <= 0 || tokens <= 0 || hidden <= 0 {
+		return nil, fmt.Errorf("cuda bert cls l2 shape must be positive")
+	}
+	outElements, err := checkedProduct("cuda bert cls l2 output", batch, hidden)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkedInt32Product("cuda bert cls l2 hidden state offset", batch, tokens, hidden); err != nil {
+		return nil, err
+	}
+	if err := checkedInt32Product("cuda bert cls l2 output offset", batch, hidden); err != nil {
+		return nil, err
+	}
+	batchArg, err := checkedCInt("cuda bert cls l2 batch", batch)
+	if err != nil {
+		return nil, err
+	}
+	tokensArg, err := checkedCInt("cuda bert cls l2 tokens", tokens)
+	if err != nil {
+		return nil, err
+	}
+	hiddenArg, err := checkedCInt("cuda bert cls l2 hidden", hidden)
+	if err != nil {
+		return nil, err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert cls l2", batch, 128)
+	if err != nil {
+		return nil, err
+	}
+	if rt.bertCLSL2Kernel == nil {
+		kernel, err := rt.compileAuxKernel(bertCLSL2KernelSource, "manta_bert_cls_l2")
+		if err != nil {
+			return nil, err
+		}
+		rt.bertCLSL2Kernel = kernel
+	}
+	hiddenBuf, err := rt.uploadFloat32(hiddenStates.F32)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(hiddenBuf)
+	outBuf, err := rt.allocFloat32(outElements)
+	if err != nil {
+		return nil, err
+	}
+	defer rt.freeBuffer(outBuf)
+	var errStr *C.char
+	if C.eosCudaLaunchBERTCLSL2(rt.ptr, rt.bertCLSL2Kernel.ptr, grid, block, hiddenBuf, outBuf, batchArg, tokensArg, hiddenArg, &errStr) != 0 {
+		return nil, cStringError(errStr)
+	}
+	out := make([]float32, outElements)
+	if err := rt.downloadFloat32(out, outBuf); err != nil {
+		return nil, err
+	}
+	return backend.NewTensorF32([]int{batch, hidden}, out), nil
 }
 
 // runCapturedGEMMBatch executes a batch of stream GEMMs. On a cache hit for
