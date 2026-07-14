@@ -1007,6 +1007,176 @@ func TestPretrainedBERTTextEmbedderDynamicBatchLengthMatchesFixedMaskedMean(t *t
 	assertEmbeddingBatchesClose(t, dynamic, fixed, 1e-6)
 }
 
+func TestPretrainedBERTRetrievalVectorExportLengthBucketsPreserveOrderAndReducePadding(t *testing.T) {
+	sourceDir, modulePath, weightsPath := writeTinyPretrainedBERTExportFixture(t)
+	datasetDir := writeTinyPretrainedBERTBEIRFixtureTexts(t, []string{
+		"alpha alpha",
+		"alpha",
+		"alpha alpha",
+		"alpha",
+	})
+	rt := New(cuda.New())
+	reference, err := ExportPretrainedBERTRetrievalVectors(context.Background(), PretrainedBERTRetrievalVectorExportConfig{
+		DatasetName: "tiny-bert",
+		DatasetDir:  datasetDir,
+		OutputDir:   filepath.Join(t.TempDir(), "reference"),
+		SourceDir:   sourceDir,
+		ModulePath:  modulePath,
+		WeightsPath: weightsPath,
+		BatchSize:   1,
+		MaxLength:   4,
+		Runtime:     rt,
+	})
+	if err != nil {
+		t.Fatalf("reference export: %v", err)
+	}
+	bucketed, err := ExportPretrainedBERTRetrievalVectors(context.Background(), PretrainedBERTRetrievalVectorExportConfig{
+		DatasetName: "tiny-bert",
+		DatasetDir:  datasetDir,
+		OutputDir:   filepath.Join(t.TempDir(), "bucketed"),
+		SourceDir:   sourceDir,
+		ModulePath:  modulePath,
+		WeightsPath: weightsPath,
+		BatchSize:   2,
+		MaxLength:   4,
+		Runtime:     rt,
+	})
+	if err != nil {
+		t.Fatalf("bucketed export: %v", err)
+	}
+	if bucketed.DocumentBatching.Strategy != "stable_length_bucket_window_v1" || bucketed.DocumentBatching.BatchSize != 2 {
+		t.Fatalf("document batching summary = %+v", bucketed.DocumentBatching)
+	}
+	if bucketed.DocumentBatching.TotalItems != 4 || bucketed.DocumentBatching.ReusedItems != 0 || bucketed.DocumentBatching.ComputedItems != 4 || bucketed.DocumentBatching.Items != 4 {
+		t.Fatalf("document batching item counters = %+v", bucketed.DocumentBatching)
+	}
+	if bucketed.DocumentBatching.BatchCount != 2 {
+		t.Fatalf("document batch count = %d, want 2", bucketed.DocumentBatching.BatchCount)
+	}
+	if bucketed.DocumentBatching.PaddedTokens != 14 || bucketed.DocumentBatching.FixedMaxTokens != 16 {
+		t.Fatalf("document padded/fixed tokens = %d/%d, want 14/16", bucketed.DocumentBatching.PaddedTokens, bucketed.DocumentBatching.FixedMaxTokens)
+	}
+	if bucketed.DocumentBatching.PaddedTokens >= bucketed.DocumentBatching.FixedMaxTokens {
+		t.Fatalf("length bucketing did not reduce document padding: %+v", bucketed.DocumentBatching)
+	}
+	referenceRows := readTinyVectorRows(t, reference.DocVectorPath)
+	bucketedRows := readTinyVectorRows(t, bucketed.DocVectorPath)
+	if got := rowIDs(bucketedRows); !slices.Equal(got, []string{"d1", "d2", "d3", "d4"}) {
+		t.Fatalf("bucketed doc ids = %v", got)
+	}
+	for i := range referenceRows {
+		assertFloat32SlicesClose(t, bucketedRows[i].Embedding, referenceRows[i].Embedding, 1e-6)
+	}
+}
+
+func TestPretrainedBERTRetrievalVectorExportLengthBucketResumePreservesCanonicalOrder(t *testing.T) {
+	sourceDir, modulePath, weightsPath := writeTinyPretrainedBERTExportFixture(t)
+	datasetDir := writeTinyPretrainedBERTBEIRFixtureTexts(t, []string{
+		"alpha alpha",
+		"alpha",
+		"alpha alpha",
+		"alpha",
+	})
+	rt := New(cuda.New())
+	seed, err := ExportPretrainedBERTRetrievalVectors(context.Background(), PretrainedBERTRetrievalVectorExportConfig{
+		DatasetName: "tiny-bert",
+		DatasetDir:  datasetDir,
+		OutputDir:   filepath.Join(t.TempDir(), "seed"),
+		SourceDir:   sourceDir,
+		ModulePath:  modulePath,
+		WeightsPath: weightsPath,
+		BatchSize:   1,
+		MaxLength:   4,
+		Runtime:     rt,
+	})
+	if err != nil {
+		t.Fatalf("seed export: %v", err)
+	}
+	outputDir := filepath.Join(t.TempDir(), "vectors")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatalf("mkdir output: %v", err)
+	}
+	writeVectorRows(t, filepath.Join(outputDir, "doc-vectors.jsonl"), readTinyVectorRows(t, seed.DocVectorPath)[:1])
+	writeVectorRows(t, filepath.Join(outputDir, "query-vectors.jsonl"), readTinyVectorRows(t, seed.QueryVectorPath)[:1])
+
+	resumed, err := ExportPretrainedBERTRetrievalVectors(context.Background(), PretrainedBERTRetrievalVectorExportConfig{
+		DatasetName: "tiny-bert",
+		DatasetDir:  datasetDir,
+		OutputDir:   outputDir,
+		SourceDir:   sourceDir,
+		ModulePath:  modulePath,
+		WeightsPath: weightsPath,
+		BatchSize:   2,
+		MaxLength:   4,
+		Runtime:     rt,
+		Resume:      true,
+	})
+	if err != nil {
+		t.Fatalf("resume export: %v", err)
+	}
+	if resumed.ReusedDocuments != 1 || resumed.WrittenDocuments != 3 || resumed.DocumentBatching.BatchCount != 2 {
+		t.Fatalf("resume counters/batching = %+v", resumed)
+	}
+	if resumed.DocumentBatching.TotalItems != 4 || resumed.DocumentBatching.ReusedItems != 1 || resumed.DocumentBatching.ComputedItems != 3 || resumed.DocumentBatching.Items != 3 {
+		t.Fatalf("resume document batching item counters = %+v", resumed.DocumentBatching)
+	}
+	if resumed.DocumentBatching.FixedMaxTokens != int64(resumed.DocumentBatching.ComputedItems*4) {
+		t.Fatalf("resume fixed-max tokens = %d, want computed_items*max_length=%d", resumed.DocumentBatching.FixedMaxTokens, resumed.DocumentBatching.ComputedItems*4)
+	}
+	if resumed.DocumentBatching.ActualTokens <= 0 || resumed.DocumentBatching.ActualTokens > resumed.DocumentBatching.PaddedTokens || resumed.DocumentBatching.PaddedTokens > resumed.DocumentBatching.FixedMaxTokens {
+		t.Fatalf("resume token counters inconsistent: %+v", resumed.DocumentBatching)
+	}
+	rows := readTinyVectorRows(t, resumed.DocVectorPath)
+	if got := rowIDs(rows); !slices.Equal(got, []string{"d1", "d2", "d3", "d4"}) {
+		t.Fatalf("resumed doc ids = %v", got)
+	}
+	seedRows := readTinyVectorRows(t, seed.DocVectorPath)
+	for i := range seedRows {
+		assertFloat32SlicesClose(t, rows[i].Embedding, seedRows[i].Embedding, 1e-6)
+	}
+}
+
+func TestPretrainedBERTRetrievalVectorExportLengthBucketBatchSize64RemainsBatched(t *testing.T) {
+	sourceDir, modulePath, weightsPath := writeTinyPretrainedBERTExportFixture(t)
+	embedder, err := LoadPretrainedBERTTextEmbedder(context.Background(), PretrainedBERTTextEmbedderConfig{
+		SourceDir:   sourceDir,
+		ModulePath:  modulePath,
+		WeightsPath: weightsPath,
+		MaxLength:   4,
+		Runtime:     New(cuda.New()),
+	})
+	if err != nil {
+		t.Fatalf("load embedder: %v", err)
+	}
+	records := make([]retrievalTextRecord, 130)
+	for i := range records {
+		text := "alpha"
+		if i%2 == 0 {
+			text = "alpha alpha"
+		}
+		records[i] = retrievalTextRecord{ID: fmt.Sprintf("d%d", i+1), Text: text}
+	}
+	vectors, stats, err := embedPretrainedBERTVectorCacheWindow(context.Background(), embedder, records, 64, "", pretrainedBERTVectorCacheWriteOptions{
+		NativeDim:   embedder.NativeDim(),
+		ExpectedDim: embedder.NativeDim(),
+	})
+	if err != nil {
+		t.Fatalf("embed length-bucketed window: %v", err)
+	}
+	if len(vectors) != len(records) {
+		t.Fatalf("vectors = %d, want %d", len(vectors), len(records))
+	}
+	if stats.BatchSize != 64 || stats.BatchCount != 3 {
+		t.Fatalf("batch stats = %+v, want batch_size 64 and 3 batches", stats)
+	}
+	if stats.TotalItems != 130 || stats.ComputedItems != 130 || stats.Items != 130 || stats.ReusedItems != 0 {
+		t.Fatalf("batch item counters = %+v", stats)
+	}
+	if stats.PaddedTokens >= stats.FixedMaxTokens {
+		t.Fatalf("batch-size 64 length bucketing did not reduce padding: %+v", stats)
+	}
+}
+
 func TestPretrainedBERTRetrievalVectorExportResumeAppendsPartialCaches(t *testing.T) {
 	sourceDir, modulePath, weightsPath := writeTinyPretrainedBERTExportFixture(t)
 	datasetDir := writeTinyPretrainedBERTBEIRFixtureN(t, 3)
@@ -1725,16 +1895,30 @@ func writeTinyPretrainedBERTBEIRFixture(t *testing.T) string {
 
 func writeTinyPretrainedBERTBEIRFixtureN(t *testing.T, n int) string {
 	t.Helper()
+	texts := make([]string, n)
+	for i := range texts {
+		texts[i] = "alpha"
+	}
+	return writeTinyPretrainedBERTBEIRFixtureTexts(t, texts)
+}
+
+func writeTinyPretrainedBERTBEIRFixtureTexts(t *testing.T, texts []string) string {
+	t.Helper()
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "qrels"), 0o755); err != nil {
 		t.Fatalf("mkdir qrels: %v", err)
 	}
 	var corpus, queries, qrels strings.Builder
 	qrels.WriteString("query-id\tcorpus-id\tscore\n")
-	for i := 1; i <= n; i++ {
-		fmt.Fprintf(&corpus, `{"_id":"d%d","title":"", "text":"alpha"}`+"\n", i)
-		fmt.Fprintf(&queries, `{"_id":"q%d","text":"alpha"}`+"\n", i)
-		fmt.Fprintf(&qrels, "q%d\td%d\t1\n", i, i)
+	for i, text := range texts {
+		id := i + 1
+		encodedText, err := json.Marshal(text)
+		if err != nil {
+			t.Fatalf("marshal text: %v", err)
+		}
+		fmt.Fprintf(&corpus, `{"_id":"d%d","title":"", "text":%s}`+"\n", id, encodedText)
+		fmt.Fprintf(&queries, `{"_id":"q%d","text":%s}`+"\n", id, encodedText)
+		fmt.Fprintf(&qrels, "q%d\td%d\t1\n", id, id)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "corpus.jsonl"), []byte(corpus.String()), 0o644); err != nil {
 		t.Fatalf("write corpus: %v", err)

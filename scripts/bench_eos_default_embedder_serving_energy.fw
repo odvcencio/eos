@@ -15,14 +15,37 @@ import (
 )
 
 const schema = "eos.default_embedder_serving_energy.v1"
+const unsetEnvironmentValue = "<unset>"
+
+var effectiveEnvironmentAllowlist = []string{
+	"CUDA_VISIBLE_DEVICES",
+	"NVIDIA_VISIBLE_DEVICES",
+	"EOS_REQUIRE_BACKEND",
+	"EOS_BERT_DENSE_ACCEL",
+	"EOS_BERT_CUDA_12LAYER_HIDDEN",
+	"EOS_BERT_CUDA_MAX_BATCH_TOKENS",
+	"EOS_BERT_CUDA_SELECTED_PACKAGE_PATH",
+	"EOS_BERT_CUDA_SELECTED_PACKAGE_CONTRACT",
+	"EOS_BERT_CUDA_SELECTED_PACKAGE_PARITY",
+	"EOS_BERT_CUDA_SELECTED_PACKAGE_CONCURRENCY",
+	"EOS_CUDA_GRAPH",
+	"EOS_CUDA_DISABLE_ACCUMULATED_MATMUL_SINGLE_SYNC",
+	"EOS_ENERGY_BENCH_WORKLOAD_MODE",
+	"EOS_ENERGY_BENCH_ARTIFACT",
+	"EOS_ENERGY_BENCH_BATCH_SIZE",
+	"EOS_ENERGY_BENCH_GPU_INDEX",
+	"EOS_ENERGY_BENCH_NVIDIA_SMI",
+	"EOS_ENERGY_REQUIRE_DEVICE_ENCODER",
+}
 
 type commandRecord struct {
-	Label     string   `json:"label"`
-	Args      []string `json:"args"`
-	Log       string   `json:"log"`
-	StartedAt string   `json:"started_at"`
-	EndedAt   string   `json:"ended_at"`
-	ExitOK    bool     `json:"exit_ok"`
+	Label                string            `json:"label"`
+	Args                 []string          `json:"args"`
+	Log                  string            `json:"log"`
+	StartedAt            string            `json:"started_at"`
+	EndedAt              string            `json:"ended_at"`
+	ExitOK               bool              `json:"exit_ok"`
+	EffectiveEnvironment map[string]string `json:"effective_environment"`
 }
 
 type powerSample struct {
@@ -34,47 +57,57 @@ type powerSample struct {
 }
 
 type phaseResult struct {
-	Phase                         string        `json:"phase"`
-	Workload                      string        `json:"workload"`
-	Command                       commandRecord `json:"command"`
-	TelemetryStatus               string        `json:"telemetry_status"`
-	TelemetryReason               string        `json:"telemetry_reason,omitempty"`
-	TelemetrySource               string        `json:"telemetry_source"`
-	GPUIndex                      string        `json:"gpu_index,omitempty"`
-	WallSeconds                   float64       `json:"wall_seconds"`
-	QueryCount                    int           `json:"query_count"`
-	DocumentCount                 int           `json:"document_count,omitempty"`
-	WorkloadItemCount             int           `json:"workload_item_count,omitempty"`
-	SampleCount                   int           `json:"sample_count"`
-	AveragePowerWatts             float64       `json:"average_power_watts,omitempty"`
-	EnergyJoules                  float64       `json:"energy_joules,omitempty"`
-	EnergyJoulesPerQuery          *float64      `json:"energy_joules_per_query,omitempty"`
-	EnergyJoulesPerWorkloadItem   *float64      `json:"energy_joules_per_workload_item,omitempty"`
-	OutputJSON                    string        `json:"output_json,omitempty"`
-	OutputTSV                     string        `json:"output_tsv,omitempty"`
+	Phase                            string        `json:"phase"`
+	Workload                         string        `json:"workload"`
+	Command                          commandRecord `json:"command"`
+	TelemetryStatus                  string        `json:"telemetry_status"`
+	TelemetryReason                  string        `json:"telemetry_reason,omitempty"`
+	TelemetrySource                  string        `json:"telemetry_source"`
+	GPUIndex                         string        `json:"gpu_index,omitempty"`
+	WallSeconds                      float64       `json:"wall_seconds"`
+	QueryCount                       int           `json:"query_count"`
+	DocumentCount                    int           `json:"document_count,omitempty"`
+	WorkloadItemCount                int           `json:"workload_item_count,omitempty"`
+	SampleCount                      int           `json:"sample_count"`
+	AveragePowerWatts                float64       `json:"average_power_watts,omitempty"`
+	EnergyJoules                     float64       `json:"energy_joules,omitempty"`
+	EnergyJoulesPerQuery             *float64      `json:"energy_joules_per_query,omitempty"`
+	EnergyJoulesPerWorkloadItem      *float64      `json:"energy_joules_per_workload_item,omitempty"`
+	BaselinePowerWatts               float64       `json:"baseline_power_watts,omitempty"`
+	BaselineAdjustmentMethod         string        `json:"baseline_adjustment_method,omitempty"`
+	BaselineAdjustmentSource         string        `json:"baseline_adjustment_source,omitempty"`
+	IncrementalEnergyJoulesRaw       float64       `json:"incremental_energy_joules_raw,omitempty"`
+	IncrementalEnergyJoules          float64       `json:"incremental_energy_joules,omitempty"`
+	IncrementalEnergyClamped         bool          `json:"incremental_energy_clamped,omitempty"`
+	IncrementalJoulesPerQuery        *float64      `json:"incremental_joules_per_query,omitempty"`
+	IncrementalJoulesPerWorkloadItem *float64      `json:"incremental_joules_per_workload_item,omitempty"`
+	OutputJSON                       string        `json:"output_json,omitempty"`
+	OutputTSV                        string        `json:"output_tsv,omitempty"`
 }
 
 type manifest struct {
-	Schema           string        `json:"schema"`
-	GeneratedAt      string        `json:"generated_at"`
-	RunDir           string        `json:"run_dir"`
-	WorkloadMode     string        `json:"workload_mode"`
-	Artifact         string        `json:"artifact"`
-	Dataset          string        `json:"dataset"`
-	DatasetDir       string        `json:"dataset_dir"`
-	MaxDocs          string        `json:"max_docs"`
-	MaxQueries       string        `json:"max_queries"`
-	SampleIntervalMS int           `json:"sample_interval_ms"`
-	RequirePower     bool          `json:"require_power"`
-	EosBinary        string        `json:"eos_binary"`
-	EosBinarySHA256  string        `json:"eos_binary_sha256"`
-	BuildCommand     commandRecord `json:"build_command"`
-	CommandProvenance []commandRecord `json:"command_provenance"`
-	SummaryTSV        string        `json:"summary_tsv"`
-	PowerSamplesJSONL string       `json:"power_samples_jsonl"`
-	Phases           []phaseResult `json:"phases"`
-	OverallStatus    string        `json:"overall_status"`
-	UnsupportedReason string       `json:"unsupported_reason,omitempty"`
+	Schema               string            `json:"schema"`
+	GeneratedAt          string            `json:"generated_at"`
+	RunDir               string            `json:"run_dir"`
+	WorkloadMode         string            `json:"workload_mode"`
+	Artifact             string            `json:"artifact"`
+	ArtifactSHA256       string            `json:"artifact_sha256"`
+	Dataset              string            `json:"dataset"`
+	DatasetDir           string            `json:"dataset_dir"`
+	MaxDocs              string            `json:"max_docs"`
+	MaxQueries           string            `json:"max_queries"`
+	SampleIntervalMS     int               `json:"sample_interval_ms"`
+	RequirePower         bool              `json:"require_power"`
+	EosBinary            string            `json:"eos_binary"`
+	EosBinarySHA256      string            `json:"eos_binary_sha256"`
+	EffectiveEnvironment map[string]string `json:"effective_environment"`
+	BuildCommand         commandRecord     `json:"build_command"`
+	CommandProvenance    []commandRecord   `json:"command_provenance"`
+	SummaryTSV           string            `json:"summary_tsv"`
+	PowerSamplesJSONL    string            `json:"power_samples_jsonl"`
+	Phases               []phaseResult     `json:"phases"`
+	OverallStatus        string            `json:"overall_status"`
+	UnsupportedReason    string            `json:"unsupported_reason,omitempty"`
 }
 
 type turboQuantMetrics struct {
@@ -91,14 +124,14 @@ type vectorExportManifest struct {
 }
 
 type telemetrySampler struct {
-	mu          sync.Mutex
-	samples     []powerSample
-	source      string
-	gpuIndex    string
-	nvidiaSMI   string
-	fakeWatts   []float64
-	fakeCursor  int
-	firstErr     string
+	mu         sync.Mutex
+	samples    []powerSample
+	source     string
+	gpuIndex   string
+	nvidiaSMI  string
+	fakeWatts  []float64
+	fakeCursor int
+	firstErr   string
 }
 
 func usage() {
@@ -130,6 +163,8 @@ Environment:
   EOS_ENERGY_BENCH_RERANK_STORAGE=fp16
   EOS_ENERGY_BENCH_GPU_INDEX=0
   EOS_ENERGY_BENCH_SAMPLE_MS=200
+  EOS_ENERGY_BENCH_BASELINE_WATTS=0 # optional idle/baseline watts for separate incremental energy
+  EOS_ENERGY_BENCH_BASELINE_SOURCE=none
   EOS_ENERGY_BENCH_REQUIRE_POWER=0   # set 1 to fail when power telemetry is unavailable
   EOS_ENERGY_REQUIRE_DEVICE_ENCODER=0 # imported_bert only: append --require-device-encoder`)
 }
@@ -148,6 +183,29 @@ func getenvBool(name string, fallback bool) bool {
 		return fallback
 	}
 	return value == "1" || value == "true" || value == "yes"
+}
+
+func captureEffectiveEnvironment() map[string]string {
+	out := make(map[string]string, len(effectiveEnvironmentAllowlist))
+	for _, name := range effectiveEnvironmentAllowlist {
+		value, ok := os.LookupEnv(name)
+		if !ok {
+			value = unsetEnvironmentValue
+		}
+		out[name] = value
+	}
+	return out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
 }
 
 func parseIntEnv(name string, fallback int) (int, error) {
@@ -366,7 +424,7 @@ func (s *telemetrySampler) snapshot() ([]powerSample, string) {
 	return out, s.firstErr
 }
 
-func runMeasuredCommand(root string, logDir string, label string, args []string, sampler *telemetrySampler, interval time.Duration) (commandRecord, []powerSample, float64, error) {
+func runMeasuredCommand(root string, logDir string, label string, args []string, sampler *telemetrySampler, interval time.Duration, effectiveEnvironment map[string]string) (commandRecord, []powerSample, float64, error) {
 	fmt.Println("\n== " + label + " ==")
 	fmt.Println("+ " + renderCommand(args))
 	logPath := filepath.Join(logDir, label+".log")
@@ -394,12 +452,13 @@ func runMeasuredCommand(root string, logDir string, label string, args []string,
 			end := time.Now().UTC()
 			samples, _ := sampler.snapshot()
 			return commandRecord{
-				Label:     label,
-				Args:      args,
-				Log:       logPath,
-				StartedAt: start.Format(time.RFC3339Nano),
-				EndedAt:   end.Format(time.RFC3339Nano),
-				ExitOK:    err == nil,
+				Label:                label,
+				Args:                 args,
+				Log:                  logPath,
+				StartedAt:            start.Format(time.RFC3339Nano),
+				EndedAt:              end.Format(time.RFC3339Nano),
+				ExitOK:               err == nil,
+				EffectiveEnvironment: cloneStringMap(effectiveEnvironment),
 			}, samples, end.Sub(start).Seconds(), err
 		case <-ticker.C:
 			sampler.sample()
@@ -407,7 +466,7 @@ func runMeasuredCommand(root string, logDir string, label string, args []string,
 	}
 }
 
-func runUnmeasuredCommand(root string, logDir string, label string, args []string) (commandRecord, error) {
+func runUnmeasuredCommand(root string, logDir string, label string, args []string, effectiveEnvironment map[string]string) (commandRecord, error) {
 	fmt.Println("\n== " + label + " ==")
 	fmt.Println("+ " + renderCommand(args))
 	logPath := filepath.Join(logDir, label+".log")
@@ -422,12 +481,13 @@ func runUnmeasuredCommand(root string, logDir string, label string, args []strin
 	fmt.Print(string(output))
 	end := time.Now().UTC()
 	return commandRecord{
-		Label:     label,
-		Args:      args,
-		Log:       logPath,
-		StartedAt: start.Format(time.RFC3339Nano),
-		EndedAt:   end.Format(time.RFC3339Nano),
-		ExitOK:    err == nil,
+		Label:                label,
+		Args:                 args,
+		Log:                  logPath,
+		StartedAt:            start.Format(time.RFC3339Nano),
+		EndedAt:              end.Format(time.RFC3339Nano),
+		ExitOK:               err == nil,
+		EffectiveEnvironment: cloneStringMap(effectiveEnvironment),
 	}, err
 }
 
@@ -460,6 +520,45 @@ func energyCost(energy float64, count int) *float64 {
 	return &value
 }
 
+func parseFloatEnv(name string, fallback float64) (float64, error) {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a float: %w", name, err)
+	}
+	return parsed, nil
+}
+
+func applyBaselineAdjustment(phase *phaseResult, baselineWatts float64, baselineSource string, incrementalDenominator string) {
+	if phase == nil {
+		return
+	}
+	phase.BaselinePowerWatts = baselineWatts
+	phase.BaselineAdjustmentSource = baselineSource
+	if baselineWatts <= 0 || phase.WallSeconds <= 0 || phase.EnergyJoules <= 0 {
+		phase.BaselineAdjustmentMethod = "none"
+		return
+	}
+	phase.BaselineAdjustmentMethod = "gross_energy_minus_baseline_watts_times_wall_seconds"
+	raw := phase.EnergyJoules - baselineWatts*phase.WallSeconds
+	phase.IncrementalEnergyJoulesRaw = raw
+	incremental := raw
+	if incremental < 0 {
+		incremental = 0
+		phase.IncrementalEnergyClamped = true
+	}
+	phase.IncrementalEnergyJoules = incremental
+	switch incrementalDenominator {
+	case "query":
+		phase.IncrementalJoulesPerQuery = energyCost(incremental, phase.QueryCount)
+	case "workload_item":
+		phase.IncrementalJoulesPerWorkloadItem = energyCost(incremental, phase.WorkloadItemCount)
+	}
+}
+
 func formatOptionalFloat(value *float64) string {
 	if value == nil {
 		return ""
@@ -482,9 +581,9 @@ func writeSamples(path string, samples []powerSample) error {
 
 func writeSummaryTSV(path string, phases []phaseResult) error {
 	var b strings.Builder
-	b.WriteString("phase\tworkload\ttelemetry_status\ttelemetry_source\tgpu_index\twall_seconds\tquery_count\tdocument_count\tworkload_item_count\tsample_count\taverage_power_watts\tenergy_joules\tenergy_joules_per_query\tenergy_joules_per_workload_item\toutput_json\toutput_tsv\n")
+	b.WriteString("phase\tworkload\ttelemetry_status\ttelemetry_source\tgpu_index\twall_seconds\tquery_count\tdocument_count\tworkload_item_count\tsample_count\taverage_power_watts\tgross_energy_joules\tgross_energy_joules_per_query\tgross_energy_joules_per_workload_item\tbaseline_power_watts\tbaseline_adjustment_method\tbaseline_adjustment_source\tincremental_energy_joules_raw\tincremental_energy_joules\tincremental_energy_clamped\tincremental_joules_per_query\tincremental_joules_per_workload_item\toutput_json\toutput_tsv\n")
 	for _, phase := range phases {
-		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\t%.6f\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%s\t%s\t%s\t%s\n",
+		fmt.Fprintf(&b, "%s\t%s\t%s\t%s\t%s\t%.6f\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%s\t%s\t%.6f\t%s\t%s\t%.6f\t%.6f\t%t\t%s\t%s\t%s\t%s\n",
 			phase.Phase,
 			phase.Workload,
 			phase.TelemetryStatus,
@@ -499,6 +598,14 @@ func writeSummaryTSV(path string, phases []phaseResult) error {
 			phase.EnergyJoules,
 			formatOptionalFloat(phase.EnergyJoulesPerQuery),
 			formatOptionalFloat(phase.EnergyJoulesPerWorkloadItem),
+			phase.BaselinePowerWatts,
+			phase.BaselineAdjustmentMethod,
+			phase.BaselineAdjustmentSource,
+			phase.IncrementalEnergyJoulesRaw,
+			phase.IncrementalEnergyJoules,
+			phase.IncrementalEnergyClamped,
+			formatOptionalFloat(phase.IncrementalJoulesPerQuery),
+			formatOptionalFloat(phase.IncrementalJoulesPerWorkloadItem),
 			phase.OutputJSON,
 			phase.OutputTSV)
 	}
@@ -649,6 +756,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "artifact does not exist or is not a file: %s\n", artifact)
 		os.Exit(1)
 	}
+	artifactSHA256, err := sha256File(artifact)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "hash artifact failed: %v\n", err)
+		os.Exit(1)
+	}
+	effectiveEnvironment := captureEffectiveEnvironment()
 	workloadMode, err := workloadModeFromEnv()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -676,7 +789,7 @@ func main() {
 	}
 	eosBin := filepath.Join(runRoot, "bin", "eos")
 	buildArgs := []string{"go", "build", "-o", eosBin, "./cmd/eos"}
-	buildCommand, err := runUnmeasuredCommand(root, filepath.Join(runRoot, "logs"), "build-eos", buildArgs)
+	buildCommand, err := runUnmeasuredCommand(root, filepath.Join(runRoot, "logs"), "build-eos", buildArgs, effectiveEnvironment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "build eos binary failed: %v\n", err)
 		os.Exit(1)
@@ -699,6 +812,16 @@ func main() {
 		os.Exit(1)
 	}
 	requirePower := getenvBool("EOS_ENERGY_BENCH_REQUIRE_POWER", false)
+	baselineWatts, err := parseFloatEnv("EOS_ENERGY_BENCH_BASELINE_WATTS", 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if baselineWatts < 0 {
+		fmt.Fprintln(os.Stderr, "EOS_ENERGY_BENCH_BASELINE_WATTS must be non-negative")
+		os.Exit(1)
+	}
+	baselineSource := getenv("EOS_ENERGY_BENCH_BASELINE_SOURCE", "none")
 	sampler, err := newTelemetrySampler()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -714,7 +837,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	encoderCommand, encoderSamples, encoderWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "encoder-only", encoderArgs, sampler, time.Duration(sampleMS)*time.Millisecond)
+	encoderCommand, encoderSamples, encoderWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "encoder-only", encoderArgs, sampler, time.Duration(sampleMS)*time.Millisecond, effectiveEnvironment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "encoder-only workload failed: %v\n", err)
 		os.Exit(1)
@@ -740,6 +863,7 @@ func main() {
 		EnergyJoulesPerWorkloadItem: energyCost(encoderEnergy, encoderWorkloadItems),
 		OutputJSON:                  vectorManifest,
 	}
+	applyBaselineAdjustment(&encoderPhase, baselineWatts, baselineSource, "workload_item")
 
 	metricsJSON := filepath.Join(runRoot, dataset+".turboquant-serving.metrics.json")
 	metricsTSV := filepath.Join(runRoot, dataset+".turboquant-serving.metrics.tsv")
@@ -749,7 +873,7 @@ func main() {
 		os.Exit(1)
 	}
 	beforeScoringSamples, _ := sampler.snapshot()
-	scoringCommand, allScoringSamples, scoringWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "index-scoring", scoringArgs, sampler, time.Duration(sampleMS)*time.Millisecond)
+	scoringCommand, allScoringSamples, scoringWall, err := runMeasuredCommand(root, filepath.Join(runRoot, "logs"), "index-scoring", scoringArgs, sampler, time.Duration(sampleMS)*time.Millisecond, effectiveEnvironment)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "index/scoring workload failed: %v\n", err)
 		os.Exit(1)
@@ -775,6 +899,7 @@ func main() {
 		OutputJSON:           metricsJSON,
 		OutputTSV:            metricsTSV,
 	}
+	applyBaselineAdjustment(&scoringPhase, baselineWatts, baselineSource, "query")
 
 	samples, firstErr := sampler.snapshot()
 	samplesPath := filepath.Join(runRoot, "power-samples.jsonl")
@@ -791,26 +916,28 @@ func main() {
 		os.Exit(1)
 	}
 	out := manifest{
-		Schema:            schema,
-		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
-		RunDir:            runRoot,
-		WorkloadMode:      workloadMode,
-		Artifact:          artifact,
-		Dataset:           dataset,
-		DatasetDir:        datasetDir,
-		MaxDocs:           maxDocs,
-		MaxQueries:        maxQueries,
-		SampleIntervalMS:  sampleMS,
-		RequirePower:      requirePower,
-		EosBinary:         eosBin,
-		EosBinarySHA256:   eosBinarySHA256,
-		BuildCommand:      buildCommand,
-		CommandProvenance: []commandRecord{buildCommand, encoderCommand, scoringCommand},
-		SummaryTSV:        summaryTSV,
-		PowerSamplesJSONL: samplesPath,
-		Phases:            phases,
-		OverallStatus:     overallStatus,
-		UnsupportedReason: unsupportedReason,
+		Schema:               schema,
+		GeneratedAt:          time.Now().UTC().Format(time.RFC3339),
+		RunDir:               runRoot,
+		WorkloadMode:         workloadMode,
+		Artifact:             artifact,
+		ArtifactSHA256:       artifactSHA256,
+		Dataset:              dataset,
+		DatasetDir:           datasetDir,
+		MaxDocs:              maxDocs,
+		MaxQueries:           maxQueries,
+		SampleIntervalMS:     sampleMS,
+		RequirePower:         requirePower,
+		EosBinary:            eosBin,
+		EosBinarySHA256:      eosBinarySHA256,
+		EffectiveEnvironment: cloneStringMap(effectiveEnvironment),
+		BuildCommand:         buildCommand,
+		CommandProvenance:    []commandRecord{buildCommand, encoderCommand, scoringCommand},
+		SummaryTSV:           summaryTSV,
+		PowerSamplesJSONL:    samplesPath,
+		Phases:               phases,
+		OverallStatus:        overallStatus,
+		UnsupportedReason:    unsupportedReason,
 	}
 	if err := writeJSON(manifestJSON, out); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -820,7 +947,7 @@ func main() {
 	fmt.Printf("manifest: %s\n", manifestJSON)
 	fmt.Printf("power_samples: %s\n", samplesPath)
 	for _, phase := range phases {
-		fmt.Printf("%s: status=%s wall_seconds=%.6f queries=%d documents=%d workload_items=%d energy_joules=%.6f energy_joules_per_query=%s energy_joules_per_workload_item=%s samples=%d\n",
+		fmt.Printf("%s: status=%s wall_seconds=%.6f queries=%d documents=%d workload_items=%d gross_energy_joules=%.6f gross_energy_joules_per_query=%s gross_energy_joules_per_workload_item=%s baseline_watts=%.6f baseline_method=%s baseline_source=%s incremental_energy_joules_raw=%.6f incremental_energy_joules=%.6f incremental_joules_per_query=%s incremental_joules_per_workload_item=%s samples=%d\n",
 			phase.Phase,
 			phase.TelemetryStatus,
 			phase.WallSeconds,
@@ -830,6 +957,13 @@ func main() {
 			phase.EnergyJoules,
 			formatOptionalFloat(phase.EnergyJoulesPerQuery),
 			formatOptionalFloat(phase.EnergyJoulesPerWorkloadItem),
+			phase.BaselinePowerWatts,
+			phase.BaselineAdjustmentMethod,
+			phase.BaselineAdjustmentSource,
+			phase.IncrementalEnergyJoulesRaw,
+			phase.IncrementalEnergyJoules,
+			formatOptionalFloat(phase.IncrementalJoulesPerQuery),
+			formatOptionalFloat(phase.IncrementalJoulesPerWorkloadItem),
 			phase.SampleCount)
 	}
 	if requirePower && overallStatus != "measured" {

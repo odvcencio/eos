@@ -2069,9 +2069,17 @@ extern "C" __global__ void manta_bert_attention_context(
     int heads,
     int head_dim
 ) {
-    int job = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ double logits[512];
+    __shared__ float qvec[32];
+    __shared__ double reduce[256];
+    __shared__ int active_reduce[256];
+
+    int job = blockIdx.x;
     int jobs = batch * tokens * heads;
     if (job >= jobs) {
+        return;
+    }
+    if (batch <= 0 || tokens <= 0 || tokens > 512 || heads <= 0 || head_dim <= 0 || head_dim > 32 || hidden != heads * head_dim) {
         return;
     }
     int head = job % heads;
@@ -2081,61 +2089,80 @@ extern "C" __global__ void manta_bert_attention_context(
     int query_row = b * tokens + query_token;
     int head_base = head * head_dim;
     double scale = rsqrt((double)head_dim);
-    double max_logit = -1.0 / 0.0;
-    int active_keys = 0;
 
-    for (int key_token = 0; key_token < tokens; ++key_token) {
-        if (attention_mask[b * tokens + key_token] == 0) {
-            continue;
-        }
-        int key_row = b * tokens + key_token;
-        double dot = 0.0;
-        for (int d = 0; d < head_dim; ++d) {
-            int idx = head_base + d;
-            dot += (double)query[query_row * hidden + idx] * (double)key[key_row * hidden + idx];
-        }
-        double logit = dot * scale;
-        if (logit > max_logit) {
-            max_logit = logit;
-        }
-        ++active_keys;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        qvec[d] = query[query_row * hidden + head_base + d];
     }
+    __syncthreads();
+
+    double local_max = -1.0 / 0.0;
+    int local_active = 0;
+    for (int key_token = threadIdx.x; key_token < tokens; key_token += blockDim.x) {
+        double logit = -1.0 / 0.0;
+        if (attention_mask[b * tokens + key_token] != 0) {
+            int key_row = b * tokens + key_token;
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += (double)qvec[d] * (double)key[key_row * hidden + head_base + d];
+            }
+            logit = dot * scale;
+            if (logit > local_max) {
+                local_max = logit;
+            }
+            local_active += 1;
+        }
+        logits[key_token] = logit;
+    }
+    reduce[threadIdx.x] = local_max;
+    active_reduce[threadIdx.x] = local_active;
+    __syncthreads();
+
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            double other = reduce[threadIdx.x + stride];
+            if (other > reduce[threadIdx.x]) {
+                reduce[threadIdx.x] = other;
+            }
+            active_reduce[threadIdx.x] += active_reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    double max_logit = reduce[0];
+    int active_keys = active_reduce[0];
 
     int out_base = query_row * hidden + head_base;
     if (active_keys == 0) {
-        for (int d = 0; d < head_dim; ++d) {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
             out0[out_base + d] = 0.0f;
         }
         return;
     }
 
-    double sum_exp = 0.0;
-    for (int key_token = 0; key_token < tokens; ++key_token) {
-        if (attention_mask[b * tokens + key_token] == 0) {
-            continue;
+    double local_sum = 0.0;
+    for (int key_token = threadIdx.x; key_token < tokens; key_token += blockDim.x) {
+        if (attention_mask[b * tokens + key_token] != 0) {
+            local_sum += exp(logits[key_token] - max_logit);
         }
-        int key_row = b * tokens + key_token;
-        double dot = 0.0;
-        for (int d = 0; d < head_dim; ++d) {
-            int idx = head_base + d;
-            dot += (double)query[query_row * hidden + idx] * (double)key[key_row * hidden + idx];
-        }
-        sum_exp += exp(dot * scale - max_logit);
     }
+    reduce[threadIdx.x] = local_sum;
+    __syncthreads();
 
-    for (int d = 0; d < head_dim; ++d) {
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    double sum_exp = reduce[0];
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         double acc = 0.0;
         for (int key_token = 0; key_token < tokens; ++key_token) {
             if (attention_mask[b * tokens + key_token] == 0) {
                 continue;
             }
             int key_row = b * tokens + key_token;
-            double dot = 0.0;
-            for (int kd = 0; kd < head_dim; ++kd) {
-                int idx = head_base + kd;
-                dot += (double)query[query_row * hidden + idx] * (double)key[key_row * hidden + idx];
-            }
-            double prob = exp(dot * scale - max_logit) / sum_exp;
+            double prob = exp(logits[key_token] - max_logit) / sum_exp;
             acc += prob * (double)value[key_row * hidden + head_base + d];
         }
         out0[out_base + d] = (float)acc;
@@ -5240,7 +5267,16 @@ func (rt *deviceRuntime) runBERTAttentionContextDevice(query, key, value, attent
 	if heads <= 0 || hidden%heads != 0 {
 		return fmt.Errorf("cuda bert attention hidden=%d must be divisible by heads=%d", hidden, heads)
 	}
+	if batch <= 0 {
+		return fmt.Errorf("cuda bert attention batch=%d unsupported, want positive", batch)
+	}
+	if tokens <= 0 || tokens > 512 {
+		return fmt.Errorf("cuda bert attention tokens=%d unsupported, want 1..512", tokens)
+	}
 	headDim := hidden / heads
+	if headDim <= 0 || headDim > 32 {
+		return fmt.Errorf("cuda bert attention head_dim=%d unsupported, want 1..32", headDim)
+	}
 	jobs, err := checkedProduct("cuda bert attention jobs", batch, tokens, heads)
 	if err != nil {
 		return err
@@ -5257,7 +5293,12 @@ func (rt *deviceRuntime) runBERTAttentionContextDevice(query, key, value, attent
 			return err
 		}
 	}
-	grid, block, err := checkedLaunch1D("cuda bert attention context", jobs, 128)
+	grid, err := checkedCUint("cuda bert attention context grid", uint(jobs))
+	if err != nil {
+		return err
+	}
+	blockSize := bertAttentionContextBlockSize(tokens)
+	block, err := checkedCUint("cuda bert attention context block", blockSize)
 	if err != nil {
 		return err
 	}
@@ -5290,6 +5331,13 @@ func (rt *deviceRuntime) runBERTAttentionContextDevice(query, key, value, attent
 		return cStringError(errStr)
 	}
 	return nil
+}
+
+func bertAttentionContextBlockSize(tokens int) uint {
+	if tokens <= 256 {
+		return 128
+	}
+	return 256
 }
 
 func (rt *deviceRuntime) runResidentBERTGEMM(lhs C.CUdeviceptr, lhsRows, lhsCols int, rightName string, out C.CUdeviceptr, transposeRight bool) error {
@@ -5747,6 +5795,12 @@ func (rt *deviceRuntime) preflightBGEFullEncoder(step eosartifact.Step, inputs [
 	if err != nil {
 		return bertCUDAResidentWeightPlan{}, stats, err
 	}
+	if batch <= 0 {
+		return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder batch=%d unsupported for cooperative attention, want positive", batch)
+	}
+	if tokens <= 0 || tokens > 512 {
+		return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder tokens=%d unsupported for cooperative attention, want 1..512", tokens)
+	}
 	if rows > maxBatchTokens {
 		return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder batch tokens %d exceed EOS_BERT_CUDA_MAX_BATCH_TOKENS=%d", rows, maxBatchTokens)
 	}
@@ -5840,7 +5894,7 @@ func (rt *deviceRuntime) preflightBGEFullEncoder(step eosartifact.Step, inputs [
 	}{
 		{"cuda BGE full encoder embedding launch", rows, 128},
 		{"cuda BGE full encoder qkv bias launch", hiddenElements, 256},
-		{"cuda BGE full encoder attention launch", attentionJobs, 128},
+		{"cuda BGE full encoder attention launch", attentionJobs, bertAttentionContextBlockSize(tokens)},
 		{"cuda BGE full encoder gelu launch", intermediateElements, 256},
 		{"cuda BGE full encoder residual layernorm launch", rows, 128},
 		{"cuda BGE full encoder cls l2 launch", batch, 128},
@@ -6094,6 +6148,9 @@ func (rt *deviceRuntime) runBGEFullEncoderHidden(step eosartifact.Step, outputTy
 			"weight_fingerprint_sha256":           stats.WeightFingerprint,
 			"workspace_bytes":                     stats.WorkspaceBytes,
 			"max_batch_tokens":                    stats.MaxBatchTokens,
+			"attention_kernel_variant":            "cooperative_shared_logit_v2",
+			"attention_kernel_block_size":         int(bertAttentionContextBlockSize(tokens)),
+			"attention_kernel_max_tokens":         512,
 			"opportunistic_device_ops_ignored":    true,
 			"public_device_encoder_claim_blocked": true,
 		},

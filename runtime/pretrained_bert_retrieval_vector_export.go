@@ -11,6 +11,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -155,6 +156,8 @@ type PretrainedBERTRetrievalVectorExportSummary struct {
 	ReusedQueries                     int                                      `json:"reused_queries,omitempty"`
 	WrittenDocuments                  int                                      `json:"written_documents"`
 	WrittenQueries                    int                                      `json:"written_queries"`
+	DocumentBatching                  PretrainedBERTVectorBatchingSummary      `json:"document_batching"`
+	QueryBatching                     PretrainedBERTVectorBatchingSummary      `json:"query_batching"`
 	MaxLength                         int                                      `json:"max_length"`
 	MaxLengthSource                   string                                   `json:"max_length_source,omitempty"`
 	Pooling                           string                                   `json:"pooling,omitempty"`
@@ -166,6 +169,27 @@ type PretrainedBERTRetrievalVectorExportSummary struct {
 	QrelsPath                         string                                   `json:"qrels_path,omitempty"`
 	ElapsedSeconds                    float64                                  `json:"elapsed_seconds"`
 	CreatedAt                         time.Time                                `json:"created_at"`
+}
+
+type PretrainedBERTVectorBatchingSummary struct {
+	Strategy           string `json:"strategy"`
+	BatchSize          int    `json:"batch_size"`
+	BatchCount         int    `json:"batch_count"`
+	Items              int    `json:"items"`
+	TotalItems         int    `json:"total_items"`
+	ReusedItems        int    `json:"reused_items,omitempty"`
+	ComputedItems      int    `json:"computed_items"`
+	ActualTokens       int64  `json:"actual_tokens"`
+	PaddedTokens       int64  `json:"padded_tokens"`
+	FixedMaxTokens     int64  `json:"fixed_max_tokens"`
+	MaxEffectiveLength int    `json:"max_effective_length"`
+}
+
+func (s PretrainedBERTVectorBatchingSummary) PaddingRatio() float64 {
+	if s.FixedMaxTokens <= 0 {
+		return 0
+	}
+	return float64(s.PaddedTokens) / float64(s.FixedMaxTokens)
 }
 
 type PretrainedBERTRetrievalVectorExportProgressFunc func(PretrainedBERTRetrievalVectorExportProgress)
@@ -821,6 +845,8 @@ func ExportPretrainedBERTRetrievalVectors(ctx context.Context, cfg PretrainedBER
 		ReusedQueries:                     queryResume.Reused,
 		WrittenDocuments:                  docResume.Written,
 		WrittenQueries:                    queryResume.Written,
+		DocumentBatching:                  docResume.Batching,
+		QueryBatching:                     queryResume.Batching,
 		MaxLength:                         embedder.MaxLength(),
 		MaxLengthSource:                   embedder.MaxLengthSource(),
 		Pooling:                           embedder.Pooling(),
@@ -1130,8 +1156,9 @@ type pretrainedBERTVectorCacheWriteOptions struct {
 }
 
 type pretrainedBERTVectorCacheResumeResult struct {
-	Reused  int
-	Written int
+	Reused   int
+	Written  int
+	Batching PretrainedBERTVectorBatchingSummary
 }
 
 func writePretrainedBERTVectorCache(ctx context.Context, embedder *PretrainedBERTTextEmbedder, records []retrievalTextRecord, path string, batchSize int, prefix string, opts pretrainedBERTVectorCacheWriteOptions) (int, pretrainedBERTVectorCacheResumeResult, error) {
@@ -1151,7 +1178,15 @@ func writePretrainedBERTVectorCache(ctx context.Context, embedder *PretrainedBER
 	}
 	defer file.Close()
 	writer := bufio.NewWriter(file)
-	result := pretrainedBERTVectorCacheResumeResult{Reused: reused}
+	result := pretrainedBERTVectorCacheResumeResult{
+		Reused: reused,
+		Batching: PretrainedBERTVectorBatchingSummary{
+			Strategy:    "stable_length_bucket_window_v1",
+			BatchSize:   batchSize,
+			TotalItems:  len(records),
+			ReusedItems: reused,
+		},
+	}
 	progressStart := time.Now()
 	if opts.Resume && reused > 0 && reused < len(records) {
 		endsNewline, err := fileEndsWithNewline(path)
@@ -1164,40 +1199,20 @@ func writePretrainedBERTVectorCache(ctx context.Context, embedder *PretrainedBER
 			}
 		}
 	}
-	for start := reused; start < len(records); start += batchSize {
-		end := start + batchSize
-		if end > len(records) {
-			end = len(records)
+	windowSize := pretrainedBERTLengthBucketWindowSize(batchSize)
+	for windowStart := reused; windowStart < len(records); windowStart += windowSize {
+		windowEnd := windowStart + windowSize
+		if windowEnd > len(records) {
+			windowEnd = len(records)
 		}
-		texts := make([]string, end-start)
-		for i, record := range records[start:end] {
-			texts[i] = record.Text
-		}
-		vectors, err := embedder.EmbedTextBatch(ctx, texts, prefix)
+		windowVectors, stats, err := embedPretrainedBERTVectorCacheWindow(ctx, embedder, records[windowStart:windowEnd], batchSize, prefix, opts)
 		if err != nil {
 			return 0, pretrainedBERTVectorCacheResumeResult{}, err
 		}
-		for i, vector := range vectors {
-			record := records[start+i]
-			if len(vector) == 0 {
-				return 0, pretrainedBERTVectorCacheResumeResult{}, fmt.Errorf("vector for %q is empty", record.ID)
-			}
-			if opts.NativeDim > 0 && len(vector) != opts.NativeDim {
-				return 0, pretrainedBERTVectorCacheResumeResult{}, fmt.Errorf("vector for %q has native dimension %d, want %d", record.ID, len(vector), opts.NativeDim)
-			}
-			var embedding []float32
-			if opts.ProjectionHead != nil {
-				embedding, err = opts.ProjectionHead.Apply(vector)
-				if err != nil {
-					return 0, pretrainedBERTVectorCacheResumeResult{}, fmt.Errorf("project vector for %q: %w", record.ID, err)
-				}
-			} else {
-				embedding, err = transformRetrievalExportVector(vector, opts.OutputDim)
-				if err != nil {
-					return 0, pretrainedBERTVectorCacheResumeResult{}, fmt.Errorf("vector for %q: %w", record.ID, err)
-				}
-			}
-			nextDim, err := validatePretrainedBERTVectorCacheRow(path, start+i+1, retrievalVectorExportRow{ID: record.ID, Embedding: embedding}, record.ID, dim, opts.ExpectedDim)
+		accumulatePretrainedBERTVectorBatchingSummary(&result.Batching, stats)
+		for i, embedding := range windowVectors {
+			record := records[windowStart+i]
+			nextDim, err := validatePretrainedBERTVectorCacheRow(path, windowStart+i+1, retrievalVectorExportRow{ID: record.ID, Embedding: embedding}, record.ID, dim, opts.ExpectedDim)
 			if err != nil {
 				return 0, pretrainedBERTVectorCacheResumeResult{}, err
 			}
@@ -1224,6 +1239,125 @@ func writePretrainedBERTVectorCache(ctx context.Context, embedder *PretrainedBER
 		return 0, pretrainedBERTVectorCacheResumeResult{}, fmt.Errorf("no vector dimension observed for %s", path)
 	}
 	return dim, result, nil
+}
+
+type pretrainedBERTVectorCacheBatchItem struct {
+	Ordinal int
+	Text    string
+	Length  int
+}
+
+func pretrainedBERTLengthBucketWindowSize(batchSize int) int {
+	if batchSize <= 0 {
+		return 1
+	}
+	windowSize := batchSize * 16
+	if windowSize < batchSize {
+		return batchSize
+	}
+	return windowSize
+}
+
+func embedPretrainedBERTVectorCacheWindow(ctx context.Context, embedder *PretrainedBERTTextEmbedder, records []retrievalTextRecord, batchSize int, prefix string, opts pretrainedBERTVectorCacheWriteOptions) ([][]float32, PretrainedBERTVectorBatchingSummary, error) {
+	items := make([]pretrainedBERTVectorCacheBatchItem, len(records))
+	stats := PretrainedBERTVectorBatchingSummary{
+		Strategy:      "stable_length_bucket_window_v1",
+		BatchSize:     batchSize,
+		Items:         len(records),
+		TotalItems:    len(records),
+		ComputedItems: len(records),
+	}
+	for i, record := range records {
+		length, err := embedder.pretrainedBERTEncodedLength(prefix, record.Text)
+		if err != nil {
+			return nil, PretrainedBERTVectorBatchingSummary{}, fmt.Errorf("tokenize %q for length bucket: %w", record.ID, err)
+		}
+		items[i] = pretrainedBERTVectorCacheBatchItem{Ordinal: i, Text: record.Text, Length: length}
+		stats.ActualTokens += int64(length)
+		stats.FixedMaxTokens += int64(embedder.MaxLength())
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Length != items[j].Length {
+			return items[i].Length < items[j].Length
+		}
+		return items[i].Ordinal < items[j].Ordinal
+	})
+	out := make([][]float32, len(records))
+	for start := 0; start < len(items); start += batchSize {
+		end := start + batchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		batch := items[start:end]
+		texts := make([]string, len(batch))
+		effectiveLength := 1
+		for i, item := range batch {
+			texts[i] = item.Text
+			if item.Length > effectiveLength {
+				effectiveLength = item.Length
+			}
+		}
+		stats.BatchCount++
+		stats.PaddedTokens += int64(len(batch) * effectiveLength)
+		if effectiveLength > stats.MaxEffectiveLength {
+			stats.MaxEffectiveLength = effectiveLength
+		}
+		vectors, err := embedder.EmbedTextBatch(ctx, texts, prefix)
+		if err != nil {
+			return nil, PretrainedBERTVectorBatchingSummary{}, err
+		}
+		for i, vector := range vectors {
+			item := batch[i]
+			if len(vector) == 0 {
+				return nil, PretrainedBERTVectorBatchingSummary{}, fmt.Errorf("vector for ordinal %d is empty", item.Ordinal)
+			}
+			if opts.NativeDim > 0 && len(vector) != opts.NativeDim {
+				return nil, PretrainedBERTVectorBatchingSummary{}, fmt.Errorf("vector for ordinal %d has native dimension %d, want %d", item.Ordinal, len(vector), opts.NativeDim)
+			}
+			var embedding []float32
+			if opts.ProjectionHead != nil {
+				embedding, err = opts.ProjectionHead.Apply(vector)
+				if err != nil {
+					return nil, PretrainedBERTVectorBatchingSummary{}, fmt.Errorf("project vector for ordinal %d: %w", item.Ordinal, err)
+				}
+			} else {
+				embedding, err = transformRetrievalExportVector(vector, opts.OutputDim)
+				if err != nil {
+					return nil, PretrainedBERTVectorBatchingSummary{}, fmt.Errorf("vector for ordinal %d: %w", item.Ordinal, err)
+				}
+			}
+			out[item.Ordinal] = embedding
+		}
+	}
+	return out, stats, nil
+}
+
+func (e *PretrainedBERTTextEmbedder) pretrainedBERTEncodedLength(prefix, text string) (int, error) {
+	if e == nil || e.tokenizer == nil {
+		return 0, fmt.Errorf("pretrained BERT text embedder is not loaded")
+	}
+	encoded, err := e.tokenizer.Encode(prefix+text, HFWordPieceEncodeOptions{
+		MaxLength: e.maxLength,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(encoded.IDs) <= 0 {
+		return 1, nil
+	}
+	return len(encoded.IDs), nil
+}
+
+func accumulatePretrainedBERTVectorBatchingSummary(dst *PretrainedBERTVectorBatchingSummary, src PretrainedBERTVectorBatchingSummary) {
+	dst.Items += src.Items
+	dst.ComputedItems += src.ComputedItems
+	dst.BatchCount += src.BatchCount
+	dst.ActualTokens += src.ActualTokens
+	dst.PaddedTokens += src.PaddedTokens
+	dst.FixedMaxTokens += src.FixedMaxTokens
+	if src.MaxEffectiveLength > dst.MaxEffectiveLength {
+		dst.MaxEffectiveLength = src.MaxEffectiveLength
+	}
 }
 
 func validatePretrainedBERTVectorCachePrefix(path string, records []retrievalTextRecord, resume bool, expectedDim int) (int, int, error) {
