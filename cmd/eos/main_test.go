@@ -6024,6 +6024,131 @@ func TestTrainMetricsPayloadCompactForwardAcceleratorJSON(t *testing.T) {
 	}
 }
 
+func TestTrainMetricsPayloadCompactTrainAcceleratorJSON(t *testing.T) {
+	payload := trainMetricsPayload(
+		"train-embed",
+		"train",
+		"model.mll",
+		"",
+		eosruntime.EmbeddingTrainRunSummary{
+			EndProfile: eosruntime.EmbeddingTrainProfile{},
+		},
+		eosruntime.EmbeddingTrainPackagePaths{},
+		nil,
+	)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal metrics payload: %v", err)
+	}
+	var absentRaw map[string]any
+	if err := json.Unmarshal(data, &absentRaw); err != nil {
+		t.Fatalf("unmarshal absent metrics payload: %v\n%s", err, string(data))
+	}
+	absentDelta := absentRaw["profile_delta"].(map[string]any)
+	for _, key := range compactTrainProfileDeltaCounterKeysForTest() {
+		if _, ok := absentDelta[key]; ok {
+			t.Fatalf("%s present for absent compact train stats: %s", key, string(data))
+		}
+	}
+	if _, ok := absentDelta["compact_train_stats_available"]; ok {
+		t.Fatalf("compact_train_stats_available present for absent compact train stats: %s", string(data))
+	}
+	if strings.Contains(string(data), `"compact_train"`) {
+		t.Fatalf("compact_train present for absent compact train backend/stats: %s", string(data))
+	}
+
+	payload = trainMetricsPayload(
+		"train-embed",
+		"train",
+		"model.mll",
+		"",
+		eosruntime.EmbeddingTrainRunSummary{
+			EndProfile: eosruntime.EmbeddingTrainProfile{
+				CompactTrainBackend: eosartifact.BackendCUDA,
+			},
+			DeltaProfile: eosruntime.EmbeddingTrainProfile{
+				CompactTrain: &backend.CompactTrainAcceleratorStats{
+					ForwardCalls:          2,
+					PooledDownloadedBytes: 1024,
+					PackedBytesAvoided:    4096,
+					LiveHandles:           0,
+				},
+			},
+		},
+		eosruntime.EmbeddingTrainPackagePaths{},
+		nil,
+	)
+	data, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal cuda metrics payload: %v", err)
+	}
+	var got struct {
+		Accelerators struct {
+			CompactTrain string `json:"compact_train"`
+		} `json:"accelerators"`
+		ProfileDelta struct {
+			StatsAvailable       bool  `json:"compact_train_stats_available"`
+			ForwardCalls         int64 `json:"compact_train_forward_calls"`
+			PooledDownloadedByte int64 `json:"compact_train_pooled_downloaded_bytes"`
+			PackedBytesAvoided   int64 `json:"compact_train_packed_bytes_avoided"`
+		} `json:"profile_delta"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal metrics payload: %v\n%s", err, string(data))
+	}
+	if got.Accelerators.CompactTrain != "cuda" || !got.ProfileDelta.StatsAvailable || got.ProfileDelta.ForwardCalls != 2 || got.ProfileDelta.PooledDownloadedByte != 1024 || got.ProfileDelta.PackedBytesAvoided != 4096 {
+		t.Fatalf("compact_train metrics mismatch: %+v\n%s", got, string(data))
+	}
+	var presentRaw map[string]any
+	if err := json.Unmarshal(data, &presentRaw); err != nil {
+		t.Fatalf("unmarshal raw compact train metrics payload: %v\n%s", err, string(data))
+	}
+	presentDelta := presentRaw["profile_delta"].(map[string]any)
+	for _, key := range compactTrainProfileDeltaCounterKeysForTest() {
+		value, ok := presentDelta[key]
+		if !ok {
+			t.Fatalf("%s missing from compact train stats payload: %s", key, string(data))
+		}
+		if _, ok := value.(float64); !ok {
+			t.Fatalf("%s = %T(%v), want numeric JSON value", key, value, value)
+		}
+	}
+	for _, key := range []string{
+		"compact_train_backward_calls",
+		"compact_train_grad_pooled_uploaded_bytes",
+		"compact_train_host_grad_upload_bytes_avoided",
+		"compact_train_graph_captures",
+		"compact_train_graph_replays",
+		"compact_train_workspace_arena_bytes",
+		"compact_train_resident_grad_bytes",
+		"compact_train_live_handles",
+	} {
+		if presentDelta[key] != float64(0) {
+			t.Fatalf("%s = %v, want numeric zero\n%s", key, presentDelta[key], string(data))
+		}
+	}
+}
+
+func compactTrainProfileDeltaCounterKeysForTest() []string {
+	return []string{
+		"compact_train_forward_calls",
+		"compact_train_backward_calls",
+		"compact_train_pooled_downloaded_bytes",
+		"compact_train_grad_pooled_uploaded_bytes",
+		"compact_train_packed_bytes_avoided",
+		"compact_train_host_grad_upload_bytes_avoided",
+		"compact_train_kernel_launches",
+		"compact_train_kernel_synchronizations",
+		"compact_train_graph_captures",
+		"compact_train_graph_replays",
+		"compact_train_activation_arena_bytes",
+		"compact_train_workspace_arena_bytes",
+		"compact_train_resident_grad_bytes",
+		"compact_train_live_handles",
+		"compact_train_fallback_or_unhandled",
+	}
+}
+
 func TestEvalMetricsPayloadIncludesRetrievalMetrics(t *testing.T) {
 	payload := evalMetricsPayload(&eosruntime.EmbeddingEvalMetrics{
 		RetrievalNDCGAt10:    0.14,

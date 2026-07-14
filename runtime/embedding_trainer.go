@@ -237,6 +237,8 @@ type EmbeddingTrainer struct {
 	contrastiveBackend      eosartifact.BackendKind
 	compactForwardAccel     backend.CompactForwardAccelerator
 	compactForwardBackend   eosartifact.BackendKind
+	compactTrainAccel       backend.CompactTrainAccelerator
+	compactTrainBackend     eosartifact.BackendKind
 	compactForwardSelected  bool
 	sequenceBindingID       int
 	momentsDirty            bool
@@ -573,6 +575,24 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 		}
 		return nil, err
 	}
+	compactTrainAccel, compactTrainBackend, err := newTrainerCompactTrainAccelerator()
+	if err != nil {
+		if accel != nil {
+			accel.Close()
+		}
+		if optimizerAccel != nil {
+			optimizerAccel.Close()
+		}
+		if activationAccel != nil {
+			activationAccel.Close()
+		}
+		if compactForwardAccel != nil {
+			if closer, ok := compactForwardAccel.(interface{ Close() }); ok {
+				closer.Close()
+			}
+		}
+		return nil, err
+	}
 	if accelBackend == "" {
 		accelBackend = eosartifact.BackendKind("host")
 	}
@@ -598,6 +618,8 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 		softmaxBackwardAccel:  activationMode.softmaxBackward,
 		compactForwardAccel:   compactForwardAccel,
 		compactForwardBackend: compactForwardBackend,
+		compactTrainAccel:     compactTrainAccel,
+		compactTrainBackend:   compactTrainBackend,
 		forwardDirty:          true,
 		forwardNeedsBind:      true,
 	}, nil
@@ -840,6 +862,13 @@ func (t *EmbeddingTrainer) CloseWithError() error {
 		t.compactForwardAccel = nil
 		t.compactForwardBackend = ""
 		t.compactForwardSelected = false
+	}
+	if t.compactTrainAccel != nil {
+		if closer, ok := t.compactTrainAccel.(interface{ Close() }); ok {
+			closer.Close()
+		}
+		t.compactTrainAccel = nil
+		t.compactTrainBackend = ""
 	}
 	t.closeErr = nil
 	return nil
@@ -1174,6 +1203,7 @@ func (t *EmbeddingTrainer) TrainProfile() EmbeddingTrainProfile {
 		ActivationBackend:     t.activationBackend,
 		ContrastiveBackend:    t.contrastiveBackend,
 		CompactForwardBackend: t.compactForwardBackend,
+		CompactTrainBackend:   t.compactTrainBackend,
 		ForwardResidency:      t.ForwardResidencyStats(),
 		CompactForwardTrainer: t.compactForwardTrainer,
 		VectorDistillPhases:   t.vectorDistillPhases,
@@ -1195,6 +1225,10 @@ func (t *EmbeddingTrainer) TrainProfile() EmbeddingTrainProfile {
 	if provider, ok := t.compactForwardAccel.(backend.CompactForwardStatsProvider); ok {
 		stats := provider.Stats()
 		profile.CompactForward = &stats
+	}
+	if provider, ok := t.compactTrainAccel.(backend.CompactTrainStatsProvider); ok {
+		stats := provider.CompactTrainStats()
+		profile.CompactTrain = &stats
 	}
 	return profile
 }
@@ -4217,6 +4251,140 @@ func (t *EmbeddingTrainer) prepareCompactForwardAccelerator(forward *compactEmbe
 		}
 		if err := binder.BindCompactForwardResident(item.name, item.tensor, ref); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (t *EmbeddingTrainer) prepareCompactTrainAccelerator(forward *compactEmbeddingForwardWeights) error {
+	if t == nil || t.compactTrainAccel == nil || forward == nil {
+		return fmt.Errorf("compact train accelerator is not initialized")
+	}
+	if configurator, ok := t.compactTrainAccel.(backend.CompactForwardConfigurator); ok {
+		layers := make([]backend.CompactForwardLayerConfig, len(forward.layers))
+		for i, layer := range forward.layers {
+			layers[i] = backend.CompactForwardLayerConfig{
+				AttentionQ: layer.attnQName,
+				AttentionK: layer.attnKName,
+				AttentionV: layer.attnVName,
+				AttentionO: layer.attnOName,
+				FFNUp:      layer.ffnUpName,
+				FFNDown:    layer.ffnDownName,
+			}
+		}
+		roleName := ""
+		if forward.role != nil && t.compactState != nil && t.compactState.RoleEmbedding != nil {
+			roleName = t.compactState.RoleEmbedding.Name
+		}
+		configurator.ConfigureCompactForward(layers, t.compactState.TokenEmbedding.Name, roleName, forward.outputProjectionName, t.manifest.PositionEncoding == EmbeddingPositionEncodingRoPE)
+	}
+	for _, item := range compactTrainStateOptimizerItems(t.compactState) {
+		if item == nil || item.Tensor == nil {
+			continue
+		}
+		if item.Moment1 == nil {
+			item.Moment1 = zeroLikeMaster(item.Tensor)
+		}
+		if item.Moment2 == nil {
+			item.Moment2 = zeroLikeMaster(item.Tensor)
+		}
+	}
+	items := t.compactForwardResidentItems(forward)
+	if seeder, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterSeeder); ok {
+		for _, item := range items {
+			if item.name == "" || item.tensor == nil {
+				continue
+			}
+			if err := seeder.EnsureResidentParameter(item.name, item.tensor, item.mom1, item.mom2); err != nil {
+				return err
+			}
+		}
+	}
+	provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider)
+	if !ok {
+		return fmt.Errorf("compact resident train requires resident optimizer provider")
+	}
+	binder, ok := t.compactTrainAccel.(backend.CompactTrainResidentBinder)
+	if !ok {
+		return fmt.Errorf("compact train accelerator cannot bind resident parameters")
+	}
+	for _, item := range items {
+		if item.name == "" || item.tensor == nil {
+			continue
+		}
+		ref, ok := provider.ResidentParameter(item.name)
+		if !ok {
+			return fmt.Errorf("compact train resident ref %q is unavailable", item.name)
+		}
+		if err := binder.BindCompactTrainResident(item.name, item.tensor, ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *EmbeddingTrainer) validateCompactResidentTrainForwardHandles(inputs []embeddingSequenceInput, forward *embeddingForwardWeights) error {
+	if t == nil || !t.isCompactTrainer() || t.compactTrainAccel == nil || forward == nil || forward.compact == nil || len(inputs) == 0 {
+		return nil
+	}
+	compactForward := forward.compact
+	if err := t.prepareCompactTrainAccelerator(compactForward); err != nil {
+		return err
+	}
+	type bucketInput struct {
+		tokens []int32
+		mask   []int32
+		role   int32
+	}
+	groupOrder := make([]int, 0)
+	groups := map[int][]bucketInput{}
+	for i, input := range inputs {
+		mask, err := t.prepareMask(input.tokens, input.mask)
+		if err != nil {
+			return fmt.Errorf("%s: %w", embeddingSequenceInputLabel(input, i), err)
+		}
+		seqLen := len(input.tokens)
+		if _, exists := groups[seqLen]; !exists {
+			groupOrder = append(groupOrder, seqLen)
+		}
+		groups[seqLen] = append(groups[seqLen], bucketInput{
+			tokens: append([]int32(nil), input.tokens...),
+			mask:   normalizeCompactForwardMask(mask),
+			role:   input.role,
+		})
+	}
+	sort.Ints(groupOrder)
+	refs, err := t.compactForwardResidentRefs(compactForward)
+	if err != nil {
+		return err
+	}
+	for _, seqLen := range groupOrder {
+		bucket := groups[seqLen]
+		req := backend.CompactTrainForwardRequest{
+			Shape:        t.compactForwardShape(compactForward, len(bucket), seqLen),
+			Tokens:       make([][]int32, len(bucket)),
+			Masks:        make([][]int32, len(bucket)),
+			Roles:        make([]int32, len(bucket)),
+			ResidentRefs: refs,
+			GELUMode:     compactForwardGELUMode(),
+			StepID:       uint64(t.step),
+		}
+		for i, input := range bucket {
+			req.Tokens[i] = input.tokens
+			req.Masks[i] = input.mask
+			req.Roles[i] = input.role
+		}
+		if preflight, ok := t.compactTrainAccel.(backend.CompactTrainPreflight); ok {
+			if err := preflight.PreflightCompactTrainForward(req); err != nil {
+				return fmt.Errorf("compact resident train forward preflight T=%d B=%d: %w", seqLen, len(bucket), err)
+			}
+		}
+		result, err := t.compactTrainAccel.RunCompactTrainForward(req)
+		if err != nil {
+			return fmt.Errorf("compact resident train forward T=%d B=%d: %w", seqLen, len(bucket), err)
+		}
+		if err := t.compactTrainAccel.ReleaseCompactTrainHandle(result.Handle); err != nil {
+			return fmt.Errorf("compact resident train forward release T=%d B=%d: %w", seqLen, len(bucket), err)
 		}
 	}
 	return nil

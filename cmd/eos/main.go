@@ -7024,6 +7024,7 @@ type trainAcceleratorsJSON struct {
 	Activation     string `json:"activation"`
 	Contrastive    string `json:"contrastive"`
 	CompactForward string `json:"compact_forward,omitempty"`
+	CompactTrain   string `json:"compact_train,omitempty"`
 }
 
 type trainProfileDeltaJSON struct {
@@ -7048,10 +7049,30 @@ type trainProfileDeltaJSON struct {
 	CompactForwardKernelLaunches              int64   `json:"compact_forward_kernel_launches"`
 	CompactForwardKernelSynchronizations      int64   `json:"compact_forward_kernel_synchronizations"`
 	CompactForwardRunNanos                    int64   `json:"compact_forward_run_nanos"`
-	OptimizerUpdates                          int64   `json:"optimizer_updates"`
-	OptimizerSyncs                            int64   `json:"optimizer_syncs"`
-	ActivationCalls                           int64   `json:"activation_calls"`
-	ContrastiveCalls                          int64   `json:"contrastive_calls"`
+	CompactTrainStatsAvailable                bool    `json:"compact_train_stats_available,omitempty"`
+	*compactTrainProfileDeltaJSON             `json:",omitempty"`
+	OptimizerUpdates                          int64 `json:"optimizer_updates"`
+	OptimizerSyncs                            int64 `json:"optimizer_syncs"`
+	ActivationCalls                           int64 `json:"activation_calls"`
+	ContrastiveCalls                          int64 `json:"contrastive_calls"`
+}
+
+type compactTrainProfileDeltaJSON struct {
+	CompactTrainForwardCalls               int64 `json:"compact_train_forward_calls"`
+	CompactTrainBackwardCalls              int64 `json:"compact_train_backward_calls"`
+	CompactTrainPooledDownloadedBytes      int64 `json:"compact_train_pooled_downloaded_bytes"`
+	CompactTrainGradPooledUploadedBytes    int64 `json:"compact_train_grad_pooled_uploaded_bytes"`
+	CompactTrainPackedBytesAvoided         int64 `json:"compact_train_packed_bytes_avoided"`
+	CompactTrainHostGradUploadBytesAvoided int64 `json:"compact_train_host_grad_upload_bytes_avoided"`
+	CompactTrainKernelLaunches             int64 `json:"compact_train_kernel_launches"`
+	CompactTrainKernelSynchronizations     int64 `json:"compact_train_kernel_synchronizations"`
+	CompactTrainGraphCaptures              int64 `json:"compact_train_graph_captures"`
+	CompactTrainGraphReplays               int64 `json:"compact_train_graph_replays"`
+	CompactTrainActivationArenaBytes       int64 `json:"compact_train_activation_arena_bytes"`
+	CompactTrainWorkspaceArenaBytes        int64 `json:"compact_train_workspace_arena_bytes"`
+	CompactTrainResidentGradBytes          int64 `json:"compact_train_resident_grad_bytes"`
+	CompactTrainLiveHandles                int64 `json:"compact_train_live_handles"`
+	CompactTrainFallbackOrUnhandled        int64 `json:"compact_train_fallback_or_unhandled"`
 }
 
 type trainPackagePathsJSON struct {
@@ -7374,6 +7395,9 @@ func trainAcceleratorsPayload(profile eosruntime.EmbeddingTrainProfile) trainAcc
 	if profile.CompactForwardBackend != "" {
 		payload.CompactForward = displayTrainBackend(profile.CompactForwardBackend)
 	}
+	if profile.CompactTrainBackend != "" {
+		payload.CompactTrain = displayTrainBackend(profile.CompactTrainBackend)
+	}
 	return payload
 }
 
@@ -7406,6 +7430,25 @@ func trainProfileDeltaPayload(profile eosruntime.EmbeddingTrainProfile) trainPro
 		payload.CompactForwardKernelLaunches = profile.CompactForward.KernelLaunches
 		payload.CompactForwardKernelSynchronizations = profile.CompactForward.KernelSynchronizations
 		payload.CompactForwardRunNanos = profile.CompactForward.RunNanos
+	}
+	if profile.CompactTrain != nil {
+		payload.CompactTrainStatsAvailable = true
+		payload.compactTrainProfileDeltaJSON = &compactTrainProfileDeltaJSON{
+			CompactTrainForwardCalls:               profile.CompactTrain.ForwardCalls,
+			CompactTrainBackwardCalls:              profile.CompactTrain.BackwardCalls,
+			CompactTrainPooledDownloadedBytes:      profile.CompactTrain.PooledDownloadedBytes,
+			CompactTrainGradPooledUploadedBytes:    profile.CompactTrain.GradPooledUploadedBytes,
+			CompactTrainPackedBytesAvoided:         profile.CompactTrain.PackedBytesAvoided,
+			CompactTrainHostGradUploadBytesAvoided: profile.CompactTrain.HostGradUploadBytesAvoided,
+			CompactTrainKernelLaunches:             profile.CompactTrain.KernelLaunches,
+			CompactTrainKernelSynchronizations:     profile.CompactTrain.KernelSynchronizations,
+			CompactTrainGraphCaptures:              profile.CompactTrain.GraphCaptures,
+			CompactTrainGraphReplays:               profile.CompactTrain.GraphReplays,
+			CompactTrainActivationArenaBytes:       profile.CompactTrain.ActivationArenaBytes,
+			CompactTrainWorkspaceArenaBytes:        profile.CompactTrain.WorkspaceArenaBytes,
+			CompactTrainResidentGradBytes:          profile.CompactTrain.ResidentGradBytes,
+			CompactTrainLiveHandles:                profile.CompactTrain.LiveHandles,
+		}
 	}
 	return payload
 }

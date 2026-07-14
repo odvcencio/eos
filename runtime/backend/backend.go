@@ -196,6 +196,40 @@ type CompactForwardAcceleratorStats struct {
 	LastKernelSynchronizations  int64
 }
 
+// CompactTrainAcceleratorStats summarizes backend-owned compact resident train
+// activity. A nil stats provider means unavailable; a zero-valued available
+// stats struct means the implementation exists but has not run.
+type CompactTrainAcceleratorStats struct {
+	ForwardCalls               int64
+	BackwardCalls              int64
+	HandlesCreated             int64
+	HandlesReleased            int64
+	LiveHandles                int64
+	GradientZeroCalls          int64
+	ResidentGradBytes          int64
+	ActivationArenaBytes       int64
+	WorkspaceArenaBytes        int64
+	UploadedBytes              int64
+	DownloadedBytes            int64
+	PooledDownloadedBytes      int64
+	GradPooledUploadedBytes    int64
+	StatusDownloadedBytes      int64
+	PackedBytesAvoided         int64
+	HostGradUploadBytesAvoided int64
+	KernelLaunches             int64
+	KernelSynchronizations     int64
+	GraphCaptures              int64
+	GraphReplays               int64
+	ForwardNanos               int64
+	BackwardNanos              int64
+	OptimizerResidentGradNanos int64
+	LastShape                  CompactForwardShape
+	LastForwardLaunches        int64
+	LastBackwardLaunches       int64
+	LastForwardSyncs           int64
+	LastBackwardSyncs          int64
+}
+
 // ContrastiveGradResult contains pooled embedding gradients and unnormalized row metrics.
 type ContrastiveGradResult struct {
 	QueryGrads    *Tensor
@@ -205,6 +239,7 @@ type ContrastiveGradResult struct {
 }
 
 const CompactForwardPackedStateVersion = 1
+const CompactTrainStateVersion = 1
 
 const (
 	CompactForwardGELUExact = "exact"
@@ -289,6 +324,63 @@ type CompactForwardResult struct {
 	Data   []float32
 }
 
+// CompactTrainForwardRequest asks a resident-train accelerator to run compact
+// forward while keeping backward-required activations device-resident. The host
+// ABI exposes only pooled outputs and liveness handles.
+type CompactTrainForwardRequest struct {
+	Shape        CompactForwardShape
+	Tokens       [][]int32
+	Masks        [][]int32
+	Roles        []int32
+	ResidentRefs []CompactForwardResidentRef
+	GELUMode     string
+	StepID       uint64
+}
+
+type CompactTrainHandle struct {
+	Backend    eosartifact.BackendKind
+	Token      CompactTrainHandleToken
+	Shape      CompactForwardShape
+	Generation uint64
+}
+
+type CompactTrainHandleToken interface {
+	CompactTrainHandleToken()
+	Backend() eosartifact.BackendKind
+	Generation() uint64
+	Alive() bool
+}
+
+type CompactTrainForwardResult struct {
+	Handle       CompactTrainHandle
+	Pooled       *Tensor
+	ActiveCounts []int32
+}
+
+type CompactTrainBackwardRequest struct {
+	Handle     CompactTrainHandle
+	GradPooled *Tensor
+}
+
+type CompactTrainBackwardResult struct {
+	ResidentGradRefs []ResidentGradientRef
+}
+
+type ResidentGradientRef struct {
+	Name       string
+	Backend    eosartifact.BackendKind
+	Token      ResidentGradientToken
+	Elements   int
+	Generation uint64
+}
+
+type ResidentGradientToken interface {
+	ResidentGradientToken()
+	Backend() eosartifact.BackendKind
+	Generation() uint64
+	Alive() bool
+}
+
 // CompactForwardLayerConfig names one compact transformer layer's resident
 // parameters for accelerator configuration.
 type CompactForwardLayerConfig struct {
@@ -340,10 +432,28 @@ type CompactForwardAccelerator interface {
 	RunCompactForward(req CompactForwardRequest) (CompactForwardResult, error)
 }
 
+// CompactTrainAccelerator optionally executes compact resident train. Forward
+// may be implemented before backward, but selected training callers must fail
+// closed when backward/resident-gradient functionality is unsupported.
+type CompactTrainAccelerator interface {
+	Backend() eosartifact.BackendKind
+	BeginCompactTrainStep(stepID uint64, refs []CompactForwardResidentRef) error
+	RunCompactTrainForward(req CompactTrainForwardRequest) (CompactTrainForwardResult, error)
+	RunCompactTrainBackward(req CompactTrainBackwardRequest) (CompactTrainBackwardResult, error)
+	EndCompactTrainStep(stepID uint64) error
+	ReleaseCompactTrainHandle(handle CompactTrainHandle) error
+}
+
 // CompactForwardStatsProvider exposes compact-forward counters when the
 // selected accelerator can report them.
 type CompactForwardStatsProvider interface {
 	Stats() CompactForwardAcceleratorStats
+}
+
+// CompactTrainStatsProvider exposes compact resident-train counters when the
+// selected accelerator can report them.
+type CompactTrainStatsProvider interface {
+	CompactTrainStats() CompactTrainAcceleratorStats
 }
 
 // CompactForwardConfigurator configures model-specific compact-forward names.
@@ -357,10 +467,22 @@ type CompactForwardResidentBinder interface {
 	BindCompactForwardResident(name string, tensor *Tensor, ref OptimizerResidentParameter) error
 }
 
+// CompactTrainResidentBinder binds compact resident-train parameters from
+// resident optimizer state.
+type CompactTrainResidentBinder interface {
+	BindCompactTrainResident(name string, tensor *Tensor, ref OptimizerResidentParameter) error
+}
+
 // CompactForwardPreflight validates a request before it is selected for the
 // fail-closed packed path.
 type CompactForwardPreflight interface {
 	PreflightCompactForward(req CompactForwardRequest) error
+}
+
+// CompactTrainPreflight validates a resident-train forward request before a
+// fail-closed validation path selects it.
+type CompactTrainPreflight interface {
+	PreflightCompactTrainForward(req CompactTrainForwardRequest) error
 }
 
 // OptimizerAccelerator exposes a backend-owned optimizer update fast path.
@@ -370,6 +492,10 @@ type OptimizerAccelerator interface {
 	SyncState(name string, tensor, mom1, mom2 *Tensor, includeMoments bool) error
 	Stats() OptimizerAcceleratorStats
 	Close()
+}
+
+type ResidentGradientOptimizerAccelerator interface {
+	ApplyUpdateWithResidentGrad(name string, cfg OptimizerUpdateConfig, tensor, mom1, mom2 *Tensor, grad ResidentGradientRef) error
 }
 
 // ForcedOptimizerSyncAccelerator optionally records the semantic reason for a
@@ -425,6 +551,7 @@ var optimizerAcceleratorFactories []optimizerAcceleratorFactory
 var activationAcceleratorFactories []activationAcceleratorFactory
 var contrastiveAcceleratorFactories []contrastiveAcceleratorFactory
 var compactForwardAcceleratorFactories []compactForwardAcceleratorFactory
+var compactTrainAcceleratorFactories []compactTrainAcceleratorFactory
 
 type matMulAcceleratorFactory struct {
 	kind    eosartifact.BackendKind
@@ -449,6 +576,11 @@ type contrastiveAcceleratorFactory struct {
 type compactForwardAcceleratorFactory struct {
 	kind    eosartifact.BackendKind
 	factory func() (CompactForwardAccelerator, error)
+}
+
+type compactTrainAcceleratorFactory struct {
+	kind    eosartifact.BackendKind
+	factory func() (CompactTrainAccelerator, error)
 }
 
 // KernelDispatcher executes a launch_kernel step through a backend-owned path.
@@ -584,6 +716,18 @@ func RegisterCompactForwardAccelerator(kind eosartifact.BackendKind, factory fun
 	})
 }
 
+// RegisterCompactTrainAccelerator registers an optional backend-owned compact
+// resident-train fast path.
+func RegisterCompactTrainAccelerator(kind eosartifact.BackendKind, factory func() (CompactTrainAccelerator, error)) {
+	if factory == nil {
+		return
+	}
+	compactTrainAcceleratorFactories = append(compactTrainAcceleratorFactories, compactTrainAcceleratorFactory{
+		kind:    kind,
+		factory: factory,
+	})
+}
+
 // NewPreferredMatMulAccelerator returns the first available registered accelerator.
 func NewPreferredMatMulAccelerator(preferred ...eosartifact.BackendKind) (MatMulAccelerator, eosartifact.BackendKind, error) {
 	for _, kind := range preferred {
@@ -680,6 +824,31 @@ func NewPreferredCompactForwardAccelerator(preferred ...eosartifact.BackendKind)
 	}
 	if len(errs) != 0 {
 		return nil, "", fmt.Errorf("compact forward accelerator factory failed: %w", errors.Join(errs...))
+	}
+	return nil, "", nil
+}
+
+// NewPreferredCompactTrainAccelerator returns the first available registered
+// compact resident-train accelerator.
+func NewPreferredCompactTrainAccelerator(preferred ...eosartifact.BackendKind) (CompactTrainAccelerator, eosartifact.BackendKind, error) {
+	var errs []error
+	for _, kind := range preferred {
+		for _, candidate := range compactTrainAcceleratorFactories {
+			if candidate.kind != kind {
+				continue
+			}
+			accel, err := candidate.factory()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", kind, err))
+				continue
+			}
+			if accel != nil {
+				return accel, kind, nil
+			}
+		}
+	}
+	if len(errs) != 0 {
+		return nil, "", fmt.Errorf("compact train accelerator factory failed: %w", errors.Join(errs...))
 	}
 	return nil, "", nil
 }
