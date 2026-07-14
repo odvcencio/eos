@@ -110,20 +110,23 @@ type MatMulAcceleratorStats struct {
 
 // OptimizerAcceleratorStats summarizes backend-owned optimizer update activity.
 type OptimizerAcceleratorStats struct {
-	LogicalSteps           int64
-	TensorUpdateCalls      int64
-	UpdateCalls            int64
-	DeferredSyncUpdates    int64
-	SyncCalls              int64
-	ForcedSyncCalls        int64
-	LastForcedSyncReason   string
-	UploadedBytes          int64
-	DownloadedBytes        int64
-	UploadedBytesPerStep   float64
-	DownloadedBytesPerStep float64
-	UpdateNanos            int64
-	SyncNanos              int64
-	ResidentParams         int64
+	LogicalSteps                   int64
+	TensorUpdateCalls              int64
+	UpdateCalls                    int64
+	ResidentGradUpdateCalls        int64
+	DeferredSyncUpdates            int64
+	SyncCalls                      int64
+	ForcedSyncCalls                int64
+	LastForcedSyncReason           string
+	UploadedBytes                  int64
+	ResidentGradUploadBytesAvoided int64
+	DownloadedBytes                int64
+	UploadedBytesPerStep           float64
+	DownloadedBytesPerStep         float64
+	UpdateNanos                    int64
+	ResidentGradUpdateNanos        int64
+	SyncNanos                      int64
+	ResidentParams                 int64
 }
 
 // OptimizerResidentParameter is a backend-owned device parameter reference.
@@ -445,6 +448,7 @@ type CompactTrainAccelerator interface {
 	RunCompactTrainForward(req CompactTrainForwardRequest) (CompactTrainForwardResult, error)
 	RunCompactTrainBackward(req CompactTrainBackwardRequest) (CompactTrainBackwardResult, error)
 	EndCompactTrainStep(stepID uint64) error
+	AbortCompactTrainStep(stepID uint64) error
 	ReleaseCompactTrainHandle(handle CompactTrainHandle) error
 }
 
@@ -498,8 +502,23 @@ type OptimizerAccelerator interface {
 	Close()
 }
 
+// OptimizerPreflightAccelerator validates a host-gradient optimizer update
+// without launching work, uploading gradients, allocating resident buffers, or
+// mutating optimizer state/statistics. Implementations must validate the same
+// predictable tensor/config/resident-binding errors as ApplyUpdate.
+type OptimizerPreflightAccelerator interface {
+	PreflightApplyUpdate(name string, cfg OptimizerUpdateConfig, tensor, mom1, mom2, grad *Tensor) error
+}
+
 type ResidentGradientOptimizerAccelerator interface {
 	ApplyUpdateWithResidentGrad(name string, cfg OptimizerUpdateConfig, tensor, mom1, mom2 *Tensor, grad ResidentGradientRef) error
+}
+
+// ResidentGradientOptimizerPreflightAccelerator validates a resident-gradient
+// update without launching work, consuming the gradient, or mutating optimizer
+// state or statistics. Implementations must use the same validation as Apply.
+type ResidentGradientOptimizerPreflightAccelerator interface {
+	PreflightApplyUpdateWithResidentGrad(name string, cfg OptimizerUpdateConfig, tensor, mom1, mom2 *Tensor, grad ResidentGradientRef) error
 }
 
 // ForcedOptimizerSyncAccelerator optionally records the semantic reason for a

@@ -137,7 +137,7 @@ import (
 type CompactTrainAccelerator struct {
 	*CompactForwardAccelerator
 	stats        backend.CompactTrainAcceleratorStats
-	arena        *compactTrainArena
+	arenas       map[*compactTrainHandleToken]*compactTrainArena
 	trainKernels compactTrainKernels
 	grads        map[string]*compactTrainGradient
 	gradGen      uint64
@@ -165,11 +165,25 @@ type compactTrainKernels struct {
 }
 
 type compactTrainGradient struct {
-	ptr        C.CUdeviceptr
-	elements   int
+	ptr                 C.CUdeviceptr
+	elements            int
+	generation          uint64
+	stepID              uint64
+	token               *compactTrainGradientToken
+	optimizerOwner      *optimizerAccelerator
+	optimizerToken      *optimizerResidentParameterToken
+	optimizerGeneration uint64
+	optimizerParam      C.CUdeviceptr
+	optimizerUsed       bool
+}
+
+type compactTrainResidentRefSnapshot struct {
+	ref        backend.CompactForwardResidentRef
+	token      *optimizerResidentParameterToken
+	owner      *optimizerAccelerator
 	generation uint64
-	stepID     uint64
-	token      *compactTrainGradientToken
+	param      C.CUdeviceptr
+	elements   int
 }
 
 type compactTrainGradientToken struct {
@@ -182,6 +196,7 @@ type compactTrainGradientToken struct {
 
 type compactTrainArena struct {
 	shape      backend.CompactForwardShape
+	id         uint64
 	generation uint64
 	live       bool
 	token      *compactTrainHandleToken
@@ -235,6 +250,7 @@ type compactTrainLayerArena struct {
 }
 
 type compactTrainHandleToken struct {
+	owner      *CompactTrainAccelerator
 	backend    eosartifact.BackendKind
 	generation uint64
 	stepID     uint64
@@ -533,9 +549,9 @@ extern "C" __global__ void eos_compact_train_rope_transpose(
         return;
     }
     int pos = seq > 0 ? row % seq : row;
-    float theta = (float)pos / powf(10000.0f, (float)col / (float)cols);
-    float c = cosf(theta);
-    float s = sinf(theta);
+    double theta = (double)pos / pow(10000.0, (double)col / (double)cols);
+    float c = (float)cos(theta);
+    float s = (float)sin(theta);
     float x0 = src[base];
     float x1 = src[base + 1];
     out0[base] = x0 * c + x1 * s;
@@ -706,11 +722,38 @@ func NewCompactTrainAccelerator() (*CompactTrainAccelerator, error) {
 			ropeTranspose:       ropeTranspose,
 			inputScatter:        inputScatter,
 		},
-		grads: map[string]*compactTrainGradient{},
+		grads:  map[string]*compactTrainGradient{},
+		arenas: map[*compactTrainHandleToken]*compactTrainArena{},
 	}, nil
 }
 
 func (a *CompactTrainAccelerator) Backend() eosartifact.BackendKind { return eosartifact.BackendCUDA }
+
+func (a *CompactTrainAccelerator) ConfigureCompactForward(names []backend.CompactForwardLayerConfig, tokenName, roleName, outputProjectionName string, useRoPE bool) {
+	a.configureCompactTrain(compactForwardLayerNamesFromBackend(names), tokenName, roleName, outputProjectionName, useRoPE)
+}
+
+func (a *CompactTrainAccelerator) Configure(names []CompactForwardLayerNames, tokenName, roleName, outputProjectionName string, useRoPE bool) {
+	a.configureCompactTrain(names, tokenName, roleName, outputProjectionName, useRoPE)
+}
+
+func (a *CompactTrainAccelerator) configureCompactTrain(names []CompactForwardLayerNames, tokenName, roleName, outputProjectionName string, useRoPE bool) {
+	if a == nil || a.CompactForwardAccelerator == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.releaseArenasLocked()
+	a.releaseGradientsLocked()
+	a.stepActive = false
+	a.stepSealed = false
+	a.stepPoisoned = false
+	a.layers = append(a.layers[:0], names...)
+	a.tokenName = tokenName
+	a.roleName = roleName
+	a.outName = outputProjectionName
+	a.useRoPE = useRoPE
+}
 
 func (a *CompactTrainAccelerator) Close() {
 	if a == nil || a.CompactForwardAccelerator == nil {
@@ -719,7 +762,7 @@ func (a *CompactTrainAccelerator) Close() {
 	a.mu.Lock()
 	a.closed = true
 	a.releaseGradientsLocked()
-	a.releaseArenaLocked()
+	a.releaseArenasLocked()
 	if a.device != nil {
 		a.device.destroyAuxKernel(a.trainKernels.finalProjectionGrad)
 		a.device.destroyAuxKernel(a.trainKernels.finalHiddenGrad)
@@ -794,35 +837,27 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 	if a == nil || a.CompactForwardAccelerator == nil {
 		return fmt.Errorf("cuda compact train accelerator is not initialized")
 	}
+	snapshots, unlockOptimizer, err := lockCompactTrainResidentRefs(refs)
+	if err != nil {
+		return err
+	}
+	defer unlockOptimizer()
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.device == nil || a.closed {
 		return fmt.Errorf("cuda compact train accelerator is closed")
 	}
-	if a.stepActive && (!a.stepPoisoned || (a.arena != nil && a.arena.live)) {
+	if a.stepActive && (!a.stepPoisoned || a.stats.LiveHandles > 0) {
 		return fmt.Errorf("cuda compact train step %d is already active", a.stepID)
 	}
-	if len(refs) == 0 {
+	if len(snapshots) == 0 {
 		return fmt.Errorf("cuda compact train resident refs are required")
 	}
-	byName := make(map[string]backend.CompactForwardResidentRef, len(refs))
-	for _, ref := range refs {
-		if ref.Name == "" {
-			return fmt.Errorf("cuda compact train resident ref has empty name")
-		}
-		if _, exists := byName[ref.Name]; exists {
-			return fmt.Errorf("cuda compact train resident ref %q is duplicated", ref.Name)
-		}
-		if err := a.validateStepResidentRefLocked(ref); err != nil {
-			return err
-		}
-		byName[ref.Name] = ref
-	}
-	if err := a.validateBeginResidentRefSetLocked(byName); err != nil {
+	if err := a.validateBeginResidentRefSetLocked(snapshots); err != nil {
 		return err
 	}
 	nextGradGen := a.gradGen + 1
-	pending := make(map[string]*compactTrainGradient, len(refs))
+	pending := make(map[string]*compactTrainGradient, len(snapshots))
 	freePending := func() {
 		for _, grad := range pending {
 			if grad != nil && grad.ptr != 0 {
@@ -832,7 +867,8 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 		}
 	}
 	var bytes int64
-	for _, ref := range refs {
+	for _, snapshot := range snapshots {
+		ref := snapshot.ref
 		ptr, err := a.device.allocFloat32(ref.Elements)
 		if err != nil {
 			freePending()
@@ -843,11 +879,22 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 			freePending()
 			return err
 		}
-		token := &compactTrainGradientToken{owner: a, name: ref.Name, generation: nextGradGen, stepID: stepID, elements: ref.Elements}
-		pending[ref.Name] = &compactTrainGradient{ptr: ptr, elements: ref.Elements, generation: nextGradGen, stepID: stepID, token: token}
+		gradToken := &compactTrainGradientToken{owner: a, name: ref.Name, generation: nextGradGen, stepID: stepID, elements: ref.Elements}
+		pending[ref.Name] = &compactTrainGradient{
+			ptr:                 ptr,
+			elements:            ref.Elements,
+			generation:          nextGradGen,
+			stepID:              stepID,
+			token:               gradToken,
+			optimizerOwner:      snapshot.owner,
+			optimizerToken:      snapshot.token,
+			optimizerGeneration: snapshot.generation,
+			optimizerParam:      snapshot.param,
+		}
 		bytes += int64(ref.Elements * 4)
 	}
 	a.releaseGradientsLocked()
+	a.releaseArenasLocked()
 	a.gradGen = nextGradGen
 	a.stepID = stepID
 	a.stepActive = true
@@ -874,14 +921,37 @@ func (a *CompactTrainAccelerator) EndCompactTrainStep(stepID uint64) error {
 	if a.stepID != stepID {
 		return fmt.Errorf("cuda compact train step %d is stale, current %d", stepID, a.stepID)
 	}
-	if a.arena != nil && a.arena.live {
-		return fmt.Errorf("cuda compact train end step with live handle")
+	if a.stats.LiveHandles > 0 {
+		return fmt.Errorf("cuda compact train end step with %d live handles", a.stats.LiveHandles)
 	}
 	if a.stepPoisoned {
 		return fmt.Errorf("cuda compact train step %d is poisoned", a.stepID)
 	}
 	a.stepActive = false
 	a.stepSealed = true
+	return nil
+}
+
+func (a *CompactTrainAccelerator) AbortCompactTrainStep(stepID uint64) error {
+	if a == nil || a.CompactForwardAccelerator == nil {
+		return fmt.Errorf("cuda compact train accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.device == nil || a.closed {
+		return fmt.Errorf("cuda compact train accelerator is closed")
+	}
+	if !a.stepActive && !a.stepSealed {
+		return fmt.Errorf("cuda compact train step is not active")
+	}
+	if a.stepID != stepID {
+		return fmt.Errorf("cuda compact train abort step %d is stale, current %d", stepID, a.stepID)
+	}
+	a.releaseArenasLocked()
+	a.releaseGradientsLocked()
+	a.stepActive = false
+	a.stepSealed = false
+	a.stepPoisoned = false
 	return nil
 }
 
@@ -892,10 +962,10 @@ func (a *CompactTrainAccelerator) RunCompactTrainBackward(req backend.CompactTra
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	start := time.Now()
-	if err := a.validateBackwardRequestLocked(req); err != nil {
+	arena, err := a.validateBackwardRequestLocked(req)
+	if err != nil {
 		return backend.CompactTrainBackwardResult{}, err
 	}
-	arena := a.arena
 	shape := arena.shape
 	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
 	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
@@ -980,10 +1050,10 @@ func (a *CompactTrainAccelerator) runCompactTrainFinalOutputBackwardForDebug(req
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	start := time.Now()
-	if err := a.validateBackwardRequestLocked(req); err != nil {
+	arena, err := a.validateBackwardRequestLocked(req)
+	if err != nil {
 		return compactTrainFinalOutputDebugResult{}, err
 	}
-	arena := a.arena
 	shape := arena.shape
 	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
 	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
@@ -1044,10 +1114,10 @@ func (a *CompactTrainAccelerator) runCompactTrainFFNBackwardForDebug(req backend
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	start := time.Now()
-	if err := a.validateBackwardRequestLocked(req); err != nil {
+	arena, err := a.validateBackwardRequestLocked(req)
+	if err != nil {
 		return compactTrainFFNBackwardDebugResult{}, err
 	}
-	arena := a.arena
 	shape := arena.shape
 	if shape.Layers <= 0 {
 		return compactTrainFFNBackwardDebugResult{}, fmt.Errorf("cuda compact train ffn debug backward requires at least one layer")
@@ -1096,10 +1166,10 @@ func (a *CompactTrainAccelerator) runCompactTrainLayerBackwardForDebug(req backe
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	start := time.Now()
-	if err := a.validateBackwardRequestLocked(req); err != nil {
+	arena, err := a.validateBackwardRequestLocked(req)
+	if err != nil {
 		return compactTrainLayerBackwardDebugResult{}, err
 	}
-	arena := a.arena
 	shape := arena.shape
 	if shape.Layers <= 0 {
 		return compactTrainLayerBackwardDebugResult{}, fmt.Errorf("cuda compact train layer debug backward requires at least one layer")
@@ -1313,66 +1383,89 @@ func (a *CompactTrainAccelerator) runInputScatterBackwardLocked(gradInput C.CUde
 	return a.launchInputScatter(gradInput, arena.tokens, arena.roles, tokenGrad.ptr, rolePtr, shape.Batch, shape.Tokens, shape.ModelDim, a.bindings.token.rows, roleRows)
 }
 
-func (a *CompactTrainAccelerator) copyResidentGradientForDebug(ref backend.ResidentGradientRef) (*backend.Tensor, error) {
-	if a == nil || a.CompactForwardAccelerator == nil {
-		return nil, fmt.Errorf("cuda compact train accelerator is not initialized")
+func lockCompactTrainResidentRefs(refs []backend.CompactForwardResidentRef) (map[string]compactTrainResidentRefSnapshot, func(), error) {
+	if len(refs) == 0 {
+		return nil, func() {}, nil
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	grad, err := a.validateResidentGradientRefLocked(ref)
-	if err != nil {
-		return nil, err
+	tokens := make(map[string]*optimizerResidentParameterToken, len(refs))
+	var owner *optimizerAccelerator
+	for _, ref := range refs {
+		if ref.Name == "" {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref has empty name")
+		}
+		if _, exists := tokens[ref.Name]; exists {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q is duplicated", ref.Name)
+		}
+		if ref.Backend != eosartifact.BackendCUDA {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q backend %q, want cuda", ref.Name, ref.Backend)
+		}
+		if ref.Token == nil {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q token is nil", ref.Name)
+		}
+		if ref.Token.Backend() != eosartifact.BackendCUDA {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q token backend %q, want cuda", ref.Name, ref.Token.Backend())
+		}
+		token, ok := ref.Token.(*optimizerResidentParameterToken)
+		if !ok || token == nil {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q has invalid cuda token", ref.Name)
+		}
+		if token.owner == nil {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q owner is nil", ref.Name)
+		}
+		if token.name != ref.Name {
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q token name %q mismatch", ref.Name, token.name)
+		}
+		if owner == nil {
+			owner = token.owner
+		} else if owner != token.owner {
+			return nil, nil, fmt.Errorf("cuda compact train resident refs span multiple optimizer owners")
+		}
+		tokens[ref.Name] = token
 	}
-	host := make([]float32, grad.elements)
-	if err := a.device.downloadFloat32(host, grad.ptr); err != nil {
-		return nil, err
+	owner.mu.RLock()
+	unlock := func() { owner.mu.RUnlock() }
+	if owner.device == nil {
+		unlock()
+		return nil, nil, fmt.Errorf("cuda compact train resident optimizer is closed")
 	}
-	a.stats.DownloadedBytes += int64(len(host) * 4)
-	return backend.NewTensorF32([]int{grad.elements}, host), nil
+	out := make(map[string]compactTrainResidentRefSnapshot, len(refs))
+	for _, ref := range refs {
+		token := tokens[ref.Name]
+		state, ok := owner.resident[ref.Name]
+		if !ok {
+			unlock()
+			return nil, nil, fmt.Errorf("cuda compact train resident token %q is no longer resident", ref.Name)
+		}
+		if state.token != token {
+			unlock()
+			return nil, nil, fmt.Errorf("cuda compact train resident token %q is stale", ref.Name)
+		}
+		if state.generation != token.generation || state.generation != ref.Token.Generation() {
+			unlock()
+			return nil, nil, fmt.Errorf("cuda compact train resident token %q generation %d is stale, current %d", ref.Name, token.generation, state.generation)
+		}
+		if ref.Elements != state.elements {
+			unlock()
+			return nil, nil, fmt.Errorf("cuda compact train resident ref %q elements %d, want %d", ref.Name, ref.Elements, state.elements)
+		}
+		out[ref.Name] = compactTrainResidentRefSnapshot{
+			ref:        ref,
+			token:      token,
+			owner:      owner,
+			generation: state.generation,
+			param:      state.param,
+			elements:   state.elements,
+		}
+	}
+	return out, unlock, nil
 }
 
-func (a *CompactTrainAccelerator) validateStepResidentRefLocked(ref backend.CompactForwardResidentRef) error {
-	if ref.Backend != eosartifact.BackendCUDA {
-		return fmt.Errorf("cuda compact train resident ref %q backend %q, want cuda", ref.Name, ref.Backend)
-	}
-	if ref.Token == nil {
-		return fmt.Errorf("cuda compact train resident ref %q token is nil", ref.Name)
-	}
-	if ref.Token.Backend() != eosartifact.BackendCUDA {
-		return fmt.Errorf("cuda compact train resident ref %q token backend %q, want cuda", ref.Name, ref.Token.Backend())
-	}
-	token, ok := ref.Token.(*optimizerResidentParameterToken)
-	if !ok || token == nil {
-		return fmt.Errorf("cuda compact train resident ref %q has invalid cuda token", ref.Name)
-	}
-	binding, ok := a.bindingForName(ref.Name)
-	if !ok {
-		return fmt.Errorf("cuda compact train resident binding %q is missing", ref.Name)
-	}
-	state, unlock, err := token.lockCurrent()
-	if err != nil {
-		return err
-	}
-	defer unlock()
-	if ref.Elements != state.elements {
-		return fmt.Errorf("cuda compact train resident ref %q elements %d, want %d", ref.Name, ref.Elements, state.elements)
-	}
-	if binding.ptr != state.param || binding.elements != state.elements {
-		return fmt.Errorf("cuda compact train resident ref %q no longer matches bound device state", ref.Name)
-	}
-	bridged := a.bridged[ref.Name]
-	if bridged == nil || bridged.generation != token.generation {
-		return fmt.Errorf("cuda compact train resident ref %q generation %d does not match bound generation", ref.Name, token.generation)
-	}
-	return nil
-}
-
-func (a *CompactTrainAccelerator) validateBeginResidentRefSetLocked(byName map[string]backend.CompactForwardResidentRef) error {
+func (a *CompactTrainAccelerator) validateBeginResidentRefSetLocked(byName map[string]compactTrainResidentRefSnapshot) error {
 	required := a.requiredBeginResidentNamesLocked()
 	requiredSet := make(map[string]bool, len(required))
 	for _, name := range required {
 		requiredSet[name] = true
-		ref, ok := byName[name]
+		snapshot, ok := byName[name]
 		if !ok {
 			return fmt.Errorf("cuda compact train resident ref %q is missing", name)
 		}
@@ -1380,8 +1473,15 @@ func (a *CompactTrainAccelerator) validateBeginResidentRefSetLocked(byName map[s
 		if !ok {
 			return fmt.Errorf("cuda compact train resident binding %q is missing", name)
 		}
-		if ref.Elements != binding.elements {
-			return fmt.Errorf("cuda compact train resident ref %q elements %d, want %d", name, ref.Elements, binding.elements)
+		if snapshot.ref.Elements != binding.elements || snapshot.elements != binding.elements {
+			return fmt.Errorf("cuda compact train resident ref %q elements %d, want %d", name, snapshot.ref.Elements, binding.elements)
+		}
+		if binding.ptr != snapshot.param {
+			return fmt.Errorf("cuda compact train resident ref %q no longer matches bound device state", name)
+		}
+		bridged := a.bridged[name]
+		if bridged == nil || bridged != snapshot.token || bridged.generation != snapshot.generation {
+			return fmt.Errorf("cuda compact train resident ref %q generation %d does not match bound generation", name, snapshot.generation)
 		}
 	}
 	for name := range byName {
@@ -1410,30 +1510,28 @@ func (a *CompactTrainAccelerator) requiredBeginResidentNamesLocked() []string {
 	return a.requiredResidentNames(backend.CompactForwardShape{HasOutputProjection: a.outName != ""})
 }
 
-func (a *CompactTrainAccelerator) validateBackwardRequestLocked(req backend.CompactTrainBackwardRequest) error {
+func (a *CompactTrainAccelerator) validateBackwardRequestLocked(req backend.CompactTrainBackwardRequest) (*compactTrainArena, error) {
 	if a.device == nil || a.closed {
-		return fmt.Errorf("cuda compact train accelerator is closed")
+		return nil, fmt.Errorf("cuda compact train accelerator is closed")
 	}
 	if !a.stepActive {
-		return fmt.Errorf("cuda compact train step is not active")
+		return nil, fmt.Errorf("cuda compact train step is not active")
 	}
 	if a.stepPoisoned {
-		return fmt.Errorf("cuda compact train step %d is poisoned", a.stepID)
+		return nil, fmt.Errorf("cuda compact train step %d is poisoned", a.stepID)
 	}
-	if a.arena == nil || !a.arena.live {
-		return fmt.Errorf("cuda compact train backward requires a live handle")
+	arena, err := a.validateHandleLocked(req.Handle)
+	if err != nil {
+		return nil, err
 	}
-	if err := a.validateHandleLocked(req.Handle); err != nil {
-		return err
-	}
-	shape := a.arena.shape
+	shape := arena.shape
 	if req.GradPooled == nil || req.GradPooled.DType != "f32" || len(req.GradPooled.Shape) != 2 || req.GradPooled.Shape[0] != shape.Batch || req.GradPooled.Shape[1] != shape.OutputDim || len(req.GradPooled.F32) != shape.Batch*shape.OutputDim {
-		return fmt.Errorf("cuda compact train pooled gradient shape %v, want [%d %d]", tensorShapeForError(req.GradPooled), shape.Batch, shape.OutputDim)
+		return nil, fmt.Errorf("cuda compact train pooled gradient shape %v, want [%d %d]", tensorShapeForError(req.GradPooled), shape.Batch, shape.OutputDim)
 	}
 	if err := a.validateCurrentStepGradSetLocked(shape); err != nil {
-		return err
+		return nil, err
 	}
-	return nil
+	return arena, nil
 }
 
 func (a *CompactTrainAccelerator) validateResidentGradientRefLocked(ref backend.ResidentGradientRef) (*compactTrainGradient, error) {
@@ -1515,41 +1613,46 @@ func (a *CompactTrainAccelerator) validateCurrentStepGradSetLocked(shape backend
 	return nil
 }
 
-func (a *CompactTrainAccelerator) validateHandleLocked(handle backend.CompactTrainHandle) error {
+func (a *CompactTrainAccelerator) validateHandleLocked(handle backend.CompactTrainHandle) (*compactTrainArena, error) {
 	if !a.stepActive {
-		return fmt.Errorf("cuda compact train step is not active")
+		return nil, fmt.Errorf("cuda compact train step is not active")
 	}
 	token, ok := handle.Token.(*compactTrainHandleToken)
 	if !ok || token == nil {
-		return fmt.Errorf("cuda compact train handle has invalid token")
+		return nil, fmt.Errorf("cuda compact train handle has invalid token")
+	}
+	if token.owner != a {
+		return nil, fmt.Errorf("cuda compact train handle owner mismatch")
 	}
 	if handle.Backend != eosartifact.BackendCUDA || token.Backend() != eosartifact.BackendCUDA {
-		return fmt.Errorf("cuda compact train handle backend mismatch")
+		return nil, fmt.Errorf("cuda compact train handle backend mismatch")
 	}
 	if handle.StepID != a.stepID || token.StepID() != a.stepID || token.StepID() != handle.StepID {
-		return fmt.Errorf("cuda compact train handle step %d is stale, current %d", handle.StepID, a.stepID)
+		return nil, fmt.Errorf("cuda compact train handle step %d is stale, current %d", handle.StepID, a.stepID)
 	}
-	if a.arena == nil || a.arena.token != token || a.arena.generation != handle.Generation || token.Generation() != handle.Generation {
-		return fmt.Errorf("cuda compact train handle is stale")
+	arena := a.arenas[token]
+	if arena == nil || arena.token != token || arena.id != token.id || arena.generation != handle.Generation || token.Generation() != handle.Generation {
+		return nil, fmt.Errorf("cuda compact train handle is stale")
 	}
-	if handle.Shape != a.arena.shape {
-		return fmt.Errorf("cuda compact train handle shape mismatch")
+	if handle.Shape != arena.shape {
+		return nil, fmt.Errorf("cuda compact train handle shape mismatch")
 	}
-	if !token.Alive() {
-		return fmt.Errorf("cuda compact train handle already released")
+	if !arena.live || !token.Alive() {
+		return nil, fmt.Errorf("cuda compact train handle already released")
 	}
-	return nil
+	return arena, nil
 }
 
 func (a *CompactTrainAccelerator) consumeHandleLocked(handle backend.CompactTrainHandle) error {
-	if err := a.validateHandleLocked(handle); err != nil {
+	arena, err := a.validateHandleLocked(handle)
+	if err != nil {
 		return err
 	}
 	token := handle.Token.(*compactTrainHandleToken)
 	if !token.alive.CompareAndSwap(true, false) {
 		return fmt.Errorf("cuda compact train handle already released")
 	}
-	a.arena.live = false
+	arena.live = false
 	a.stats.HandlesReleased++
 	a.stats.LiveHandles--
 	return nil
@@ -1612,7 +1715,7 @@ func (a *CompactTrainAccelerator) ensureBackwardWorkspaceLocked(arena *compactTr
 	if err := alloc(&arena.gradRoPE, rows*shape.ModelDim); err != nil {
 		return err
 	}
-	a.stats.WorkspaceArenaBytes = arena.workspaceBytes
+	a.refreshArenaStatsLocked()
 	return nil
 }
 
@@ -1637,9 +1740,6 @@ func (a *CompactTrainAccelerator) residentGradientRefsLocked() []backend.Residen
 }
 
 func (a *CompactTrainAccelerator) requiredResidentNamesForCurrentStepLocked() []string {
-	if a.arena != nil {
-		return a.requiredResidentNames(a.arena.shape)
-	}
 	names := make([]string, 0, len(a.grads))
 	for name := range a.grads {
 		names = append(names, name)
@@ -1830,9 +1930,6 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	if err := a.validateCurrentStepGradSetLocked(req.Shape); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	if a.arena != nil && a.arena.live {
-		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train arena already has a live handle")
-	}
 	unlocks, err := a.lockBridgeTokens()
 	if err != nil {
 		return backend.CompactTrainForwardResult{}, err
@@ -1842,7 +1939,15 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	if err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	arena.generation++
+	keepArena := false
+	defer func() {
+		if !keepArena {
+			a.freeArena(arena)
+		}
+	}()
+	a.nextHandleID++
+	arena.id = a.nextHandleID
+	arena.generation = a.nextHandleID
 	shape := req.Shape
 	geluFast, _ := compactForwardGELUFast(req.GELUMode)
 	arena.geluFast = geluFast
@@ -1940,11 +2045,12 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	if err := a.device.downloadInt32(activeCounts, arena.active); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	token := &compactTrainHandleToken{backend: eosartifact.BackendCUDA, generation: arena.generation, stepID: a.stepID, id: a.nextHandleID + 1}
+	token := &compactTrainHandleToken{owner: a, backend: eosartifact.BackendCUDA, generation: arena.generation, stepID: a.stepID, id: arena.id}
 	token.alive.Store(true)
-	a.nextHandleID = token.id
 	arena.token = token
 	arena.live = true
+	a.arenas[token] = arena
+	keepArena = true
 	pooledBytes := int64(len(pooled) * 4)
 	statusBytes := int64(4)
 	activeBytes := int64(len(activeCounts) * 4)
@@ -1963,8 +2069,7 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	a.stats.LastShape = shape
 	a.stats.LastForwardLaunches = forwardLaunches
 	a.stats.LastForwardSyncs = forwardSyncs
-	a.stats.ActivationArenaBytes = arena.bytes
-	a.stats.WorkspaceArenaBytes = 0
+	a.refreshArenaStatsLocked()
 	return backend.CompactTrainForwardResult{
 		Handle: backend.CompactTrainHandle{
 			Backend:    eosartifact.BackendCUDA,
@@ -1991,10 +2096,6 @@ func (a *CompactTrainAccelerator) ReleaseCompactTrainHandle(handle backend.Compa
 }
 
 func (a *CompactTrainAccelerator) prepareArenaLocked(shape backend.CompactForwardShape) (*compactTrainArena, error) {
-	if a.arena != nil && a.arena.shape == shape {
-		return a.arena, nil
-	}
-	a.releaseArenaLocked()
 	arena := &compactTrainArena{shape: shape}
 	B, T, D, H := shape.Batch, shape.Tokens, shape.ModelDim, shape.FFNDim
 	rows := B * T
@@ -2075,8 +2176,6 @@ func (a *CompactTrainAccelerator) prepareArenaLocked(shape backend.CompactForwar
 			return nil, err
 		}
 	}
-	a.arena = arena
-	a.stats.ActivationArenaBytes = arena.bytes
 	return arena, nil
 }
 
@@ -2093,14 +2192,32 @@ func (a *CompactTrainAccelerator) replaceUploadedInt32(dst *C.CUdeviceptr, data 
 	return nil
 }
 
-func (a *CompactTrainAccelerator) releaseArenaLocked() {
-	if a.arena != nil {
-		a.freeArena(a.arena)
-		a.arena = nil
+func (a *CompactTrainAccelerator) releaseArenasLocked() {
+	for token, arena := range a.arenas {
+		if arena != nil && arena.live {
+			if token != nil && token.alive.CompareAndSwap(true, false) {
+				a.stats.HandlesReleased++
+			}
+			arena.live = false
+		}
+		a.freeArena(arena)
+		delete(a.arenas, token)
 	}
 	a.stats.ActivationArenaBytes = 0
 	a.stats.WorkspaceArenaBytes = 0
 	a.stats.LiveHandles = 0
+}
+
+func (a *CompactTrainAccelerator) refreshArenaStatsLocked() {
+	var activationBytes, workspaceBytes int64
+	for _, arena := range a.arenas {
+		if arena != nil {
+			activationBytes += arena.bytes
+			workspaceBytes += arena.workspaceBytes
+		}
+	}
+	a.stats.ActivationArenaBytes = activationBytes
+	a.stats.WorkspaceArenaBytes = workspaceBytes
 }
 
 func (a *CompactTrainAccelerator) releaseGradientsLocked() {

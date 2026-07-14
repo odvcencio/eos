@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"os"
 	"runtime/debug"
+	"sort"
 	"time"
 
 	"m31labs.dev/eos/runtime/backend"
@@ -33,6 +34,31 @@ type vectorDistillBatchScratch struct {
 	projVec     []float32
 	gradProj    []float32
 	gradStudent []float32
+}
+
+type vectorDistillResidentBucket struct {
+	seqLen      int
+	uniqueSlots []int
+	req         backend.CompactTrainForwardRequest
+	handle      backend.CompactTrainHandle
+	pooled      *backend.Tensor
+}
+
+type vectorDistillResidentForward struct {
+	uniqueForInput []int
+	uniqueEncoded  []*embeddingEncodedSequence
+	buckets        []vectorDistillResidentBucket
+	refs           []backend.CompactForwardResidentRef
+	stepID         uint64
+}
+
+type pendingCompactResidentOptimizerUpdate struct {
+	item       *CompactEmbeddingTrainTensor
+	mom1, mom2 *backend.Tensor
+	assignMom1 bool
+	assignMom2 bool
+	ref        backend.ResidentGradientRef
+	cfg        backend.OptimizerUpdateConfig
 }
 
 // newVectorDistillProjectionState allocates and Kaiming-initialises a fresh
@@ -65,6 +91,9 @@ func (t *EmbeddingTrainer) FitVectorDistill(
 ) (EmbeddingTrainRunSummary, error) {
 	if t == nil {
 		return EmbeddingTrainRunSummary{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainRunSummary{}, err
 	}
 	cfg = normalizedTrainRunConfig(cfg)
 	if cfg.EvalOnly {
@@ -425,6 +454,9 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 	if !t.isCompactTrainer() {
 		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("vector distillation requires compact_transformer_v1")
 	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, proj, err
+	}
 	if len(batch) == 0 {
 		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("vector distillation batch is empty")
 	}
@@ -462,6 +494,9 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 	forward := t.prepareForwardWeights()
 	if forward == nil || forward.compact == nil {
 		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("missing compact forward weights")
+	}
+	if compactResidentTrainEnabled() && t.compactTrainAccel != nil {
+		return t.trainVectorDistillBatchResidentWithScratch(batch, inputs, proj, teacherDim, forward, relationalWeight, scratch)
 	}
 	encodeStart := time.Now()
 	encoded, err := t.encodeSequenceInputs(inputs, forward, true)
@@ -536,6 +571,431 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 		Loss:      totalLoss*batchScale + relationalLoss,
 		BatchSize: len(batch),
 	}, proj, nil
+}
+
+func (t *EmbeddingTrainer) trainVectorDistillBatchResidentWithScratch(
+	batch []EmbeddingTokenizedVectorDistillExample,
+	inputs []embeddingSequenceInput,
+	proj *vectorDistillProjectionState,
+	teacherDim int,
+	forward *embeddingForwardWeights,
+	relationalWeight float32,
+	scratch *vectorDistillBatchScratch,
+) (EmbeddingTrainMetrics, *vectorDistillProjectionState, error) {
+	if t == nil || !t.isCompactTrainer() || t.compactTrainAccel == nil {
+		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("compact resident vector-distill train is not available")
+	}
+	t.compactForwardSelected = false
+	residentOpt, ok := t.optimizerAccel.(backend.ResidentGradientOptimizerAccelerator)
+	if !ok {
+		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("compact resident vector-distill train requires resident-gradient optimizer")
+	}
+	residentForward, err := t.runVectorDistillResidentForward(inputs, forward)
+	if err != nil {
+		return EmbeddingTrainMetrics{}, proj, err
+	}
+	stepCompleted := false
+	aborted := false
+	defer func() {
+		if !stepCompleted && !aborted {
+			_ = t.compactTrainAccel.AbortCompactTrainStep(residentForward.stepID)
+		}
+	}()
+	encoded := residentForward.uniqueEncoded
+	if proj == nil {
+		if len(encoded) == 0 || len(encoded[0].pooled) == 0 {
+			return EmbeddingTrainMetrics{}, nil, fmt.Errorf("vector distillation: resident encoded sequence has empty pooled output")
+		}
+		proj = newVectorDistillProjectionState(len(encoded[0].pooled), teacherDim, rand.New(rand.NewSource(42)))
+	}
+	var relationalLoss float32
+	var relationalGrads [][]float32
+	if relationalWeight > 0 {
+		students := make([][]float32, len(batch))
+		teachers := make([][]float32, len(batch))
+		for i, unique := range residentForward.uniqueForInput {
+			students[i] = encoded[unique].pooled
+			teachers[i] = batch[i].TeacherVector
+		}
+		relationalLoss, relationalGrads, err = t.vectorDistillRelationalLossAndGrad(students, teachers, relationalWeight)
+		if err != nil {
+			return EmbeddingTrainMetrics{}, proj, fmt.Errorf("relational loss: %w", err)
+		}
+	}
+	uniqueGradPooled, gradW, totalLoss, err := t.computeVectorDistillResidentPooledGradientsWithScratch(batch, residentForward, proj, relationalGrads, scratch)
+	if err != nil {
+		return EmbeddingTrainMetrics{}, proj, err
+	}
+	var residentGradRefs []backend.ResidentGradientRef
+	backwardStart := time.Now()
+	for bi := range residentForward.buckets {
+		bucket := &residentForward.buckets[bi]
+		gradData := make([]float32, 0, len(bucket.uniqueSlots)*bucket.req.Shape.OutputDim)
+		for _, unique := range bucket.uniqueSlots {
+			grad := uniqueGradPooled[unique]
+			if len(grad) != bucket.req.Shape.OutputDim {
+				return EmbeddingTrainMetrics{}, proj, fmt.Errorf("compact resident train pooled grad for unique %d has dim %d, want %d", unique, len(grad), bucket.req.Shape.OutputDim)
+			}
+			gradData = append(gradData, grad...)
+		}
+		result, err := t.compactTrainAccel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{
+			Handle:     bucket.handle,
+			GradPooled: backend.NewTensorF32([]int{len(bucket.uniqueSlots), bucket.req.Shape.OutputDim}, gradData),
+		})
+		if err != nil {
+			return EmbeddingTrainMetrics{}, proj, fmt.Errorf("compact resident train backward T=%d B=%d: %w", bucket.seqLen, len(bucket.uniqueSlots), err)
+		}
+		bucket.handle = backend.CompactTrainHandle{}
+		residentGradRefs = result.ResidentGradRefs
+	}
+	t.vectorDistillPhases.BackwardNanos += time.Since(backwardStart).Nanoseconds()
+	if err := t.compactTrainAccel.EndCompactTrainStep(residentForward.stepID); err != nil {
+		_ = t.compactTrainAccel.AbortCompactTrainStep(residentForward.stepID)
+		aborted = true
+		return EmbeddingTrainMetrics{}, proj, fmt.Errorf("compact resident train end step: %w", err)
+	}
+	batchScale := float32(1) / float32(len(batch))
+	optimizerStart := time.Now()
+	pendingUpdates, err := t.preflightCompactOptimizerUpdatesWithResidentGrads(residentOpt, residentGradRefs, batchScale, int(residentForward.stepID))
+	if err != nil {
+		t.compactForwardSelected = false
+		return EmbeddingTrainMetrics{}, proj, err
+	}
+	prospectiveProjStep := proj.Step + 1
+	if err := t.preflightVectorDistillProjectionAdamWForStep(proj, gradW, prospectiveProjStep); err != nil {
+		t.compactForwardSelected = false
+		return EmbeddingTrainMetrics{}, proj, err
+	}
+	if err := t.applyPreflightedCompactOptimizerUpdatesWithResidentGrads(residentOpt, pendingUpdates); err != nil {
+		return EmbeddingTrainMetrics{}, proj, t.poisonAfterOptimizerLaunch(err)
+	}
+	if err := t.applyVectorDistillProjectionAdamWForStepStrict(proj, gradW, prospectiveProjStep); err != nil {
+		return EmbeddingTrainMetrics{}, proj, t.poisonAfterOptimizerLaunch(err)
+	}
+	t.step = int(residentForward.stepID)
+	t.compactState.Step = t.step
+	t.compactOptimizerUpdates++
+	t.compactForwardSelected = true
+	proj.Step = prospectiveProjStep
+	t.vectorDistillPhases.OptimizerNanos += time.Since(optimizerStart).Nanoseconds()
+	stepCompleted = true
+	return EmbeddingTrainMetrics{
+		Loss:      totalLoss*batchScale + relationalLoss,
+		BatchSize: len(batch),
+	}, proj, nil
+}
+
+func (t *EmbeddingTrainer) runVectorDistillResidentForward(inputs []embeddingSequenceInput, forward *embeddingForwardWeights) (*vectorDistillResidentForward, error) {
+	if t == nil || forward == nil || forward.compact == nil {
+		return nil, fmt.Errorf("compact resident train forward requires compact weights")
+	}
+	t.compactForwardSelected = false
+	compactForward := forward.compact
+	if err := t.prepareCompactTrainAccelerator(compactForward); err != nil {
+		return nil, err
+	}
+	out := &vectorDistillResidentForward{
+		uniqueForInput: make([]int, len(inputs)),
+		stepID:         uint64(t.step + 1),
+	}
+	sequenceCache := map[string]int{}
+	groupOrder := make([]int, 0)
+	groups := map[int][]int{}
+	tokensByUnique := make([][]int32, 0, len(inputs))
+	masksByUnique := make([][]int32, 0, len(inputs))
+	rolesByUnique := make([]int32, 0, len(inputs))
+	for i, input := range inputs {
+		mask, err := t.prepareMask(input.tokens, input.mask)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", embeddingSequenceInputLabel(input, i), err)
+		}
+		normalizedMask := normalizeCompactForwardMask(mask)
+		key := embeddingBatchSequenceKey(input.tokens, normalizedMask, input.role)
+		unique, ok := sequenceCache[key]
+		if !ok {
+			unique = len(tokensByUnique)
+			sequenceCache[key] = unique
+			tokensByUnique = append(tokensByUnique, append([]int32(nil), input.tokens...))
+			masksByUnique = append(masksByUnique, normalizedMask)
+			rolesByUnique = append(rolesByUnique, input.role)
+			seqLen := len(input.tokens)
+			if _, exists := groups[seqLen]; !exists {
+				groupOrder = append(groupOrder, seqLen)
+			}
+			groups[seqLen] = append(groups[seqLen], unique)
+		}
+		out.uniqueForInput[i] = unique
+	}
+	sort.Ints(groupOrder)
+	refs, err := t.compactForwardResidentRefs(compactForward)
+	if err != nil {
+		return nil, err
+	}
+	out.refs = refs
+	for _, seqLen := range groupOrder {
+		uniqueSlots := groups[seqLen]
+		req := backend.CompactTrainForwardRequest{
+			Shape:        t.compactForwardShape(compactForward, len(uniqueSlots), seqLen),
+			Tokens:       make([][]int32, len(uniqueSlots)),
+			Masks:        make([][]int32, len(uniqueSlots)),
+			Roles:        make([]int32, len(uniqueSlots)),
+			ResidentRefs: refs,
+			GELUMode:     compactForwardGELUMode(),
+			StepID:       out.stepID,
+		}
+		for i, unique := range uniqueSlots {
+			req.Tokens[i] = tokensByUnique[unique]
+			req.Masks[i] = masksByUnique[unique]
+			req.Roles[i] = rolesByUnique[unique]
+		}
+		if preflight, ok := t.compactTrainAccel.(backend.CompactTrainPreflight); ok {
+			if err := preflight.PreflightCompactTrainForward(req); err != nil {
+				return nil, fmt.Errorf("compact resident train forward preflight T=%d B=%d: %w", seqLen, len(uniqueSlots), err)
+			}
+		}
+		out.buckets = append(out.buckets, vectorDistillResidentBucket{seqLen: seqLen, uniqueSlots: uniqueSlots, req: req})
+	}
+	if len(out.buckets) == 0 {
+		return nil, fmt.Errorf("compact resident train has no exact-length buckets")
+	}
+	if err := t.compactTrainAccel.BeginCompactTrainStep(out.stepID, refs); err != nil {
+		return nil, fmt.Errorf("compact resident train begin step: %w", err)
+	}
+	began := true
+	defer func() {
+		if began {
+			_ = t.compactTrainAccel.AbortCompactTrainStep(out.stepID)
+		}
+	}()
+	out.uniqueEncoded = make([]*embeddingEncodedSequence, len(tokensByUnique))
+	encodeStart := time.Now()
+	for bi := range out.buckets {
+		bucket := &out.buckets[bi]
+		result, err := t.compactTrainAccel.RunCompactTrainForward(bucket.req)
+		if err != nil {
+			_ = t.releaseVectorDistillResidentHandles(out)
+			return nil, fmt.Errorf("compact resident train forward T=%d B=%d: %w", bucket.seqLen, len(bucket.uniqueSlots), err)
+		}
+		bucket.handle = result.Handle
+		bucket.pooled = result.Pooled
+		if result.Pooled == nil || len(result.Pooled.Shape) != 2 || result.Pooled.Shape[0] != len(bucket.uniqueSlots) || result.Pooled.Shape[1] != bucket.req.Shape.OutputDim {
+			_ = t.releaseVectorDistillResidentHandles(out)
+			return nil, fmt.Errorf("compact resident train forward T=%d B=%d pooled shape %v, want [%d %d]", bucket.seqLen, len(bucket.uniqueSlots), tensorShapeForError(result.Pooled), len(bucket.uniqueSlots), bucket.req.Shape.OutputDim)
+		}
+		for row, unique := range bucket.uniqueSlots {
+			start := row * bucket.req.Shape.OutputDim
+			end := start + bucket.req.Shape.OutputDim
+			out.uniqueEncoded[unique] = &embeddingEncodedSequence{
+				pooled: append([]float32(nil), result.Pooled.F32[start:end]...),
+				tokens: tokensByUnique[unique],
+				role:   rolesByUnique[unique],
+			}
+		}
+	}
+	t.vectorDistillPhases.EncodeNanos += time.Since(encodeStart).Nanoseconds()
+	began = false
+	return out, nil
+}
+
+func (t *EmbeddingTrainer) releaseVectorDistillResidentHandles(forward *vectorDistillResidentForward) error {
+	if t == nil || t.compactTrainAccel == nil || forward == nil {
+		return nil
+	}
+	var firstErr error
+	for i := range forward.buckets {
+		handle := forward.buckets[i].handle
+		if handle.Token == nil {
+			continue
+		}
+		if err := t.compactTrainAccel.ReleaseCompactTrainHandle(handle); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		forward.buckets[i].handle = backend.CompactTrainHandle{}
+	}
+	return firstErr
+}
+
+func (t *EmbeddingTrainer) computeVectorDistillResidentPooledGradientsWithScratch(
+	batch []EmbeddingTokenizedVectorDistillExample,
+	forward *vectorDistillResidentForward,
+	proj *vectorDistillProjectionState,
+	relationalGrads [][]float32,
+	scratch *vectorDistillBatchScratch,
+) ([][]float32, []float32, float32, error) {
+	if forward == nil || len(forward.uniqueEncoded) == 0 {
+		return nil, nil, 0, fmt.Errorf("compact resident train has no encoded rows")
+	}
+	uniqueGrads := make([][]float32, len(forward.uniqueEncoded))
+	for i, enc := range forward.uniqueEncoded {
+		if enc == nil || len(enc.pooled) == 0 {
+			return nil, nil, 0, fmt.Errorf("compact resident train unique row %d has empty pooled output", i)
+		}
+		uniqueGrads[i] = make([]float32, len(enc.pooled))
+	}
+	if relationalGrads != nil && len(relationalGrads) != len(batch) {
+		return nil, nil, 0, fmt.Errorf("compact resident train relational gradient count %d, want %d", len(relationalGrads), len(batch))
+	}
+	var gradW []float32
+	if scratch != nil {
+		gradW = ensureFloat32Scratch(scratch.gradW, proj.InputDim*proj.OutDim)
+		scratch.gradW = gradW
+	} else {
+		gradW = make([]float32, proj.InputDim*proj.OutDim)
+	}
+	totalLoss := float32(0)
+	for i, unique := range forward.uniqueForInput {
+		enc := forward.uniqueEncoded[unique]
+		student := enc.pooled
+		teacher := batch[i].TeacherVector
+		projectionLossStart := time.Now()
+		var projVec []float32
+		if scratch != nil {
+			projVec = ensureFloat32Scratch(scratch.projVec, proj.OutDim)
+			scratch.projVec = projVec
+		} else {
+			projVec = make([]float32, proj.OutDim)
+		}
+		if err := t.projectVectorDistillStudent(student, proj, projVec); err != nil {
+			return nil, nil, 0, fmt.Errorf("example %d projection: %w", i, err)
+		}
+		var lossResult VectorDistillLossResult
+		var lerr error
+		if scratch != nil {
+			lossResult, lerr = vectorDistillLossAndGradInto(projVec, teacher, scratch.gradProj)
+			scratch.gradProj = lossResult.GradProj
+		} else {
+			lossResult, lerr = VectorDistillLossAndGrad(projVec, teacher)
+		}
+		if lerr != nil {
+			return nil, nil, 0, fmt.Errorf("example %d: %w", i, lerr)
+		}
+		totalLoss += lossResult.Loss
+		t.vectorDistillPhases.ProjectionLossNanos += time.Since(projectionLossStart).Nanoseconds()
+		backwardStart := time.Now()
+		gradStudent := make([]float32, proj.InputDim)
+		if err := t.accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj, gradStudent, gradW); err != nil {
+			return nil, nil, 0, fmt.Errorf("example %d projection backward: %w", i, err)
+		}
+		if relationalGrads != nil {
+			if len(relationalGrads[i]) != len(gradStudent) {
+				return nil, nil, 0, fmt.Errorf("compact resident train relational gradient %d dim %d, want %d", i, len(relationalGrads[i]), len(gradStudent))
+			}
+			n := float32(len(batch))
+			for k, g := range relationalGrads[i] {
+				gradStudent[k] += g * n
+			}
+		}
+		for k, g := range gradStudent {
+			uniqueGrads[unique][k] += g
+		}
+		t.vectorDistillPhases.BackwardNanos += time.Since(backwardStart).Nanoseconds()
+	}
+	return uniqueGrads, gradW, totalLoss, nil
+}
+
+func (t *EmbeddingTrainer) applyCompactOptimizerUpdatesWithResidentGrads(residentOpt backend.ResidentGradientOptimizerAccelerator, refs []backend.ResidentGradientRef, scale float32, stepID int) error {
+	pending, err := t.preflightCompactOptimizerUpdatesWithResidentGrads(residentOpt, refs, scale, stepID)
+	if err != nil {
+		return err
+	}
+	return t.applyPreflightedCompactOptimizerUpdatesWithResidentGrads(residentOpt, pending)
+}
+
+func (t *EmbeddingTrainer) preflightCompactOptimizerUpdatesWithResidentGrads(residentOpt backend.ResidentGradientOptimizerAccelerator, refs []backend.ResidentGradientRef, scale float32, stepID int) ([]pendingCompactResidentOptimizerUpdate, error) {
+	if t == nil || t.compactState == nil {
+		return nil, nil
+	}
+	if residentOpt == nil {
+		return nil, fmt.Errorf("compact resident train requires resident-gradient optimizer")
+	}
+	refByName := make(map[string]backend.ResidentGradientRef, len(refs))
+	for _, ref := range refs {
+		if ref.Name == "" {
+			return nil, fmt.Errorf("compact resident train returned empty gradient ref name")
+		}
+		if _, exists := refByName[ref.Name]; exists {
+			return nil, fmt.Errorf("compact resident train returned duplicate gradient ref %q", ref.Name)
+		}
+		refByName[ref.Name] = ref
+	}
+	expected := map[string]bool{}
+	for _, item := range compactTrainStateOptimizerItems(t.compactState) {
+		if item == nil || item.Name == "" || item.Tensor == nil {
+			continue
+		}
+		expected[item.Name] = true
+		ref, ok := refByName[item.Name]
+		if !ok {
+			return nil, fmt.Errorf("compact resident train missing gradient ref %q", item.Name)
+		}
+		if ref.Elements != len(item.Tensor.F32) {
+			return nil, fmt.Errorf("compact resident train gradient ref %q elements %d, want %d", item.Name, ref.Elements, len(item.Tensor.F32))
+		}
+	}
+	for name := range refByName {
+		if !expected[name] {
+			return nil, fmt.Errorf("compact resident train unexpected gradient ref %q", name)
+		}
+	}
+	preflight, ok := residentOpt.(backend.ResidentGradientOptimizerPreflightAccelerator)
+	if !ok {
+		return nil, fmt.Errorf("compact resident train requires resident-gradient optimizer preflight")
+	}
+	items := compactTrainStateOptimizerItems(t.compactState)
+	pending := make([]pendingCompactResidentOptimizerUpdate, 0, len(items))
+	for _, item := range items {
+		if item == nil || item.Name == "" || item.Tensor == nil {
+			continue
+		}
+		mom1, mom2 := item.Moment1, item.Moment2
+		assignMom1, assignMom2 := false, false
+		if mom1 == nil {
+			mom1 = zeroLikeMaster(item.Tensor)
+			assignMom1 = true
+		}
+		if mom2 == nil {
+			mom2 = zeroLikeMaster(item.Tensor)
+			assignMom2 = true
+		}
+		cfg := t.optimizerUpdateConfig(scale)
+		cfg.Step = stepID
+		cfg.DeferSync = t.deferOptimizerSync && t.canBridgeResidentOptimizerParam(item.Name, item.Tensor)
+		pending = append(pending, pendingCompactResidentOptimizerUpdate{
+			item: item, mom1: mom1, mom2: mom2,
+			assignMom1: assignMom1, assignMom2: assignMom2,
+			ref: refByName[item.Name], cfg: cfg,
+		})
+	}
+	// Validate the complete exact ordered set before assigning moments or
+	// launching the first compact student update.
+	for _, update := range pending {
+		if err := preflight.PreflightApplyUpdateWithResidentGrad(update.item.Name, update.cfg, update.item.Tensor, update.mom1, update.mom2, update.ref); err != nil {
+			return nil, fmt.Errorf("compact resident optimizer preflight %q: %w", update.item.Name, err)
+		}
+	}
+	return pending, nil
+}
+
+func (t *EmbeddingTrainer) applyPreflightedCompactOptimizerUpdatesWithResidentGrads(residentOpt backend.ResidentGradientOptimizerAccelerator, pending []pendingCompactResidentOptimizerUpdate) error {
+	if t == nil || residentOpt == nil {
+		return nil
+	}
+	for _, update := range pending {
+		if update.assignMom1 {
+			update.item.Moment1 = update.mom1
+		}
+		if update.assignMom2 {
+			update.item.Moment2 = update.mom2
+		}
+	}
+	for _, update := range pending {
+		if err := residentOpt.ApplyUpdateWithResidentGrad(update.item.Name, update.cfg, update.item.Tensor, update.mom1, update.mom2, update.ref); err != nil {
+			return fmt.Errorf("compact resident optimizer update %q: %w", update.item.Name, err)
+		}
+	}
+	t.momentsDirty = true
+	t.invalidateForwardWeights()
+	return nil
 }
 
 // computeVectorDistillBatchGradients runs the per-example projection forward
@@ -753,7 +1213,64 @@ func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
 }
 
 func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistillProjectionState, gradW []float32) error {
-	if proj == nil || len(proj.W) == 0 || proj.Step <= 0 {
+	if proj == nil {
+		return nil
+	}
+	return t.applyVectorDistillProjectionAdamWForStep(proj, gradW, proj.Step)
+}
+
+func (t *EmbeddingTrainer) preflightVectorDistillProjectionAdamWForStep(proj *vectorDistillProjectionState, gradW []float32, step int) error {
+	if proj == nil || len(proj.W) == 0 || step <= 0 {
+		return nil
+	}
+	if len(gradW) != len(proj.W) {
+		return fmt.Errorf("vector-distill projection optimizer preflight: grad size %d does not match weight size %d", len(gradW), len(proj.W))
+	}
+	if proj.InputDim <= 0 || proj.OutDim <= 0 || proj.InputDim*proj.OutDim != len(proj.W) {
+		return fmt.Errorf("vector-distill projection optimizer preflight: shape [%d %d] does not match weight size %d", proj.InputDim, proj.OutDim, len(proj.W))
+	}
+	if len(proj.Mom1) != len(proj.W) || len(proj.Mom2) != len(proj.W) {
+		return fmt.Errorf("vector-distill projection optimizer preflight: moment sizes %d/%d do not match weight size %d", len(proj.Mom1), len(proj.Mom2), len(proj.W))
+	}
+	if t == nil || t.optimizerAccel == nil {
+		return nil
+	}
+	preflight, ok := t.optimizerAccel.(backend.OptimizerPreflightAccelerator)
+	if !ok {
+		return fmt.Errorf("vector-distill projection optimizer preflight requires optimizer preflight support")
+	}
+	shape := []int{proj.InputDim, proj.OutDim}
+	weights := backend.NewTensorF32(shape, proj.W)
+	mom1 := backend.NewTensorF32(shape, proj.Mom1)
+	mom2 := backend.NewTensorF32(shape, proj.Mom2)
+	name := proj.residentName()
+	cfg := backend.OptimizerUpdateConfig{
+		Optimizer:    t.config.Optimizer,
+		Step:         step,
+		LearningRate: t.config.LearningRate,
+		WeightDecay:  t.config.WeightDecay,
+		Beta1:        t.config.Beta1,
+		Beta2:        t.config.Beta2,
+		Epsilon:      t.config.Epsilon,
+		Scale:        1,
+		DeferSync:    t.deferOptimizerSync && t.canBridgeResidentOptimizerParam(name, weights),
+	}
+	if err := preflight.PreflightApplyUpdate(name, cfg, weights, mom1, mom2, backend.NewTensorF32(shape, gradW)); err != nil {
+		return fmt.Errorf("vector-distill projection optimizer preflight %q: %w", name, err)
+	}
+	return nil
+}
+
+func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamWForStep(proj *vectorDistillProjectionState, gradW []float32, step int) error {
+	return t.applyVectorDistillProjectionAdamWForStepWithFallback(proj, gradW, step, true)
+}
+
+func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamWForStepStrict(proj *vectorDistillProjectionState, gradW []float32, step int) error {
+	return t.applyVectorDistillProjectionAdamWForStepWithFallback(proj, gradW, step, false)
+}
+
+func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamWForStepWithFallback(proj *vectorDistillProjectionState, gradW []float32, step int, allowHostFallback bool) error {
+	if proj == nil || len(proj.W) == 0 || step <= 0 {
 		return nil
 	}
 	if t != nil && t.optimizerAccel != nil && len(gradW) == len(proj.W) {
@@ -765,7 +1282,7 @@ func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistill
 		deferSync := t.deferOptimizerSync && t.canBridgeResidentOptimizerParam(name, weights)
 		cfg := backend.OptimizerUpdateConfig{
 			Optimizer:    t.config.Optimizer,
-			Step:         proj.Step,
+			Step:         step,
 			LearningRate: t.config.LearningRate,
 			WeightDecay:  t.config.WeightDecay,
 			Beta1:        t.config.Beta1,
@@ -792,14 +1309,14 @@ func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistill
 				return err
 			}
 			return nil
-		} else if deferSync || t.hasResidentOptimizerParam(name) {
+		} else if !allowHostFallback || deferSync || t.hasResidentOptimizerParam(name) {
 			return fmt.Errorf("vector-distill projection optimizer update: %w", err)
 		}
 	}
 	applyVectorDistillProjectionAdamW(
 		proj.W, proj.Mom1, proj.Mom2, gradW,
 		t.config.LearningRate, t.config.Beta1, t.config.Beta2, t.config.Epsilon, t.config.WeightDecay,
-		proj.Step,
+		step,
 	)
 	return nil
 }
@@ -815,7 +1332,13 @@ func (p *vectorDistillProjectionState) residentName() string {
 }
 
 func (t *EmbeddingTrainer) syncVectorDistillProjectionState(proj *vectorDistillProjectionState, reason string) error {
-	if t == nil || t.optimizerAccel == nil || proj == nil || len(proj.W) == 0 {
+	if t == nil || proj == nil || len(proj.W) == 0 {
+		return nil
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return err
+	}
+	if t.optimizerAccel == nil {
 		return nil
 	}
 	shape := []int{proj.InputDim, proj.OutDim}

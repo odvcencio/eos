@@ -119,11 +119,19 @@ func (t *fakeResidentOptimizerToken) Alive() bool {
 }
 
 type fakeResidentOptimizerAccelerator struct {
-	resident map[string]*fakeResidentOptimizerToken
-	applyErr error
-	syncErr  error
-	closed   bool
-	stats    backend.OptimizerAcceleratorStats
+	resident            map[string]*fakeResidentOptimizerToken
+	applyErr            error
+	applyErrNames       map[string]error
+	applyCalls          int64
+	preflightErr        error
+	preflightErrNames   map[string]error
+	preflightCalls      int64
+	preflightApplyErr   error
+	preflightApplyCalls int64
+	residentApplyCalls  int64
+	syncErr             error
+	closed              bool
+	stats               backend.OptimizerAcceleratorStats
 }
 
 func (a *fakeResidentOptimizerAccelerator) Backend() eosartifact.BackendKind {
@@ -131,8 +139,12 @@ func (a *fakeResidentOptimizerAccelerator) Backend() eosartifact.BackendKind {
 }
 
 func (a *fakeResidentOptimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
+	a.applyCalls++
 	if a.applyErr != nil {
 		return a.applyErr
+	}
+	if err := a.applyErrNames[name]; err != nil {
+		return err
 	}
 	if tensor == nil || grad == nil {
 		return fmt.Errorf("fake resident optimizer requires tensor and grad")
@@ -161,6 +173,29 @@ func (a *fakeResidentOptimizerAccelerator) ApplyUpdate(name string, cfg backend.
 	a.stats.TensorUpdateCalls++
 	if cfg.DeferSync {
 		a.stats.DeferredSyncUpdates++
+	}
+	return nil
+}
+
+func (a *fakeResidentOptimizerAccelerator) PreflightApplyUpdate(name string, _ backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
+	a.preflightApplyCalls++
+	if a.preflightApplyErr != nil {
+		return a.preflightApplyErr
+	}
+	if err := a.preflightErrNames[name]; err != nil {
+		return err
+	}
+	if tensor == nil || grad == nil {
+		return fmt.Errorf("fake optimizer preflight %q requires tensor and grad", name)
+	}
+	if len(grad.F32) != len(tensor.F32) {
+		return fmt.Errorf("fake optimizer preflight %q grad mismatch", name)
+	}
+	if mom1 == nil || mom2 == nil {
+		return fmt.Errorf("fake optimizer preflight %q requires moments", name)
+	}
+	if len(mom1.F32) != len(tensor.F32) || len(mom2.F32) != len(tensor.F32) {
+		return fmt.Errorf("fake optimizer preflight %q moment mismatch", name)
 	}
 	return nil
 }
@@ -209,6 +244,41 @@ func (a *fakeResidentOptimizerAccelerator) EnsureResidentParameter(name string, 
 	return nil
 }
 
+func (a *fakeResidentOptimizerAccelerator) ApplyUpdateWithResidentGrad(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) error {
+	a.residentApplyCalls++
+	if a.applyErr != nil {
+		return a.applyErr
+	}
+	if tensor == nil {
+		return fmt.Errorf("fake resident optimizer requires tensor")
+	}
+	zeros := backend.NewTensorF32(tensor.Shape, make([]float32, len(tensor.F32)))
+	if grad.Elements != 0 && grad.Elements != len(tensor.F32) {
+		return fmt.Errorf("fake resident gradient %q elements %d, want %d", grad.Name, grad.Elements, len(tensor.F32))
+	}
+	return a.ApplyUpdate(name, cfg, tensor, mom1, mom2, zeros)
+}
+
+func (a *fakeResidentOptimizerAccelerator) PreflightApplyUpdateWithResidentGrad(name string, _ backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) error {
+	a.preflightCalls++
+	if a.preflightErr != nil {
+		return a.preflightErr
+	}
+	if err := a.preflightErrNames[name]; err != nil {
+		return err
+	}
+	if tensor == nil || mom1 == nil || mom2 == nil {
+		return fmt.Errorf("fake resident optimizer preflight %q requires tensor and moments", name)
+	}
+	if grad.Name != name || grad.Elements != len(tensor.F32) {
+		return fmt.Errorf("fake resident optimizer preflight %q gradient mismatch", name)
+	}
+	if len(mom1.F32) != len(tensor.F32) || len(mom2.F32) != len(tensor.F32) {
+		return fmt.Errorf("fake resident optimizer preflight %q moment mismatch", name)
+	}
+	return nil
+}
+
 type residentAwareCountingMatMulAccelerator struct {
 	countingMatMulAccelerator
 	residentBindCalls int
@@ -240,22 +310,62 @@ func (t *fakeCompactTrainHandleToken) Generation() uint64 { return t.generation 
 func (t *fakeCompactTrainHandleToken) StepID() uint64     { return t.stepID }
 func (t *fakeCompactTrainHandleToken) Alive() bool        { return t != nil && t.alive }
 
+type fakeResidentGradientToken struct {
+	alive      bool
+	generation uint64
+}
+
+func (t *fakeResidentGradientToken) ResidentGradientToken() {}
+func (t *fakeResidentGradientToken) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+func (t *fakeResidentGradientToken) Generation() uint64 { return t.generation }
+func (t *fakeResidentGradientToken) Alive() bool        { return t != nil && t.alive }
+
 type fakeCompactTrainAccelerator struct {
-	configured     bool
-	bound          map[string]backend.OptimizerResidentParameter
-	preflightCalls int64
-	forwardCalls   int64
-	releaseCalls   int64
-	nextGeneration uint64
-	live           map[uint64]*fakeCompactTrainHandleToken
-	preflightErr   error
-	forwardErr     error
-	releaseErr     error
-	stats          backend.CompactTrainAcceleratorStats
+	configured      bool
+	bound           map[string]backend.OptimizerResidentParameter
+	preflightCalls  int64
+	beginCalls      int64
+	forwardCalls    int64
+	backwardCalls   int64
+	endCalls        int64
+	abortCalls      int64
+	releaseCalls    int64
+	backwardGrads   []*backend.Tensor
+	forwardRequests []backend.CompactTrainForwardRequest
+	nextGeneration  uint64
+	live            map[uint64]*fakeCompactTrainHandleToken
+	supportBackward bool
+	activeStep      uint64
+	sealedStep      uint64
+	gradientTokens  []*fakeResidentGradientToken
+	preflightErr    error
+	forwardErr      error
+	backwardErr     error
+	endErr          error
+	releaseErr      error
+	closed          bool
+	stats           backend.CompactTrainAcceleratorStats
 }
 
 func (a *fakeCompactTrainAccelerator) Backend() eosartifact.BackendKind {
 	return eosartifact.BackendCUDA
+}
+
+func (a *fakeCompactTrainAccelerator) Close() {
+	a.closed = true
+	for _, token := range a.live {
+		token.alive = false
+	}
+	for _, token := range a.gradientTokens {
+		token.alive = false
+	}
+	a.live = nil
+	a.gradientTokens = nil
+	a.activeStep = 0
+	a.sealedStep = 0
+	a.stats.LiveHandles = 0
 }
 
 func (a *fakeCompactTrainAccelerator) ConfigureCompactForward([]backend.CompactForwardLayerConfig, string, string, string, bool) {
@@ -287,16 +397,93 @@ func (a *fakeCompactTrainAccelerator) PreflightCompactTrainForward(req backend.C
 	return validateCompactForwardPackedInputs(req.Shape, req.Tokens, req.Masks, req.Roles)
 }
 
-func (a *fakeCompactTrainAccelerator) BeginCompactTrainStep(uint64, []backend.CompactForwardResidentRef) error {
-	return fmt.Errorf("fake compact train backward unsupported")
+func (a *fakeCompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []backend.CompactForwardResidentRef) error {
+	if !a.supportBackward {
+		return fmt.Errorf("fake compact train backward unsupported")
+	}
+	a.beginCalls++
+	if len(refs) == 0 {
+		return fmt.Errorf("fake compact train begin requires resident refs")
+	}
+	a.activeStep = stepID
+	a.sealedStep = 0
+	return nil
 }
 
-func (a *fakeCompactTrainAccelerator) EndCompactTrainStep(uint64) error {
-	return fmt.Errorf("fake compact train backward unsupported")
+func (a *fakeCompactTrainAccelerator) EndCompactTrainStep(stepID uint64) error {
+	if !a.supportBackward {
+		return fmt.Errorf("fake compact train backward unsupported")
+	}
+	a.endCalls++
+	if a.endErr != nil {
+		return a.endErr
+	}
+	if a.activeStep != stepID {
+		return fmt.Errorf("fake compact train stale end step")
+	}
+	a.activeStep = 0
+	a.sealedStep = stepID
+	return nil
 }
 
-func (a *fakeCompactTrainAccelerator) RunCompactTrainBackward(backend.CompactTrainBackwardRequest) (backend.CompactTrainBackwardResult, error) {
-	return backend.CompactTrainBackwardResult{}, fmt.Errorf("fake compact train backward unsupported")
+func (a *fakeCompactTrainAccelerator) AbortCompactTrainStep(stepID uint64) error {
+	if !a.supportBackward {
+		return fmt.Errorf("fake compact train backward unsupported")
+	}
+	a.abortCalls++
+	if a.activeStep != 0 && a.activeStep != stepID || a.sealedStep != 0 && a.sealedStep != stepID {
+		return fmt.Errorf("fake compact train stale abort step")
+	}
+	for gen, token := range a.live {
+		if token.alive {
+			token.alive = false
+			a.stats.HandlesReleased++
+		}
+		delete(a.live, gen)
+	}
+	a.stats.LiveHandles = 0
+	for _, token := range a.gradientTokens {
+		token.alive = false
+	}
+	a.gradientTokens = nil
+	a.activeStep = 0
+	a.sealedStep = 0
+	return nil
+}
+
+func (a *fakeCompactTrainAccelerator) RunCompactTrainBackward(req backend.CompactTrainBackwardRequest) (backend.CompactTrainBackwardResult, error) {
+	if !a.supportBackward {
+		return backend.CompactTrainBackwardResult{}, fmt.Errorf("fake compact train backward unsupported")
+	}
+	a.backwardCalls++
+	if a.backwardErr != nil {
+		return backend.CompactTrainBackwardResult{}, a.backwardErr
+	}
+	token, ok := req.Handle.Token.(*fakeCompactTrainHandleToken)
+	if !ok || token == nil || !token.alive {
+		return backend.CompactTrainBackwardResult{}, fmt.Errorf("fake compact train backward requires live handle")
+	}
+	token.alive = false
+	delete(a.live, token.generation)
+	a.stats.BackwardCalls++
+	a.stats.HandlesReleased++
+	a.stats.LiveHandles--
+	a.backwardGrads = append(a.backwardGrads, req.GradPooled.Clone())
+	refs := make([]backend.ResidentGradientRef, 0, len(a.bound))
+	for name, ref := range a.bound {
+		a.nextGeneration++
+		gradToken := &fakeResidentGradientToken{alive: true, generation: a.nextGeneration}
+		a.gradientTokens = append(a.gradientTokens, gradToken)
+		refs = append(refs, backend.ResidentGradientRef{
+			Name:       name,
+			Backend:    eosartifact.BackendCUDA,
+			Token:      gradToken,
+			Elements:   ref.Elements,
+			Generation: a.nextGeneration,
+			StepID:     req.Handle.StepID,
+		})
+	}
+	return backend.CompactTrainBackwardResult{ResidentGradRefs: refs}, nil
 }
 
 func (a *fakeCompactTrainAccelerator) RunCompactTrainForward(req backend.CompactTrainForwardRequest) (backend.CompactTrainForwardResult, error) {
@@ -304,6 +491,7 @@ func (a *fakeCompactTrainAccelerator) RunCompactTrainForward(req backend.Compact
 	if a.forwardErr != nil {
 		return backend.CompactTrainForwardResult{}, a.forwardErr
 	}
+	a.forwardRequests = append(a.forwardRequests, req)
 	a.nextGeneration++
 	token := &fakeCompactTrainHandleToken{alive: true, generation: a.nextGeneration, stepID: req.StepID}
 	if a.live == nil {

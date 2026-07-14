@@ -74,6 +74,7 @@ type residentOptimizerState struct {
 	elements   int
 	hasMoments bool
 	generation uint64
+	token      *optimizerResidentParameterToken
 }
 
 type optimizerResidentParameterToken struct {
@@ -127,6 +128,10 @@ func (t *optimizerResidentParameterToken) lockCurrent() (residentOptimizerState,
 		unlock()
 		return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token %q generation %d is stale, current %d", t.name, t.generation, state.generation)
 	}
+	if state.token != t {
+		unlock()
+		return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token %q is stale", t.name)
+	}
 	return state, unlock, nil
 }
 
@@ -174,44 +179,22 @@ func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpd
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.device == nil || a.kernel == nil {
-		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	validated, err := a.validateOptimizerUpdateLocked(name, cfg, tensor, mom1, mom2, grad, false)
+	if err != nil {
+		return err
 	}
-	if tensor == nil || grad == nil {
-		return fmt.Errorf("cuda optimizer update requires tensor and grad")
-	}
-	elements := len(tensor.F32)
+	elements := validated.elements
 	if elements == 0 {
 		return nil
 	}
-	if len(grad.F32) != elements {
-		return fmt.Errorf("cuda optimizer grad size %d does not match tensor size %d", len(grad.F32), elements)
-	}
 	start := time.Now()
-	mode := 1
-	switch cfg.Optimizer {
-	case "", "adamw":
-		if mom1 == nil || mom2 == nil {
-			return fmt.Errorf("cuda adamw update requires first and second moment tensors")
-		}
-	case "sgd":
-		mode = 0
-	default:
-		return fmt.Errorf("cuda optimizer update does not support %q", cfg.Optimizer)
-	}
-	if mom1 != nil && len(mom1.F32) != elements {
-		return fmt.Errorf("cuda optimizer first moment size %d does not match tensor size %d", len(mom1.F32), elements)
-	}
-	if mom2 != nil && len(mom2.F32) != elements {
-		return fmt.Errorf("cuda optimizer second moment size %d does not match tensor size %d", len(mom2.F32), elements)
-	}
 	gradBuf, err := a.device.uploadFloat32(grad.F32)
 	if err != nil {
 		return err
 	}
 	defer a.device.freeBuffer(gradBuf)
 	a.stats.UploadedBytes += int64(len(grad.F32) * 4)
-	state, transient, err := a.ensureResidentState(name, tensor, mom1, mom2, elements, mode == 1)
+	state, transient, err := a.ensureResidentState(name, tensor, mom1, mom2, elements, validated.mode == 1)
 	if err != nil {
 		return err
 	}
@@ -221,7 +204,7 @@ func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpd
 
 	corr1 := float32(1)
 	corr2 := float32(1)
-	if mode == 1 {
+	if validated.mode == 1 {
 		corr1 -= float32(math.Pow(float64(cfg.Beta1), float64(cfg.Step)))
 		corr2 -= float32(math.Pow(float64(cfg.Beta2), float64(cfg.Step)))
 	}
@@ -236,7 +219,7 @@ func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpd
 		state.mom2,
 		gradBuf,
 		elements,
-		mode,
+		validated.mode,
 		cfg.LearningRate,
 		cfg.WeightDecay,
 		cfg.Beta1,
@@ -263,6 +246,270 @@ func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpd
 		a.stats.DownloadedBytes += int64(len(tensor.F32) * 4)
 	}
 	a.stats.UpdateNanos += time.Since(start).Nanoseconds()
+	a.stats.ResidentParams = int64(len(a.resident))
+	a.updatePerStepStats()
+	return nil
+}
+
+type optimizerUpdateValidation struct {
+	elements int
+	mode     int
+}
+
+func (a *optimizerAccelerator) PreflightApplyUpdate(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, err := a.validateOptimizerUpdateLocked(name, cfg, tensor, mom1, mom2, grad, true)
+	return err
+}
+
+func (a *optimizerAccelerator) validateOptimizerUpdateLocked(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor, preflight bool) (optimizerUpdateValidation, error) {
+	if a.device == nil || a.kernel == nil {
+		return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	if tensor == nil || grad == nil {
+		return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer update requires tensor and grad")
+	}
+	elements := len(tensor.F32)
+	if elements == 0 {
+		return optimizerUpdateValidation{}, nil
+	}
+	if len(grad.F32) != elements {
+		return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer grad size %d does not match tensor size %d", len(grad.F32), elements)
+	}
+	mode := 1
+	switch cfg.Optimizer {
+	case "", "adamw":
+		if mom1 == nil || mom2 == nil {
+			return optimizerUpdateValidation{}, fmt.Errorf("cuda adamw update requires first and second moment tensors")
+		}
+	case "sgd":
+		mode = 0
+	default:
+		return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer update does not support %q", cfg.Optimizer)
+	}
+	if mom1 != nil && len(mom1.F32) != elements {
+		return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer first moment size %d does not match tensor size %d", len(mom1.F32), elements)
+	}
+	if mom2 != nil && len(mom2.F32) != elements {
+		return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer second moment size %d does not match tensor size %d", len(mom2.F32), elements)
+	}
+	if preflight && cfg.DeferSync && name != "" {
+		if state, ok := a.resident[name]; ok && (state.elements != elements || state.hasMoments != (mode == 1)) {
+			return optimizerUpdateValidation{}, fmt.Errorf("cuda optimizer state %q metadata mismatch", name)
+		}
+	}
+	return optimizerUpdateValidation{elements: elements, mode: mode}, nil
+}
+
+type residentGradientUpdateValidation struct {
+	elements     int
+	mode         int
+	state        residentOptimizerState
+	residentGrad *compactTrainGradient
+	gradOwner    *CompactTrainAccelerator
+}
+
+// validateResidentGradientUpdateLocked is the single validation path for
+// preflight and apply. a.mu must be held. On success it also returns with the
+// gradient owner's mutex held so the validated allocation cannot change before
+// apply launches (or preflight returns).
+func (a *optimizerAccelerator) validateResidentGradientUpdateLocked(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) (*residentGradientUpdateValidation, error) {
+	if a.device == nil || a.kernel == nil {
+		return nil, fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	if name == "" {
+		return nil, fmt.Errorf("cuda optimizer resident-gradient update requires a parameter name")
+	}
+	if tensor == nil {
+		return nil, fmt.Errorf("cuda optimizer resident-gradient update %q requires tensor", name)
+	}
+	elements := len(tensor.F32)
+	if elements == 0 {
+		return &residentGradientUpdateValidation{}, nil
+	}
+	if grad.Name != name {
+		return nil, fmt.Errorf("cuda optimizer resident gradient name %q does not match parameter %q", grad.Name, name)
+	}
+	if grad.Backend != eosartifact.BackendCUDA {
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q backend %q, want cuda", grad.Name, grad.Backend)
+	}
+	if grad.Elements != elements {
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q elements %d does not match tensor size %d", grad.Name, grad.Elements, elements)
+	}
+	mode := 1
+	switch cfg.Optimizer {
+	case "", "adamw":
+		if mom1 == nil || mom2 == nil {
+			return nil, fmt.Errorf("cuda adamw resident-gradient update requires first and second moment tensors")
+		}
+	case "sgd":
+		mode = 0
+	default:
+		return nil, fmt.Errorf("cuda optimizer resident-gradient update does not support %q", cfg.Optimizer)
+	}
+	if mom1 != nil && len(mom1.F32) != elements {
+		return nil, fmt.Errorf("cuda optimizer first moment size %d does not match tensor size %d", len(mom1.F32), elements)
+	}
+	if mom2 != nil && len(mom2.F32) != elements {
+		return nil, fmt.Errorf("cuda optimizer second moment size %d does not match tensor size %d", len(mom2.F32), elements)
+	}
+	state, ok := a.resident[name]
+	if !ok {
+		return nil, fmt.Errorf("cuda optimizer state %q is not resident", name)
+	}
+	if state.elements != elements || state.hasMoments != (mode == 1) {
+		return nil, fmt.Errorf("cuda optimizer state %q metadata mismatch", name)
+	}
+	gradToken, ok := grad.Token.(*compactTrainGradientToken)
+	if !ok || gradToken == nil {
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q has invalid cuda token", grad.Name)
+	}
+	if gradToken.Backend() != eosartifact.BackendCUDA {
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q token backend %q, want cuda", grad.Name, gradToken.Backend())
+	}
+	gradOwner := gradToken.owner
+	if gradOwner == nil {
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q owner is nil", grad.Name)
+	}
+	gradOwner.mu.Lock()
+	fail := func(err error) (*residentGradientUpdateValidation, error) {
+		gradOwner.mu.Unlock()
+		return nil, err
+	}
+	if gradOwner.closed || gradOwner.device == nil {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q owner is closed", grad.Name))
+	}
+	if !gradOwner.stepSealed || gradOwner.stepActive {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q step %d is not sealed", grad.Name, grad.StepID))
+	}
+	if gradOwner.stepPoisoned {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q step %d is poisoned", grad.Name, grad.StepID))
+	}
+	if gradToken.owner != gradOwner || gradToken.name != grad.Name {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q owner/name mismatch", grad.Name))
+	}
+	if gradToken.generation != grad.Generation || gradToken.stepID != grad.StepID || gradToken.elements != grad.Elements {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q token metadata mismatch", grad.Name))
+	}
+	residentGrad := gradOwner.grads[grad.Name]
+	if residentGrad == nil || residentGrad.token != gradToken || residentGrad.ptr == 0 {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q is stale", grad.Name))
+	}
+	if residentGrad.generation != grad.Generation || residentGrad.stepID != grad.StepID || residentGrad.elements != grad.Elements {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q generation/elements mismatch", grad.Name))
+	}
+	if residentGrad.optimizerOwner != a {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q belongs to a different optimizer", grad.Name))
+	}
+	if residentGrad.optimizerToken == nil || residentGrad.optimizerToken != state.token {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q optimizer token is stale", grad.Name))
+	}
+	if residentGrad.optimizerGeneration != state.generation {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q optimizer generation %d is stale, current %d", grad.Name, residentGrad.optimizerGeneration, state.generation))
+	}
+	if residentGrad.optimizerParam != state.param {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q optimizer parameter pointer is stale", grad.Name))
+	}
+	if residentGrad.optimizerUsed {
+		return fail(fmt.Errorf("cuda optimizer resident gradient %q was already used for step %d", grad.Name, grad.StepID))
+	}
+	return &residentGradientUpdateValidation{elements: elements, mode: mode, state: state, residentGrad: residentGrad, gradOwner: gradOwner}, nil
+}
+
+func (a *optimizerAccelerator) PreflightApplyUpdateWithResidentGrad(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	validated, err := a.validateResidentGradientUpdateLocked(name, cfg, tensor, mom1, mom2, grad)
+	if err != nil {
+		return err
+	}
+	if validated.gradOwner != nil {
+		validated.gradOwner.mu.Unlock()
+	}
+	return nil
+}
+
+func (a *optimizerAccelerator) ApplyUpdateWithResidentGrad(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	validated, err := a.validateResidentGradientUpdateLocked(name, cfg, tensor, mom1, mom2, grad)
+	if err != nil {
+		return err
+	}
+	if validated.gradOwner != nil {
+		defer validated.gradOwner.mu.Unlock()
+	}
+	if validated.elements == 0 {
+		return nil
+	}
+	elements := validated.elements
+	mode := validated.mode
+	state := validated.state
+	residentGrad := validated.residentGrad
+	gradOwner := validated.gradOwner
+	start := time.Now()
+	corr1 := float32(1)
+	corr2 := float32(1)
+	if mode == 1 {
+		corr1 -= float32(math.Pow(float64(cfg.Beta1), float64(cfg.Step)))
+		corr2 -= float32(math.Pow(float64(cfg.Beta2), float64(cfg.Step)))
+	}
+	block := 128
+	grid := (elements + block - 1) / block
+	if err := a.device.launchOptimizerUpdate(
+		a.kernel,
+		uint(grid),
+		uint(block),
+		state.param,
+		state.mom1,
+		state.mom2,
+		residentGrad.ptr,
+		elements,
+		mode,
+		cfg.LearningRate,
+		cfg.WeightDecay,
+		cfg.Beta1,
+		cfg.Beta2,
+		corr1,
+		corr2,
+		cfg.Epsilon,
+		cfg.Scale,
+	); err != nil {
+		return err
+	}
+	residentGrad.optimizerUsed = true
+	a.stats.UpdateCalls++
+	a.stats.TensorUpdateCalls++
+	a.stats.ResidentGradUpdateCalls++
+	avoided := int64(elements * 4)
+	a.stats.ResidentGradUploadBytesAvoided += avoided
+	gradOwner.stats.HostGradUploadBytesAvoided += avoided
+	if cfg.Step != 0 && cfg.Step != a.lastLogicalStep {
+		a.stats.LogicalSteps++
+		a.lastLogicalStep = cfg.Step
+	}
+	if cfg.DeferSync && name != "" {
+		a.stats.DeferredSyncUpdates++
+	} else {
+		if err := a.device.downloadFloat32(tensor.F32, state.param); err != nil {
+			return err
+		}
+		a.stats.DownloadedBytes += int64(len(tensor.F32) * 4)
+	}
+	elapsed := time.Since(start).Nanoseconds()
+	a.stats.UpdateNanos += elapsed
+	a.stats.ResidentGradUpdateNanos += elapsed
+	gradOwner.stats.OptimizerResidentGradNanos += elapsed
 	a.stats.ResidentParams = int64(len(a.resident))
 	a.updatePerStepStats()
 	return nil
@@ -356,7 +603,7 @@ func (a *optimizerAccelerator) ResidentParameter(name string) (backend.Optimizer
 	}
 	return backend.OptimizerResidentParameter{
 		Backend:  eosartifact.BackendCUDA,
-		Token:    &optimizerResidentParameterToken{owner: a, name: name, generation: state.generation},
+		Token:    state.token,
 		Elements: state.elements,
 	}, true
 }
@@ -430,6 +677,7 @@ func (a *optimizerAccelerator) ensureResidentState(name string, tensor, mom1, mo
 	}
 	a.nextGen++
 	state.generation = a.nextGen
+	state.token = &optimizerResidentParameterToken{owner: a, name: name, generation: state.generation}
 	a.resident[name] = state
 	a.stats.ResidentParams = int64(len(a.resident))
 	return state, false, nil

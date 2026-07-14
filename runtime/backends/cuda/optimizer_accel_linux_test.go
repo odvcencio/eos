@@ -4,6 +4,7 @@ package cuda
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,6 +60,39 @@ func TestCUDAOptimizerAcceleratorKeepsResidentStateAcrossUpdates(t *testing.T) {
 	}
 	if len(accel.resident) != 1 {
 		t.Fatalf("resident state count = %d, want 1", len(accel.resident))
+	}
+	beforePreflight := accel.Stats()
+	preflightParam := param.Clone()
+	preflightMom1 := mom1.Clone()
+	preflightMom2 := mom2.Clone()
+	preflightGrad := backend.NewTensorF32([]int{2, 2}, []float32{
+		0.03, -0.04,
+		0.07, -0.08,
+	})
+	if err := accel.PreflightApplyUpdate("projection", cfg, preflightParam, preflightMom1, preflightMom2, preflightGrad); err != nil {
+		t.Fatalf("valid optimizer preflight: %v", err)
+	}
+	if err := accel.PreflightApplyUpdate("projection", cfg, preflightParam, preflightMom1, preflightMom2, preflightGrad); err != nil {
+		t.Fatalf("repeated optimizer preflight: %v", err)
+	}
+	if after := accel.Stats(); after != beforePreflight {
+		t.Fatalf("optimizer preflight mutated stats: before=%+v after=%+v", beforePreflight, after)
+	}
+	assertCloseF32Slice(t, "preflight param", preflightParam.F32, param.F32, 0)
+	assertCloseF32Slice(t, "preflight mom1", preflightMom1.F32, mom1.F32, 0)
+	assertCloseF32Slice(t, "preflight mom2", preflightMom2.F32, mom2.F32, 0)
+	if err := accel.PreflightApplyUpdate("projection", cfg, preflightParam, preflightMom1, preflightMom2, backend.NewTensorF32([]int{1, 3}, []float32{1, 2, 3})); err == nil || !strings.Contains(err.Error(), "grad size") {
+		t.Fatalf("bad grad preflight err = %v, want grad size", err)
+	}
+	badCfg := cfg
+	badCfg.Optimizer = "rmsprop"
+	if err := accel.PreflightApplyUpdate("projection", badCfg, preflightParam, preflightMom1, preflightMom2, preflightGrad); err == nil || !strings.Contains(err.Error(), "does not support") {
+		t.Fatalf("bad optimizer preflight err = %v, want unsupported optimizer", err)
+	}
+	badCfg = cfg
+	badCfg.DeferSync = true
+	if err := accel.PreflightApplyUpdate("projection", badCfg, backend.NewTensorF32([]int{1, 3}, []float32{1, 2, 3}), backend.NewTensorF32([]int{1, 3}, make([]float32, 3)), backend.NewTensorF32([]int{1, 3}, make([]float32, 3)), backend.NewTensorF32([]int{1, 3}, []float32{0, 0, 0})); err == nil || !strings.Contains(err.Error(), "metadata mismatch") {
+		t.Fatalf("resident binding preflight err = %v, want metadata mismatch", err)
 	}
 
 	cfg.Step = 2
@@ -197,6 +231,207 @@ func TestCUDAOptimizerDeferredSyncParityAndExplicitDownloads(t *testing.T) {
 	}
 	if afterSync.DownloadedBytes == 0 {
 		t.Fatal("deferred sync did not download host state at explicit boundary")
+	}
+}
+
+func TestCUDAOptimizerApplyUpdateWithResidentGradParityAndFailures(t *testing.T) {
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	weights := compactForwardTestWeights(false)
+	trainOptAny, err := NewOptimizerAccelerator()
+	if err != nil {
+		t.Fatalf("new train optimizer accelerator: %v", err)
+	}
+	if trainOptAny == nil {
+		t.Skip("no cuda optimizer accelerator available")
+	}
+	trainOpt := trainOptAny.(*optimizerAccelerator)
+	trainAccel, err := NewCompactTrainAccelerator()
+	if err != nil {
+		trainOpt.Close()
+		t.Fatalf("new compact train accelerator: %v", err)
+	}
+	defer trainAccel.Close()
+	defer trainOpt.Close()
+	layers := make([]CompactForwardLayerNames, shape.Layers)
+	for layer := range layers {
+		prefix := "layer" + string(rune('0'+layer)) + "_"
+		layers[layer] = CompactForwardLayerNames{
+			AttentionQ: prefix + "attn_q",
+			AttentionK: prefix + "attn_k",
+			AttentionV: prefix + "attn_v",
+			AttentionO: prefix + "attn_o",
+			FFNUp:      prefix + "ffn_up",
+			FFNDown:    prefix + "ffn_down",
+		}
+	}
+	trainAccel.Configure(layers, "token_embedding", "role_embedding", "", true)
+	paramA := weights["layer1_ffn_up"].Clone()
+	mom1A := backend.NewTensorF32(paramA.Shape, seqData(len(paramA.F32), 0.0002, -0.003))
+	mom2A := backend.NewTensorF32(paramA.Shape, seqData(len(paramA.F32), 0.0001, 0.004))
+	paramB := paramA.Clone()
+	mom1B := mom1A.Clone()
+	mom2B := mom2A.Clone()
+	for name, tensor := range weights {
+		seedTensor := tensor.Clone()
+		seedMom1 := backend.NewTensorF32(tensor.Shape, make([]float32, len(tensor.F32)))
+		seedMom2 := backend.NewTensorF32(tensor.Shape, make([]float32, len(tensor.F32)))
+		if name == "layer1_ffn_up" {
+			seedTensor = paramB
+			seedMom1 = mom1B
+			seedMom2 = mom2B
+		}
+		if err := trainOpt.EnsureResidentParameter(name, seedTensor, seedMom1, seedMom2); err != nil {
+			t.Fatalf("seed resident %s: %v", name, err)
+		}
+		ref, ok := trainOpt.ResidentParameter(name)
+		if !ok {
+			t.Fatalf("resident %s missing", name)
+		}
+		if err := trainAccel.BindCompactTrainResident(name, tensor, ref); err != nil {
+			t.Fatalf("bind resident %s: %v", name, err)
+		}
+	}
+	refs := compactTrainResidentRefsForTest(t, trainAccel, shape)
+	if err := trainAccel.BeginCompactTrainStep(201, refs); err != nil {
+		t.Fatalf("begin compact train step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		GELUMode:     backend.CompactForwardGELUExact,
+		StepID:       201,
+	}
+	forward, err := trainAccel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("compact train forward: %v", err)
+	}
+	backward, err := trainAccel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{
+		Handle:     forward.Handle,
+		GradPooled: backend.NewTensorF32([]int{shape.Batch, shape.OutputDim}, seqData(shape.Batch*shape.OutputDim, 0.031, -0.047)),
+	})
+	if err != nil {
+		t.Fatalf("compact train backward: %v", err)
+	}
+	gradRef := residentGradRefByName(t, backward.ResidentGradRefs, "layer1_ffn_up")
+	reallocatedRef := residentGradRefByName(t, backward.ResidentGradRefs, "layer1_ffn_down")
+	hostGrad, err := trainAccel.copyResidentGradientForDebug(gradRef)
+	if err != nil {
+		t.Fatalf("copy resident gradient: %v", err)
+	}
+	if err := trainAccel.EndCompactTrainStep(201); err != nil {
+		t.Fatalf("end compact train step: %v", err)
+	}
+
+	hostOptAny, err := NewOptimizerAccelerator()
+	if err != nil {
+		t.Fatalf("new host optimizer accelerator: %v", err)
+	}
+	if hostOptAny == nil {
+		t.Skip("no cuda optimizer accelerator available")
+	}
+	otherOptAny, err := NewOptimizerAccelerator()
+	if err != nil {
+		hostOptAny.(*optimizerAccelerator).Close()
+		t.Fatalf("new other optimizer accelerator: %v", err)
+	}
+	if otherOptAny == nil {
+		hostOptAny.(*optimizerAccelerator).Close()
+		t.Skip("no cuda optimizer accelerator available")
+	}
+	hostOpt := hostOptAny.(*optimizerAccelerator)
+	otherOpt := otherOptAny.(*optimizerAccelerator)
+	defer hostOpt.Close()
+	defer otherOpt.Close()
+	cfg := backend.OptimizerUpdateConfig{
+		Optimizer:    "adamw",
+		Step:         1,
+		LearningRate: 0.01,
+		WeightDecay:  0.001,
+		Beta1:        0.9,
+		Beta2:        0.999,
+		Epsilon:      1e-8,
+		Scale:        0.25,
+	}
+	if err := hostOpt.ApplyUpdate("layer1_ffn_up", cfg, paramA, mom1A, mom2A, hostGrad); err != nil {
+		t.Fatalf("host grad update: %v", err)
+	}
+	if err := otherOpt.EnsureResidentParameter("layer1_ffn_up", paramB.Clone(), mom1B.Clone(), mom2B.Clone()); err != nil {
+		t.Fatalf("seed other optimizer: %v", err)
+	}
+	if err := otherOpt.ApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB.Clone(), mom1B.Clone(), mom2B.Clone(), gradRef); err == nil || !strings.Contains(err.Error(), "different optimizer") {
+		t.Fatalf("cross-optimizer resident grad update err = %v, want different optimizer", err)
+	}
+	downParam := weights["layer1_ffn_down"].Clone()
+	downMom1 := backend.NewTensorF32(downParam.Shape, make([]float32, len(downParam.F32)))
+	downMom2 := backend.NewTensorF32(downParam.Shape, make([]float32, len(downParam.F32)))
+	replacement := backend.NewTensorF32([]int{1, 1}, []float32{0})
+	replaceCfg := backend.OptimizerUpdateConfig{Optimizer: "sgd", Step: 101, LearningRate: 0, Scale: 1, DeferSync: true}
+	if err := trainOpt.ApplyUpdate("layer1_ffn_down", replaceCfg, replacement, nil, nil, backend.NewTensorF32([]int{1, 1}, []float32{0})); err != nil {
+		t.Fatalf("replace resident parameter with different allocation: %v", err)
+	}
+	restoreCfg := cfg
+	restoreCfg.Step = 102
+	restoreCfg.LearningRate = 0
+	if err := trainOpt.ApplyUpdate("layer1_ffn_down", restoreCfg, downParam, downMom1, downMom2, backend.NewTensorF32(downParam.Shape, make([]float32, len(downParam.F32)))); err != nil {
+		t.Fatalf("restore resident parameter with new token: %v", err)
+	}
+	if err := trainOpt.ApplyUpdateWithResidentGrad("layer1_ffn_down", cfg, downParam, downMom1, downMom2, reallocatedRef); err == nil || !strings.Contains(err.Error(), "token is stale") {
+		t.Fatalf("reallocated resident grad update err = %v, want stale token", err)
+	}
+	beforePreflight := trainOpt.Stats()
+	beforeTrainPreflight := trainAccel.CompactTrainStats()
+	if err := trainOpt.PreflightApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, gradRef); err != nil {
+		t.Fatalf("resident grad preflight: %v", err)
+	}
+	if err := trainOpt.PreflightApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, gradRef); err != nil {
+		t.Fatalf("repeated resident grad preflight: %v", err)
+	}
+	if after := trainOpt.Stats(); after != beforePreflight {
+		t.Fatalf("resident grad preflight mutated optimizer stats: before=%+v after=%+v", beforePreflight, after)
+	}
+	if after := trainAccel.CompactTrainStats(); after != beforeTrainPreflight {
+		t.Fatalf("resident grad preflight mutated compact train stats: before=%+v after=%+v", beforeTrainPreflight, after)
+	}
+	beforeResident := trainOpt.Stats()
+	if err := trainOpt.ApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, gradRef); err != nil {
+		t.Fatalf("resident grad update: %v", err)
+	}
+	assertCloseF32Slice(t, "param", paramB.F32, paramA.F32, 3e-8)
+	if err := trainOpt.SyncState("layer1_ffn_up", paramB, mom1B, mom2B, true); err != nil {
+		t.Fatalf("sync resident updated state: %v", err)
+	}
+	if err := hostOpt.SyncState("layer1_ffn_up", paramA, mom1A, mom2A, true); err != nil {
+		t.Fatalf("sync host updated state: %v", err)
+	}
+	assertCloseF32Slice(t, "synced param", paramB.F32, paramA.F32, 3e-8)
+	assertCloseF32Slice(t, "synced mom1", mom1B.F32, mom1A.F32, 3e-8)
+	assertCloseF32Slice(t, "synced mom2", mom2B.F32, mom2A.F32, 3e-8)
+	afterResident := trainOpt.Stats()
+	if afterResident.UploadedBytes != beforeResident.UploadedBytes {
+		t.Fatalf("resident grad update uploaded bytes delta = %d, want 0", afterResident.UploadedBytes-beforeResident.UploadedBytes)
+	}
+	if afterResident.ResidentGradUpdateCalls != 1 || afterResident.ResidentGradUploadBytesAvoided != int64(len(hostGrad.F32)*4) {
+		t.Fatalf("resident grad stats = %+v, want one call and %d bytes avoided", afterResident, len(hostGrad.F32)*4)
+	}
+	trainStats := trainAccel.CompactTrainStats()
+	if trainStats.HostGradUploadBytesAvoided != int64(len(hostGrad.F32)*4) || trainStats.OptimizerResidentGradNanos <= 0 {
+		t.Fatalf("compact train optimizer bridge stats = %+v", trainStats)
+	}
+	if err := trainOpt.ApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, gradRef); err == nil || !strings.Contains(err.Error(), "already used") {
+		t.Fatalf("duplicate resident grad update err = %v, want already used", err)
+	}
+	stale := gradRef
+	stale.Generation++
+	if err := trainOpt.ApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, stale); err == nil || !strings.Contains(err.Error(), "metadata mismatch") {
+		t.Fatalf("stale resident grad update err = %v, want metadata mismatch", err)
+	}
+	wrongName := gradRef
+	wrongName.Name = "layer0_ffn_up"
+	if err := trainOpt.ApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, wrongName); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("wrong name resident grad update err = %v, want name mismatch", err)
 	}
 }
 

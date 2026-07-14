@@ -7052,6 +7052,9 @@ type trainProfileDeltaJSON struct {
 	CompactTrainStatsAvailable                bool    `json:"compact_train_stats_available,omitempty"`
 	*compactTrainProfileDeltaJSON             `json:",omitempty"`
 	OptimizerUpdates                          int64 `json:"optimizer_updates"`
+	OptimizerResidentGradUpdates              int64 `json:"optimizer_resident_grad_updates"`
+	OptimizerResidentGradUploadBytesAvoided   int64 `json:"optimizer_resident_grad_upload_bytes_avoided"`
+	OptimizerResidentGradUpdateNanos          int64 `json:"optimizer_resident_grad_update_nanos"`
 	OptimizerSyncs                            int64 `json:"optimizer_syncs"`
 	ActivationCalls                           int64 `json:"activation_calls"`
 	ContrastiveCalls                          int64 `json:"contrastive_calls"`
@@ -7403,19 +7406,22 @@ func trainAcceleratorsPayload(profile eosruntime.EmbeddingTrainProfile) trainAcc
 
 func trainProfileDeltaPayload(profile eosruntime.EmbeddingTrainProfile) trainProfileDeltaJSON {
 	payload := trainProfileDeltaJSON{
-		MatMulBindCalls:                   profile.ForwardResidency.MatMul.BindCalls,
-		MatMulRuns:                        profile.ForwardResidency.MatMul.RunCalls,
-		MatMulRunUploadMB:                 bytesToMiB(profile.ForwardResidency.MatMul.RunUploadedBytes),
-		MatMulRunDownloadMB:               bytesToMiB(profile.ForwardResidency.MatMul.RunDownloadedBytes),
-		CompactForwardAttemptedCalls:      profile.CompactForwardTrainer.AttemptedCalls,
-		CompactForwardBucketCount:         profile.CompactForwardTrainer.BucketCount,
-		CompactForwardFallbackOrUnhandled: profile.CompactForwardTrainer.FallbackOrUnhandled,
-		CompactForwardPreflightFailures:   profile.CompactForwardTrainer.PreflightFailures,
-		CompactForwardResidentRefCount:    profile.CompactForwardTrainer.ResidentRefCount,
-		OptimizerUpdates:                  profile.Optimizer.UpdateCalls,
-		OptimizerSyncs:                    profile.Optimizer.SyncCalls,
-		ActivationCalls:                   profile.Activation.GELUBackwardCalls + profile.Activation.SoftmaxBackwardCalls + profile.Activation.LayerNormBackwardCalls,
-		ContrastiveCalls:                  profile.Contrastive.RunCalls,
+		MatMulBindCalls:                         profile.ForwardResidency.MatMul.BindCalls,
+		MatMulRuns:                              profile.ForwardResidency.MatMul.RunCalls,
+		MatMulRunUploadMB:                       bytesToMiB(profile.ForwardResidency.MatMul.RunUploadedBytes),
+		MatMulRunDownloadMB:                     bytesToMiB(profile.ForwardResidency.MatMul.RunDownloadedBytes),
+		CompactForwardAttemptedCalls:            profile.CompactForwardTrainer.AttemptedCalls,
+		CompactForwardBucketCount:               profile.CompactForwardTrainer.BucketCount,
+		CompactForwardFallbackOrUnhandled:       profile.CompactForwardTrainer.FallbackOrUnhandled,
+		CompactForwardPreflightFailures:         profile.CompactForwardTrainer.PreflightFailures,
+		CompactForwardResidentRefCount:          profile.CompactForwardTrainer.ResidentRefCount,
+		OptimizerUpdates:                        profile.Optimizer.UpdateCalls,
+		OptimizerResidentGradUpdates:            profile.Optimizer.ResidentGradUpdateCalls,
+		OptimizerResidentGradUploadBytesAvoided: profile.Optimizer.ResidentGradUploadBytesAvoided,
+		OptimizerResidentGradUpdateNanos:        profile.Optimizer.ResidentGradUpdateNanos,
+		OptimizerSyncs:                          profile.Optimizer.SyncCalls,
+		ActivationCalls:                         profile.Activation.GELUBackwardCalls + profile.Activation.SoftmaxBackwardCalls + profile.Activation.LayerNormBackwardCalls,
+		ContrastiveCalls:                        profile.Contrastive.RunCalls,
 	}
 	if profile.CompactForward != nil {
 		payload.CompactForwardStatsAvailable = true

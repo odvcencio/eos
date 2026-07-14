@@ -30,6 +30,10 @@ func (compactTrainAcceleratorForTest) EndCompactTrainStep(uint64) error {
 	return fmt.Errorf("compact train test accelerator is not executable")
 }
 
+func (compactTrainAcceleratorForTest) AbortCompactTrainStep(uint64) error {
+	return fmt.Errorf("compact train test accelerator is not executable")
+}
+
 func (compactTrainAcceleratorForTest) ReleaseCompactTrainHandle(CompactTrainHandle) error {
 	return fmt.Errorf("compact train test accelerator is not executable")
 }

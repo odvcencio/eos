@@ -524,6 +524,551 @@ func TestVectorDistillStudentResidentUpdateErrorStopsBeforeProjectionUpdate(t *t
 	assertCloseF32Slice(t, "projection after failed student update", proj.W, before, 0)
 }
 
+func TestVectorDistillResidentRouteFailuresAbortAndKeepSelectedFalse(t *testing.T) {
+	cases := []struct {
+		name      string
+		proj      *vectorDistillProjectionState
+		setup     func(*fakeCompactTrainAccelerator, *fakeResidentOptimizerAccelerator)
+		clear     func(*fakeCompactTrainAccelerator, *fakeResidentOptimizerAccelerator)
+		wantAbort int64
+		wantEnd   int64
+		wantErr   string
+	}{
+		{
+			name: "forward",
+			proj: residentRouteProjectionForTest(),
+			setup: func(train *fakeCompactTrainAccelerator, _ *fakeResidentOptimizerAccelerator) {
+				train.forwardErr = fmt.Errorf("forced forward failure")
+			},
+			clear: func(train *fakeCompactTrainAccelerator, _ *fakeResidentOptimizerAccelerator) {
+				train.forwardErr = nil
+			},
+			wantAbort: 1,
+			wantErr:   "forced forward failure",
+		},
+		{
+			name: "loss",
+			proj: &vectorDistillProjectionState{
+				W:        make([]float32, 3*3),
+				Mom1:     make([]float32, 3*3),
+				Mom2:     make([]float32, 3*3),
+				InputDim: 3,
+				OutDim:   3,
+			},
+			wantAbort: 1,
+			wantErr:   "proj length",
+		},
+		{
+			name: "backward",
+			proj: residentRouteProjectionForTest(),
+			setup: func(train *fakeCompactTrainAccelerator, _ *fakeResidentOptimizerAccelerator) {
+				train.backwardErr = fmt.Errorf("forced backward validation failure")
+			},
+			clear: func(train *fakeCompactTrainAccelerator, _ *fakeResidentOptimizerAccelerator) {
+				train.backwardErr = nil
+			},
+			wantAbort: 1,
+			wantErr:   "forced backward validation failure",
+		},
+		{
+			name: "end",
+			proj: residentRouteProjectionForTest(),
+			setup: func(train *fakeCompactTrainAccelerator, _ *fakeResidentOptimizerAccelerator) {
+				train.endErr = fmt.Errorf("forced end failure")
+			},
+			clear: func(train *fakeCompactTrainAccelerator, _ *fakeResidentOptimizerAccelerator) {
+				train.endErr = nil
+			},
+			wantAbort: 1,
+			wantEnd:   1,
+			wantErr:   "forced end failure",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			trainer := newCompactEmbeddingTrainerForTest(t, 3)
+			t.Cleanup(trainer.Close)
+			t.Setenv(compactResidentTrainEnv, "1")
+			opt := &fakeResidentOptimizerAccelerator{applyErrNames: map[string]error{}}
+			train := &fakeCompactTrainAccelerator{supportBackward: true}
+			trainer.optimizerAccel = opt
+			trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+			trainer.compactTrainAccel = train
+			trainer.compactTrainBackend = eosartifact.BackendCUDA
+			trainer.compactForwardSelected = true
+			if tc.setup != nil {
+				tc.setup(train, opt)
+			}
+			proj := tc.proj
+			proj.ResidentName = "resident_route_projection"
+			beforeStep := trainer.step
+			beforeUpdates := trainer.compactOptimizerUpdates
+			_, gotProj, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+				vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+			}, proj, 4, EmbeddingRoleQuery, 0)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("resident route error = %v, want %q", err, tc.wantErr)
+			}
+			if gotProj != proj {
+				t.Fatal("resident route returned a different projection on failure")
+			}
+			if trainer.compactForwardSelected {
+				t.Fatal("resident route failure left compactForwardSelected=true")
+			}
+			if train.abortCalls != tc.wantAbort || train.endCalls != tc.wantEnd {
+				t.Fatalf("abort/end calls = %d/%d, want %d/%d", train.abortCalls, train.endCalls, tc.wantAbort, tc.wantEnd)
+			}
+			if train.stats.LiveHandles != 0 {
+				t.Fatalf("live handles after failure = %d, want 0", train.stats.LiveHandles)
+			}
+			if train.activeStep != 0 || train.sealedStep != 0 || len(train.gradientTokens) != 0 {
+				t.Fatalf("step residue after failure active/sealed/grad_tokens=%d/%d/%d", train.activeStep, train.sealedStep, len(train.gradientTokens))
+			}
+			if trainer.step != beforeStep || trainer.compactState.Step != beforeStep || trainer.compactOptimizerUpdates != beforeUpdates {
+				t.Fatalf("published state changed on failure: step=%d stateStep=%d updates=%d, want %d/%d", trainer.step, trainer.compactState.Step, trainer.compactOptimizerUpdates, beforeStep, beforeUpdates)
+			}
+			if tc.clear != nil {
+				tc.clear(train, opt)
+			}
+			retryProj := residentRouteProjectionForTest()
+			retryProj.ResidentName = "resident_route_projection_retry"
+			_, _, err = trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+				vectorDistillTestExample("retry", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+			}, retryProj, 4, EmbeddingRoleQuery, 0)
+			if err != nil {
+				t.Fatalf("retry after %s failure: %v", tc.name, err)
+			}
+			if !trainer.compactForwardSelected || trainer.step != beforeStep+1 || trainer.compactState.Step != beforeStep+1 || train.stats.LiveHandles != 0 {
+				t.Fatalf("retry after %s did not publish clean state: selected=%t step=%d stateStep=%d live=%d", tc.name, trainer.compactForwardSelected, trainer.step, trainer.compactState.Step, train.stats.LiveHandles)
+			}
+		})
+	}
+}
+
+func TestVectorDistillResidentRouteSuccessPublishesSelectedAfterFullStep(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	t.Setenv(compactResidentTrainEnv, "1")
+	opt := &fakeResidentOptimizerAccelerator{applyErrNames: map[string]error{}}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.compactTrainAccel = train
+	trainer.compactTrainBackend = eosartifact.BackendCUDA
+	proj := residentRouteProjectionForTest()
+	proj.ResidentName = "resident_route_projection"
+	_, gotProj, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0)
+	if err != nil {
+		t.Fatalf("resident route success: %v", err)
+	}
+	if gotProj != proj || proj.Step != 1 || trainer.step != 1 || trainer.compactState.Step != 1 || trainer.compactOptimizerUpdates != 1 || !trainer.compactForwardSelected {
+		t.Fatalf("published success state projStep=%d step=%d stateStep=%d updates=%d selected=%t", proj.Step, trainer.step, trainer.compactState.Step, trainer.compactOptimizerUpdates, trainer.compactForwardSelected)
+	}
+	if train.abortCalls != 0 || train.endCalls != 1 || train.stats.LiveHandles != 0 {
+		t.Fatalf("success abort/end/live = %d/%d/%d, want 0/1/0", train.abortCalls, train.endCalls, train.stats.LiveHandles)
+	}
+}
+
+func TestVectorDistillResidentOptimizerLatePreflightFailureMutatesNothing(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	t.Setenv(compactResidentTrainEnv, "1")
+	items := compactTrainStateOptimizerItems(trainer.compactState)
+	if len(items) < 2 {
+		t.Fatalf("compact optimizer items = %d, want at least two", len(items))
+	}
+	lateName := items[len(items)-1].Name
+	items[0].Moment1 = nil
+	items[0].Moment2 = nil
+	opt := &fakeResidentOptimizerAccelerator{
+		applyErrNames:     map[string]error{},
+		preflightErrNames: map[string]error{lateName: fmt.Errorf("forced late predictable preflight failure")},
+	}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.compactTrainAccel = train
+	trainer.compactTrainBackend = eosartifact.BackendCUDA
+	allTensors := make([]*backend.Tensor, 0, len(items)*3)
+	for _, item := range items {
+		allTensors = append(allTensors, item.Tensor, item.Moment1, item.Moment2)
+	}
+	before := snapshotEmbeddingTrainTensors(allTensors...)
+	proj := residentRouteProjectionForTest()
+	projWBefore := append([]float32(nil), proj.W...)
+	projMom1Before := append([]float32(nil), proj.Mom1...)
+	projMom2Before := append([]float32(nil), proj.Mom2...)
+	_, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0)
+	if err == nil || !strings.Contains(err.Error(), "forced late predictable preflight failure") {
+		t.Fatalf("resident route error = %v, want late preflight failure", err)
+	}
+	if opt.preflightCalls != int64(len(items)) || opt.residentApplyCalls != 0 {
+		t.Fatalf("preflight/resident update calls = %d/%d, want %d/0", opt.preflightCalls, opt.residentApplyCalls, len(items))
+	}
+	if delta := aggregateParameterDeltaStats(before); delta.NonzeroCount != 0 {
+		t.Fatalf("parameter/moment mutation after preflight failure: %+v", delta)
+	}
+	if items[0].Moment1 != nil || items[0].Moment2 != nil {
+		t.Fatal("preflight failure assigned previously nil compact moments")
+	}
+	assertCloseF32Slice(t, "projection weights after preflight failure", proj.W, projWBefore, 0)
+	assertCloseF32Slice(t, "projection moment1 after preflight failure", proj.Mom1, projMom1Before, 0)
+	assertCloseF32Slice(t, "projection moment2 after preflight failure", proj.Mom2, projMom2Before, 0)
+	if trainer.compactForwardSelected || trainer.step != 0 || trainer.compactState.Step != 0 || trainer.compactOptimizerUpdates != 0 {
+		t.Fatalf("preflight failure published state: selected=%t step=%d stateStep=%d updates=%d", trainer.compactForwardSelected, trainer.step, trainer.compactState.Step, trainer.compactOptimizerUpdates)
+	}
+	if train.abortCalls != 1 || train.activeStep != 0 || train.sealedStep != 0 || len(train.gradientTokens) != 0 {
+		t.Fatalf("post-End preflight abort residue abort/active/sealed/grad_tokens=%d/%d/%d/%d", train.abortCalls, train.activeStep, train.sealedStep, len(train.gradientTokens))
+	}
+	delete(opt.preflightErrNames, lateName)
+	if _, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("retry", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0); err != nil {
+		t.Fatalf("retry after preflight failure: %v", err)
+	}
+	if !trainer.compactForwardSelected || trainer.step != 1 || opt.residentApplyCalls != int64(len(items)) {
+		t.Fatalf("retry state selected=%t step=%d residentUpdates=%d, want true/1/%d", trainer.compactForwardSelected, trainer.step, opt.residentApplyCalls, len(items))
+	}
+}
+
+func TestVectorDistillResidentProjectionPreflightFailureMutatesNothingAndRetries(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	t.Setenv(compactResidentTrainEnv, "1")
+	items := compactTrainStateOptimizerItems(trainer.compactState)
+	opt := &fakeResidentOptimizerAccelerator{
+		applyErrNames:     map[string]error{},
+		preflightErrNames: map[string]error{"resident_route_projection": fmt.Errorf("forced projection preflight failure")},
+	}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.compactTrainAccel = train
+	trainer.compactTrainBackend = eosartifact.BackendCUDA
+	allTensors := make([]*backend.Tensor, 0, len(items)*3)
+	for _, item := range items {
+		allTensors = append(allTensors, item.Tensor, item.Moment1, item.Moment2)
+	}
+	before := snapshotEmbeddingTrainTensors(allTensors...)
+	proj := residentRouteProjectionForTest()
+	proj.ResidentName = "resident_route_projection"
+	projBefore := append([]float32(nil), proj.W...)
+	projMom1Before := append([]float32(nil), proj.Mom1...)
+	projMom2Before := append([]float32(nil), proj.Mom2...)
+	_, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0)
+	if err == nil || !strings.Contains(err.Error(), "forced projection preflight failure") {
+		t.Fatalf("resident route error = %v, want projection preflight failure", err)
+	}
+	if opt.preflightCalls != int64(len(items)) || opt.preflightApplyCalls != 1 || opt.residentApplyCalls != 0 || opt.applyCalls != 0 {
+		t.Fatalf("preflight/apply calls resident=%d projection=%d residentApply=%d apply=%d, want %d/1/0/0", opt.preflightCalls, opt.preflightApplyCalls, opt.residentApplyCalls, opt.applyCalls, len(items))
+	}
+	if delta := aggregateParameterDeltaStats(before); delta.NonzeroCount != 0 {
+		t.Fatalf("student parameter/moment mutation after projection preflight failure: %+v", delta)
+	}
+	assertCloseF32Slice(t, "projection weights after preflight failure", proj.W, projBefore, 0)
+	assertCloseF32Slice(t, "projection moment1 after preflight failure", proj.Mom1, projMom1Before, 0)
+	assertCloseF32Slice(t, "projection moment2 after preflight failure", proj.Mom2, projMom2Before, 0)
+	if trainer.optimizerPoisonErr != nil || trainer.compactForwardSelected || trainer.step != 0 || trainer.compactState.Step != 0 || trainer.compactOptimizerUpdates != 0 {
+		t.Fatalf("projection preflight failure state poison=%v selected=%t step=%d stateStep=%d updates=%d", trainer.optimizerPoisonErr, trainer.compactForwardSelected, trainer.step, trainer.compactState.Step, trainer.compactOptimizerUpdates)
+	}
+	if train.abortCalls != 1 || train.activeStep != 0 || train.sealedStep != 0 || len(train.gradientTokens) != 0 {
+		t.Fatalf("projection preflight abort residue abort/active/sealed/grad_tokens=%d/%d/%d/%d", train.abortCalls, train.activeStep, train.sealedStep, len(train.gradientTokens))
+	}
+	delete(opt.preflightErrNames, "resident_route_projection")
+	_, _, err = trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("retry", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0)
+	if err != nil {
+		t.Fatalf("retry after projection preflight failure: %v", err)
+	}
+	if !trainer.compactForwardSelected || trainer.step != 1 || trainer.compactState.Step != 1 || opt.residentApplyCalls != int64(len(items)) {
+		t.Fatalf("retry state selected=%t step=%d stateStep=%d residentUpdates=%d, want true/1/1/%d", trainer.compactForwardSelected, trainer.step, trainer.compactState.Step, opt.residentApplyCalls, len(items))
+	}
+}
+
+func TestVectorDistillResidentStudentLateApplyFailurePoisonsAndRefusesRetry(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	t.Setenv(compactResidentTrainEnv, "1")
+	trainer.config.WeightDecay = 0.01
+	items := compactTrainStateOptimizerItems(trainer.compactState)
+	if len(items) < 2 {
+		t.Fatalf("compact optimizer items = %d, want at least two", len(items))
+	}
+	lateName := items[1].Name
+	opt := &fakeResidentOptimizerAccelerator{
+		applyErrNames:     map[string]error{lateName: fmt.Errorf("forced late student apply failure")},
+		preflightErrNames: map[string]error{},
+	}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.compactTrainAccel = train
+	trainer.compactTrainBackend = eosartifact.BackendCUDA
+	allTensors := make([]*backend.Tensor, 0, len(items)*3)
+	for _, item := range items {
+		allTensors = append(allTensors, item.Tensor, item.Moment1, item.Moment2)
+	}
+	before := snapshotEmbeddingTrainTensors(allTensors...)
+	proj := residentRouteProjectionForTest()
+	proj.ResidentName = "resident_route_projection"
+	projBefore := append([]float32(nil), proj.W...)
+	_, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0)
+	if err == nil || !strings.Contains(err.Error(), "poisoned") || !strings.Contains(err.Error(), "forced late student apply failure") {
+		t.Fatalf("resident route error = %v, want poisoned late student apply failure", err)
+	}
+	if trainer.optimizerPoisonErr == nil || trainer.compactForwardSelected || trainer.step != 0 || trainer.compactState.Step != 0 || trainer.compactOptimizerUpdates != 0 {
+		t.Fatalf("late student failure state poison=%v selected=%t step=%d stateStep=%d updates=%d", trainer.optimizerPoisonErr, trainer.compactForwardSelected, trainer.step, trainer.compactState.Step, trainer.compactOptimizerUpdates)
+	}
+	if opt.preflightCalls != int64(len(items)) || opt.preflightApplyCalls != 1 || opt.residentApplyCalls < 2 || opt.residentApplyCalls >= int64(len(items)) || opt.applyCalls != opt.residentApplyCalls {
+		t.Fatalf("late student calls preflight=%d projectionPreflight=%d residentApply=%d apply=%d len=%d", opt.preflightCalls, opt.preflightApplyCalls, opt.residentApplyCalls, opt.applyCalls, len(items))
+	}
+	if delta := aggregateParameterDeltaStats(before); delta.NonzeroCount == 0 {
+		t.Fatal("late student apply failure did not mutate any prior student optimizer state; test must model unsafe retry")
+	}
+	if proj.Step != 0 {
+		t.Fatalf("projection step after student late failure = %d, want 0", proj.Step)
+	}
+	assertCloseF32Slice(t, "projection after late student failure", proj.W, projBefore, 0)
+	if train.abortCalls != 1 || train.activeStep != 0 || train.sealedStep != 0 || len(train.gradientTokens) != 0 {
+		t.Fatalf("late student abort residue abort/active/sealed/grad_tokens=%d/%d/%d/%d", train.abortCalls, train.activeStep, train.sealedStep, len(train.gradientTokens))
+	}
+	delete(opt.applyErrNames, lateName)
+	if _, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("retry", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0); err == nil || !strings.Contains(err.Error(), "close and create a new trainer") {
+		t.Fatalf("retry after poison error = %v, want fail-closed poison", err)
+	}
+	if _, err := trainer.TrainStep(nil); err == nil || !strings.Contains(err.Error(), "poisoned") {
+		t.Fatalf("TrainStep after poison error = %v, want poisoned", err)
+	}
+	assertPoisonedTrainerRejectsOptimizerPublication(t, trainer, opt, train, proj)
+}
+
+func TestVectorDistillResidentProjectionLateApplyFailurePoisonsAndRefusesRetry(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	t.Setenv(compactResidentTrainEnv, "1")
+	trainer.config.WeightDecay = 0.01
+	items := compactTrainStateOptimizerItems(trainer.compactState)
+	opt := &fakeResidentOptimizerAccelerator{
+		applyErrNames:     map[string]error{"resident_route_projection": fmt.Errorf("forced late projection apply failure")},
+		preflightErrNames: map[string]error{},
+	}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.compactTrainAccel = train
+	trainer.compactTrainBackend = eosartifact.BackendCUDA
+	allTensors := make([]*backend.Tensor, 0, len(items)*3)
+	for _, item := range items {
+		allTensors = append(allTensors, item.Tensor, item.Moment1, item.Moment2)
+	}
+	before := snapshotEmbeddingTrainTensors(allTensors...)
+	proj := residentRouteProjectionForTest()
+	proj.ResidentName = "resident_route_projection"
+	projBefore := append([]float32(nil), proj.W...)
+	projMom1Before := append([]float32(nil), proj.Mom1...)
+	projMom2Before := append([]float32(nil), proj.Mom2...)
+	_, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0)
+	if err == nil || !strings.Contains(err.Error(), "poisoned") || !strings.Contains(err.Error(), "forced late projection apply failure") {
+		t.Fatalf("resident route error = %v, want poisoned projection apply failure", err)
+	}
+	if trainer.optimizerPoisonErr == nil || trainer.compactForwardSelected || trainer.step != 0 || trainer.compactState.Step != 0 || trainer.compactOptimizerUpdates != 0 {
+		t.Fatalf("late projection failure state poison=%v selected=%t step=%d stateStep=%d updates=%d", trainer.optimizerPoisonErr, trainer.compactForwardSelected, trainer.step, trainer.compactState.Step, trainer.compactOptimizerUpdates)
+	}
+	if opt.preflightCalls != int64(len(items)) || opt.preflightApplyCalls != 1 || opt.residentApplyCalls != int64(len(items)) || opt.applyCalls != int64(len(items)+1) {
+		t.Fatalf("late projection calls preflight=%d projectionPreflight=%d residentApply=%d apply=%d, want %d/1/%d/%d", opt.preflightCalls, opt.preflightApplyCalls, opt.residentApplyCalls, opt.applyCalls, len(items), len(items), len(items)+1)
+	}
+	if delta := aggregateParameterDeltaStats(before); delta.NonzeroCount == 0 {
+		t.Fatal("late projection apply failure did not mutate student optimizer state before failing; test must model unsafe retry")
+	}
+	if proj.Step != 0 {
+		t.Fatalf("projection step after projection late failure = %d, want 0", proj.Step)
+	}
+	assertCloseF32Slice(t, "projection weights after failed projection apply", proj.W, projBefore, 0)
+	assertCloseF32Slice(t, "projection moment1 after failed projection apply", proj.Mom1, projMom1Before, 0)
+	assertCloseF32Slice(t, "projection moment2 after failed projection apply", proj.Mom2, projMom2Before, 0)
+	if train.abortCalls != 1 || train.activeStep != 0 || train.sealedStep != 0 || len(train.gradientTokens) != 0 {
+		t.Fatalf("late projection abort residue abort/active/sealed/grad_tokens=%d/%d/%d/%d", train.abortCalls, train.activeStep, train.sealedStep, len(train.gradientTokens))
+	}
+	delete(opt.applyErrNames, "resident_route_projection")
+	if _, _, err := trainer.trainVectorDistillBatch([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("retry", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, proj, 4, EmbeddingRoleQuery, 0); err == nil || !strings.Contains(err.Error(), "close and create a new trainer") {
+		t.Fatalf("retry after projection poison error = %v, want fail-closed poison", err)
+	}
+	assertPoisonedTrainerRejectsOptimizerPublication(t, trainer, opt, train, proj)
+}
+
+func assertPoisonedTrainerRejectsOptimizerPublication(t *testing.T, trainer *EmbeddingTrainer, opt *fakeResidentOptimizerAccelerator, train *fakeCompactTrainAccelerator, proj *vectorDistillProjectionState) {
+	t.Helper()
+	if trainer.optimizerPoisonErr == nil {
+		t.Fatal("trainer is not poisoned")
+	}
+	if !trainer.momentsDirty {
+		t.Fatal("poisoned trainer cleared momentsDirty; want forensic dirty state preserved")
+	}
+	baseSyncs := opt.stats.SyncCalls
+	baseDownloads := opt.stats.DownloadedBytes
+
+	assertNoSync := func(label string) {
+		t.Helper()
+		if opt.stats.SyncCalls != baseSyncs || opt.stats.DownloadedBytes != baseDownloads {
+			t.Fatalf("%s changed sync/download counters: sync %d->%d downloaded %d->%d", label, baseSyncs, opt.stats.SyncCalls, baseDownloads, opt.stats.DownloadedBytes)
+		}
+		if !trainer.momentsDirty {
+			t.Fatalf("%s cleared momentsDirty on poisoned trainer", label)
+		}
+	}
+	wantPoison := func(label string, err error) {
+		t.Helper()
+		if err == nil || !strings.Contains(err.Error(), "poisoned") {
+			t.Fatalf("%s error = %v, want poison", label, err)
+		}
+		assertNoSync(label)
+	}
+
+	wantPoison("direct optimizer sync", trainer.syncOptimizerStateWithReason(true, "test_poison_direct_sync"))
+	_, err := trainer.Checkpoint()
+	wantPoison("checkpoint", err)
+	weights, err := trainer.ExportInferenceWeights()
+	if weights != nil {
+		t.Fatalf("export returned %d weights on poisoned trainer", len(weights))
+	}
+	wantPoison("export", err)
+	_, err = trainer.EvaluatePairs(nil)
+	wantPoison("eval", err)
+	_, err = trainer.EvalBatch(nil)
+	wantPoison("eval batch", err)
+	if proj != nil {
+		wantPoison("projection sync", trainer.syncVectorDistillProjectionState(proj, "test_poison_projection_sync"))
+	}
+
+	priorCloseErr := fmt.Errorf("prior close failure")
+	trainer.closeErr = priorCloseErr
+	err = trainer.CloseWithError()
+	wantPoison("close", err)
+	if !strings.Contains(err.Error(), priorCloseErr.Error()) {
+		t.Fatalf("close error = %v, want prior close error preserved", err)
+	}
+	if trainer.CloseError() == nil || !strings.Contains(trainer.CloseError().Error(), "poisoned") {
+		t.Fatalf("CloseError after poison close = %v, want poison", trainer.CloseError())
+	}
+	if !opt.closed {
+		t.Fatal("optimizer accelerator was not released by poisoned close")
+	}
+	if !train.closed {
+		t.Fatal("compact train accelerator was not released by poisoned close")
+	}
+	if trainer.optimizerAccel != nil || trainer.compactTrainAccel != nil || trainer.forwardMatMul != nil {
+		t.Fatalf("poisoned close left accelerators optimizer=%T compactTrain=%T forward=%T", trainer.optimizerAccel, trainer.compactTrainAccel, trainer.forwardMatMul)
+	}
+	assertNoSync("close release")
+	secondCloseErr := trainer.CloseWithError()
+	if secondCloseErr != err {
+		t.Fatalf("second poisoned CloseWithError = %v, want stable first close error %v", secondCloseErr, err)
+	}
+	if strings.Count(secondCloseErr.Error(), "poisoned") != 1 {
+		t.Fatalf("second poisoned CloseWithError duplicated poison context: %v", secondCloseErr)
+	}
+	assertNoSync("second close")
+}
+
+func TestVectorDistillResidentRouteVaryingBucketsDuplicateAliasesAndRetry(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	t.Setenv(compactResidentTrainEnv, "1")
+	opt := &fakeResidentOptimizerAccelerator{applyErrNames: map[string]error{}, preflightErrNames: map[string]error{}}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.compactTrainAccel = train
+	trainer.compactTrainBackend = eosartifact.BackendCUDA
+	batch := []EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("t3-a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+		vectorDistillTestExample("t2-a", EmbeddingRoleDocument, []int32{3, 4}, []float32{-0.1, 0.4, 0.2, -0.05}),
+		vectorDistillTestExample("t3-alias", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.3, 0.1, -0.2, 0.05}),
+		vectorDistillTestExample("t4-a", EmbeddingRoleRaw, []int32{4, 3, 2, 1}, []float32{0.15, -0.25, 0.35, -0.05}),
+		vectorDistillTestExample("t2-alias", EmbeddingRoleDocument, []int32{3, 4}, []float32{-0.2, 0.3, 0.1, 0.25}),
+	}
+	badProj := &vectorDistillProjectionState{W: make([]float32, 3*3), Mom1: make([]float32, 3*3), Mom2: make([]float32, 3*3), InputDim: 3, OutDim: 3}
+	if _, _, err := trainer.trainVectorDistillBatch(batch, badProj, 4, EmbeddingRoleQuery, 0); err == nil || !strings.Contains(err.Error(), "proj length") {
+		t.Fatalf("pre-backward injection error = %v, want projection/loss failure", err)
+	}
+	if train.abortCalls != 1 || train.backwardCalls != 0 || train.stats.LiveHandles != 0 || trainer.compactForwardSelected {
+		t.Fatalf("pre-backward abort state abort=%d backward=%d live=%d selected=%t", train.abortCalls, train.backwardCalls, train.stats.LiveHandles, trainer.compactForwardSelected)
+	}
+
+	proj := residentRouteProjectionForTest()
+	projWReference := append([]float32(nil), proj.W...)
+	if _, _, err := trainer.trainVectorDistillBatch(batch, proj, 4, EmbeddingRoleQuery, 0); err != nil {
+		t.Fatalf("retry resident route: %v", err)
+	}
+	if !trainer.compactForwardSelected || trainer.step != 1 || train.beginCalls != 2 || train.forwardCalls != 6 || train.backwardCalls != 3 || train.endCalls != 1 {
+		t.Fatalf("route counters selected=%t step=%d begin/forward/backward/end=%d/%d/%d/%d", trainer.compactForwardSelected, trainer.step, train.beginCalls, train.forwardCalls, train.backwardCalls, train.endCalls)
+	}
+	requests := train.forwardRequests[len(train.forwardRequests)-3:]
+	for i, wantT := range []int{2, 3, 4} {
+		if requests[i].Shape.Tokens != wantT || requests[i].Shape.Batch != 1 {
+			t.Fatalf("bucket %d shape B/T=%d/%d, want 1/%d", i, requests[i].Shape.Batch, requests[i].Shape.Tokens, wantT)
+		}
+	}
+	if len(train.backwardGrads) != 3 {
+		t.Fatalf("backward gradients = %d, want one per exact-T bucket", len(train.backwardGrads))
+	}
+
+	// Host/reference aggregation: the fake resident forward returns zero pooled
+	// rows. Compute each input's host projection gradient independently, then
+	// sum the two exact aliases into their single pooled resident row.
+	perInput := make([][]float32, len(batch))
+	for i := range batch {
+		loss, err := VectorDistillLossAndGrad(make([]float32, proj.OutDim), batch[i].TeacherVector)
+		if err != nil {
+			t.Fatalf("host reference loss %d: %v", i, err)
+		}
+		perInput[i] = make([]float32, proj.InputDim)
+		for k := 0; k < proj.InputDim; k++ {
+			for j := 0; j < proj.OutDim; j++ {
+				perInput[i][k] += loss.GradProj[j] * projWReference[k*proj.OutDim+j]
+			}
+		}
+	}
+	sum := func(indices ...int) []float32 {
+		out := make([]float32, proj.InputDim)
+		for _, index := range indices {
+			for k := range out {
+				out[k] += perInput[index][k]
+			}
+		}
+		return out
+	}
+	wantByBucket := [][]float32{sum(1, 4), sum(0, 2), sum(3)}
+	for i, want := range wantByBucket {
+		assertCloseF32Slice(t, fmt.Sprintf("bucket %d pooled alias gradient", i), train.backwardGrads[i].F32, want, 0)
+	}
+}
+
+func residentRouteProjectionForTest() *vectorDistillProjectionState {
+	return &vectorDistillProjectionState{
+		W:        []float32{0.2, -0.1, 0.05, 0.3, -0.4, 0.25, 0.15, 0.2, -0.05, 0.1, -0.3, 0.4},
+		Mom1:     make([]float32, 12),
+		Mom2:     make([]float32, 12),
+		InputDim: 3,
+		OutDim:   4,
+	}
+}
+
 func TestVectorDistillProjectionResidentMatMulFallbackSyncFailureFailsClosed(t *testing.T) {
 	trainer := newCompactEmbeddingTrainerForTest(t, 3)
 	proj := &vectorDistillProjectionState{

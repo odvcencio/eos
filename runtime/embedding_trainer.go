@@ -2,6 +2,7 @@ package eosruntime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -244,6 +245,7 @@ type EmbeddingTrainer struct {
 	momentsDirty            bool
 	deferOptimizerSync      bool
 	closeErr                error
+	optimizerPoisonErr      error
 	compactOptimizerUpdates int64
 	compactForwardTrainer   embeddingCompactForwardTrainerStats
 	forwardCache            *embeddingForwardWeights
@@ -825,15 +827,38 @@ func (t *EmbeddingTrainer) Close() {
 }
 
 // CloseWithError syncs host-visible optimizer state before releasing backend
-// resources. If the sync fails, resources are left alive so resident-only state
-// is not destroyed silently; callers can retry or checkpoint explicitly.
+// resources. If a normal sync fails, resources are left alive so resident-only
+// state is not destroyed silently; callers can retry or checkpoint explicitly.
+// Poisoned trainers are different: the live optimizer state may already be
+// partial, so Close must not sync it and instead releases all resources.
 func (t *EmbeddingTrainer) CloseWithError() error {
 	if t == nil {
 		return nil
 	}
+	if poisonErr := t.failIfOptimizerPoisoned(); poisonErr != nil {
+		prior := t.closeErr
+		t.releaseAccelerators()
+		if prior != nil && errors.Is(prior, t.optimizerPoisonErr) {
+			t.closeErr = prior
+		} else if prior != nil {
+			t.closeErr = errors.Join(poisonErr, prior)
+		} else {
+			t.closeErr = poisonErr
+		}
+		return t.closeErr
+	}
 	if err := t.syncOptimizerStateWithReason(true, "close"); err != nil {
 		t.closeErr = err
 		return err
+	}
+	t.releaseAccelerators()
+	t.closeErr = nil
+	return nil
+}
+
+func (t *EmbeddingTrainer) releaseAccelerators() {
+	if t == nil {
+		return
 	}
 	if t.forwardMatMul != nil {
 		t.forwardMatMul.Close()
@@ -870,8 +895,6 @@ func (t *EmbeddingTrainer) CloseWithError() error {
 		t.compactTrainAccel = nil
 		t.compactTrainBackend = ""
 	}
-	t.closeErr = nil
-	return nil
 }
 
 // CloseError returns the last close-time sync error, including errors captured
@@ -881,6 +904,30 @@ func (t *EmbeddingTrainer) CloseError() error {
 		return nil
 	}
 	return t.closeErr
+}
+
+func (t *EmbeddingTrainer) failIfOptimizerPoisoned() error {
+	if t == nil || t.optimizerPoisonErr == nil {
+		return nil
+	}
+	return fmt.Errorf("embedding trainer is poisoned after a failed post-launch optimizer update; close and create a new trainer before retrying: %w", t.optimizerPoisonErr)
+}
+
+func (t *EmbeddingTrainer) poisonAfterOptimizerLaunch(err error) error {
+	if err == nil {
+		err = fmt.Errorf("unknown optimizer update failure")
+	}
+	if t != nil {
+		t.compactForwardSelected = false
+		// Preserve the forensic signal that device/optimizer state may differ
+		// from host state. The poison guard, not clearing this bit, prevents
+		// later publication of a partial state snapshot.
+		t.momentsDirty = true
+		if t.optimizerPoisonErr == nil {
+			t.optimizerPoisonErr = err
+		}
+	}
+	return fmt.Errorf("embedding trainer is poisoned after a failed post-launch optimizer update; close and create a new trainer before retrying: %w", err)
 }
 
 func (t *EmbeddingTrainer) MemoryPlan() *MemoryPlan {
@@ -895,7 +942,13 @@ func (t *EmbeddingTrainer) syncOptimizerState(includeMoments bool) error {
 }
 
 func (t *EmbeddingTrainer) syncOptimizerStateWithReason(includeMoments bool, reason string) error {
-	if t == nil || t.optimizerAccel == nil {
+	if t == nil {
+		return nil
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return err
+	}
+	if t.optimizerAccel == nil {
 		return nil
 	}
 	if !includeMoments || !t.momentsDirty {
@@ -941,7 +994,13 @@ func (t *EmbeddingTrainer) syncOptimizerStateWithReason(includeMoments bool, rea
 }
 
 func (t *EmbeddingTrainer) syncOptimizerBinding(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool, reason string) error {
-	if t == nil || t.optimizerAccel == nil {
+	if t == nil {
+		return nil
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return err
+	}
+	if t.optimizerAccel == nil {
 		return nil
 	}
 	if reason != "" {
@@ -1008,7 +1067,13 @@ func (t *EmbeddingTrainer) optimizerParamRequiresHostForwardRead(name string) bo
 }
 
 func (t *EmbeddingTrainer) syncOptimizerTensorForHostFallback(name string, tensor *backend.Tensor, reason string) error {
-	if t == nil || name == "" || tensor == nil || t.optimizerAccel == nil {
+	if t == nil || name == "" || tensor == nil {
+		return nil
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return err
+	}
+	if t.optimizerAccel == nil {
 		return nil
 	}
 	provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider)
@@ -1427,6 +1492,9 @@ func (t *EmbeddingTrainer) EvaluatePairs(batch []EmbeddingPairExample) (Embeddin
 	if t == nil {
 		return EmbeddingEvalMetrics{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingEvalMetrics{}, err
+	}
 	if len(batch) == 0 {
 		return EmbeddingEvalMetrics{}, fmt.Errorf("evaluation batch is empty")
 	}
@@ -1696,6 +1764,9 @@ func (t *EmbeddingTrainer) EvaluateContrastive(batch []EmbeddingContrastiveExamp
 	if t == nil {
 		return EmbeddingEvalMetrics{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingEvalMetrics{}, err
+	}
 	if len(batch) == 0 {
 		return EmbeddingEvalMetrics{}, fmt.Errorf("evaluation batch is empty")
 	}
@@ -1724,6 +1795,9 @@ func (t *EmbeddingTrainer) EvaluateContrastive(batch []EmbeddingContrastiveExamp
 
 // TrainStep runs one SGD-style update over a batch of pairwise examples.
 func (t *EmbeddingTrainer) TrainStep(batch []EmbeddingPairExample) (EmbeddingTrainMetrics, error) {
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return t.runBatch(batch, true)
 }
 
@@ -1731,6 +1805,9 @@ func (t *EmbeddingTrainer) TrainStep(batch []EmbeddingPairExample) (EmbeddingTra
 func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExample) (EmbeddingTrainMetrics, error) {
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, err
 	}
 	if t.isCompactTrainer() {
 		return t.runCompactContrastiveBatchUpdate(batch)
@@ -1900,6 +1977,9 @@ func (t *EmbeddingTrainer) runCompactContrastiveBatchUpdate(batch []EmbeddingCon
 func (t *EmbeddingTrainer) TrainHardNegativeContrastiveStep(batch []EmbeddingHardNegativeExample) (EmbeddingTrainMetrics, error) {
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, err
 	}
 	if t.isCompactTrainer() {
 		return t.runCompactHardNegativeContrastiveBatchUpdate(batch)
@@ -2253,6 +2333,9 @@ func (t *EmbeddingTrainer) TrainScoreSpectrumStep(batch []EmbeddingScoreSpectrum
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	if t.isCompactTrainer() {
 		return t.runCompactScoreSpectrumBatchUpdate(batch)
 	}
@@ -2468,6 +2551,9 @@ func (t *EmbeddingTrainer) TrainListwiseGeometryStep(batch []EmbeddingTokenizedL
 func (t *EmbeddingTrainer) TrainListwiseGeometryStepWithDiagnostics(batch []EmbeddingTokenizedListwiseGeometryBatch, diagnostics bool) (EmbeddingTrainMetrics, error) {
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, err
 	}
 	if t.isCompactTrainer() {
 		return t.runCompactListwiseGeometryBatchUpdate(batch, diagnostics)
@@ -2685,6 +2771,9 @@ func (t *EmbeddingTrainer) EvaluateScoreSpectrumBatched(examples []EmbeddingScor
 	if t == nil {
 		return EmbeddingScoreSpectrumEvalMetrics{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingScoreSpectrumEvalMetrics{}, err
+	}
 	if len(examples) == 0 {
 		return EmbeddingScoreSpectrumEvalMetrics{}, fmt.Errorf("score-spectrum eval dataset is empty")
 	}
@@ -2746,6 +2835,9 @@ func (t *EmbeddingTrainer) EvaluateListwiseGeometry(batches []EmbeddingTokenized
 func (t *EmbeddingTrainer) EvaluateListwiseGeometryBatched(batches []EmbeddingTokenizedListwiseGeometryBatch, batchSize int) (EmbeddingListwiseGeometryEvalMetrics, error) {
 	if t == nil {
 		return EmbeddingListwiseGeometryEvalMetrics{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingListwiseGeometryEvalMetrics{}, err
 	}
 	if len(batches) == 0 {
 		return EmbeddingListwiseGeometryEvalMetrics{}, fmt.Errorf("listwise geometry eval dataset is empty")
@@ -3048,6 +3140,9 @@ func (t *EmbeddingTrainer) WriteEmbeddingPackage(artifactPath string) (Embedding
 	if t == nil {
 		return EmbeddingPackagePaths{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingPackagePaths{}, err
+	}
 	if err := eosartifact.WriteFile(artifactPath, t.module); err != nil {
 		return EmbeddingPackagePaths{}, err
 	}
@@ -3103,6 +3198,9 @@ func (t *EmbeddingTrainer) WriteEmbeddingPackage(artifactPath string) (Embedding
 func (t *EmbeddingTrainer) WriteTrainingPackage(artifactPath string) (EmbeddingTrainPackagePaths, error) {
 	if t == nil {
 		return EmbeddingTrainPackagePaths{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainPackagePaths{}, err
 	}
 	if err := eosartifact.WriteFile(artifactPath, t.module); err != nil {
 		return EmbeddingTrainPackagePaths{}, err
@@ -3188,6 +3286,9 @@ func (t *EmbeddingTrainer) WriteTrainingPackage(artifactPath string) (EmbeddingT
 func (t *EmbeddingTrainer) runBatch(batch []EmbeddingPairExample, update bool) (EmbeddingTrainMetrics, error) {
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return EmbeddingTrainMetrics{}, err
 	}
 	if len(batch) == 0 {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("training batch is empty")
@@ -3720,6 +3821,9 @@ func (t *EmbeddingTrainer) accumulateCompactInputGrads(tokens []int32, role int3
 func (t *EmbeddingTrainer) applyCompactOptimizerUpdates(grads *compactEmbeddingGradState, scale float32) error {
 	if t == nil || t.compactState == nil || grads == nil {
 		return nil
+	}
+	if err := t.failIfOptimizerPoisoned(); err != nil {
+		return err
 	}
 	t.step++
 	t.compactState.Step = t.step
@@ -4278,18 +4382,21 @@ func (t *EmbeddingTrainer) prepareCompactTrainAccelerator(forward *compactEmbedd
 		}
 		configurator.ConfigureCompactForward(layers, t.compactState.TokenEmbedding.Name, roleName, forward.outputProjectionName, t.manifest.PositionEncoding == EmbeddingPositionEncodingRoPE)
 	}
-	for _, item := range compactTrainStateOptimizerItems(t.compactState) {
-		if item == nil || item.Tensor == nil {
+	items := t.compactForwardResidentItems(forward)
+	for i := range items {
+		if items[i].tensor == nil {
 			continue
 		}
-		if item.Moment1 == nil {
-			item.Moment1 = zeroLikeMaster(item.Tensor)
+		// Seeding may need moments before the all-item resident-update
+		// preflight. Keep temporary zeros local so a later predictable
+		// preflight failure cannot mutate compact trainer state.
+		if items[i].mom1 == nil {
+			items[i].mom1 = zeroLikeMaster(items[i].tensor)
 		}
-		if item.Moment2 == nil {
-			item.Moment2 = zeroLikeMaster(item.Tensor)
+		if items[i].mom2 == nil {
+			items[i].mom2 = zeroLikeMaster(items[i].tensor)
 		}
 	}
-	items := t.compactForwardResidentItems(forward)
 	if seeder, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterSeeder); ok {
 		for _, item := range items {
 			if item.name == "" || item.tensor == nil {
