@@ -237,6 +237,8 @@ type EmbeddingTrainer struct {
 	contrastiveBackend      eosartifact.BackendKind
 	sequenceBindingID       int
 	momentsDirty            bool
+	deferOptimizerSync      bool
+	closeErr                error
 	compactOptimizerUpdates int64
 	forwardCache            *embeddingForwardWeights
 	compactState            *CompactEmbeddingTrainState
@@ -770,8 +772,19 @@ func validateEmbeddingTrainerWeightShapes(params embeddingTrainerParams, manifes
 
 // Close releases any backend-owned trainer acceleration state.
 func (t *EmbeddingTrainer) Close() {
+	_ = t.CloseWithError()
+}
+
+// CloseWithError syncs host-visible optimizer state before releasing backend
+// resources. If the sync fails, resources are left alive so resident-only state
+// is not destroyed silently; callers can retry or checkpoint explicitly.
+func (t *EmbeddingTrainer) CloseWithError() error {
 	if t == nil {
-		return
+		return nil
+	}
+	if err := t.syncOptimizerStateWithReason(true, "close"); err != nil {
+		t.closeErr = err
+		return err
 	}
 	if t.forwardMatMul != nil {
 		t.forwardMatMul.Close()
@@ -793,6 +806,17 @@ func (t *EmbeddingTrainer) Close() {
 		t.contrastiveAccel = nil
 		t.contrastiveBackend = ""
 	}
+	t.closeErr = nil
+	return nil
+}
+
+// CloseError returns the last close-time sync error, including errors captured
+// by the legacy Close method.
+func (t *EmbeddingTrainer) CloseError() error {
+	if t == nil {
+		return nil
+	}
+	return t.closeErr
 }
 
 func (t *EmbeddingTrainer) MemoryPlan() *MemoryPlan {
@@ -803,10 +827,26 @@ func (t *EmbeddingTrainer) MemoryPlan() *MemoryPlan {
 }
 
 func (t *EmbeddingTrainer) syncOptimizerState(includeMoments bool) error {
+	return t.syncOptimizerStateWithReason(includeMoments, "")
+}
+
+func (t *EmbeddingTrainer) syncOptimizerStateWithReason(includeMoments bool, reason string) error {
 	if t == nil || t.optimizerAccel == nil {
 		return nil
 	}
 	if !includeMoments || !t.momentsDirty {
+		return nil
+	}
+	if t.isCompactTrainer() {
+		for _, item := range compactTrainStateOptimizerItems(t.compactState) {
+			if item == nil || item.Name == "" || item.Tensor == nil {
+				continue
+			}
+			if err := t.syncOptimizerBinding(item.Name, item.Tensor, item.Moment1, item.Moment2, includeMoments, reason); err != nil {
+				return err
+			}
+		}
+		t.momentsDirty = false
 		return nil
 	}
 	bindings := []struct {
@@ -828,12 +868,139 @@ func (t *EmbeddingTrainer) syncOptimizerState(includeMoments bool) error {
 		if binding.name == "" || binding.t == nil {
 			continue
 		}
-		if err := t.optimizerAccel.SyncState(binding.name, binding.t, binding.m1, binding.m2, includeMoments); err != nil {
+		if err := t.syncOptimizerBinding(binding.name, binding.t, binding.m1, binding.m2, includeMoments, reason); err != nil {
 			return err
 		}
 	}
 	t.momentsDirty = false
 	return nil
+}
+
+func (t *EmbeddingTrainer) syncOptimizerBinding(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool, reason string) error {
+	if t == nil || t.optimizerAccel == nil {
+		return nil
+	}
+	if reason != "" {
+		if syncer, ok := t.optimizerAccel.(backend.ForcedOptimizerSyncAccelerator); ok {
+			return syncer.SyncStateWithReason(name, tensor, mom1, mom2, includeMoments, reason)
+		}
+	}
+	return t.optimizerAccel.SyncState(name, tensor, mom1, mom2, includeMoments)
+}
+
+func (t *EmbeddingTrainer) bindForwardMatrix(name string, tensor *backend.Tensor) error {
+	if t == nil || t.forwardMatMul == nil {
+		return fmt.Errorf("forward matmul accelerator is not initialized")
+	}
+	if optimizerResidentBridgeDType(tensor) {
+		if provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider); ok {
+			if binder, ok := t.forwardMatMul.(backend.DeviceResidentMatrixBinder); ok {
+				if ref, ok := provider.ResidentParameter(name); ok {
+					if err := binder.BindMatrixFromResident(name, tensor, ref); err == nil {
+						return nil
+					} else if syncErr := t.syncOptimizerTensorForHostFallback(name, tensor, "resident_bind_fallback"); syncErr != nil {
+						return fmt.Errorf("bind resident matrix %q: %w; forced host sync: %v", name, err, syncErr)
+					}
+				}
+			}
+		}
+	}
+	return t.forwardMatMul.BindMatrix(name, tensor)
+}
+
+func (t *EmbeddingTrainer) canBridgeResidentOptimizerParam(name string, tensor *backend.Tensor) bool {
+	if t == nil || name == "" || t.optimizerAccel == nil || t.forwardMatMul == nil || !optimizerResidentBridgeDType(tensor) {
+		return false
+	}
+	if _, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider); !ok {
+		return false
+	}
+	_, ok := t.forwardMatMul.(backend.DeviceResidentMatrixBinder)
+	return ok
+}
+
+func (t *EmbeddingTrainer) syncOptimizerTensorForHostFallback(name string, tensor *backend.Tensor, reason string) error {
+	if t == nil || name == "" || tensor == nil || t.optimizerAccel == nil {
+		return nil
+	}
+	provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider)
+	if !ok {
+		if t.deferOptimizerSync && t.momentsDirty && optimizerResidentBridgeDType(tensor) {
+			return fmt.Errorf("optimizer resident tensor %q cannot use host fallback without a resident provider", name)
+		}
+		return nil
+	}
+	if _, ok := provider.ResidentParameter(name); !ok {
+		if t.deferOptimizerSync && t.momentsDirty && optimizerResidentBridgeDType(tensor) {
+			return fmt.Errorf("optimizer resident tensor %q is unavailable for deferred host fallback", name)
+		}
+		return nil
+	}
+	if reason == "" {
+		reason = "host_fallback"
+	}
+	return t.syncOptimizerBinding(name, tensor, nil, nil, false, reason)
+}
+
+func (t *EmbeddingTrainer) hostWeightDataForMatMul(name string, tensor *backend.Tensor, reason string) ([]float32, error) {
+	if err := t.syncOptimizerTensorForHostFallback(name, tensor, reason); err != nil {
+		return nil, err
+	}
+	return forwardMatMulHostData(tensor), nil
+}
+
+func (t *EmbeddingTrainer) fillWeightTransposeMatMul(lhs []float32, lhsRows, lhsCols int, rhsName string, rhs *backend.Tensor, reason string, out []float32) error {
+	if rhs == nil || len(rhs.Shape) != 2 {
+		for i := range out {
+			out[i] = 0
+		}
+		return nil
+	}
+	if result, ok, err := t.tryTrainerMatMulBoundRightChecked(lhs, lhsRows, lhsCols, rhsName, rhs, false, true); err != nil {
+		return err
+	} else if ok {
+		copy(out, result)
+		return nil
+	}
+	rhsData, err := t.hostWeightDataForMatMul(rhsName, rhs, reason)
+	if err != nil {
+		return err
+	}
+	if result, ok := t.tryTrainerMatMul(lhs, lhsRows, lhsCols, rhsData, rhs.Shape[0], rhs.Shape[1], false, true); ok {
+		copy(out, result)
+	} else {
+		fillHostMatMulTranspose(lhs, lhsRows, lhsCols, rhsData, rhs.Shape[0], rhs.Shape[1], false, true, out)
+	}
+	return nil
+}
+
+func optimizerResidentBridgeDType(tensor *backend.Tensor) bool {
+	return tensor != nil && (tensor.DType == "f32" || tensor.DType == "f16")
+}
+
+func compactTrainStateOptimizerItems(state *CompactEmbeddingTrainState) []*CompactEmbeddingTrainTensor {
+	if state == nil {
+		return nil
+	}
+	items := []*CompactEmbeddingTrainTensor{&state.TokenEmbedding}
+	if state.RoleEmbedding != nil {
+		items = append(items, state.RoleEmbedding)
+	}
+	for i := range state.Layers {
+		layer := &state.Layers[i]
+		items = append(items,
+			&layer.AttentionQuery,
+			&layer.AttentionKey,
+			&layer.AttentionValue,
+			&layer.AttentionOutput,
+			&layer.FFNUp,
+			&layer.FFNDown,
+		)
+	}
+	if state.OutputProjection != nil {
+		items = append(items, state.OutputProjection)
+	}
+	return items
 }
 
 func (t *EmbeddingTrainer) primeForwardWeightResidency(attnQForward, attnKForward, attnVForward, attnOForward, hiddenForward, projForward *backend.Tensor) {
@@ -865,7 +1032,7 @@ func (t *EmbeddingTrainer) primeForwardWeightResidency(attnQForward, attnKForwar
 		if binding.name == "" || binding.tensor == nil {
 			continue
 		}
-		if err := t.forwardMatMul.BindMatrix(binding.name, binding.tensor); err != nil {
+		if err := t.bindForwardMatrix(binding.name, binding.tensor); err != nil {
 			t.Close()
 			return
 		}
@@ -905,14 +1072,14 @@ func (t *EmbeddingTrainer) primeCompactForwardWeightResidency(forward *compactEm
 			if binding.name == "" || binding.tensor == nil {
 				continue
 			}
-			if err := t.forwardMatMul.BindMatrix(binding.name, binding.tensor); err != nil {
+			if err := t.bindForwardMatrix(binding.name, binding.tensor); err != nil {
 				t.Close()
 				return
 			}
 		}
 	}
 	if forward.outputProjectionName != "" && forward.outputProjection != nil {
-		if err := t.forwardMatMul.BindMatrix(forward.outputProjectionName, forward.outputProjection); err != nil {
+		if err := t.bindForwardMatrix(forward.outputProjectionName, forward.outputProjection); err != nil {
 			t.Close()
 			return
 		}
@@ -991,7 +1158,7 @@ func (t *EmbeddingTrainer) bindSequenceTensor(state *embeddingSequenceState, slo
 	}
 	name := prefix + "_" + slot
 	if bindMatMul {
-		if err := t.forwardMatMul.BindMatrix(name, tensor); err != nil {
+		if err := t.bindForwardMatrix(name, tensor); err != nil {
 			return ""
 		}
 	}
@@ -1125,7 +1292,7 @@ func (t *EmbeddingTrainer) augmentRetrievalMetrics(metrics *EmbeddingEvalMetrics
 	// Mid-run, accelerated optimizers hold the live weights on device; sync
 	// the host masters first (as Checkpoint does) or the exported weights are
 	// stale and the retrieval score silently reflects an older model.
-	if err := t.syncOptimizerState(true); err != nil {
+	if err := t.syncOptimizerStateWithReason(true, "eval"); err != nil {
 		return fmt.Errorf("retrieval eval: sync weights: %w", err)
 	}
 	weights, err := t.ExportInferenceWeights()
@@ -1558,14 +1725,9 @@ func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExam
 	}
 
 	t.step++
-	t.applyOptimizerUpdate(t.tokenParam.Name, t.tokenEmbed, t.tokenMom1, t.tokenMom2, gradToken, batchScale)
-	t.applyOptimizerUpdate(t.roleParam.Name, t.roleEmbed, t.roleMom1, t.roleMom2, gradRole, batchScale)
-	t.applyOptimizerUpdate(t.attnQParam.Name, t.attentionQuery, t.attnQMom1, t.attnQMom2, gradAttnQ, batchScale)
-	t.applyOptimizerUpdate(t.attnKParam.Name, t.attentionKey, t.attnKMom1, t.attnKMom2, gradAttnK, batchScale)
-	t.applyOptimizerUpdate(t.attnVParam.Name, t.attentionValue, t.attnVMom1, t.attnVMom2, gradAttnV, batchScale)
-	t.applyOptimizerUpdate(t.attnOParam.Name, t.attentionOutput, t.attnOMom1, t.attnOMom2, gradAttnO, batchScale)
-	t.applyOptimizerUpdate(t.hiddenParam.Name, t.hiddenProjection, t.hiddenMom1, t.hiddenMom2, gradHidden, batchScale)
-	t.applyOptimizerUpdate(t.projParam.Name, t.projection, t.projMom1, t.projMom2, gradProj, batchScale)
+	if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * lossScale,
 		AverageScore: totalScore / float32(pairCount),
@@ -1625,7 +1787,9 @@ func (t *EmbeddingTrainer) runCompactContrastiveBatchUpdate(batch []EmbeddingCon
 			return EmbeddingTrainMetrics{}, fmt.Errorf("positive %d: %w", i, err)
 		}
 	}
-	t.applyCompactOptimizerUpdates(grads, batchScale)
+	if err := t.applyCompactOptimizerUpdates(grads, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * lossScale,
 		AverageScore: totalScore / float32(pairCount),
@@ -1829,14 +1993,9 @@ func (t *EmbeddingTrainer) TrainHardNegativeContrastiveStep(batch []EmbeddingHar
 
 	batchScale := float32(1) / float32(len(queries))
 	t.step++
-	t.applyOptimizerUpdate(t.tokenParam.Name, t.tokenEmbed, t.tokenMom1, t.tokenMom2, gradToken, batchScale)
-	t.applyOptimizerUpdate(t.roleParam.Name, t.roleEmbed, t.roleMom1, t.roleMom2, gradRole, batchScale)
-	t.applyOptimizerUpdate(t.attnQParam.Name, t.attentionQuery, t.attnQMom1, t.attnQMom2, gradAttnQ, batchScale)
-	t.applyOptimizerUpdate(t.attnKParam.Name, t.attentionKey, t.attnKMom1, t.attnKMom2, gradAttnK, batchScale)
-	t.applyOptimizerUpdate(t.attnVParam.Name, t.attentionValue, t.attnVMom1, t.attnVMom2, gradAttnV, batchScale)
-	t.applyOptimizerUpdate(t.attnOParam.Name, t.attentionOutput, t.attnOMom1, t.attnOMom2, gradAttnO, batchScale)
-	t.applyOptimizerUpdate(t.hiddenParam.Name, t.hiddenProjection, t.hiddenMom1, t.hiddenMom2, gradHidden, batchScale)
-	t.applyOptimizerUpdate(t.projParam.Name, t.projection, t.projMom1, t.projMom2, gradProj, batchScale)
+	if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * batchScale,
 		AverageScore: totalScore / float32(pairCount),
@@ -1979,7 +2138,9 @@ func (t *EmbeddingTrainer) runCompactHardNegativeContrastiveBatchUpdate(batch []
 	}
 
 	batchScale := float32(1) / float32(len(queries))
-	t.applyCompactOptimizerUpdates(grads, batchScale)
+	if err := t.applyCompactOptimizerUpdates(grads, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	pairCount := hardNegativeCandidatePairCount(len(queries), len(candidates), candidateSpans, t.config.ContrastiveLoss) + teacherPairCount
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * batchScale,
@@ -2105,14 +2266,9 @@ func (t *EmbeddingTrainer) TrainScoreSpectrumStep(batch []EmbeddingScoreSpectrum
 
 	batchScale := float32(1) / float32(len(queries))
 	t.step++
-	t.applyOptimizerUpdate(t.tokenParam.Name, t.tokenEmbed, t.tokenMom1, t.tokenMom2, gradToken, batchScale)
-	t.applyOptimizerUpdate(t.roleParam.Name, t.roleEmbed, t.roleMom1, t.roleMom2, gradRole, batchScale)
-	t.applyOptimizerUpdate(t.attnQParam.Name, t.attentionQuery, t.attnQMom1, t.attnQMom2, gradAttnQ, batchScale)
-	t.applyOptimizerUpdate(t.attnKParam.Name, t.attentionKey, t.attnKMom1, t.attnKMom2, gradAttnK, batchScale)
-	t.applyOptimizerUpdate(t.attnVParam.Name, t.attentionValue, t.attnVMom1, t.attnVMom2, gradAttnV, batchScale)
-	t.applyOptimizerUpdate(t.attnOParam.Name, t.attentionOutput, t.attnOMom1, t.attnOMom2, gradAttnO, batchScale)
-	t.applyOptimizerUpdate(t.hiddenParam.Name, t.hiddenProjection, t.hiddenMom1, t.hiddenMom2, gradHidden, batchScale)
-	t.applyOptimizerUpdate(t.projParam.Name, t.projection, t.projMom1, t.projMom2, gradProj, batchScale)
+	if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * batchScale,
 		AverageScore: totalScore / float32(pairCount),
@@ -2195,7 +2351,9 @@ func (t *EmbeddingTrainer) runCompactScoreSpectrumBatchUpdate(batch []EmbeddingS
 	}
 
 	batchScale := float32(1) / float32(len(queries))
-	t.applyCompactOptimizerUpdates(grads, batchScale)
+	if err := t.applyCompactOptimizerUpdates(grads, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * batchScale,
 		AverageScore: totalScore / float32(pairCount),
@@ -2306,14 +2464,9 @@ func (t *EmbeddingTrainer) TrainListwiseGeometryStepWithDiagnostics(batch []Embe
 		beforeUpdate = snapshotEmbeddingTrainTensors(t.tokenEmbed, t.attentionQuery, t.attentionKey, t.attentionValue, t.attentionOutput, t.hiddenProjection, t.projection)
 	}
 	t.step++
-	t.applyOptimizerUpdate(t.tokenParam.Name, t.tokenEmbed, t.tokenMom1, t.tokenMom2, gradToken, batchScale)
-	t.applyOptimizerUpdate(t.roleParam.Name, t.roleEmbed, t.roleMom1, t.roleMom2, gradRole, batchScale)
-	t.applyOptimizerUpdate(t.attnQParam.Name, t.attentionQuery, t.attnQMom1, t.attnQMom2, gradAttnQ, batchScale)
-	t.applyOptimizerUpdate(t.attnKParam.Name, t.attentionKey, t.attnKMom1, t.attnKMom2, gradAttnK, batchScale)
-	t.applyOptimizerUpdate(t.attnVParam.Name, t.attentionValue, t.attnVMom1, t.attnVMom2, gradAttnV, batchScale)
-	t.applyOptimizerUpdate(t.attnOParam.Name, t.attentionOutput, t.attnOMom1, t.attnOMom2, gradAttnO, batchScale)
-	t.applyOptimizerUpdate(t.hiddenParam.Name, t.hiddenProjection, t.hiddenMom1, t.hiddenMom2, gradHidden, batchScale)
-	t.applyOptimizerUpdate(t.projParam.Name, t.projection, t.projMom1, t.projMom2, gradProj, batchScale)
+	if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	if movement != nil {
 		movement.ParameterDelta = aggregateParameterDeltaStats(beforeUpdate)
 	}
@@ -2406,7 +2559,9 @@ func (t *EmbeddingTrainer) runCompactListwiseGeometryBatchUpdate(batch []Embeddi
 		}
 		beforeUpdate = snapshotCompactEmbeddingTrainTensors(t.compactState)
 	}
-	t.applyCompactOptimizerUpdates(grads, batchScale)
+	if err := t.applyCompactOptimizerUpdates(grads, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	if movement != nil {
 		movement.ParameterDelta = aggregateParameterDeltaStats(beforeUpdate)
 	}
@@ -2617,6 +2772,9 @@ func normalizeScoreSpectrumEvalMetrics(metrics *EmbeddingScoreSpectrumEvalMetric
 func (t *EmbeddingTrainer) ExportInferenceWeights() (map[string]*backend.Tensor, error) {
 	if t == nil {
 		return nil, fmt.Errorf("embedding trainer is not initialized")
+	}
+	if err := t.syncOptimizerStateWithReason(true, "export"); err != nil {
+		return nil, err
 	}
 	if t.isCompactTrainer() {
 		return t.exportCompactInferenceWeights()
@@ -2998,14 +3156,9 @@ func (t *EmbeddingTrainer) runBatch(batch []EmbeddingPairExample, update bool) (
 	batchScale := float32(1) / float32(len(batch))
 	if update {
 		t.step++
-		t.applyOptimizerUpdate(t.tokenParam.Name, t.tokenEmbed, t.tokenMom1, t.tokenMom2, gradToken, batchScale)
-		t.applyOptimizerUpdate(t.roleParam.Name, t.roleEmbed, t.roleMom1, t.roleMom2, gradRole, batchScale)
-		t.applyOptimizerUpdate(t.attnQParam.Name, t.attentionQuery, t.attnQMom1, t.attnQMom2, gradAttnQ, batchScale)
-		t.applyOptimizerUpdate(t.attnKParam.Name, t.attentionKey, t.attnKMom1, t.attnKMom2, gradAttnK, batchScale)
-		t.applyOptimizerUpdate(t.attnVParam.Name, t.attentionValue, t.attnVMom1, t.attnVMom2, gradAttnV, batchScale)
-		t.applyOptimizerUpdate(t.attnOParam.Name, t.attentionOutput, t.attnOMom1, t.attnOMom2, gradAttnO, batchScale)
-		t.applyOptimizerUpdate(t.hiddenParam.Name, t.hiddenProjection, t.hiddenMom1, t.hiddenMom2, gradHidden, batchScale)
-		t.applyOptimizerUpdate(t.projParam.Name, t.projection, t.projMom1, t.projMom2, gradProj, batchScale)
+		if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
+			return EmbeddingTrainMetrics{}, err
+		}
 	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * batchScale,
@@ -3046,7 +3199,9 @@ func (t *EmbeddingTrainer) runCompactPairBatchUpdate(batch []EmbeddingPairExampl
 	}
 
 	batchScale := float32(1) / float32(len(batch))
-	t.applyCompactOptimizerUpdates(grads, batchScale)
+	if err := t.applyCompactOptimizerUpdates(grads, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * batchScale,
 		AverageScore: totalScore * batchScale,
@@ -3132,12 +3287,15 @@ func (t *EmbeddingTrainer) backpropCompactEncodedSequence(seq *embeddingEncodedS
 	if forward == nil || len(forward.layers) != len(seq.layers) {
 		return fmt.Errorf("compact forward layer count %d does not match encoded layer count %d", compactForwardLayerCount(forward), len(seq.layers))
 	}
-	gradHidden, err := t.backpropCompactFinalOutput(seq, gradPooled, forward.outputProjection, grads.outputProjection)
+	gradHidden, err := t.backpropCompactFinalOutput(seq, gradPooled, forward.outputProjectionName, forward.outputProjection, grads.outputProjection)
 	if err != nil {
 		return err
 	}
 	for layerIndex := len(seq.layers) - 1; layerIndex >= 0; layerIndex-- {
-		gradHidden = t.backpropCompactLayer(seq.layers[layerIndex], gradHidden, forward.layers[layerIndex], &grads.layers[layerIndex])
+		gradHidden, err = t.backpropCompactLayer(seq.layers[layerIndex], gradHidden, forward.layers[layerIndex], &grads.layers[layerIndex])
+		if err != nil {
+			return err
+		}
 	}
 	t.accumulateCompactInputGrads(seq.tokens, seq.role, gradHidden, grads)
 	return nil
@@ -3150,7 +3308,7 @@ func compactForwardLayerCount(forward *compactEmbeddingForwardWeights) int {
 	return len(forward.layers)
 }
 
-func (t *EmbeddingTrainer) backpropCompactFinalOutput(seq *embeddingEncodedSequence, gradPooled []float32, outputProjection *backend.Tensor, gradOutputProjection []float32) ([]float32, error) {
+func (t *EmbeddingTrainer) backpropCompactFinalOutput(seq *embeddingEncodedSequence, gradPooled []float32, outputProjectionName string, outputProjection *backend.Tensor, gradOutputProjection []float32) ([]float32, error) {
 	last := seq.finalLayer()
 	if last == nil || len(last.tokens) == 0 {
 		return nil, fmt.Errorf("compact final output requires a non-empty final layer")
@@ -3210,10 +3368,8 @@ func (t *EmbeddingTrainer) backpropCompactFinalOutput(seq *embeddingEncodedSeque
 		}
 		addFloat32Slice(gradOutputProjection, gradProjStep)
 		gradNormalized = make([]float32, seqLen*modelDim)
-		if out, ok := t.tryTrainerMatMul(gradOutputRows, seqLen, outDim, outputProjection.F32, modelDim, outDim, false, true); ok {
-			copy(gradNormalized, out)
-		} else {
-			fillHostMatMulTranspose(gradOutputRows, seqLen, outDim, outputProjection.F32, modelDim, outDim, false, true, gradNormalized)
+		if err := t.fillWeightTransposeMatMul(gradOutputRows, seqLen, outDim, outputProjectionName, outputProjection, "compact_output_projection_host_fallback", gradNormalized); err != nil {
+			return nil, err
 		}
 	}
 
@@ -3235,22 +3391,22 @@ func (t *EmbeddingTrainer) backpropCompactFinalOutput(seq *embeddingEncodedSeque
 	return gradHidden, nil
 }
 
-func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32, layer compactEmbeddingForwardLayer, gradLayer *compactEmbeddingGradLayer) []float32 {
+func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, gradProjected []float32, layer compactEmbeddingForwardLayer, gradLayer *compactEmbeddingGradLayer) ([]float32, error) {
 	if state == nil || len(state.tokens) == 0 {
-		return nil
+		return nil, nil
 	}
 	seqLen := len(state.tokens)
 	d := compactLayerModelDim(layer)
 	h := compactLayerFFNDim(layer)
 	if d <= 0 || h <= 0 || len(gradProjected) != seqLen*d {
-		return make([]float32, len(state.input))
+		return make([]float32, len(state.input)), nil
 	}
 	heads, headDim, ok := compactLayerAttentionLayout(layer, d)
 	if !ok {
-		return make([]float32, len(state.input))
+		return make([]float32, len(state.input)), nil
 	}
 	if len(state.attnScores) != heads*seqLen*seqLen {
-		return make([]float32, len(state.input))
+		return make([]float32, len(state.input)), nil
 	}
 
 	gradFFNResidual := make([]float32, seqLen*d)
@@ -3278,10 +3434,8 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 	}
 	addFloat32Slice(gradLayer.ffnDown, gradFFNDownStep)
 	gradActivatedPre := make([]float32, seqLen*h)
-	if out, ok := t.tryTrainerMatMul(gradFFNOutput, seqLen, d, forwardMatMulHostData(layer.ffnDown), h, d, false, true); ok {
-		copy(gradActivatedPre, out)
-	} else {
-		fillHostMatMulTranspose(gradFFNOutput, seqLen, d, forwardMatMulHostData(layer.ffnDown), h, d, false, true, gradActivatedPre)
+	if err := t.fillWeightTransposeMatMul(gradFFNOutput, seqLen, d, layer.ffnDownName, layer.ffnDown, "compact_ffn_down_host_fallback", gradActivatedPre); err != nil {
+		return nil, err
 	}
 	gradActivated := make([]float32, seqLen*h)
 	fastGELU := fastGELUEnabled()
@@ -3306,10 +3460,8 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 	}
 	addFloat32Slice(gradLayer.ffnUp, gradFFNUpStep)
 	gradHiddenFromFFN := make([]float32, seqLen*d)
-	if out, ok := t.tryTrainerMatMul(gradActivated, seqLen, h, forwardMatMulHostData(layer.ffnUp), d, h, false, true); ok {
-		copy(gradHiddenFromFFN, out)
-	} else {
-		fillHostMatMulTranspose(gradActivated, seqLen, h, forwardMatMulHostData(layer.ffnUp), d, h, false, true, gradHiddenFromFFN)
+	if err := t.fillWeightTransposeMatMul(gradActivated, seqLen, h, layer.ffnUpName, layer.ffnUp, "compact_ffn_up_host_fallback", gradHiddenFromFFN); err != nil {
+		return nil, err
 	}
 	addFloat32Slice(gradHidden, gradHiddenFromFFN)
 
@@ -3338,10 +3490,8 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 	}
 	addFloat32Slice(gradLayer.attnO, gradAttnOStep)
 	gradMixed := make([]float32, seqLen*d)
-	if out, ok := t.tryTrainerMatMul(gradAttnOutput, seqLen, d, forwardMatMulHostData(layer.attnO), d, d, false, true); ok {
-		copy(gradMixed, out)
-	} else {
-		fillHostMatMulTranspose(gradAttnOutput, seqLen, d, forwardMatMulHostData(layer.attnO), d, d, false, true, gradMixed)
+	if err := t.fillWeightTransposeMatMul(gradAttnOutput, seqLen, d, layer.attnOName, layer.attnO, "compact_attention_output_host_fallback", gradMixed); err != nil {
+		return nil, err
 	}
 
 	gradV := make([]float32, seqLen*d)
@@ -3414,31 +3564,25 @@ func (t *EmbeddingTrainer) backpropCompactLayer(state *embeddingSequenceState, g
 	addFloat32Slice(gradLayer.attnV, gradAttnVStep)
 
 	gradInputStep := make([]float32, seqLen*d)
-	if out, ok := t.tryTrainerMatMul(gradQ, seqLen, d, forwardMatMulHostData(layer.attnQ), d, d, false, true); ok {
-		copy(gradInputStep, out)
-	} else {
-		fillHostMatMulTranspose(gradQ, seqLen, d, forwardMatMulHostData(layer.attnQ), d, d, false, true, gradInputStep)
+	if err := t.fillWeightTransposeMatMul(gradQ, seqLen, d, layer.attnQName, layer.attnQ, "compact_attention_query_host_fallback", gradInputStep); err != nil {
+		return nil, err
 	}
 	addFloat32Slice(gradInput, gradInputStep)
 	for i := range gradInputStep {
 		gradInputStep[i] = 0
 	}
-	if out, ok := t.tryTrainerMatMul(gradK, seqLen, d, forwardMatMulHostData(layer.attnK), d, d, false, true); ok {
-		copy(gradInputStep, out)
-	} else {
-		fillHostMatMulTranspose(gradK, seqLen, d, forwardMatMulHostData(layer.attnK), d, d, false, true, gradInputStep)
+	if err := t.fillWeightTransposeMatMul(gradK, seqLen, d, layer.attnKName, layer.attnK, "compact_attention_key_host_fallback", gradInputStep); err != nil {
+		return nil, err
 	}
 	addFloat32Slice(gradInput, gradInputStep)
 	for i := range gradInputStep {
 		gradInputStep[i] = 0
 	}
-	if out, ok := t.tryTrainerMatMul(gradV, seqLen, d, forwardMatMulHostData(layer.attnV), d, d, false, true); ok {
-		copy(gradInputStep, out)
-	} else {
-		fillHostMatMulTranspose(gradV, seqLen, d, forwardMatMulHostData(layer.attnV), d, d, false, true, gradInputStep)
+	if err := t.fillWeightTransposeMatMul(gradV, seqLen, d, layer.attnVName, layer.attnV, "compact_attention_value_host_fallback", gradInputStep); err != nil {
+		return nil, err
 	}
 	addFloat32Slice(gradInput, gradInputStep)
-	return gradInput
+	return gradInput, nil
 }
 
 func (t *EmbeddingTrainer) accumulateCompactInputGrads(tokens []int32, role int32, gradInput []float32, grads *compactEmbeddingGradState) {
@@ -3474,19 +3618,19 @@ func (t *EmbeddingTrainer) accumulateCompactInputGrads(tokens []int32, role int3
 	}
 }
 
-func (t *EmbeddingTrainer) applyCompactOptimizerUpdates(grads *compactEmbeddingGradState, scale float32) {
+func (t *EmbeddingTrainer) applyCompactOptimizerUpdates(grads *compactEmbeddingGradState, scale float32) error {
 	if t == nil || t.compactState == nil || grads == nil {
-		return
+		return nil
 	}
 	t.step++
 	t.compactState.Step = t.step
 	t.compactOptimizerUpdates++
-	apply := func(item *CompactEmbeddingTrainTensor, grad []float32) {
+	apply := func(item *CompactEmbeddingTrainTensor, grad []float32) error {
 		if item == nil || item.Tensor == nil {
-			return
+			return nil
 		}
 		if len(grad) != len(item.Tensor.F32) {
-			return
+			return nil
 		}
 		if item.Moment1 == nil {
 			item.Moment1 = zeroLikeMaster(item.Tensor)
@@ -3494,26 +3638,45 @@ func (t *EmbeddingTrainer) applyCompactOptimizerUpdates(grads *compactEmbeddingG
 		if item.Moment2 == nil {
 			item.Moment2 = zeroLikeMaster(item.Tensor)
 		}
-		t.applyOptimizerUpdate(item.Name, item.Tensor, item.Moment1, item.Moment2, grad, scale)
+		return t.applyOptimizerUpdate(item.Name, item.Tensor, item.Moment1, item.Moment2, grad, scale)
 	}
-	apply(&t.compactState.TokenEmbedding, grads.token)
+	if err := apply(&t.compactState.TokenEmbedding, grads.token); err != nil {
+		return err
+	}
 	if t.compactState.RoleEmbedding != nil {
-		apply(t.compactState.RoleEmbedding, grads.role)
+		if err := apply(t.compactState.RoleEmbedding, grads.role); err != nil {
+			return err
+		}
 	}
 	for i := range t.compactState.Layers {
 		layer := &t.compactState.Layers[i]
 		gradLayer := grads.layers[i]
-		apply(&layer.AttentionQuery, gradLayer.attnQ)
-		apply(&layer.AttentionKey, gradLayer.attnK)
-		apply(&layer.AttentionValue, gradLayer.attnV)
-		apply(&layer.AttentionOutput, gradLayer.attnO)
-		apply(&layer.FFNUp, gradLayer.ffnUp)
-		apply(&layer.FFNDown, gradLayer.ffnDown)
+		if err := apply(&layer.AttentionQuery, gradLayer.attnQ); err != nil {
+			return err
+		}
+		if err := apply(&layer.AttentionKey, gradLayer.attnK); err != nil {
+			return err
+		}
+		if err := apply(&layer.AttentionValue, gradLayer.attnV); err != nil {
+			return err
+		}
+		if err := apply(&layer.AttentionOutput, gradLayer.attnO); err != nil {
+			return err
+		}
+		if err := apply(&layer.FFNUp, gradLayer.ffnUp); err != nil {
+			return err
+		}
+		if err := apply(&layer.FFNDown, gradLayer.ffnDown); err != nil {
+			return err
+		}
 	}
 	if t.compactState.OutputProjection != nil {
-		apply(t.compactState.OutputProjection, grads.outputProjection)
+		if err := apply(t.compactState.OutputProjection, grads.outputProjection); err != nil {
+			return err
+		}
 	}
 	t.compactState.Config = t.config
+	return nil
 }
 
 func (t *EmbeddingTrainer) tryRunPairBatchBatched(batch []EmbeddingPairExample, forward *embeddingForwardWeights, update bool) (EmbeddingTrainMetrics, bool, error) {
@@ -3600,14 +3763,9 @@ func (t *EmbeddingTrainer) tryRunPairBatchBatched(batch []EmbeddingPairExample, 
 
 		batchScale := float32(1) / float32(len(batch))
 		t.step++
-		t.applyOptimizerUpdate(t.tokenParam.Name, t.tokenEmbed, t.tokenMom1, t.tokenMom2, gradToken, batchScale)
-		t.applyOptimizerUpdate(t.roleParam.Name, t.roleEmbed, t.roleMom1, t.roleMom2, gradRole, batchScale)
-		t.applyOptimizerUpdate(t.attnQParam.Name, t.attentionQuery, t.attnQMom1, t.attnQMom2, gradAttnQ, batchScale)
-		t.applyOptimizerUpdate(t.attnKParam.Name, t.attentionKey, t.attnKMom1, t.attnKMom2, gradAttnK, batchScale)
-		t.applyOptimizerUpdate(t.attnVParam.Name, t.attentionValue, t.attnVMom1, t.attnVMom2, gradAttnV, batchScale)
-		t.applyOptimizerUpdate(t.attnOParam.Name, t.attentionOutput, t.attnOMom1, t.attnOMom2, gradAttnO, batchScale)
-		t.applyOptimizerUpdate(t.hiddenParam.Name, t.hiddenProjection, t.hiddenMom1, t.hiddenMom2, gradHidden, batchScale)
-		t.applyOptimizerUpdate(t.projParam.Name, t.projection, t.projMom1, t.projMom2, gradProj, batchScale)
+		if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
+			return EmbeddingTrainMetrics{}, true, err
+		}
 	}
 
 	batchScale := float32(1) / float32(len(batch))
@@ -7807,9 +7965,18 @@ func (t *EmbeddingTrainer) tryTrainerMatMulBoundLeft(lhsName string, lhs, rhs *b
 }
 
 func (t *EmbeddingTrainer) tryTrainerMatMulBoundRight(lhsData []float32, lhsRows, lhsCols int, rhsName string, rhs *backend.Tensor, transposeLeft, transposeRight bool) ([]float32, bool) {
-	if rhs == nil {
+	out, ok, err := t.tryTrainerMatMulBoundRightChecked(lhsData, lhsRows, lhsCols, rhsName, rhs, transposeLeft, transposeRight)
+	if err != nil {
 		return nil, false
 	}
+	return out, ok
+}
+
+func (t *EmbeddingTrainer) tryTrainerMatMulBoundRightChecked(lhsData []float32, lhsRows, lhsCols int, rhsName string, rhs *backend.Tensor, transposeLeft, transposeRight bool) ([]float32, bool, error) {
+	if rhs == nil {
+		return nil, false, nil
+	}
+	boundFailed := false
 	if t != nil && t.forwardMatMul != nil && rhsName != "" {
 		outRows, outCols, ok := trainerMatMulShape(lhsRows, lhsCols, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight)
 		if ok {
@@ -7828,12 +7995,23 @@ func (t *EmbeddingTrainer) tryTrainerMatMulBoundRight(lhsData []float32, lhsRows
 			if err == nil && len(result.Outputs) == 1 && result.Outputs[0] != nil {
 				out := result.Outputs[0].F32
 				if len(out) == outRows*outCols {
-					return out, true
+					return out, true, nil
 				}
 			}
+			boundFailed = true
 		}
 	}
-	return t.tryTrainerMatMul(lhsData, lhsRows, lhsCols, rhs.F32, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight)
+	if boundFailed {
+		if err := t.syncOptimizerTensorForHostFallback(rhsName, rhs, "matmul_host_fallback"); err != nil {
+			return nil, false, err
+		}
+	} else if rhsName != "" {
+		if err := t.syncOptimizerTensorForHostFallback(rhsName, rhs, "matmul_host_fallback"); err != nil {
+			return nil, false, err
+		}
+	}
+	out, ok := t.tryTrainerMatMul(lhsData, lhsRows, lhsCols, rhs.F32, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight)
+	return out, ok, nil
 }
 
 func fillHostMatMul(lhs []float32, rows, inner int, rhs []float32, cols int, out []float32) {
@@ -9209,19 +9387,31 @@ func (t *EmbeddingTrainer) backpropProjectedFFNSequences(states []*embeddingSequ
 }
 
 func (t *EmbeddingTrainer) tryBatchedBoundRightMatMul(lhsMatrices [][]float32, rows, cols int, rhsName string, rhs *backend.Tensor, transposeLeft, transposeRight bool) ([][]float32, bool) {
-	if len(lhsMatrices) == 0 || rows == 0 || cols == 0 || rhs == nil {
+	out, ok, err := t.tryBatchedBoundRightMatMulChecked(lhsMatrices, rows, cols, rhsName, rhs, transposeLeft, transposeRight)
+	if err != nil {
 		return nil, false
+	}
+	return out, ok
+}
+
+func (t *EmbeddingTrainer) tryBatchedBoundRightMatMulChecked(lhsMatrices [][]float32, rows, cols int, rhsName string, rhs *backend.Tensor, transposeLeft, transposeRight bool) ([][]float32, bool, error) {
+	if len(lhsMatrices) == 0 || rows == 0 || cols == 0 || rhs == nil {
+		return nil, false, nil
 	}
 	totalRows := len(lhsMatrices) * rows
 	batched, ok := t.flattenFixedFloat32MatricesScratch(0, lhsMatrices, rows*cols)
 	if !ok {
-		return nil, false
+		return nil, false, nil
 	}
-	out, ok := t.tryTrainerMatMulBoundRight(batched, totalRows, cols, rhsName, rhs, transposeLeft, transposeRight)
+	out, ok, err := t.tryTrainerMatMulBoundRightChecked(batched, totalRows, cols, rhsName, rhs, transposeLeft, transposeRight)
+	if err != nil {
+		return nil, false, err
+	}
 	if !ok || len(out)%len(lhsMatrices) != 0 {
-		return nil, false
+		return nil, false, nil
 	}
-	return splitFloat32Views(out, len(lhsMatrices))
+	split, ok := splitFloat32Views(out, len(lhsMatrices))
+	return split, ok, nil
 }
 
 func (t *EmbeddingTrainer) tryAccumulatedTransposeMatMul(lhsMatrices, rhsMatrices [][]float32, rows, lhsCols, rhsCols int) ([]float32, bool) {
@@ -10165,14 +10355,16 @@ func (t *EmbeddingTrainer) optimizerUpdateConfig(scale float32) backend.Optimize
 	}
 }
 
-func (t *EmbeddingTrainer) applyOptimizerUpdate(name string, tensor, mom1, mom2 *backend.Tensor, grad []float32, scale float32) {
+func (t *EmbeddingTrainer) applyOptimizerUpdate(name string, tensor, mom1, mom2 *backend.Tensor, grad []float32, scale float32) error {
 	if tensor == nil {
-		return
+		return nil
 	}
 	if t != nil && t.optimizerAccel != nil && len(grad) == len(tensor.F32) {
+		cfg := t.optimizerUpdateConfig(scale)
+		cfg.DeferSync = t.deferOptimizerSync && t.canBridgeResidentOptimizerParam(name, tensor)
 		err := t.optimizerAccel.ApplyUpdate(
 			name,
-			t.optimizerUpdateConfig(scale),
+			cfg,
 			tensor,
 			mom1,
 			mom2,
@@ -10181,13 +10373,54 @@ func (t *EmbeddingTrainer) applyOptimizerUpdate(name string, tensor, mom1, mom2 
 		if err == nil {
 			t.momentsDirty = true
 			t.invalidateForwardWeights()
-			return
+			return nil
+		}
+		if t.hasResidentOptimizerParam(name) || cfg.DeferSync {
+			return fmt.Errorf("optimizer update %q: %w", name, err)
 		}
 	}
 	applyOptimizerUpdate(t.config, t.step, tensor, mom1, mom2, grad, scale)
 	if t != nil {
 		t.invalidateForwardWeights()
 	}
+	return nil
+}
+
+func (t *EmbeddingTrainer) applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj []float32, scale float32) error {
+	updates := []struct {
+		name   string
+		tensor *backend.Tensor
+		mom1   *backend.Tensor
+		mom2   *backend.Tensor
+		grad   []float32
+	}{
+		{name: t.tokenParam.Name, tensor: t.tokenEmbed, mom1: t.tokenMom1, mom2: t.tokenMom2, grad: gradToken},
+		{name: t.roleParam.Name, tensor: t.roleEmbed, mom1: t.roleMom1, mom2: t.roleMom2, grad: gradRole},
+		{name: t.attnQParam.Name, tensor: t.attentionQuery, mom1: t.attnQMom1, mom2: t.attnQMom2, grad: gradAttnQ},
+		{name: t.attnKParam.Name, tensor: t.attentionKey, mom1: t.attnKMom1, mom2: t.attnKMom2, grad: gradAttnK},
+		{name: t.attnVParam.Name, tensor: t.attentionValue, mom1: t.attnVMom1, mom2: t.attnVMom2, grad: gradAttnV},
+		{name: t.attnOParam.Name, tensor: t.attentionOutput, mom1: t.attnOMom1, mom2: t.attnOMom2, grad: gradAttnO},
+		{name: t.hiddenParam.Name, tensor: t.hiddenProjection, mom1: t.hiddenMom1, mom2: t.hiddenMom2, grad: gradHidden},
+		{name: t.projParam.Name, tensor: t.projection, mom1: t.projMom1, mom2: t.projMom2, grad: gradProj},
+	}
+	for _, update := range updates {
+		if err := t.applyOptimizerUpdate(update.name, update.tensor, update.mom1, update.mom2, update.grad, scale); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (t *EmbeddingTrainer) hasResidentOptimizerParam(name string) bool {
+	if t == nil || name == "" || t.optimizerAccel == nil {
+		return false
+	}
+	provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider)
+	if !ok {
+		return false
+	}
+	_, ok = provider.ResidentParameter(name)
+	return ok
 }
 
 type embeddingTrainTensorSnapshot struct {

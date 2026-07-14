@@ -87,6 +87,7 @@ type OptimizerUpdateConfig struct {
 	Beta2        float32
 	Epsilon      float32
 	Scale        float32
+	DeferSync    bool
 }
 
 // MatMulAcceleratorStats summarizes backend-owned matmul prep, residency, and run activity.
@@ -108,13 +109,39 @@ type MatMulAcceleratorStats struct {
 
 // OptimizerAcceleratorStats summarizes backend-owned optimizer update activity.
 type OptimizerAcceleratorStats struct {
-	UpdateCalls     int64
-	SyncCalls       int64
-	UploadedBytes   int64
-	DownloadedBytes int64
-	UpdateNanos     int64
-	SyncNanos       int64
-	ResidentParams  int64
+	LogicalSteps           int64
+	TensorUpdateCalls      int64
+	UpdateCalls            int64
+	DeferredSyncUpdates    int64
+	SyncCalls              int64
+	ForcedSyncCalls        int64
+	LastForcedSyncReason   string
+	UploadedBytes          int64
+	DownloadedBytes        int64
+	UploadedBytesPerStep   float64
+	DownloadedBytesPerStep float64
+	UpdateNanos            int64
+	SyncNanos              int64
+	ResidentParams         int64
+}
+
+// OptimizerResidentParameter is a backend-owned device parameter reference.
+// It carries a live owner/generation token so matching backend accelerators can
+// reject stale bindings after optimizer replacement, reallocation, or close.
+type OptimizerResidentParameter struct {
+	Backend  eosartifact.BackendKind
+	Token    OptimizerResidentParameterToken
+	Elements int
+}
+
+// OptimizerResidentParameterToken is implemented by backend-private resident
+// parameter tokens. The runtime treats it as opaque liveness metadata; backend
+// packages may type-assert to their private token implementation.
+type OptimizerResidentParameterToken interface {
+	OptimizerResidentParameterToken()
+	Backend() eosartifact.BackendKind
+	Generation() uint64
+	Alive() bool
 }
 
 // ActivationAcceleratorStats summarizes backend-owned activation backward activity.
@@ -189,6 +216,24 @@ type OptimizerAccelerator interface {
 	SyncState(name string, tensor, mom1, mom2 *Tensor, includeMoments bool) error
 	Stats() OptimizerAcceleratorStats
 	Close()
+}
+
+// ForcedOptimizerSyncAccelerator optionally records the semantic reason for a
+// host-visible optimizer sync.
+type ForcedOptimizerSyncAccelerator interface {
+	SyncStateWithReason(name string, tensor, mom1, mom2 *Tensor, includeMoments bool, reason string) error
+}
+
+// ResidentOptimizerParameterProvider optionally exposes backend-owned parameter
+// buffers for another accelerator from the same backend.
+type ResidentOptimizerParameterProvider interface {
+	ResidentParameter(name string) (OptimizerResidentParameter, bool)
+}
+
+// DeviceResidentMatrixBinder optionally binds a matrix directly from a
+// backend-owned device buffer rather than from host tensor contents.
+type DeviceResidentMatrixBinder interface {
+	BindMatrixFromResident(name string, tensor *Tensor, ref OptimizerResidentParameter) error
 }
 
 // ActivationAccelerator exposes backend-owned elementwise training ops.

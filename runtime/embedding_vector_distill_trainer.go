@@ -15,12 +15,13 @@ import (
 // projection matrix and its AdamW moments.  It is NEVER persisted to disk;
 // the served model uses the native 128-d student output exclusively.
 type vectorDistillProjectionState struct {
-	W        []float32 // shape [inputDim * teacherDim], row-major
-	Mom1     []float32 // AdamW first moment
-	Mom2     []float32 // AdamW second moment
-	InputDim int
-	OutDim   int
-	Step     int // AdamW step counter (separate from student step)
+	W            []float32 // shape [inputDim * teacherDim], row-major
+	Mom1         []float32 // AdamW first moment
+	Mom2         []float32 // AdamW second moment
+	InputDim     int
+	OutDim       int
+	Step         int // AdamW step counter (separate from student step)
+	ResidentName string
 }
 
 type vectorDistillBatchScratch struct {
@@ -45,11 +46,12 @@ func newVectorDistillProjectionState(inputDim, outDim int, rng *rand.Rand) *vect
 		W[i] = (rng.Float32()*2 - 1) * bound
 	}
 	return &vectorDistillProjectionState{
-		W:        W,
-		Mom1:     make([]float32, n),
-		Mom2:     make([]float32, n),
-		InputDim: inputDim,
-		OutDim:   outDim,
+		W:            W,
+		Mom1:         make([]float32, n),
+		Mom2:         make([]float32, n),
+		InputDim:     inputDim,
+		OutDim:       outDim,
+		ResidentName: fmt.Sprintf("vector_distill_projection_%p", &W[0]),
 	}
 }
 
@@ -98,6 +100,11 @@ func (t *EmbeddingTrainer) FitVectorDistill(
 		return EmbeddingTrainRunSummary{}, err
 	}
 	cfg = t.syncTrainRunObjectiveConfig(cfg)
+	previousDeferredSync := t.deferOptimizerSync
+	t.deferOptimizerSync = true
+	defer func() {
+		t.deferOptimizerSync = previousDeferredSync
+	}()
 
 	runStart := time.Now()
 	startStep := t.step
@@ -506,12 +513,16 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 	batchScale := float32(1) / float32(len(batch))
 
 	// Update student parameters
-	t.applyCompactOptimizerUpdates(grads, batchScale)
+	if err := t.applyCompactOptimizerUpdates(grads, batchScale); err != nil {
+		return EmbeddingTrainMetrics{}, proj, err
+	}
 
 	// Update projection with its own AdamW (same LR/hyper-params as student)
 	proj.Step++
 	optimizerStart := time.Now()
-	t.applyVectorDistillProjectionAdamW(proj, gradW)
+	if err := t.applyVectorDistillProjectionAdamW(proj, gradW); err != nil {
+		return EmbeddingTrainMetrics{}, proj, err
+	}
 	t.vectorDistillPhases.OptimizerNanos += time.Since(optimizerStart).Nanoseconds()
 
 	return EmbeddingTrainMetrics{
@@ -575,7 +586,9 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 		} else {
 			projVec = make([]float32, proj.OutDim)
 		}
-		t.projectVectorDistillStudent(student, proj, projVec)
+		if err := t.projectVectorDistillStudent(student, proj, projVec); err != nil {
+			return nil, nil, 0, fmt.Errorf("example %d projection: %w", i, err)
+		}
 
 		// Loss and gradient w.r.t. projected vector
 		var lossResult VectorDistillLossResult
@@ -601,7 +614,9 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 		} else {
 			gradStudent = make([]float32, proj.InputDim)
 		}
-		t.accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj, gradStudent, gradW)
+		if err := t.accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj, gradStudent, gradW); err != nil {
+			return nil, nil, 0, fmt.Errorf("example %d projection backward: %w", i, err)
+		}
 
 		// Merge in the relational term's gradient w.r.t. the same raw student
 		// vector (computed directly, not through the projection).
@@ -633,13 +648,25 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 	return grads, gradW, totalLoss, nil
 }
 
-func (t *EmbeddingTrainer) projectVectorDistillStudent(student []float32, proj *vectorDistillProjectionState, out []float32) {
+func (t *EmbeddingTrainer) projectVectorDistillStudent(student []float32, proj *vectorDistillProjectionState, out []float32) error {
 	if proj == nil || len(student) == 0 || len(out) != proj.OutDim {
-		return
+		return nil
+	}
+	if name := proj.residentName(); name != "" {
+		weights := backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.W)
+		if accelerated, ok, err := t.tryTrainerMatMulBoundRightChecked(student, 1, proj.InputDim, name, weights, false, false); err != nil {
+			return err
+		} else if ok && len(accelerated) == proj.OutDim {
+			copy(out, accelerated)
+			return nil
+		}
+		if err := t.syncVectorDistillProjectionState(proj, "host_fallback"); err != nil {
+			return err
+		}
 	}
 	if accelerated, ok := t.tryTrainerMatMul(student, 1, proj.InputDim, proj.W, proj.InputDim, proj.OutDim, false, false); ok && len(accelerated) == proj.OutDim {
 		copy(out, accelerated)
-		return
+		return nil
 	}
 	for si := 0; si < proj.InputDim; si++ {
 		base := si * proj.OutDim
@@ -648,6 +675,7 @@ func (t *EmbeddingTrainer) projectVectorDistillStudent(student []float32, proj *
 			out[k] += proj.W[base+k] * sv
 		}
 	}
+	return nil
 }
 
 func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
@@ -656,16 +684,33 @@ func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
 	proj *vectorDistillProjectionState,
 	gradStudent []float32,
 	gradW []float32,
-) {
+) error {
 	if proj == nil || len(gradProj) == 0 || len(student) == 0 {
-		return
+		return nil
 	}
 	studentGradOK := false
-	if accelerated, ok := t.tryTrainerMatMul(gradProj, 1, proj.OutDim, proj.W, proj.InputDim, proj.OutDim, false, true); ok && len(accelerated) == proj.InputDim {
-		for i, v := range accelerated {
-			gradStudent[i] += v
+	if name := proj.residentName(); name != "" {
+		weights := backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.W)
+		if accelerated, ok, err := t.tryTrainerMatMulBoundRightChecked(gradProj, 1, proj.OutDim, name, weights, false, true); err != nil {
+			return err
+		} else if ok && len(accelerated) == proj.InputDim {
+			for i, v := range accelerated {
+				gradStudent[i] += v
+			}
+			studentGradOK = true
+		} else {
+			if err := t.syncVectorDistillProjectionState(proj, "host_fallback"); err != nil {
+				return err
+			}
 		}
-		studentGradOK = true
+	}
+	if !studentGradOK {
+		if accelerated, ok := t.tryTrainerMatMul(gradProj, 1, proj.OutDim, proj.W, proj.InputDim, proj.OutDim, false, true); ok && len(accelerated) == proj.InputDim {
+			for i, v := range accelerated {
+				gradStudent[i] += v
+			}
+			studentGradOK = true
+		}
 	}
 	weightGradOK := false
 	if accelerated, ok := t.tryTrainerMatMul(student, 1, proj.InputDim, gradProj, 1, proj.OutDim, true, false); ok && len(accelerated) == len(gradW) {
@@ -675,7 +720,7 @@ func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
 		weightGradOK = true
 	}
 	if studentGradOK && weightGradOK {
-		return
+		return nil
 	}
 	if studentGradOK {
 		for i := 0; i < proj.InputDim; i++ {
@@ -685,7 +730,7 @@ func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
 				gradW[base+k] += si * gradProj[k]
 			}
 		}
-		return
+		return nil
 	}
 	if weightGradOK {
 		for i := 0; i < proj.InputDim; i++ {
@@ -696,20 +741,23 @@ func (t *EmbeddingTrainer) accumulateVectorDistillProjectionGrads(
 			}
 			gradStudent[i] += gs
 		}
-		return
+		return nil
 	}
 	accumulateVectorDistillProjectionGrads(student, gradProj, proj.W, gradStudent, gradW)
+	return nil
 }
 
-func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistillProjectionState, gradW []float32) {
+func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistillProjectionState, gradW []float32) error {
 	if proj == nil || len(proj.W) == 0 || proj.Step <= 0 {
-		return
+		return nil
 	}
 	if t != nil && t.optimizerAccel != nil && len(gradW) == len(proj.W) {
 		shape := []int{proj.InputDim, proj.OutDim}
 		weights := backend.NewTensorF32(shape, proj.W)
 		mom1 := backend.NewTensorF32(shape, proj.Mom1)
 		mom2 := backend.NewTensorF32(shape, proj.Mom2)
+		name := proj.residentName()
+		deferSync := t.deferOptimizerSync && t.canBridgeResidentOptimizerParam(name, weights)
 		cfg := backend.OptimizerUpdateConfig{
 			Optimizer:    t.config.Optimizer,
 			Step:         proj.Step,
@@ -719,16 +767,28 @@ func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistill
 			Beta2:        t.config.Beta2,
 			Epsilon:      t.config.Epsilon,
 			Scale:        1,
+			DeferSync:    deferSync,
 		}
-		name := fmt.Sprintf("vector_distill_projection_%p", proj)
 		if err := t.optimizerAccel.ApplyUpdate(name, cfg, weights, mom1, mom2, backend.NewTensorF32(shape, gradW)); err == nil {
-			if err := t.optimizerAccel.SyncState(name, weights, mom1, mom2, true); err == nil {
+			t.momentsDirty = true
+			if deferSync {
+				if err := t.bindForwardMatrix(name, weights); err != nil {
+					if syncErr := t.syncVectorDistillProjectionState(proj, "resident_bind_fallback"); syncErr != nil {
+						return fmt.Errorf("vector-distill projection bind: %w; forced sync: %v", err, syncErr)
+					}
+				}
+				return nil
+			}
+			if err := t.syncOptimizerBinding(name, weights, mom1, mom2, true, "host_fallback"); err == nil {
 				copy(proj.W, weights.F32)
 				copy(proj.Mom1, mom1.F32)
 				copy(proj.Mom2, mom2.F32)
-				t.momentsDirty = true
-				return
+			} else {
+				return err
 			}
+			return nil
+		} else if deferSync || t.hasResidentOptimizerParam(name) {
+			return fmt.Errorf("vector-distill projection optimizer update: %w", err)
 		}
 	}
 	applyVectorDistillProjectionAdamW(
@@ -736,6 +796,34 @@ func (t *EmbeddingTrainer) applyVectorDistillProjectionAdamW(proj *vectorDistill
 		t.config.LearningRate, t.config.Beta1, t.config.Beta2, t.config.Epsilon, t.config.WeightDecay,
 		proj.Step,
 	)
+	return nil
+}
+
+func (p *vectorDistillProjectionState) residentName() string {
+	if p == nil {
+		return ""
+	}
+	if p.ResidentName == "" {
+		p.ResidentName = fmt.Sprintf("vector_distill_projection_%p", p)
+	}
+	return p.ResidentName
+}
+
+func (t *EmbeddingTrainer) syncVectorDistillProjectionState(proj *vectorDistillProjectionState, reason string) error {
+	if t == nil || t.optimizerAccel == nil || proj == nil || len(proj.W) == 0 {
+		return nil
+	}
+	shape := []int{proj.InputDim, proj.OutDim}
+	weights := backend.NewTensorF32(shape, proj.W)
+	mom1 := backend.NewTensorF32(shape, proj.Mom1)
+	mom2 := backend.NewTensorF32(shape, proj.Mom2)
+	if err := t.syncOptimizerBinding(proj.residentName(), weights, mom1, mom2, true, reason); err != nil {
+		return err
+	}
+	copy(proj.W, weights.F32)
+	copy(proj.Mom1, mom1.F32)
+	copy(proj.Mom2, mom2.F32)
+	return nil
 }
 
 func (t *EmbeddingTrainer) vectorDistillRelationalLossAndGrad(students, teachers [][]float32, weight float32) (float32, [][]float32, error) {

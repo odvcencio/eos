@@ -68,7 +68,7 @@ func (t *EmbeddingTrainer) Checkpoint() (EmbeddingTrainCheckpoint, error) {
 	if t == nil {
 		return EmbeddingTrainCheckpoint{}, fmt.Errorf("embedding trainer is not initialized")
 	}
-	if err := t.syncOptimizerState(true); err != nil {
+	if err := t.syncOptimizerStateWithReason(true, "checkpoint"); err != nil {
 		return EmbeddingTrainCheckpoint{}, err
 	}
 	if t.isCompactTrainer() {

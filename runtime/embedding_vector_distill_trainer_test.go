@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -375,7 +376,9 @@ func TestVectorDistillProjectionRoutesMatMulsAndOptimizerThroughAccelerators(t *
 		OutDim:   proj.OutDim,
 		Step:     proj.Step,
 	}
-	trainer.applyVectorDistillProjectionAdamW(proj, gotGradW)
+	if err := trainer.applyVectorDistillProjectionAdamW(proj, gotGradW); err != nil {
+		t.Fatalf("apply projection optimizer update: %v", err)
+	}
 	applyVectorDistillProjectionAdamW(hostProj.W, hostProj.Mom1, hostProj.Mom2, gotGradW, trainer.config.LearningRate, trainer.config.Beta1, trainer.config.Beta2, trainer.config.Epsilon, trainer.config.WeightDecay, hostProj.Step)
 	assertTensorClose(t, backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.W), []int{proj.InputDim, proj.OutDim}, hostProj.W)
 	assertTensorClose(t, backend.NewTensorF32([]int{proj.InputDim, proj.OutDim}, proj.Mom1), []int{proj.InputDim, proj.OutDim}, hostProj.Mom1)
@@ -386,6 +389,95 @@ func TestVectorDistillProjectionRoutesMatMulsAndOptimizerThroughAccelerators(t *
 	if optimizerAccel.stats.SyncCalls != 1 {
 		t.Fatalf("optimizer sync calls = %d, want 1", optimizerAccel.stats.SyncCalls)
 	}
+}
+
+func TestVectorDistillProjectionResidentUpdateErrorFailsClosed(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	proj := &vectorDistillProjectionState{
+		W:        []float32{0.2, -0.1, 0.05, 0.3, -0.4, 0.25},
+		Mom1:     []float32{0, 0, 0, 0, 0, 0},
+		Mom2:     []float32{0, 0, 0, 0, 0, 0},
+		InputDim: 2,
+		OutDim:   3,
+		Step:     1,
+	}
+	name := proj.residentName()
+	before := append([]float32(nil), proj.W...)
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{
+		applyErr: fmt.Errorf("forced projection update failure"),
+		resident: map[string]*fakeResidentOptimizerToken{
+			name: {tensor: backend.NewTensorF32([]int{2, 3}, append([]float32(nil), proj.W...)), generation: 1, alive: true},
+		},
+	}
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.deferOptimizerSync = true
+	err := trainer.applyVectorDistillProjectionAdamW(proj, []float32{0.1, 0.2, 0.3, 0.4, 0.5, 0.6})
+	if err == nil || !strings.Contains(err.Error(), "forced projection update failure") {
+		t.Fatalf("projection update error = %v, want forced resident failure", err)
+	}
+	assertCloseF32Slice(t, "projection after failed resident update", proj.W, before, 0)
+}
+
+func TestVectorDistillStudentResidentUpdateErrorStopsBeforeProjectionUpdate(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{
+		applyErr: fmt.Errorf("forced student optimizer failure"),
+	}
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.deferOptimizerSync = true
+	proj := &vectorDistillProjectionState{
+		W:        []float32{0.2, -0.1, 0.05, 0.3, -0.4, 0.25, 0.15, 0.2, -0.05, 0.1, -0.3, 0.4},
+		Mom1:     make([]float32, 12),
+		Mom2:     make([]float32, 12),
+		InputDim: 3,
+		OutDim:   4,
+	}
+	before := append([]float32(nil), proj.W...)
+	batch := []EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+		vectorDistillTestExample("b", EmbeddingRoleDocument, []int32{3, 2, 1}, []float32{-0.1, 0.4, 0.2, -0.05}),
+	}
+
+	_, gotProj, err := trainer.trainVectorDistillBatch(batch, proj, 4, EmbeddingRoleQuery, 0)
+	if err == nil || !strings.Contains(err.Error(), "forced student optimizer failure") {
+		t.Fatalf("trainVectorDistillBatch error = %v, want student optimizer failure", err)
+	}
+	if gotProj != proj {
+		t.Fatal("trainVectorDistillBatch returned a different projection after failure")
+	}
+	if proj.Step != 0 {
+		t.Fatalf("projection step = %d, want 0 because projection update must not run", proj.Step)
+	}
+	assertCloseF32Slice(t, "projection after failed student update", proj.W, before, 0)
+}
+
+func TestVectorDistillProjectionResidentMatMulFallbackSyncFailureFailsClosed(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	proj := &vectorDistillProjectionState{
+		W:        []float32{0.2, -0.1, 0.05, 0.3, -0.4, 0.25},
+		Mom1:     []float32{0, 0, 0, 0, 0, 0},
+		Mom2:     []float32{0, 0, 0, 0, 0, 0},
+		InputDim: 2,
+		OutDim:   3,
+		Step:     1,
+	}
+	name := proj.residentName()
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{
+		syncErr: fmt.Errorf("forced projection fallback sync failure"),
+		resident: map[string]*fakeResidentOptimizerToken{
+			name: {tensor: backend.NewTensorF32([]int{2, 3}, append([]float32(nil), proj.W...)), generation: 1, alive: true},
+		},
+	}
+	trainer.forwardMatMul = &countingMatMulAccelerator{}
+	trainer.deferOptimizerSync = true
+	trainer.momentsDirty = true
+
+	out := make([]float32, proj.OutDim)
+	err := trainer.projectVectorDistillStudent([]float32{0.7, -0.2}, proj, out)
+	if err == nil || !strings.Contains(err.Error(), "forced projection fallback sync failure") {
+		t.Fatalf("projectVectorDistillStudent error = %v, want fallback sync failure", err)
+	}
+	assertCloseF32Slice(t, "projection output after failed fallback", out, make([]float32, proj.OutDim), 0)
 }
 
 func TestVectorDistillCompactForwardResidencyAndQKVCounters(t *testing.T) {

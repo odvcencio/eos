@@ -62,6 +62,18 @@ func TestFlattenFixedFloat32MatricesScratchCopiesNonContiguousViews(t *testing.T
 	}
 }
 
+func assertCloseF32Slice(t *testing.T, label string, got, want []float32, tol float32) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s length = %d, want %d", label, len(got), len(want))
+	}
+	for i := range got {
+		if abs32(got[i]-want[i]) > tol {
+			t.Fatalf("%s[%d] = %.8f, want %.8f (tol %.8f)", label, i, got[i], want[i], tol)
+		}
+	}
+}
+
 type countingMatMulAccelerator struct {
 	bindCalls         int
 	runCalls          int
@@ -78,6 +90,139 @@ type countingMatMulAccelerator struct {
 	downloadedBytes   int64
 	bindUploadedBytes int64
 	bound             map[string]*backend.Tensor
+}
+
+type fakeResidentOptimizerToken struct {
+	tensor     *backend.Tensor
+	generation uint64
+	alive      bool
+}
+
+func (t *fakeResidentOptimizerToken) OptimizerResidentParameterToken() {}
+
+func (t *fakeResidentOptimizerToken) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (t *fakeResidentOptimizerToken) Generation() uint64 {
+	if t == nil {
+		return 0
+	}
+	return t.generation
+}
+
+func (t *fakeResidentOptimizerToken) Alive() bool {
+	return t != nil && t.alive
+}
+
+type fakeResidentOptimizerAccelerator struct {
+	resident map[string]*fakeResidentOptimizerToken
+	applyErr error
+	syncErr  error
+	closed   bool
+	stats    backend.OptimizerAcceleratorStats
+}
+
+func (a *fakeResidentOptimizerAccelerator) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (a *fakeResidentOptimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
+	if a.applyErr != nil {
+		return a.applyErr
+	}
+	if tensor == nil || grad == nil {
+		return fmt.Errorf("fake resident optimizer requires tensor and grad")
+	}
+	if a.resident == nil {
+		a.resident = map[string]*fakeResidentOptimizerToken{}
+	}
+	target := tensor
+	if cfg.DeferSync {
+		if existing := a.resident[name]; existing != nil && existing.tensor != nil {
+			target = existing.tensor
+		} else {
+			target = tensor.Clone()
+			a.resident[name] = &fakeResidentOptimizerToken{tensor: target, generation: 1, alive: true}
+		}
+	}
+	applyOptimizerUpdate(EmbeddingTrainConfig{
+		Optimizer:    cfg.Optimizer,
+		LearningRate: cfg.LearningRate,
+		WeightDecay:  cfg.WeightDecay,
+		Beta1:        cfg.Beta1,
+		Beta2:        cfg.Beta2,
+		Epsilon:      cfg.Epsilon,
+	}, cfg.Step, target, mom1, mom2, grad.F32, cfg.Scale)
+	a.stats.UpdateCalls++
+	a.stats.TensorUpdateCalls++
+	if cfg.DeferSync {
+		a.stats.DeferredSyncUpdates++
+	}
+	return nil
+}
+
+func (a *fakeResidentOptimizerAccelerator) SyncState(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool) error {
+	a.stats.SyncCalls++
+	if a.syncErr != nil {
+		return a.syncErr
+	}
+	if token := a.resident[name]; token != nil && token.tensor != nil && tensor != nil {
+		copy(tensor.F32, token.tensor.F32)
+	}
+	return nil
+}
+
+func (a *fakeResidentOptimizerAccelerator) Stats() backend.OptimizerAcceleratorStats {
+	return a.stats
+}
+
+func (a *fakeResidentOptimizerAccelerator) Close() {
+	a.closed = true
+	for _, token := range a.resident {
+		token.alive = false
+	}
+}
+
+func (a *fakeResidentOptimizerAccelerator) ResidentParameter(name string) (backend.OptimizerResidentParameter, bool) {
+	token := a.resident[name]
+	if token == nil || token.tensor == nil || !token.alive {
+		return backend.OptimizerResidentParameter{}, false
+	}
+	return backend.OptimizerResidentParameter{Backend: eosartifact.BackendCUDA, Token: token, Elements: len(token.tensor.F32)}, true
+}
+
+type residentAwareCountingMatMulAccelerator struct {
+	countingMatMulAccelerator
+	residentBindCalls int
+}
+
+func (a *residentAwareCountingMatMulAccelerator) BindMatrixFromResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
+	token, ok := ref.Token.(*fakeResidentOptimizerToken)
+	if !ok || token == nil || !token.Alive() || token.tensor == nil {
+		return fmt.Errorf("invalid fake resident token for %q", name)
+	}
+	if ref.Elements != len(token.tensor.F32) {
+		return fmt.Errorf("resident token %q elements = %d, want %d", name, ref.Elements, len(token.tensor.F32))
+	}
+	if a.bound == nil {
+		a.bound = map[string]*backend.Tensor{}
+	}
+	a.residentBindCalls++
+	a.bound[name] = token.tensor
+	return nil
+}
+
+type failingResidentBindMatMulAccelerator struct {
+	countingMatMulAccelerator
+	bindErr error
+}
+
+func (a *failingResidentBindMatMulAccelerator) BindMatrixFromResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
+	if a.bindErr != nil {
+		return a.bindErr
+	}
+	return fmt.Errorf("forced resident bind failure for %q", name)
 }
 
 func (a *countingMatMulAccelerator) Backend() eosartifact.BackendKind {
@@ -2462,6 +2607,162 @@ func TestCompactEmbeddingTrainerUsesMatMulAcceleratorForForwardAndBackward(t *te
 	}
 }
 
+func TestCompactBackwardWeightTransposeReadsResidentWeights(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	name := "layer0_ffn_down"
+	hostWeight := backend.NewTensorF32([]int{3, 4}, []float32{
+		100, 100, 100, 100,
+		100, 100, 100, 100,
+		100, 100, 100, 100,
+	})
+	residentWeight := backend.NewTensorF32([]int{3, 4}, []float32{
+		1, 2, 3, 4,
+		-1, -2, -3, -4,
+		0.5, 1.5, 2.5, 3.5,
+	})
+	opt := &fakeResidentOptimizerAccelerator{resident: map[string]*fakeResidentOptimizerToken{
+		name: {tensor: residentWeight, generation: 1, alive: true},
+	}}
+	mm := &residentAwareCountingMatMulAccelerator{}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = mm
+	trainer.deferOptimizerSync = true
+	trainer.momentsDirty = true
+
+	if err := trainer.bindForwardMatrix(name, hostWeight); err != nil {
+		t.Fatalf("bind resident forward matrix: %v", err)
+	}
+	lhs := []float32{
+		1, 0, 1, 0,
+		0, 1, 0, 1,
+	}
+	out := make([]float32, 2*3)
+	if err := trainer.fillWeightTransposeMatMul(lhs, 2, 4, name, hostWeight, "compact_test_host_fallback", out); err != nil {
+		t.Fatalf("resident transpose matmul: %v", err)
+	}
+	want := make([]float32, len(out))
+	fillHostMatMulTranspose(lhs, 2, 4, residentWeight.F32, 3, 4, false, true, want)
+	assertCloseF32Slice(t, "resident compact transpose", out, want, 1e-6)
+	if mm.residentBindCalls != 1 {
+		t.Fatalf("resident bind calls = %d, want 1", mm.residentBindCalls)
+	}
+	if opt.stats.SyncCalls != 0 {
+		t.Fatalf("host sync calls = %d, want 0 while resident binding is live", opt.stats.SyncCalls)
+	}
+}
+
+func TestEmbeddingTrainerResidentOptimizerUpdateErrorFailsClosed(t *testing.T) {
+	trainer := newTinyTrainableFFNEmbeddingTrainer(t, 0.05)
+	param := backend.NewTensorF32([]int{2, 2}, []float32{1, 2, 3, 4})
+	mom1 := backend.NewTensorF32([]int{2, 2}, []float32{0, 0, 0, 0})
+	mom2 := backend.NewTensorF32([]int{2, 2}, []float32{0, 0, 0, 0})
+	before := append([]float32(nil), param.F32...)
+	name := "projection"
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{
+		applyErr: fmt.Errorf("forced resident update failure"),
+		resident: map[string]*fakeResidentOptimizerToken{
+			name: {tensor: param.Clone(), generation: 1, alive: true},
+		},
+	}
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.deferOptimizerSync = true
+	err := trainer.applyOptimizerUpdate(name, param, mom1, mom2, []float32{0.1, 0.2, 0.3, 0.4}, 1)
+	if err == nil || !strings.Contains(err.Error(), "forced resident update failure") {
+		t.Fatalf("apply optimizer update error = %v, want forced resident failure", err)
+	}
+	assertCloseF32Slice(t, "host tensor after failed resident update", param.F32, before, 0)
+}
+
+func TestCompactResidentBindAndHostSyncFailureFailsClosed(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	name := "layer0_ffn_down"
+	hostWeight := backend.NewTensorF32([]int{3, 4}, []float32{
+		100, 100, 100, 100,
+		100, 100, 100, 100,
+		100, 100, 100, 100,
+	})
+	residentWeight := backend.NewTensorF32([]int{3, 4}, []float32{
+		1, 2, 3, 4,
+		-1, -2, -3, -4,
+		0.5, 1.5, 2.5, 3.5,
+	})
+	syncErr := fmt.Errorf("forced fallback sync failure")
+	opt := &fakeResidentOptimizerAccelerator{
+		syncErr: syncErr,
+		resident: map[string]*fakeResidentOptimizerToken{
+			name: {tensor: residentWeight, generation: 1, alive: true},
+		},
+	}
+	mm := &failingResidentBindMatMulAccelerator{bindErr: fmt.Errorf("forced resident bind failure")}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = mm
+	trainer.deferOptimizerSync = true
+	trainer.momentsDirty = true
+
+	err := trainer.bindForwardMatrix(name, hostWeight)
+	if err == nil || !strings.Contains(err.Error(), "forced fallback sync failure") {
+		t.Fatalf("bindForwardMatrix error = %v, want fallback sync failure", err)
+	}
+	if mm.bindCalls != 0 {
+		t.Fatalf("host BindMatrix calls = %d, want 0 after failed resident bind plus failed sync", mm.bindCalls)
+	}
+
+	out := make([]float32, 2*3)
+	err = trainer.fillWeightTransposeMatMul([]float32{1, 0, 1, 0, 0, 1, 0, 1}, 2, 4, name, hostWeight, "compact_test_host_fallback", out)
+	if err == nil || !strings.Contains(err.Error(), "forced fallback sync failure") {
+		t.Fatalf("fallback matmul error = %v, want sync failure", err)
+	}
+}
+
+func TestEmbeddingTrainerCloseWithErrorPreservesResidentStateOnSyncFailure(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	name := trainer.compactState.TokenEmbedding.Name
+	token := &fakeResidentOptimizerToken{
+		tensor:     trainer.compactState.TokenEmbedding.Tensor.Clone(),
+		generation: 1,
+		alive:      true,
+	}
+	opt := &fakeResidentOptimizerAccelerator{
+		syncErr: fmt.Errorf("forced close sync failure"),
+		resident: map[string]*fakeResidentOptimizerToken{
+			name: token,
+		},
+	}
+	trainer.optimizerAccel = opt
+	trainer.momentsDirty = true
+
+	err := trainer.CloseWithError()
+	if err == nil || !strings.Contains(err.Error(), "forced close sync failure") {
+		t.Fatalf("CloseWithError error = %v, want close sync failure", err)
+	}
+	if trainer.CloseError() != err {
+		t.Fatalf("CloseError = %v, want same error %v", trainer.CloseError(), err)
+	}
+	if trainer.optimizerAccel == nil {
+		t.Fatal("optimizer accelerator was cleared after failed close sync")
+	}
+	if opt.closed {
+		t.Fatal("optimizer accelerator was closed after failed close sync")
+	}
+	if !token.Alive() {
+		t.Fatal("resident token was invalidated after failed close sync")
+	}
+
+	opt.syncErr = nil
+	if err := trainer.CloseWithError(); err != nil {
+		t.Fatalf("second CloseWithError after clearing sync error: %v", err)
+	}
+	if trainer.CloseError() != nil {
+		t.Fatalf("CloseError after successful close = %v, want nil", trainer.CloseError())
+	}
+	if !opt.closed {
+		t.Fatal("optimizer accelerator was not closed after successful retry")
+	}
+	if token.Alive() {
+		t.Fatal("resident token is still alive after successful close")
+	}
+}
+
 func TestCompactEmbeddingTrainerUsesActivationAcceleratorForBackward(t *testing.T) {
 	host := newCompactEmbeddingTrainerForTest(t, 3)
 	host.forwardMatMul = nil
@@ -4365,7 +4666,9 @@ func TestEmbeddingTrainerForwardWeightCacheReusesTensorsUntilUpdate(t *testing.T
 		t.Fatal("expected cached forward tensors to be reused")
 	}
 
-	trainer.applyOptimizerUpdate(trainer.projParam.Name, trainer.projection, trainer.projMom1, trainer.projMom2, make([]float32, len(trainer.projection.F32)), 1)
+	if err := trainer.applyOptimizerUpdate(trainer.projParam.Name, trainer.projection, trainer.projMom1, trainer.projMom2, make([]float32, len(trainer.projection.F32)), 1); err != nil {
+		t.Fatalf("apply optimizer update: %v", err)
+	}
 
 	third := trainer.prepareForwardWeights()
 	if third == nil {
@@ -4406,7 +4709,9 @@ func TestEmbeddingTrainerPrimeForwardWeightResidencySkipsRedundantBinds(t *testi
 		t.Fatalf("backend bind calls = %d, want %d", stats.MatMul.BindCalls, firstCalls)
 	}
 
-	trainer.applyOptimizerUpdate(trainer.projParam.Name, trainer.projection, trainer.projMom1, trainer.projMom2, make([]float32, len(trainer.projection.F32)), 1)
+	if err := trainer.applyOptimizerUpdate(trainer.projParam.Name, trainer.projection, trainer.projMom1, trainer.projMom2, make([]float32, len(trainer.projection.F32)), 1); err != nil {
+		t.Fatalf("apply optimizer update: %v", err)
+	}
 	forward = trainer.prepareForwardWeights()
 	trainer.primeForwardWeightResidency(forward.attnQ, forward.attnK, forward.attnV, forward.attnO, forward.hidden, forward.proj)
 	if fake.bindCalls != firstCalls+5 {

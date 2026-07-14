@@ -11,6 +11,7 @@ import "C"
 import (
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -57,10 +58,13 @@ extern "C" __global__ void manta_optimizer_update(
 `
 
 type optimizerAccelerator struct {
-	device   *deviceRuntime
-	kernel   *auxKernel
-	resident map[string]residentOptimizerState
-	stats    backend.OptimizerAcceleratorStats
+	mu              sync.RWMutex
+	device          *deviceRuntime
+	kernel          *auxKernel
+	resident        map[string]residentOptimizerState
+	stats           backend.OptimizerAcceleratorStats
+	nextGen         uint64
+	lastLogicalStep int
 }
 
 type residentOptimizerState struct {
@@ -69,6 +73,59 @@ type residentOptimizerState struct {
 	mom2       C.CUdeviceptr
 	elements   int
 	hasMoments bool
+	generation uint64
+}
+
+type optimizerResidentParameterToken struct {
+	owner      *optimizerAccelerator
+	name       string
+	generation uint64
+}
+
+func (t *optimizerResidentParameterToken) OptimizerResidentParameterToken() {}
+
+func (t *optimizerResidentParameterToken) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (t *optimizerResidentParameterToken) Generation() uint64 {
+	if t == nil {
+		return 0
+	}
+	return t.generation
+}
+
+func (t *optimizerResidentParameterToken) Alive() bool {
+	if t == nil {
+		return false
+	}
+	_, unlock, err := t.lockCurrent()
+	if unlock != nil {
+		unlock()
+	}
+	return err == nil
+}
+
+func (t *optimizerResidentParameterToken) lockCurrent() (residentOptimizerState, func(), error) {
+	if t == nil || t.owner == nil || t.name == "" {
+		return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token is invalid")
+	}
+	t.owner.mu.RLock()
+	unlock := func() { t.owner.mu.RUnlock() }
+	if t.owner.device == nil {
+		unlock()
+		return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token %q owner is closed", t.name)
+	}
+	state, ok := t.owner.resident[t.name]
+	if !ok {
+		unlock()
+		return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token %q is no longer resident", t.name)
+	}
+	if state.generation != t.generation {
+		unlock()
+		return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token %q generation %d is stale, current %d", t.name, t.generation, state.generation)
+	}
+	return state, unlock, nil
 }
 
 func init() {
@@ -99,13 +156,23 @@ func (a *optimizerAccelerator) Stats() backend.OptimizerAcceleratorStats {
 	if a == nil {
 		return backend.OptimizerAcceleratorStats{}
 	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 	stats := a.stats
+	if stats.TensorUpdateCalls == 0 {
+		stats.TensorUpdateCalls = stats.UpdateCalls
+	}
 	stats.ResidentParams = int64(len(a.resident))
 	return stats
 }
 
 func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
-	if a == nil || a.device == nil || a.kernel == nil {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.device == nil || a.kernel == nil {
 		return fmt.Errorf("cuda optimizer accelerator is not initialized")
 	}
 	if tensor == nil || grad == nil {
@@ -179,18 +246,41 @@ func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpd
 	); err != nil {
 		return err
 	}
-	if err := a.device.downloadFloat32(tensor.F32, state.param); err != nil {
-		return err
-	}
 	a.stats.UpdateCalls++
-	a.stats.DownloadedBytes += int64(len(tensor.F32) * 4)
+	a.stats.TensorUpdateCalls++
+	if cfg.Step != 0 && cfg.Step != a.lastLogicalStep {
+		a.stats.LogicalSteps++
+		a.lastLogicalStep = cfg.Step
+	}
+	if cfg.DeferSync && name != "" {
+		a.stats.DeferredSyncUpdates++
+	} else {
+		if err := a.device.downloadFloat32(tensor.F32, state.param); err != nil {
+			return err
+		}
+		a.stats.DownloadedBytes += int64(len(tensor.F32) * 4)
+	}
 	a.stats.UpdateNanos += time.Since(start).Nanoseconds()
 	a.stats.ResidentParams = int64(len(a.resident))
+	a.updatePerStepStats()
 	return nil
 }
 
 func (a *optimizerAccelerator) SyncState(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool) error {
-	if a == nil || a.device == nil {
+	return a.syncState(name, tensor, mom1, mom2, includeMoments, "")
+}
+
+func (a *optimizerAccelerator) SyncStateWithReason(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool, reason string) error {
+	return a.syncState(name, tensor, mom1, mom2, includeMoments, reason)
+}
+
+func (a *optimizerAccelerator) syncState(name string, tensor, mom1, mom2 *backend.Tensor, includeMoments bool, reason string) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.device == nil {
 		return fmt.Errorf("cuda optimizer accelerator is not initialized")
 	}
 	if name == "" {
@@ -212,8 +302,13 @@ func (a *optimizerAccelerator) SyncState(name string, tensor, mom1, mom2 *backen
 	}
 	if !includeMoments {
 		a.stats.SyncCalls++
+		if reason != "" {
+			a.stats.ForcedSyncCalls++
+			a.stats.LastForcedSyncReason = reason
+		}
 		a.stats.SyncNanos += time.Since(start).Nanoseconds()
 		a.stats.ResidentParams = int64(len(a.resident))
+		a.updatePerStepStats()
 		return nil
 	}
 	if state.hasMoments {
@@ -237,9 +332,43 @@ func (a *optimizerAccelerator) SyncState(name string, tensor, mom1, mom2 *backen
 		}
 	}
 	a.stats.SyncCalls++
+	if reason != "" {
+		a.stats.ForcedSyncCalls++
+		a.stats.LastForcedSyncReason = reason
+	}
 	a.stats.SyncNanos += time.Since(start).Nanoseconds()
 	a.stats.ResidentParams = int64(len(a.resident))
+	a.updatePerStepStats()
 	return nil
+}
+
+func (a *optimizerAccelerator) ResidentParameter(name string) (backend.OptimizerResidentParameter, bool) {
+	if a == nil || name == "" {
+		return backend.OptimizerResidentParameter{}, false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	state, ok := a.resident[name]
+	if !ok {
+		return backend.OptimizerResidentParameter{}, false
+	}
+	return backend.OptimizerResidentParameter{
+		Backend:  eosartifact.BackendCUDA,
+		Token:    &optimizerResidentParameterToken{owner: a, name: name, generation: state.generation},
+		Elements: state.elements,
+	}, true
+}
+
+func (a *optimizerAccelerator) updatePerStepStats() {
+	if a == nil || a.stats.UpdateCalls == 0 {
+		return
+	}
+	steps := float64(a.stats.LogicalSteps)
+	if steps == 0 {
+		steps = float64(a.stats.UpdateCalls)
+	}
+	a.stats.UploadedBytesPerStep = float64(a.stats.UploadedBytes) / steps
+	a.stats.DownloadedBytesPerStep = float64(a.stats.DownloadedBytes) / steps
 }
 
 func (a *optimizerAccelerator) ensureResidentState(name string, tensor, mom1, mom2 *backend.Tensor, elements int, requireMoments bool) (residentOptimizerState, bool, error) {
@@ -261,6 +390,8 @@ func (a *optimizerAccelerator) ensureResidentState(name string, tensor, mom1, mo
 	if err != nil {
 		return residentOptimizerState{}, false, err
 	}
+	a.nextGen++
+	state.generation = a.nextGen
 	a.resident[name] = state
 	a.stats.ResidentParams = int64(len(a.resident))
 	return state, false, nil
@@ -306,7 +437,12 @@ func (a *optimizerAccelerator) releaseResidentState(state residentOptimizerState
 }
 
 func (a *optimizerAccelerator) Close() {
-	if a == nil || a.device == nil {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.device == nil {
 		return
 	}
 	for name, state := range a.resident {
