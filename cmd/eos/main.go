@@ -7448,6 +7448,7 @@ func trainProfileDeltaPayload(profile eosruntime.EmbeddingTrainProfile) trainPro
 			CompactTrainWorkspaceArenaBytes:        profile.CompactTrain.WorkspaceArenaBytes,
 			CompactTrainResidentGradBytes:          profile.CompactTrain.ResidentGradBytes,
 			CompactTrainLiveHandles:                profile.CompactTrain.LiveHandles,
+			CompactTrainFallbackOrUnhandled:        profile.CompactTrain.FallbackOrUnhandled,
 		}
 	}
 	return payload

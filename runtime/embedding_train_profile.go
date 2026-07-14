@@ -337,6 +337,7 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		out.KernelSynchronizations -= start.KernelSynchronizations
 		out.GraphCaptures -= start.GraphCaptures
 		out.GraphReplays -= start.GraphReplays
+		out.FallbackOrUnhandled -= start.FallbackOrUnhandled
 		out.ForwardNanos -= start.ForwardNanos
 		out.BackwardNanos -= start.BackwardNanos
 		out.OptimizerResidentGradNanos -= start.OptimizerResidentGradNanos
@@ -373,6 +374,7 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.KernelSynchronizations += right.KernelSynchronizations
 		out.GraphCaptures += right.GraphCaptures
 		out.GraphReplays += right.GraphReplays
+		out.FallbackOrUnhandled += right.FallbackOrUnhandled
 		out.ForwardNanos += right.ForwardNanos
 		out.BackwardNanos += right.BackwardNanos
 		out.OptimizerResidentGradNanos += right.OptimizerResidentGradNanos

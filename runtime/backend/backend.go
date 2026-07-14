@@ -220,6 +220,7 @@ type CompactTrainAcceleratorStats struct {
 	KernelSynchronizations     int64
 	GraphCaptures              int64
 	GraphReplays               int64
+	FallbackOrUnhandled        int64
 	ForwardNanos               int64
 	BackwardNanos              int64
 	OptimizerResidentGradNanos int64
@@ -342,12 +343,14 @@ type CompactTrainHandle struct {
 	Token      CompactTrainHandleToken
 	Shape      CompactForwardShape
 	Generation uint64
+	StepID     uint64
 }
 
 type CompactTrainHandleToken interface {
 	CompactTrainHandleToken()
 	Backend() eosartifact.BackendKind
 	Generation() uint64
+	StepID() uint64
 	Alive() bool
 }
 
@@ -372,6 +375,7 @@ type ResidentGradientRef struct {
 	Token      ResidentGradientToken
 	Elements   int
 	Generation uint64
+	StepID     uint64
 }
 
 type ResidentGradientToken interface {

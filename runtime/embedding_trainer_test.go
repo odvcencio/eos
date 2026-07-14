@@ -229,6 +229,7 @@ type fakeCompactForwardAccelerator struct {
 type fakeCompactTrainHandleToken struct {
 	alive      bool
 	generation uint64
+	stepID     uint64
 }
 
 func (t *fakeCompactTrainHandleToken) CompactTrainHandleToken() {}
@@ -236,6 +237,7 @@ func (t *fakeCompactTrainHandleToken) Backend() eosartifact.BackendKind {
 	return eosartifact.BackendCUDA
 }
 func (t *fakeCompactTrainHandleToken) Generation() uint64 { return t.generation }
+func (t *fakeCompactTrainHandleToken) StepID() uint64     { return t.stepID }
 func (t *fakeCompactTrainHandleToken) Alive() bool        { return t != nil && t.alive }
 
 type fakeCompactTrainAccelerator struct {
@@ -303,7 +305,7 @@ func (a *fakeCompactTrainAccelerator) RunCompactTrainForward(req backend.Compact
 		return backend.CompactTrainForwardResult{}, a.forwardErr
 	}
 	a.nextGeneration++
-	token := &fakeCompactTrainHandleToken{alive: true, generation: a.nextGeneration}
+	token := &fakeCompactTrainHandleToken{alive: true, generation: a.nextGeneration, stepID: req.StepID}
 	if a.live == nil {
 		a.live = map[uint64]*fakeCompactTrainHandleToken{}
 	}
@@ -313,7 +315,7 @@ func (a *fakeCompactTrainAccelerator) RunCompactTrainForward(req backend.Compact
 	a.stats.LiveHandles++
 	a.stats.PooledDownloadedBytes += int64(req.Shape.Batch * req.Shape.OutputDim * 4)
 	return backend.CompactTrainForwardResult{
-		Handle: backend.CompactTrainHandle{Backend: eosartifact.BackendCUDA, Token: token, Shape: req.Shape, Generation: token.generation},
+		Handle: backend.CompactTrainHandle{Backend: eosartifact.BackendCUDA, Token: token, Shape: req.Shape, Generation: token.generation, StepID: token.stepID},
 		Pooled: backend.NewTensorF32([]int{req.Shape.Batch, req.Shape.OutputDim}, make([]float32, req.Shape.Batch*req.Shape.OutputDim)),
 	}, nil
 }
