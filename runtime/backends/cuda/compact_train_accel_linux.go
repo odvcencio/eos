@@ -26,6 +26,11 @@ typedef struct {
 
 static int eosCudaLaunchCompactTrainFinalProjectionGrad(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr normalized, CUdeviceptr gradRows, CUdeviceptr gradOutProjection, int rows, int modelDim, int outDim, char** err);
 static int eosCudaLaunchCompactTrainFinalHiddenGrad(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr projected, CUdeviceptr normalized, CUdeviceptr outputProjection, CUdeviceptr gradPooled, CUdeviceptr masks, CUdeviceptr active, CUdeviceptr gradRows, CUdeviceptr gradNormalized, CUdeviceptr gradHidden, int batch, int seq, int modelDim, int outDim, int hasProjection, char** err);
+static int eosCudaLaunchCompactTrainLayerNormBackward(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr normalized, CUdeviceptr pre, CUdeviceptr out0, int rows, int cols, char** err);
+static int eosCudaLaunchCompactTrainMatMulLeftTransposeAccum(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr lhs, CUdeviceptr gradOut, CUdeviceptr gradWeight, int rows, int inDim, int outDim, char** err);
+static int eosCudaLaunchCompactTrainMatMulRightTranspose(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr weight, CUdeviceptr gradIn, int rows, int inDim, int outDim, char** err);
+static int eosCudaLaunchCompactTrainGELUBackward(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr preAct, CUdeviceptr out0, int elements, int fast, char** err);
+static int eosCudaLaunchCompactTrainAdd(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr left, CUdeviceptr right, CUdeviceptr out0, int elements, char** err);
 
 static char* eos_compact_train_dup_cu_error(const char* prefix, CUresult res) {
 	const char* name = 0;
@@ -74,6 +79,31 @@ static int eosCudaLaunchCompactTrainFinalHiddenGrad(EosCudaRuntime* rt, EosCudaK
 	void* args[] = {&projected, &normalized, &outputProjection, &gradPooled, &masks, &active, &gradRows, &gradNormalized, &gradHidden, &batch, &seq, &modelDim, &outDim, &hasProjection};
 	return eos_compact_train_launch(rt, kernel, grid, block, args, err);
 }
+
+static int eosCudaLaunchCompactTrainLayerNormBackward(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr normalized, CUdeviceptr pre, CUdeviceptr out0, int rows, int cols, char** err) {
+	void* args[] = {&gradOut, &normalized, &pre, &out0, &rows, &cols};
+	return eos_compact_train_launch(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchCompactTrainMatMulLeftTransposeAccum(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr lhs, CUdeviceptr gradOut, CUdeviceptr gradWeight, int rows, int inDim, int outDim, char** err) {
+	void* args[] = {&lhs, &gradOut, &gradWeight, &rows, &inDim, &outDim};
+	return eos_compact_train_launch(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchCompactTrainMatMulRightTranspose(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr weight, CUdeviceptr gradIn, int rows, int inDim, int outDim, char** err) {
+	void* args[] = {&gradOut, &weight, &gradIn, &rows, &inDim, &outDim};
+	return eos_compact_train_launch(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchCompactTrainGELUBackward(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr preAct, CUdeviceptr out0, int elements, int fast, char** err) {
+	void* args[] = {&gradOut, &preAct, &out0, &elements, &fast};
+	return eos_compact_train_launch(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchCompactTrainAdd(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr left, CUdeviceptr right, CUdeviceptr out0, int elements, char** err) {
+	void* args[] = {&left, &right, &out0, &elements};
+	return eos_compact_train_launch(rt, kernel, grid, block, args, err);
+}
 */
 import "C"
 
@@ -102,6 +132,11 @@ type CompactTrainAccelerator struct {
 type compactTrainKernels struct {
 	finalProjectionGrad *auxKernel
 	finalHiddenGrad     *auxKernel
+	layerNormBackward   *auxKernel
+	matMulLeftTAccum    *auxKernel
+	matMulRightT        *auxKernel
+	geluBackward        *auxKernel
+	add                 *auxKernel
 }
 
 type compactTrainGradient struct {
@@ -125,6 +160,7 @@ type compactTrainArena struct {
 	generation uint64
 	live       bool
 	token      *compactTrainHandleToken
+	geluFast   bool
 
 	tokens C.CUdeviceptr
 	masks  C.CUdeviceptr
@@ -141,6 +177,11 @@ type compactTrainArena struct {
 	gradOutputRows      C.CUdeviceptr
 	gradNormalized      C.CUdeviceptr
 	gradHidden          C.CUdeviceptr
+	gradFFNResidual     C.CUdeviceptr
+	gradActivatedPre    C.CUdeviceptr
+	gradActivated       C.CUdeviceptr
+	gradHiddenFromFFN   C.CUdeviceptr
+	gradAttention       C.CUdeviceptr
 	modelScratch        []C.CUdeviceptr
 	ffnScratch          []C.CUdeviceptr
 	layers              []compactTrainLayerArena
@@ -294,6 +335,107 @@ extern "C" __global__ void eos_compact_train_final_hidden_grad(
         gradHidden[idx] = (gnorm - normalized[idx] * dotNG) / norm;
     }
 }
+
+extern "C" __global__ void eos_compact_train_layernorm_backward(
+    const float* gradOut, const float* normalized, const float* pre, float* out0,
+    int rows, int cols
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    int base = row * cols;
+    float mean = 0.0f;
+    for (int c = 0; c < cols; ++c) {
+        mean += pre[base + c];
+    }
+    mean /= (float)cols;
+    float variance = 0.0f;
+    for (int c = 0; c < cols; ++c) {
+        float centered = pre[base + c] - mean;
+        variance += centered * centered;
+    }
+    variance /= (float)cols;
+    float invStd = rsqrtf(variance + 1.0e-5f);
+    float sumGrad = 0.0f;
+    float sumGradNorm = 0.0f;
+    for (int c = 0; c < cols; ++c) {
+        float g = gradOut[base + c];
+        sumGrad += g;
+        sumGradNorm += g * normalized[base + c];
+    }
+    float n = (float)cols;
+    for (int c = 0; c < cols; ++c) {
+        out0[base + c] = (invStd / n) * (n * gradOut[base + c] - sumGrad - normalized[base + c] * sumGradNorm);
+    }
+}
+
+extern "C" __global__ void eos_compact_train_matmul_left_t_accum(
+    const float* lhs, const float* gradOut, float* gradWeight,
+    int rows, int inDim, int outDim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = inDim * outDim;
+    if (idx >= total) return;
+    int o = idx % outDim;
+    int i = idx / outDim;
+    float sum = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+        sum += lhs[r * inDim + i] * gradOut[r * outDim + o];
+    }
+    gradWeight[idx] += sum;
+}
+
+extern "C" __global__ void eos_compact_train_matmul_right_t(
+    const float* gradOut, const float* weight, float* gradIn,
+    int rows, int inDim, int outDim
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rows * inDim;
+    if (idx >= total) return;
+    int i = idx % inDim;
+    int r = idx / inDim;
+    float sum = 0.0f;
+    for (int o = 0; o < outDim; ++o) {
+        sum += gradOut[r * outDim + o] * weight[i * outDim + o];
+    }
+    gradIn[idx] = sum;
+}
+
+static __device__ float eos_compact_train_fast_tanh(float x) {
+    if (x >= 3.0f) return 1.0f;
+    if (x <= -3.0f) return -1.0f;
+    float x2 = x * x;
+    return x * (27.0f + x2) / (27.0f + 9.0f * x2);
+}
+
+static __device__ float eos_compact_train_fast_tanh_derivative(float x) {
+    if (x >= 3.0f || x <= -3.0f) return 0.0f;
+    float x2 = x * x;
+    float diff = x2 - 9.0f;
+    float den = 3.0f + x2;
+    return (diff * diff) / (9.0f * den * den);
+}
+
+extern "C" __global__ void eos_compact_train_gelu_backward(
+    const float* gradOut, const float* preAct, float* out0, int elements, int fast
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements) return;
+    float x = preAct[idx];
+    float inner = 0.7978845608f * (x + 0.044715f * x * x * x);
+    float t = fast != 0 ? eos_compact_train_fast_tanh(inner) : tanhf(inner);
+    float innerGrad = 0.7978845608f * (1.0f + 3.0f * 0.044715f * x * x);
+    float tanhGrad = fast != 0 ? eos_compact_train_fast_tanh_derivative(inner) : (1.0f - t * t);
+    float geluGrad = 0.5f * (1.0f + t) + 0.5f * x * tanhGrad * innerGrad;
+    out0[idx] = gradOut[idx] * geluGrad;
+}
+
+extern "C" __global__ void eos_compact_train_add(
+    const float* left, const float* right, float* out0, int elements
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= elements) return;
+    out0[idx] = left[idx] + right[idx];
+}
 `
 
 func init() {
@@ -325,10 +467,63 @@ func NewCompactTrainAccelerator() (*CompactTrainAccelerator, error) {
 		base.Close()
 		return nil, err
 	}
+	ln, err := compile("eos_compact_train_layernorm_backward")
+	if err != nil {
+		base.device.destroyAuxKernel(proj)
+		base.device.destroyAuxKernel(hidden)
+		base.Close()
+		return nil, err
+	}
+	leftT, err := compile("eos_compact_train_matmul_left_t_accum")
+	if err != nil {
+		base.device.destroyAuxKernel(proj)
+		base.device.destroyAuxKernel(hidden)
+		base.device.destroyAuxKernel(ln)
+		base.Close()
+		return nil, err
+	}
+	rightT, err := compile("eos_compact_train_matmul_right_t")
+	if err != nil {
+		base.device.destroyAuxKernel(proj)
+		base.device.destroyAuxKernel(hidden)
+		base.device.destroyAuxKernel(ln)
+		base.device.destroyAuxKernel(leftT)
+		base.Close()
+		return nil, err
+	}
+	gelu, err := compile("eos_compact_train_gelu_backward")
+	if err != nil {
+		base.device.destroyAuxKernel(proj)
+		base.device.destroyAuxKernel(hidden)
+		base.device.destroyAuxKernel(ln)
+		base.device.destroyAuxKernel(leftT)
+		base.device.destroyAuxKernel(rightT)
+		base.Close()
+		return nil, err
+	}
+	add, err := compile("eos_compact_train_add")
+	if err != nil {
+		base.device.destroyAuxKernel(proj)
+		base.device.destroyAuxKernel(hidden)
+		base.device.destroyAuxKernel(ln)
+		base.device.destroyAuxKernel(leftT)
+		base.device.destroyAuxKernel(rightT)
+		base.device.destroyAuxKernel(gelu)
+		base.Close()
+		return nil, err
+	}
 	return &CompactTrainAccelerator{
 		CompactForwardAccelerator: base,
-		trainKernels:              compactTrainKernels{finalProjectionGrad: proj, finalHiddenGrad: hidden},
-		grads:                     map[string]*compactTrainGradient{},
+		trainKernels: compactTrainKernels{
+			finalProjectionGrad: proj,
+			finalHiddenGrad:     hidden,
+			layerNormBackward:   ln,
+			matMulLeftTAccum:    leftT,
+			matMulRightT:        rightT,
+			geluBackward:        gelu,
+			add:                 add,
+		},
+		grads: map[string]*compactTrainGradient{},
 	}, nil
 }
 
@@ -345,6 +540,11 @@ func (a *CompactTrainAccelerator) Close() {
 	if a.device != nil {
 		a.device.destroyAuxKernel(a.trainKernels.finalProjectionGrad)
 		a.device.destroyAuxKernel(a.trainKernels.finalHiddenGrad)
+		a.device.destroyAuxKernel(a.trainKernels.layerNormBackward)
+		a.device.destroyAuxKernel(a.trainKernels.matMulLeftTAccum)
+		a.device.destroyAuxKernel(a.trainKernels.matMulRightT)
+		a.device.destroyAuxKernel(a.trainKernels.geluBackward)
+		a.device.destroyAuxKernel(a.trainKernels.add)
 	}
 	a.mu.Unlock()
 	a.CompactForwardAccelerator.Close()
@@ -497,12 +697,19 @@ func (a *CompactTrainAccelerator) RunCompactTrainBackward(req backend.CompactTra
 		return backend.CompactTrainBackwardResult{}, err
 	}
 	a.stats.FallbackOrUnhandled++
-	return backend.CompactTrainBackwardResult{}, fmt.Errorf("cuda compact train full layer backward is unsupported in this bounded final-output slice")
+	return backend.CompactTrainBackwardResult{}, fmt.Errorf("cuda compact train full layer backward is unsupported in this bounded final-output+ffn/layernorm slice")
 }
 
 type compactTrainFinalOutputDebugResult struct {
 	ResidentGradRefs []backend.ResidentGradientRef
 	GradHidden       *backend.Tensor
+}
+
+type compactTrainFFNBackwardDebugResult struct {
+	ResidentGradRefs      []backend.ResidentGradientRef
+	GradHidden            *backend.Tensor
+	GradAttentionBoundary *backend.Tensor
+	Layer                 int
 }
 
 func (a *CompactTrainAccelerator) runCompactTrainFinalOutputBackwardForDebug(req backend.CompactTrainBackwardRequest) (compactTrainFinalOutputDebugResult, error) {
@@ -567,6 +774,136 @@ func (a *CompactTrainAccelerator) runCompactTrainFinalOutputBackwardForDebug(req
 		ResidentGradRefs: a.residentGradientRefsLocked(),
 		GradHidden:       backend.NewTensorF32([]int{shape.Batch, shape.Tokens, shape.ModelDim}, hidden),
 	}, nil
+}
+
+func (a *CompactTrainAccelerator) runCompactTrainFFNBackwardForDebug(req backend.CompactTrainBackwardRequest) (compactTrainFFNBackwardDebugResult, error) {
+	if a == nil || a.CompactForwardAccelerator == nil {
+		return compactTrainFFNBackwardDebugResult{}, fmt.Errorf("cuda compact train accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	start := time.Now()
+	if err := a.validateBackwardRequestLocked(req); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	arena := a.arena
+	shape := arena.shape
+	if shape.Layers <= 0 {
+		return compactTrainFFNBackwardDebugResult{}, fmt.Errorf("cuda compact train ffn debug backward requires at least one layer")
+	}
+	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
+	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
+	if err := a.runFinalOutputBackwardLocked(req, arena, shape); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	layerIdx := shape.Layers - 1
+	if err := a.runLayerFFNBackwardLocked(layerIdx, arena, shape); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	hidden := make([]float32, shape.Batch*shape.Tokens*shape.ModelDim)
+	if err := a.device.downloadFloat32(hidden, arena.gradHidden); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	boundary := make([]float32, shape.Batch*shape.Tokens*shape.ModelDim)
+	if err := a.device.downloadFloat32(boundary, arena.gradAttention); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	if err := a.consumeHandleLocked(req.Handle); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	backwardLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
+	backwardSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
+	a.stats.BackwardCalls++
+	a.stats.BackwardNanos += time.Since(start).Nanoseconds()
+	a.stats.DownloadedBytes += int64((len(hidden) + len(boundary)) * 4)
+	a.stats.KernelLaunches += backwardLaunches
+	a.stats.KernelSynchronizations += backwardSyncs
+	a.stats.LastBackwardLaunches = backwardLaunches
+	a.stats.LastBackwardSyncs = backwardSyncs
+	return compactTrainFFNBackwardDebugResult{
+		ResidentGradRefs:      a.residentGradientRefsLocked(),
+		GradHidden:            backend.NewTensorF32([]int{shape.Batch, shape.Tokens, shape.ModelDim}, hidden),
+		GradAttentionBoundary: backend.NewTensorF32([]int{shape.Batch, shape.Tokens, shape.ModelDim}, boundary),
+		Layer:                 layerIdx,
+	}, nil
+}
+
+func (a *CompactTrainAccelerator) runFinalOutputBackwardLocked(req backend.CompactTrainBackwardRequest, arena *compactTrainArena, shape backend.CompactForwardShape) error {
+	if err := a.ensureBackwardWorkspaceLocked(arena); err != nil {
+		return err
+	}
+	if err := a.device.copyFloat32ToBuffer(arena.gradPooled, req.GradPooled.F32); err != nil {
+		return err
+	}
+	a.stats.UploadedBytes += int64(len(req.GradPooled.F32) * 4)
+	a.stats.GradPooledUploadedBytes += int64(len(req.GradPooled.F32) * 4)
+	lastProjected := arena.input
+	if shape.Layers > 0 {
+		lastProjected = arena.layers[shape.Layers-1].projected
+	}
+	outProjectionPtr := C.CUdeviceptr(0)
+	if shape.HasOutputProjection {
+		outProjectionPtr = a.bindings.out.ptr
+	}
+	if err := a.launchFinalHiddenGrad(lastProjected, arena.finalNorm, outProjectionPtr, arena.gradPooled, arena.masks, arena.active, arena.gradOutputRows, arena.gradNormalized, arena.gradHidden, shape); err != nil {
+		return err
+	}
+	if shape.HasOutputProjection {
+		grad, ok := a.grads[a.outName]
+		if !ok || grad == nil || grad.ptr == 0 {
+			return fmt.Errorf("cuda compact train output projection gradient %q is not resident", a.outName)
+		}
+		if err := a.launchFinalProjectionGrad(arena.finalNorm, arena.gradOutputRows, grad.ptr, shape.Batch*shape.Tokens, shape.ModelDim, shape.OutputDim); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (a *CompactTrainAccelerator) runLayerFFNBackwardLocked(layerIdx int, arena *compactTrainArena, shape backend.CompactForwardShape) error {
+	if layerIdx < 0 || layerIdx >= len(arena.layers) || layerIdx >= len(a.bindings.layer) || layerIdx >= len(a.layers) {
+		return fmt.Errorf("cuda compact train layer %d is out of range", layerIdx)
+	}
+	if err := a.ensureBackwardWorkspaceLocked(arena); err != nil {
+		return err
+	}
+	rows, d, h := shape.Batch*shape.Tokens, shape.ModelDim, shape.FFNDim
+	layer := arena.layers[layerIdx]
+	binding := a.bindings.layer[layerIdx]
+	names := a.layers[layerIdx]
+	if err := a.launchLayerNormBackward(arena.gradHidden, layer.projected, layer.ffnResidual, arena.gradFFNResidual, rows, d); err != nil {
+		return err
+	}
+	ffnDownGrad, ok := a.grads[names.FFNDown]
+	if !ok || ffnDownGrad == nil || ffnDownGrad.ptr == 0 {
+		return fmt.Errorf("cuda compact train ffn_down gradient %q is not resident", names.FFNDown)
+	}
+	if err := a.launchMatMulLeftTransposeAccum(layer.activated, arena.gradFFNResidual, ffnDownGrad.ptr, rows, h, d); err != nil {
+		return err
+	}
+	if err := a.launchMatMulRightTranspose(arena.gradFFNResidual, binding.down.ptr, arena.gradActivatedPre, rows, h, d); err != nil {
+		return err
+	}
+	if err := a.launchGELUBackward(arena.gradActivatedPre, layer.ffnHidden, arena.gradActivated, rows*h, arena.geluFast); err != nil {
+		return err
+	}
+	ffnUpGrad, ok := a.grads[names.FFNUp]
+	if !ok || ffnUpGrad == nil || ffnUpGrad.ptr == 0 {
+		return fmt.Errorf("cuda compact train ffn_up gradient %q is not resident", names.FFNUp)
+	}
+	if err := a.launchMatMulLeftTransposeAccum(layer.hidden, arena.gradActivated, ffnUpGrad.ptr, rows, d, h); err != nil {
+		return err
+	}
+	if err := a.launchMatMulRightTranspose(arena.gradActivated, binding.up.ptr, arena.gradHiddenFromFFN, rows, d, h); err != nil {
+		return err
+	}
+	if err := a.launchAdd(arena.gradFFNResidual, arena.gradHiddenFromFFN, arena.gradHidden, rows*d); err != nil {
+		return err
+	}
+	if err := a.launchLayerNormBackward(arena.gradHidden, layer.hidden, layer.attnResidual, arena.gradAttention, rows, d); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a *CompactTrainAccelerator) copyResidentGradientForDebug(ref backend.ResidentGradientRef) (*backend.Tensor, error) {
@@ -743,6 +1080,21 @@ func (a *CompactTrainAccelerator) ensureBackwardWorkspaceLocked(arena *compactTr
 	if err := alloc(&arena.gradHidden, rows*shape.ModelDim); err != nil {
 		return err
 	}
+	if err := alloc(&arena.gradFFNResidual, rows*shape.ModelDim); err != nil {
+		return err
+	}
+	if err := alloc(&arena.gradActivatedPre, rows*shape.FFNDim); err != nil {
+		return err
+	}
+	if err := alloc(&arena.gradActivated, rows*shape.FFNDim); err != nil {
+		return err
+	}
+	if err := alloc(&arena.gradHiddenFromFFN, rows*shape.ModelDim); err != nil {
+		return err
+	}
+	if err := alloc(&arena.gradAttention, rows*shape.ModelDim); err != nil {
+		return err
+	}
 	a.stats.WorkspaceArenaBytes = arena.workspaceBytes
 	return nil
 }
@@ -815,6 +1167,75 @@ func (a *CompactTrainAccelerator) launchFinalHiddenGrad(projected, normalized, o
 	return nil
 }
 
+func (a *CompactTrainAccelerator) launchLayerNormBackward(gradOut, normalized, pre, out C.CUdeviceptr, rows, cols int) error {
+	grid, block, err := checkedLaunch1D("cuda compact train layernorm backward", rows, 128)
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchCompactTrainLayerNormBackward(a.device.ptr, a.trainKernels.layerNormBackward.ptr, grid, block, gradOut, normalized, pre, out, C.int(rows), C.int(cols), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	a.recordKernelLaunch()
+	return nil
+}
+
+func (a *CompactTrainAccelerator) launchMatMulLeftTransposeAccum(lhs, gradOut, gradWeight C.CUdeviceptr, rows, inDim, outDim int) error {
+	grid, block, err := checkedLaunch1D("cuda compact train matmul left transpose accum", inDim*outDim, 128)
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchCompactTrainMatMulLeftTransposeAccum(a.device.ptr, a.trainKernels.matMulLeftTAccum.ptr, grid, block, lhs, gradOut, gradWeight, C.int(rows), C.int(inDim), C.int(outDim), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	a.recordKernelLaunch()
+	return nil
+}
+
+func (a *CompactTrainAccelerator) launchMatMulRightTranspose(gradOut, weight, gradIn C.CUdeviceptr, rows, inDim, outDim int) error {
+	grid, block, err := checkedLaunch1D("cuda compact train matmul right transpose", rows*inDim, 128)
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchCompactTrainMatMulRightTranspose(a.device.ptr, a.trainKernels.matMulRightT.ptr, grid, block, gradOut, weight, gradIn, C.int(rows), C.int(inDim), C.int(outDim), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	a.recordKernelLaunch()
+	return nil
+}
+
+func (a *CompactTrainAccelerator) launchGELUBackward(gradOut, preAct, out C.CUdeviceptr, elements int, fast bool) error {
+	grid, block, err := checkedLaunch1D("cuda compact train gelu backward", elements, 128)
+	if err != nil {
+		return err
+	}
+	fastFlag := 0
+	if fast {
+		fastFlag = 1
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchCompactTrainGELUBackward(a.device.ptr, a.trainKernels.geluBackward.ptr, grid, block, gradOut, preAct, out, C.int(elements), C.int(fastFlag), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	a.recordKernelLaunch()
+	return nil
+}
+
+func (a *CompactTrainAccelerator) launchAdd(left, right, out C.CUdeviceptr, elements int) error {
+	grid, block, err := checkedLaunch1D("cuda compact train add", elements, 128)
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchCompactTrainAdd(a.device.ptr, a.trainKernels.add.ptr, grid, block, left, right, out, C.int(elements), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	a.recordKernelLaunch()
+	return nil
+}
+
 func (a *CompactTrainAccelerator) RunCompactTrainForward(req backend.CompactTrainForwardRequest) (backend.CompactTrainForwardResult, error) {
 	if a == nil || a.CompactForwardAccelerator == nil {
 		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train accelerator is not initialized")
@@ -859,6 +1280,7 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	arena.generation++
 	shape := req.Shape
 	geluFast, _ := compactForwardGELUFast(req.GELUMode)
+	arena.geluFast = geluFast
 	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
 	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
 	B, T, D, H, L, O := shape.Batch, shape.Tokens, shape.ModelDim, shape.FFNDim, shape.Layers, shape.OutputDim
@@ -1137,7 +1559,7 @@ func (a *CompactTrainAccelerator) freeArena(arena *compactTrainArena) {
 	if a == nil || a.device == nil || arena == nil {
 		return
 	}
-	for _, ptr := range []C.CUdeviceptr{arena.tokens, arena.masks, arena.roles, arena.status, arena.input, arena.active, arena.finalNorm, arena.outputRows, arena.preProjectionPooled, arena.finalPooled, arena.gradPooled, arena.gradOutputRows, arena.gradNormalized, arena.gradHidden} {
+	for _, ptr := range []C.CUdeviceptr{arena.tokens, arena.masks, arena.roles, arena.status, arena.input, arena.active, arena.finalNorm, arena.outputRows, arena.preProjectionPooled, arena.finalPooled, arena.gradPooled, arena.gradOutputRows, arena.gradNormalized, arena.gradHidden, arena.gradFFNResidual, arena.gradActivatedPre, arena.gradActivated, arena.gradHiddenFromFFN, arena.gradAttention} {
 		if ptr != 0 {
 			_ = a.device.freeBuffer(ptr)
 		}

@@ -595,6 +595,259 @@ func TestCompactTrainFinalOutputBackwardDebugParityAndResidentRefs(t *testing.T)
 	}
 }
 
+func TestCompactTrainResidualLayerNormBackwardKernelParity(t *testing.T) {
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	rows, cols := 3, 4
+	gradOut := seqData(rows*cols, 0.019, -0.041)
+	pre := seqData(rows*cols, -0.027, 0.083)
+	normalized := layerNormHost(pre, rows, cols)
+	want := make([]float32, rows*cols)
+	for row := 0; row < rows; row++ {
+		base := row * cols
+		compactTrainBackwardLayerNormRow(want[base:base+cols], gradOut[base:base+cols], normalized[base:base+cols], pre[base:base+cols])
+	}
+	gradPtr, err := accel.device.uploadFloat32(gradOut)
+	if err != nil {
+		t.Fatalf("upload grad: %v", err)
+	}
+	defer accel.device.freeBuffer(gradPtr)
+	normPtr, err := accel.device.uploadFloat32(normalized)
+	if err != nil {
+		t.Fatalf("upload normalized: %v", err)
+	}
+	defer accel.device.freeBuffer(normPtr)
+	prePtr, err := accel.device.uploadFloat32(pre)
+	if err != nil {
+		t.Fatalf("upload pre: %v", err)
+	}
+	defer accel.device.freeBuffer(prePtr)
+	outPtr, err := accel.device.allocFloat32(rows * cols)
+	if err != nil {
+		t.Fatalf("alloc out: %v", err)
+	}
+	defer accel.device.freeBuffer(outPtr)
+	if err := accel.launchLayerNormBackward(gradPtr, normPtr, prePtr, outPtr, rows, cols); err != nil {
+		t.Fatalf("launch layernorm backward: %v", err)
+	}
+	got := make([]float32, rows*cols)
+	if err := accel.device.downloadFloat32(got, outPtr); err != nil {
+		t.Fatalf("download layernorm backward: %v", err)
+	}
+	t.Logf("resident layernorm backward max_abs=%g rmse=%g", compactTrainMaxAbs(got, want), compactTrainRMSE(got, want))
+	assertFloatSlicesClose(t, got, want, 3e-8)
+}
+
+func TestCompactTrainGELUBackwardKernelExactAndFastParity(t *testing.T) {
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	gradOut := seqData(17, -0.013, 0.037)
+	preAct := []float32{-3.5, -3, -2.25, -1.5, -0.75, -0.25, 0, 0.25, 0.75, 1.5, 2.25, 3, 3.5, -0.11, 0.43, -1.17, 2.01}
+	for _, fast := range []bool{false, true} {
+		want := make([]float32, len(preAct))
+		compactTrainFillGELUBackwardMul(want, gradOut, preAct, fast)
+		gradPtr, err := accel.device.uploadFloat32(gradOut)
+		if err != nil {
+			t.Fatalf("upload grad fast=%v: %v", fast, err)
+		}
+		prePtr, err := accel.device.uploadFloat32(preAct)
+		if err != nil {
+			accel.device.freeBuffer(gradPtr)
+			t.Fatalf("upload pre fast=%v: %v", fast, err)
+		}
+		outPtr, err := accel.device.allocFloat32(len(preAct))
+		if err != nil {
+			accel.device.freeBuffer(gradPtr)
+			accel.device.freeBuffer(prePtr)
+			t.Fatalf("alloc out fast=%v: %v", fast, err)
+		}
+		if err := accel.launchGELUBackward(gradPtr, prePtr, outPtr, len(preAct), fast); err != nil {
+			accel.device.freeBuffer(gradPtr)
+			accel.device.freeBuffer(prePtr)
+			accel.device.freeBuffer(outPtr)
+			t.Fatalf("launch gelu backward fast=%v: %v", fast, err)
+		}
+		got := make([]float32, len(preAct))
+		if err := accel.device.downloadFloat32(got, outPtr); err != nil {
+			accel.device.freeBuffer(gradPtr)
+			accel.device.freeBuffer(prePtr)
+			accel.device.freeBuffer(outPtr)
+			t.Fatalf("download gelu backward fast=%v: %v", fast, err)
+		}
+		accel.device.freeBuffer(gradPtr)
+		accel.device.freeBuffer(prePtr)
+		accel.device.freeBuffer(outPtr)
+		t.Logf("resident gelu backward fast=%v max_abs=%g rmse=%g", fast, compactTrainMaxAbs(got, want), compactTrainRMSE(got, want))
+		assertFloatSlicesClose(t, got, want, 3e-8)
+	}
+}
+
+func TestCompactTrainFFNBackwardDebugParityAndResidentAccumulation(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		layers     int
+		projection bool
+		gelu       string
+		tokens     [][]int32
+		masks      [][]int32
+		roles      []int32
+	}{
+		{
+			name:   "b1_t2_exact",
+			layers: 1,
+			gelu:   backend.CompactForwardGELUExact,
+			tokens: [][]int32{{2, 1}},
+			masks:  [][]int32{{1, 1}},
+			roles:  []int32{0},
+		},
+		{
+			name:   "b1_t2_exact_2layers",
+			layers: 2,
+			gelu:   backend.CompactForwardGELUExact,
+			tokens: [][]int32{{2, 1}},
+			masks:  [][]int32{{1, 1}},
+			roles:  []int32{0},
+		},
+		{
+			name:   "b2_t3_masks_fast",
+			layers: 2,
+			gelu:   backend.CompactForwardGELUFast,
+			tokens: [][]int32{{2, 1, 3}, {1, 4, 2}},
+			masks:  [][]int32{{1, 1, 0}, {1, 0, 1}},
+			roles:  []int32{0, 2},
+		},
+		{
+			name:       "projection_boundary",
+			layers:     2,
+			projection: true,
+			gelu:       backend.CompactForwardGELUExact,
+			tokens:     [][]int32{{2, 1, 3}},
+			masks:      [][]int32{{1, 1, 0}},
+			roles:      []int32{1},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			shape := backend.CompactForwardShape{Batch: len(tc.tokens), Tokens: len(tc.tokens[0]), ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: tc.layers, OutputDim: 4}
+			if tc.projection {
+				shape.OutputDim = 3
+				shape.HasOutputProjection = true
+			}
+			accel, cleanup := newBoundCompactTrainShapeTestAccelerator(t, shape, true, tc.projection, compactForwardTestWeights(tc.projection))
+			defer cleanup()
+			refs := compactTrainResidentRefsForTest(t, accel, shape)
+			if err := accel.BeginCompactTrainStep(41, refs); err != nil {
+				t.Fatalf("begin step: %v", err)
+			}
+			req := backend.CompactTrainForwardRequest{
+				Shape:        shape,
+				Tokens:       tc.tokens,
+				Masks:        tc.masks,
+				Roles:        tc.roles,
+				ResidentRefs: refs,
+				GELUMode:     tc.gelu,
+				StepID:       41,
+			}
+			forward, err := accel.RunCompactTrainForward(req)
+			if err != nil {
+				t.Fatalf("forward: %v", err)
+			}
+			gradPooled := backend.NewTensorF32([]int{shape.Batch, shape.OutputDim}, seqData(shape.Batch*shape.OutputDim, 0.031, -0.047))
+			got, err := accel.runCompactTrainFFNBackwardForDebug(backend.CompactTrainBackwardRequest{Handle: forward.Handle, GradPooled: gradPooled})
+			if err != nil {
+				t.Fatalf("ffn debug backward: %v", err)
+			}
+			if got.Layer != shape.Layers-1 {
+				t.Fatalf("debug layer = %d, want %d", got.Layer, shape.Layers-1)
+			}
+			want := hostCompactTrainTopFFNBackwardForCUDATest(req, true, tc.projection, gradPooled.F32)
+			t.Logf("ffn debug grad_hidden max_abs=%g rmse=%g", compactTrainMaxAbs(got.GradHidden.F32, want.gradHidden), compactTrainRMSE(got.GradHidden.F32, want.gradHidden))
+			t.Logf("ffn debug attention_boundary max_abs=%g rmse=%g", compactTrainMaxAbs(got.GradAttentionBoundary.F32, want.gradAttention), compactTrainRMSE(got.GradAttentionBoundary.F32, want.gradAttention))
+			assertFloatSlicesClose(t, got.GradHidden.F32, want.gradHidden, 3e-8)
+			assertFloatSlicesClose(t, got.GradAttentionBoundary.F32, want.gradAttention, 3e-8)
+			layerPrefix := fmt.Sprintf("layer%d_", shape.Layers-1)
+			upRef := residentGradRefByName(t, got.ResidentGradRefs, layerPrefix+"ffn_up")
+			downRef := residentGradRefByName(t, got.ResidentGradRefs, layerPrefix+"ffn_down")
+			upGrad, err := accel.copyResidentGradientForDebug(upRef)
+			if err != nil {
+				t.Fatalf("copy ffn_up grad: %v", err)
+			}
+			downGrad, err := accel.copyResidentGradientForDebug(downRef)
+			if err != nil {
+				t.Fatalf("copy ffn_down grad: %v", err)
+			}
+			t.Logf("ffn_up grad max_abs=%g rmse=%g", compactTrainMaxAbs(upGrad.F32, want.ffnUp), compactTrainRMSE(upGrad.F32, want.ffnUp))
+			t.Logf("ffn_down grad max_abs=%g rmse=%g", compactTrainMaxAbs(downGrad.F32, want.ffnDown), compactTrainRMSE(downGrad.F32, want.ffnDown))
+			assertFloatSlicesClose(t, upGrad.F32, want.ffnUp, 3e-8)
+			assertFloatSlicesClose(t, downGrad.F32, want.ffnDown, 3e-8)
+			assertCompactTrainBackwardWorkspaceDistinct(t, accel, shape)
+			if err := accel.EndCompactTrainStep(41); err != nil {
+				t.Fatalf("end step: %v", err)
+			}
+		})
+	}
+}
+
+func TestCompactTrainFFNBackwardResidentGradAccumulatesAcrossBuckets(t *testing.T) {
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, true, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(51, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	defer func() {
+		if err := accel.EndCompactTrainStep(51); err != nil {
+			t.Fatalf("end step: %v", err)
+		}
+	}()
+	var wantUp, wantDown []float32
+	var lastRefs []backend.ResidentGradientRef
+	for bucket, tokens := range [][][]int32{{{2, 1}}, {{3, 4}}} {
+		req := backend.CompactTrainForwardRequest{
+			Shape:        shape,
+			Tokens:       tokens,
+			Masks:        [][]int32{{1, 1}},
+			Roles:        []int32{int32(bucket)},
+			ResidentRefs: refs,
+			GELUMode:     backend.CompactForwardGELUExact,
+			StepID:       51,
+		}
+		forward, err := accel.RunCompactTrainForward(req)
+		if err != nil {
+			t.Fatalf("forward bucket %d: %v", bucket, err)
+		}
+		gradPooled := backend.NewTensorF32([]int{1, shape.OutputDim}, seqData(shape.OutputDim, 0.017+float64(bucket)*0.003, -0.029))
+		got, err := accel.runCompactTrainFFNBackwardForDebug(backend.CompactTrainBackwardRequest{Handle: forward.Handle, GradPooled: gradPooled})
+		if err != nil {
+			t.Fatalf("ffn backward bucket %d: %v", bucket, err)
+		}
+		lastRefs = got.ResidentGradRefs
+		want := hostCompactTrainTopFFNBackwardForCUDATest(req, true, false, gradPooled.F32)
+		if wantUp == nil {
+			wantUp = make([]float32, len(want.ffnUp))
+			wantDown = make([]float32, len(want.ffnDown))
+		}
+		addFloat32SlicesForCUDATest(wantUp, want.ffnUp)
+		addFloat32SlicesForCUDATest(wantDown, want.ffnDown)
+	}
+	upGrad, err := accel.copyResidentGradientForDebug(residentGradRefByName(t, lastRefs, "layer1_ffn_up"))
+	if err != nil {
+		t.Fatalf("copy accumulated ffn_up: %v", err)
+	}
+	downGrad, err := accel.copyResidentGradientForDebug(residentGradRefByName(t, lastRefs, "layer1_ffn_down"))
+	if err != nil {
+		t.Fatalf("copy accumulated ffn_down: %v", err)
+	}
+	t.Logf("accumulated ffn_up max_abs=%g rmse=%g", compactTrainMaxAbs(upGrad.F32, wantUp), compactTrainRMSE(upGrad.F32, wantUp))
+	t.Logf("accumulated ffn_down max_abs=%g rmse=%g", compactTrainMaxAbs(downGrad.F32, wantDown), compactTrainRMSE(downGrad.F32, wantDown))
+	assertFloatSlicesClose(t, upGrad.F32, wantUp, 3e-8)
+	assertFloatSlicesClose(t, downGrad.F32, wantDown, 3e-8)
+	stats := accel.CompactTrainStats()
+	if stats.BackwardCalls != 2 || stats.GradPooledUploadedBytes != int64(2*shape.OutputDim*4) || stats.LiveHandles != 0 {
+		t.Fatalf("accumulation stats = %+v", stats)
+	}
+}
+
 func TestCompactTrainHandleReleaseAfterCloseFailsClosed(t *testing.T) {
 	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
 	defer cleanup()
@@ -850,6 +1103,206 @@ func hostCompactTrainFinalOutputBackwardForCUDATest(req backend.CompactTrainForw
 	return hidden, gradProjection
 }
 
+type compactTrainTopFFNBackwardWant struct {
+	gradHidden    []float32
+	gradAttention []float32
+	ffnUp         []float32
+	ffnDown       []float32
+}
+
+func hostCompactTrainTopFFNBackwardForCUDATest(req backend.CompactTrainForwardRequest, rope, projection bool, gradPooled []float32) compactTrainTopFFNBackwardWant {
+	packedReq := backend.CompactForwardRequest{
+		Shape:        req.Shape,
+		Tokens:       req.Tokens,
+		Masks:        req.Masks,
+		Roles:        req.Roles,
+		ResidentRefs: req.ResidentRefs,
+		GELUMode:     req.GELUMode,
+	}
+	packed := hostCompactForwardForCUDATest(packedReq, rope, projection)
+	shape := req.Shape
+	gradProjected, _ := hostCompactTrainFinalOutputBackwardForCUDATest(req, rope, projection, gradPooled)
+	layerIdx := shape.Layers - 1
+	out := compactTrainTopFFNBackwardWant{
+		gradHidden:    make([]float32, shape.Batch*shape.Tokens*shape.ModelDim),
+		gradAttention: make([]float32, shape.Batch*shape.Tokens*shape.ModelDim),
+		ffnUp:         make([]float32, shape.ModelDim*shape.FFNDim),
+		ffnDown:       make([]float32, shape.FFNDim*shape.ModelDim),
+	}
+	weights := compactForwardTestWeights(projection)
+	up := weights[fmt.Sprintf("layer%d_ffn_up", layerIdx)].F32
+	down := weights[fmt.Sprintf("layer%d_ffn_down", layerIdx)].F32
+	for b := 0; b < shape.Batch; b++ {
+		span := func(name string) []float32 {
+			s := compactForwardSpanByName(packed.Layout, compactForwardLayerSpanName(b, layerIdx, name))
+			return packed.Data[s.Offset : s.Offset+s.Len]
+		}
+		projected := span("projected")
+		ffnResidual := span("ffnResidual")
+		activated := span("activated")
+		ffnHidden := span("ffnHidden")
+		hidden := span("hidden")
+		attnResidual := span("attnResidual")
+		gradBase := b * shape.Tokens * shape.ModelDim
+		gradFFNResidual := make([]float32, shape.Tokens*shape.ModelDim)
+		for row := 0; row < shape.Tokens; row++ {
+			base := row * shape.ModelDim
+			compactTrainBackwardLayerNormRow(
+				gradFFNResidual[base:base+shape.ModelDim],
+				gradProjected[gradBase+base:gradBase+base+shape.ModelDim],
+				projected[base:base+shape.ModelDim],
+				ffnResidual[base:base+shape.ModelDim],
+			)
+		}
+		compactTrainMatMulLeftTransposeAccum(activated, gradFFNResidual, out.ffnDown, shape.Tokens, shape.FFNDim, shape.ModelDim)
+		gradActivatedPre := compactTrainMatMulRightTranspose(gradFFNResidual, down, shape.Tokens, shape.FFNDim, shape.ModelDim)
+		gradActivated := make([]float32, shape.Tokens*shape.FFNDim)
+		compactTrainFillGELUBackwardMul(gradActivated, gradActivatedPre, ffnHidden, req.GELUMode == backend.CompactForwardGELUFast)
+		compactTrainMatMulLeftTransposeAccum(hidden, gradActivated, out.ffnUp, shape.Tokens, shape.ModelDim, shape.FFNDim)
+		gradHiddenFromFFN := compactTrainMatMulRightTranspose(gradActivated, up, shape.Tokens, shape.ModelDim, shape.FFNDim)
+		gradHidden := make([]float32, shape.Tokens*shape.ModelDim)
+		for i := range gradHidden {
+			gradHidden[i] = gradFFNResidual[i] + gradHiddenFromFFN[i]
+			out.gradHidden[gradBase+i] = gradHidden[i]
+		}
+		for row := 0; row < shape.Tokens; row++ {
+			base := row * shape.ModelDim
+			compactTrainBackwardLayerNormRow(
+				out.gradAttention[gradBase+base:gradBase+base+shape.ModelDim],
+				gradHidden[base:base+shape.ModelDim],
+				hidden[base:base+shape.ModelDim],
+				attnResidual[base:base+shape.ModelDim],
+			)
+		}
+	}
+	return out
+}
+
+func compactTrainBackwardLayerNormRow(dst, gradOut, normalized, pre []float32) {
+	mean := float32(0)
+	for _, value := range pre {
+		mean += value
+	}
+	mean /= float32(len(pre))
+	variance := float32(0)
+	for _, value := range pre {
+		centered := value - mean
+		variance += centered * centered
+	}
+	variance /= float32(len(pre))
+	invStd := float32(1.0 / math.Sqrt(float64(variance)+1e-5))
+	sumGrad := float32(0)
+	sumGradNorm := float32(0)
+	for i := range gradOut {
+		sumGrad += gradOut[i]
+		sumGradNorm += gradOut[i] * normalized[i]
+	}
+	n := float32(len(pre))
+	for i := range gradOut {
+		dst[i] = (invStd / n) * (n*gradOut[i] - sumGrad - normalized[i]*sumGradNorm)
+	}
+}
+
+func compactTrainFillGELUBackwardMul(dst, gradOut, preAct []float32, fast bool) {
+	for i, value := range preAct {
+		inner := float32(0.7978845608) * (value + float32(0.044715)*value*value*value)
+		t := float32(math.Tanh(float64(inner)))
+		tanhGrad := float32(1) - t*t
+		if fast {
+			t = compactTrainFastTanh(inner)
+			tanhGrad = compactTrainFastTanhDerivative(inner)
+		}
+		innerGrad := float32(0.7978845608) * (1 + float32(3*0.044715)*value*value)
+		dst[i] = gradOut[i] * (0.5*(1+t) + 0.5*value*tanhGrad*innerGrad)
+	}
+}
+
+func compactTrainFastTanh(inner float32) float32 {
+	if inner >= 3 {
+		return 1
+	}
+	if inner <= -3 {
+		return -1
+	}
+	x2 := inner * inner
+	return inner * (27 + x2) / (27 + 9*x2)
+}
+
+func compactTrainFastTanhDerivative(x float32) float32 {
+	if x >= 3 || x <= -3 {
+		return 0
+	}
+	x2 := x * x
+	diff := x2 - 9
+	den := 3 + x2
+	return (diff * diff) / (9 * den * den)
+}
+
+func compactTrainMatMulLeftTransposeAccum(lhs, gradOut, gradWeight []float32, rows, inDim, outDim int) {
+	for i := 0; i < inDim; i++ {
+		for o := 0; o < outDim; o++ {
+			sum := float32(0)
+			for r := 0; r < rows; r++ {
+				sum += lhs[r*inDim+i] * gradOut[r*outDim+o]
+			}
+			gradWeight[i*outDim+o] += sum
+		}
+	}
+}
+
+func compactTrainMatMulRightTranspose(gradOut, weight []float32, rows, inDim, outDim int) []float32 {
+	gradIn := make([]float32, rows*inDim)
+	for r := 0; r < rows; r++ {
+		for i := 0; i < inDim; i++ {
+			sum := float32(0)
+			for o := 0; o < outDim; o++ {
+				sum += gradOut[r*outDim+o] * weight[i*outDim+o]
+			}
+			gradIn[r*inDim+i] = sum
+		}
+	}
+	return gradIn
+}
+
+func addFloat32SlicesForCUDATest(dst, src []float32) {
+	for i := range dst {
+		dst[i] += src[i]
+	}
+}
+
+func assertCompactTrainBackwardWorkspaceDistinct(t *testing.T, accel *CompactTrainAccelerator, shape backend.CompactForwardShape) {
+	t.Helper()
+	if accel.arena == nil {
+		t.Fatal("missing compact train arena")
+	}
+	arena := accel.arena
+	ptrs := map[uintptr]string{}
+	for name, ptr := range map[string]uintptr{
+		"gradPooled":        uintptr(arena.gradPooled),
+		"gradOutputRows":    uintptr(arena.gradOutputRows),
+		"gradNormalized":    uintptr(arena.gradNormalized),
+		"gradHidden":        uintptr(arena.gradHidden),
+		"gradFFNResidual":   uintptr(arena.gradFFNResidual),
+		"gradActivatedPre":  uintptr(arena.gradActivatedPre),
+		"gradActivated":     uintptr(arena.gradActivated),
+		"gradHiddenFromFFN": uintptr(arena.gradHiddenFromFFN),
+		"gradAttention":     uintptr(arena.gradAttention),
+	} {
+		if ptr == 0 {
+			t.Fatalf("workspace %s was not allocated", name)
+		}
+		if prev, ok := ptrs[ptr]; ok {
+			t.Fatalf("workspace %s aliases %s", name, prev)
+		}
+		ptrs[ptr] = name
+	}
+	rows := shape.Batch * shape.Tokens
+	wantBytes := int64((shape.Batch*shape.OutputDim + rows*shape.OutputDim + 5*rows*shape.ModelDim + 2*rows*shape.FFNDim) * 4)
+	if got := accel.CompactTrainStats().WorkspaceArenaBytes; got != wantBytes {
+		t.Fatalf("workspace bytes = %d, want %d", got, wantBytes)
+	}
+}
+
 func residentGradRefByName(t *testing.T, refs []backend.ResidentGradientRef, name string) backend.ResidentGradientRef {
 	t.Helper()
 	for _, ref := range refs {
@@ -870,6 +1323,18 @@ func compactTrainMaxAbs(got, want []float32) float32 {
 		}
 	}
 	return maxAbs
+}
+
+func compactTrainRMSE(got, want []float32) float32 {
+	if len(got) == 0 || len(got) != len(want) {
+		return 0
+	}
+	sum := float64(0)
+	for i := range got {
+		d := float64(got[i] - want[i])
+		sum += d * d
+	}
+	return float32(math.Sqrt(sum / float64(len(got))))
 }
 
 func assertFloatSlicesClose(t *testing.T, got, want []float32, tol float32) {
