@@ -912,11 +912,32 @@ func (t *EmbeddingTrainer) canBridgeResidentOptimizerParam(name string, tensor *
 	if t == nil || name == "" || t.optimizerAccel == nil || t.forwardMatMul == nil || !optimizerResidentBridgeDType(tensor) {
 		return false
 	}
+	if t.optimizerParamRequiresHostForwardRead(name) {
+		return false
+	}
 	if _, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider); !ok {
 		return false
 	}
 	_, ok := t.forwardMatMul.(backend.DeviceResidentMatrixBinder)
 	return ok
+}
+
+func (t *EmbeddingTrainer) optimizerParamRequiresHostForwardRead(name string) bool {
+	if t == nil || name == "" {
+		return false
+	}
+	if name == t.tokenParam.Name || name == t.roleParam.Name {
+		return true
+	}
+	if t.compactState != nil {
+		if name == t.compactState.TokenEmbedding.Name {
+			return true
+		}
+		if t.compactState.RoleEmbedding != nil && name == t.compactState.RoleEmbedding.Name {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *EmbeddingTrainer) syncOptimizerTensorForHostFallback(name string, tensor *backend.Tensor, reason string) error {

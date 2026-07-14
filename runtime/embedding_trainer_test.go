@@ -2651,6 +2651,57 @@ func TestCompactBackwardWeightTransposeReadsResidentWeights(t *testing.T) {
 	}
 }
 
+func TestCompactDeferredOptimizerKeepsHostReadEmbeddingsCurrent(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	opt := &fakeResidentOptimizerAccelerator{}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	trainer.deferOptimizerSync = true
+
+	if trainer.compactState.RoleEmbedding == nil {
+		t.Fatal("compact fixture is missing role embedding")
+	}
+	grads := newCompactEmbeddingGradState(trainer.compactState)
+	grads.token[0] = 1
+	grads.role[0] = -1
+	grads.layers[0].ffnDown[0] = 1
+	tokenBefore := append([]float32(nil), trainer.compactState.TokenEmbedding.Tensor.F32...)
+	roleBefore := append([]float32(nil), trainer.compactState.RoleEmbedding.Tensor.F32...)
+	ffnDown := trainer.compactState.Layers[0].FFNDown
+	ffnDownBefore := append([]float32(nil), ffnDown.Tensor.F32...)
+
+	if err := trainer.applyCompactOptimizerUpdates(grads, 1); err != nil {
+		t.Fatalf("compact optimizer update: %v", err)
+	}
+
+	if _, ok := opt.ResidentParameter(trainer.compactState.TokenEmbedding.Name); ok {
+		t.Fatalf("token embedding was left resident-deferred; compact forward reads it from host")
+	}
+	if _, ok := opt.ResidentParameter(trainer.compactState.RoleEmbedding.Name); ok {
+		t.Fatalf("role embedding was left resident-deferred; compact forward reads it from host")
+	}
+	if float32SlicesClose(trainer.compactState.TokenEmbedding.Tensor.F32, tokenBefore, 0) {
+		t.Fatalf("token embedding host tensor did not receive immediate update")
+	}
+	if float32SlicesClose(trainer.compactState.RoleEmbedding.Tensor.F32, roleBefore, 0) {
+		t.Fatalf("role embedding host tensor did not receive immediate update")
+	}
+	ref, ok := opt.ResidentParameter(ffnDown.Name)
+	if !ok {
+		t.Fatalf("matrix parameter %q was not kept resident-deferred", ffnDown.Name)
+	}
+	token, ok := ref.Token.(*fakeResidentOptimizerToken)
+	if !ok || token.tensor == nil {
+		t.Fatalf("matrix resident token = %#v, want fake token with tensor", ref.Token)
+	}
+	if !float32SlicesClose(ffnDown.Tensor.F32, ffnDownBefore, 0) {
+		t.Fatalf("deferred matrix host tensor changed before explicit sync")
+	}
+	if float32SlicesClose(token.tensor.F32, ffnDownBefore, 0) {
+		t.Fatalf("deferred matrix resident tensor did not receive update")
+	}
+}
+
 func TestEmbeddingTrainerResidentOptimizerUpdateErrorFailsClosed(t *testing.T) {
 	trainer := newTinyTrainableFFNEmbeddingTrainer(t, 0.05)
 	param := backend.NewTensorF32([]int{2, 2}, []float32{1, 2, 3, 4})

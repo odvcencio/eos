@@ -329,6 +329,79 @@ func TestVectorDistillHostFallbackRecordsPhaseTimers(t *testing.T) {
 	}
 }
 
+func TestFitVectorDistillOptimizerSyncModeControlsDeferredUpdates(t *testing.T) {
+	trainSet := []EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+		vectorDistillTestExample("b", EmbeddingRoleDocument, []int32{3, 2, 1}, []float32{-0.1, 0.4, 0.2, -0.05}),
+	}
+
+	run := func(mode string) (EmbeddingTrainRunSummary, *fakeResidentOptimizerAccelerator, error) {
+		t.Helper()
+		trainer := newCompactEmbeddingTrainerForTest(t, 3)
+		opt := &fakeResidentOptimizerAccelerator{}
+		trainer.optimizerAccel = opt
+		trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+		summary, err := trainer.FitVectorDistill(trainSet, EmbeddingTrainRunConfig{
+			Epochs:                     1,
+			BatchSize:                  2,
+			Shuffle:                    false,
+			VectorDistillOptimizerSync: mode,
+		})
+		if trainer.deferOptimizerSync {
+			t.Fatalf("deferOptimizerSync was not restored after mode %q", mode)
+		}
+		return summary, opt, err
+	}
+
+	defaultSummary, defaultOpt, err := run("")
+	if err != nil {
+		t.Fatalf("default vector-distill fit: %v", err)
+	}
+	if defaultSummary.Config.VectorDistillOptimizerSync != VectorDistillOptimizerSyncDeferred {
+		t.Fatalf("default sync mode = %q, want %q", defaultSummary.Config.VectorDistillOptimizerSync, VectorDistillOptimizerSyncDeferred)
+	}
+	if defaultOpt.stats.DeferredSyncUpdates == 0 {
+		t.Fatalf("default deferred sync updates = %d, want > 0", defaultOpt.stats.DeferredSyncUpdates)
+	}
+	if defaultSummary.DeltaProfile.Optimizer.DeferredSyncUpdates == 0 {
+		t.Fatalf("default profile deferred sync updates = %d, want > 0", defaultSummary.DeltaProfile.Optimizer.DeferredSyncUpdates)
+	}
+
+	immediateSummary, immediateOpt, err := run(VectorDistillOptimizerSyncImmediate)
+	if err != nil {
+		t.Fatalf("immediate vector-distill fit: %v", err)
+	}
+	if immediateSummary.Config.VectorDistillOptimizerSync != VectorDistillOptimizerSyncImmediate {
+		t.Fatalf("immediate sync mode = %q, want %q", immediateSummary.Config.VectorDistillOptimizerSync, VectorDistillOptimizerSyncImmediate)
+	}
+	if immediateOpt.stats.DeferredSyncUpdates != 0 {
+		t.Fatalf("immediate deferred sync updates = %d, want 0", immediateOpt.stats.DeferredSyncUpdates)
+	}
+	if immediateSummary.DeltaProfile.Optimizer.DeferredSyncUpdates != 0 {
+		t.Fatalf("immediate profile deferred sync updates = %d, want 0", immediateSummary.DeltaProfile.Optimizer.DeferredSyncUpdates)
+	}
+}
+
+func TestFitVectorDistillOptimizerSyncModeRejectsInvalidMode(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	opt := &fakeResidentOptimizerAccelerator{}
+	trainer.optimizerAccel = opt
+	trainer.forwardMatMul = &residentAwareCountingMatMulAccelerator{}
+	_, err := trainer.FitVectorDistill([]EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+	}, EmbeddingTrainRunConfig{
+		Epochs:                     1,
+		BatchSize:                  1,
+		VectorDistillOptimizerSync: "sometimes",
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported vector_distill_optimizer_sync") {
+		t.Fatalf("invalid sync mode error = %v, want unsupported mode", err)
+	}
+	if opt.stats.UpdateCalls != 0 {
+		t.Fatalf("optimizer updates after invalid mode = %d, want 0", opt.stats.UpdateCalls)
+	}
+}
+
 func TestVectorDistillProjectionRoutesMatMulsAndOptimizerThroughAccelerators(t *testing.T) {
 	trainer := newCompactEmbeddingTrainerForTest(t, 3)
 	matmulAccel := &fakeVectorDistillMatMulAccelerator{}

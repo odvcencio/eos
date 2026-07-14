@@ -12,6 +12,11 @@ import (
 	"time"
 )
 
+const (
+	VectorDistillOptimizerSyncDeferred  = "deferred"
+	VectorDistillOptimizerSyncImmediate = "immediate"
+)
+
 // EmbeddingTrainRunConfig controls dataset-level native training.
 type EmbeddingTrainRunConfig struct {
 	Epochs                int
@@ -39,6 +44,7 @@ type EmbeddingTrainRunConfig struct {
 	// (similarity-matrix) distillation term over the RAW student pooled
 	// vectors, supervising the served geometry directly. 0 disables it.
 	VectorDistillRelationalWeight     float32
+	VectorDistillOptimizerSync        string
 	MovementDiagnostics               bool
 	AllowResearchOnlyScoreSpectrum    bool
 	AllowResearchOnlyListwiseGeometry bool
@@ -3124,6 +3130,9 @@ func normalizedTrainRunConfig(cfg EmbeddingTrainRunConfig) EmbeddingTrainRunConf
 	if cfg.VectorDistillDefaultRole == "" {
 		cfg.VectorDistillDefaultRole = EmbeddingRoleQuery
 	}
+	if mode, err := NormalizeVectorDistillOptimizerSyncMode(cfg.VectorDistillOptimizerSync); err == nil {
+		cfg.VectorDistillOptimizerSync = mode
+	}
 	cfg.GroupedLossWeight = effectiveGroupedLossWeight(cfg.ContrastiveLoss, cfg.GroupedLossWeight)
 	cfg.HardNegativeSourceWeights = normalizeHardNegativeSourceWeights(cfg.HardNegativeSourceWeights)
 	cfg.TeacherSourceTemperatures = normalizeHardNegativeTeacherTemperatures(cfg.TeacherSourceTemperatures)
@@ -3163,6 +3172,17 @@ func normalizedTrainRunConfig(cfg EmbeddingTrainRunConfig) EmbeddingTrainRunConf
 	cfg = normalizedScoreSpectrumRunConfig(cfg)
 	cfg.TeacherScoreNormalization = normalizeTeacherScoreNormalization(cfg.TeacherScoreNormalization)
 	return cfg
+}
+
+func NormalizeVectorDistillOptimizerSyncMode(mode string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(strings.ReplaceAll(mode, "-", "_"))) {
+	case "", VectorDistillOptimizerSyncDeferred:
+		return VectorDistillOptimizerSyncDeferred, nil
+	case VectorDistillOptimizerSyncImmediate:
+		return VectorDistillOptimizerSyncImmediate, nil
+	default:
+		return "", fmt.Errorf("unsupported vector_distill_optimizer_sync %q (supported: %s, %s)", mode, VectorDistillOptimizerSyncDeferred, VectorDistillOptimizerSyncImmediate)
+	}
 }
 
 func normalizedScoreSpectrumRunConfig(cfg EmbeddingTrainRunConfig) EmbeddingTrainRunConfig {

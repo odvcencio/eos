@@ -5737,6 +5737,23 @@ func TestRunTrainEmbedRejectsInvalidRetrievalEvalRoleMode(t *testing.T) {
 	}
 }
 
+func TestRunTrainEmbedRejectsInvalidVectorDistillOptimizerSyncMode(t *testing.T) {
+	_, err := captureRunOutputAndError(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--vector-distill-train",
+		"--vector-distill-optimizer-sync", "eventually",
+		"artifact.mll",
+		"train.jsonl",
+	})
+	if err == nil {
+		t.Fatal("train-embed accepted invalid vector-distill optimizer sync mode")
+	}
+	if !strings.Contains(err.Error(), `unsupported vector_distill_optimizer_sync "eventually"`) {
+		t.Fatalf("invalid vector-distill optimizer sync error = %v", err)
+	}
+}
+
 func TestRunTrainEmbedProgressEveryPrintsInnerProgress(t *testing.T) {
 	path := writeTrainableArtifact(t)
 	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {

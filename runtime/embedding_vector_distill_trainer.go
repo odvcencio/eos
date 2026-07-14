@@ -95,13 +95,18 @@ func (t *EmbeddingTrainer) FitVectorDistill(
 	if !validTrainSelectionMetric(cfg.SelectMetric) {
 		return EmbeddingTrainRunSummary{}, fmt.Errorf("unsupported select_metric %q", cfg.SelectMetric)
 	}
+	optimizerSyncMode, err := NormalizeVectorDistillOptimizerSyncMode(cfg.VectorDistillOptimizerSync)
+	if err != nil {
+		return EmbeddingTrainRunSummary{}, err
+	}
+	cfg.VectorDistillOptimizerSync = optimizerSyncMode
 	t.configureRetrievalEval(cfg.RetrievalEvalRuntime, cfg.RetrievalEval, cfg.RetrievalEvalTokenizer)
 	if err := t.applyTrainRunOverrides(cfg); err != nil {
 		return EmbeddingTrainRunSummary{}, err
 	}
 	cfg = t.syncTrainRunObjectiveConfig(cfg)
 	previousDeferredSync := t.deferOptimizerSync
-	t.deferOptimizerSync = true
+	t.deferOptimizerSync = optimizerSyncMode == VectorDistillOptimizerSyncDeferred
 	defer func() {
 		t.deferOptimizerSync = previousDeferredSync
 	}()

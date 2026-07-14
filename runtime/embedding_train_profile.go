@@ -269,8 +269,13 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 		profile.VectorDistillPhases.ProjectionLossNanos != 0 ||
 		profile.VectorDistillPhases.BackwardNanos != 0 ||
 		profile.VectorDistillPhases.OptimizerNanos != 0 ||
+		profile.Optimizer.LogicalSteps != 0 ||
+		profile.Optimizer.TensorUpdateCalls != 0 ||
 		profile.Optimizer.UpdateCalls != 0 ||
+		profile.Optimizer.DeferredSyncUpdates != 0 ||
 		profile.Optimizer.SyncCalls != 0 ||
+		profile.Optimizer.ForcedSyncCalls != 0 ||
+		profile.Optimizer.LastForcedSyncReason != "" ||
 		profile.Optimizer.UploadedBytes != 0 ||
 		profile.Optimizer.DownloadedBytes != 0 ||
 		profile.Optimizer.UpdateNanos != 0 ||
@@ -322,13 +327,17 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 			OptimizerNanos:      left.VectorDistillPhases.OptimizerNanos + right.VectorDistillPhases.OptimizerNanos,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			UpdateCalls:     left.Optimizer.UpdateCalls + right.Optimizer.UpdateCalls,
-			SyncCalls:       left.Optimizer.SyncCalls + right.Optimizer.SyncCalls,
-			UploadedBytes:   left.Optimizer.UploadedBytes + right.Optimizer.UploadedBytes,
-			DownloadedBytes: left.Optimizer.DownloadedBytes + right.Optimizer.DownloadedBytes,
-			UpdateNanos:     left.Optimizer.UpdateNanos + right.Optimizer.UpdateNanos,
-			SyncNanos:       left.Optimizer.SyncNanos + right.Optimizer.SyncNanos,
-			ResidentParams:  left.Optimizer.ResidentParams,
+			LogicalSteps:        left.Optimizer.LogicalSteps + right.Optimizer.LogicalSteps,
+			TensorUpdateCalls:   left.Optimizer.TensorUpdateCalls + right.Optimizer.TensorUpdateCalls,
+			UpdateCalls:         left.Optimizer.UpdateCalls + right.Optimizer.UpdateCalls,
+			DeferredSyncUpdates: left.Optimizer.DeferredSyncUpdates + right.Optimizer.DeferredSyncUpdates,
+			SyncCalls:           left.Optimizer.SyncCalls + right.Optimizer.SyncCalls,
+			ForcedSyncCalls:     left.Optimizer.ForcedSyncCalls + right.Optimizer.ForcedSyncCalls,
+			UploadedBytes:       left.Optimizer.UploadedBytes + right.Optimizer.UploadedBytes,
+			DownloadedBytes:     left.Optimizer.DownloadedBytes + right.Optimizer.DownloadedBytes,
+			UpdateNanos:         left.Optimizer.UpdateNanos + right.Optimizer.UpdateNanos,
+			SyncNanos:           left.Optimizer.SyncNanos + right.Optimizer.SyncNanos,
+			ResidentParams:      left.Optimizer.ResidentParams,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              left.Activation.BindCalls + right.Activation.BindCalls,
@@ -361,8 +370,15 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 	}
 	if hasRight {
 		out.ForwardResidency.MatMul.BoundMatrices = right.ForwardResidency.MatMul.BoundMatrices
+		if right.Optimizer.LastForcedSyncReason != "" {
+			out.Optimizer.LastForcedSyncReason = right.Optimizer.LastForcedSyncReason
+		} else {
+			out.Optimizer.LastForcedSyncReason = left.Optimizer.LastForcedSyncReason
+		}
 		out.Optimizer.ResidentParams = right.Optimizer.ResidentParams
 		out.Activation.BoundTensors = right.Activation.BoundTensors
+	} else {
+		out.Optimizer.LastForcedSyncReason = left.Optimizer.LastForcedSyncReason
 	}
 	return out
 }
@@ -400,13 +416,17 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 			OptimizerNanos:      base.VectorDistillPhases.OptimizerNanos + delta.VectorDistillPhases.OptimizerNanos,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			UpdateCalls:     base.Optimizer.UpdateCalls + delta.Optimizer.UpdateCalls,
-			SyncCalls:       base.Optimizer.SyncCalls + delta.Optimizer.SyncCalls,
-			UploadedBytes:   base.Optimizer.UploadedBytes + delta.Optimizer.UploadedBytes,
-			DownloadedBytes: base.Optimizer.DownloadedBytes + delta.Optimizer.DownloadedBytes,
-			UpdateNanos:     base.Optimizer.UpdateNanos + delta.Optimizer.UpdateNanos,
-			SyncNanos:       base.Optimizer.SyncNanos + delta.Optimizer.SyncNanos,
-			ResidentParams:  base.Optimizer.ResidentParams,
+			LogicalSteps:        base.Optimizer.LogicalSteps + delta.Optimizer.LogicalSteps,
+			TensorUpdateCalls:   base.Optimizer.TensorUpdateCalls + delta.Optimizer.TensorUpdateCalls,
+			UpdateCalls:         base.Optimizer.UpdateCalls + delta.Optimizer.UpdateCalls,
+			DeferredSyncUpdates: base.Optimizer.DeferredSyncUpdates + delta.Optimizer.DeferredSyncUpdates,
+			SyncCalls:           base.Optimizer.SyncCalls + delta.Optimizer.SyncCalls,
+			ForcedSyncCalls:     base.Optimizer.ForcedSyncCalls + delta.Optimizer.ForcedSyncCalls,
+			UploadedBytes:       base.Optimizer.UploadedBytes + delta.Optimizer.UploadedBytes,
+			DownloadedBytes:     base.Optimizer.DownloadedBytes + delta.Optimizer.DownloadedBytes,
+			UpdateNanos:         base.Optimizer.UpdateNanos + delta.Optimizer.UpdateNanos,
+			SyncNanos:           base.Optimizer.SyncNanos + delta.Optimizer.SyncNanos,
+			ResidentParams:      base.Optimizer.ResidentParams,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              base.Activation.BindCalls + delta.Activation.BindCalls,
@@ -439,8 +459,15 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 	}
 	if hasTrainProfileActivity(delta) {
 		out.ForwardResidency.MatMul.BoundMatrices = delta.ForwardResidency.MatMul.BoundMatrices
+		if delta.Optimizer.LastForcedSyncReason != "" {
+			out.Optimizer.LastForcedSyncReason = delta.Optimizer.LastForcedSyncReason
+		} else {
+			out.Optimizer.LastForcedSyncReason = base.Optimizer.LastForcedSyncReason
+		}
 		out.Optimizer.ResidentParams = delta.Optimizer.ResidentParams
 		out.Activation.BoundTensors = delta.Activation.BoundTensors
+	} else {
+		out.Optimizer.LastForcedSyncReason = base.Optimizer.LastForcedSyncReason
 	}
 	return out
 }
@@ -456,13 +483,18 @@ func diffTrainProfile(start, end EmbeddingTrainProfile) EmbeddingTrainProfile {
 		ForwardResidency:    diffForwardResidencyStats(start.ForwardResidency, end.ForwardResidency),
 		VectorDistillPhases: diffVectorDistillPhaseTimers(start.VectorDistillPhases, end.VectorDistillPhases),
 		Optimizer: backend.OptimizerAcceleratorStats{
-			UpdateCalls:     end.Optimizer.UpdateCalls - start.Optimizer.UpdateCalls,
-			SyncCalls:       end.Optimizer.SyncCalls - start.Optimizer.SyncCalls,
-			UploadedBytes:   end.Optimizer.UploadedBytes - start.Optimizer.UploadedBytes,
-			DownloadedBytes: end.Optimizer.DownloadedBytes - start.Optimizer.DownloadedBytes,
-			UpdateNanos:     end.Optimizer.UpdateNanos - start.Optimizer.UpdateNanos,
-			SyncNanos:       end.Optimizer.SyncNanos - start.Optimizer.SyncNanos,
-			ResidentParams:  end.Optimizer.ResidentParams,
+			LogicalSteps:         end.Optimizer.LogicalSteps - start.Optimizer.LogicalSteps,
+			TensorUpdateCalls:    end.Optimizer.TensorUpdateCalls - start.Optimizer.TensorUpdateCalls,
+			UpdateCalls:          end.Optimizer.UpdateCalls - start.Optimizer.UpdateCalls,
+			DeferredSyncUpdates:  end.Optimizer.DeferredSyncUpdates - start.Optimizer.DeferredSyncUpdates,
+			SyncCalls:            end.Optimizer.SyncCalls - start.Optimizer.SyncCalls,
+			ForcedSyncCalls:      end.Optimizer.ForcedSyncCalls - start.Optimizer.ForcedSyncCalls,
+			LastForcedSyncReason: end.Optimizer.LastForcedSyncReason,
+			UploadedBytes:        end.Optimizer.UploadedBytes - start.Optimizer.UploadedBytes,
+			DownloadedBytes:      end.Optimizer.DownloadedBytes - start.Optimizer.DownloadedBytes,
+			UpdateNanos:          end.Optimizer.UpdateNanos - start.Optimizer.UpdateNanos,
+			SyncNanos:            end.Optimizer.SyncNanos - start.Optimizer.SyncNanos,
+			ResidentParams:       end.Optimizer.ResidentParams,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              end.Activation.BindCalls - start.Activation.BindCalls,

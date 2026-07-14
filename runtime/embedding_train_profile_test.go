@@ -41,13 +41,18 @@ func TestEmbeddingTrainProfileRoundTrip(t *testing.T) {
 			},
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			UpdateCalls:     4,
-			SyncCalls:       2,
-			UploadedBytes:   1024,
-			DownloadedBytes: 512,
-			UpdateNanos:     100,
-			SyncNanos:       40,
-			ResidentParams:  3,
+			LogicalSteps:         4,
+			TensorUpdateCalls:    13,
+			UpdateCalls:          4,
+			DeferredSyncUpdates:  9,
+			SyncCalls:            2,
+			ForcedSyncCalls:      1,
+			LastForcedSyncReason: "restore-best-test",
+			UploadedBytes:        1024,
+			DownloadedBytes:      512,
+			UpdateNanos:          100,
+			SyncNanos:            40,
+			ResidentParams:       3,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              4,
@@ -91,6 +96,21 @@ func TestEmbeddingTrainProfileRoundTrip(t *testing.T) {
 	}
 	if got.Optimizer.UpdateCalls != want.Optimizer.UpdateCalls {
 		t.Fatalf("optimizer update calls = %d, want %d", got.Optimizer.UpdateCalls, want.Optimizer.UpdateCalls)
+	}
+	if got.Optimizer.LogicalSteps != want.Optimizer.LogicalSteps {
+		t.Fatalf("optimizer logical steps = %d, want %d", got.Optimizer.LogicalSteps, want.Optimizer.LogicalSteps)
+	}
+	if got.Optimizer.TensorUpdateCalls != want.Optimizer.TensorUpdateCalls {
+		t.Fatalf("optimizer tensor update calls = %d, want %d", got.Optimizer.TensorUpdateCalls, want.Optimizer.TensorUpdateCalls)
+	}
+	if got.Optimizer.DeferredSyncUpdates != want.Optimizer.DeferredSyncUpdates {
+		t.Fatalf("optimizer deferred sync updates = %d, want %d", got.Optimizer.DeferredSyncUpdates, want.Optimizer.DeferredSyncUpdates)
+	}
+	if got.Optimizer.ForcedSyncCalls != want.Optimizer.ForcedSyncCalls {
+		t.Fatalf("optimizer forced sync calls = %d, want %d", got.Optimizer.ForcedSyncCalls, want.Optimizer.ForcedSyncCalls)
+	}
+	if got.Optimizer.LastForcedSyncReason != want.Optimizer.LastForcedSyncReason {
+		t.Fatalf("optimizer last forced sync reason = %q, want %q", got.Optimizer.LastForcedSyncReason, want.Optimizer.LastForcedSyncReason)
 	}
 	if got.Activation.GELUBackwardCalls != want.Activation.GELUBackwardCalls {
 		t.Fatalf("activation gelu calls = %d, want %d", got.Activation.GELUBackwardCalls, want.Activation.GELUBackwardCalls)
@@ -154,5 +174,207 @@ func TestEmbeddingTrainerFitCapturesProfileDelta(t *testing.T) {
 	}
 	if fake.bindCalls <= 0 {
 		t.Fatalf("fake bind calls = %d, want positive", fake.bindCalls)
+	}
+}
+
+func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
+	left := EmbeddingTrainProfile{
+		Version:          EmbeddingTrainProfileVersion,
+		OptimizerBackend: eosartifact.BackendCUDA,
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         2,
+			TensorUpdateCalls:    9,
+			UpdateCalls:          2,
+			DeferredSyncUpdates:  7,
+			SyncCalls:            1,
+			ForcedSyncCalls:      1,
+			LastForcedSyncReason: "left-pressure",
+			ResidentParams:       3,
+		},
+	}
+	right := EmbeddingTrainProfile{
+		Version:          EmbeddingTrainProfileVersion,
+		OptimizerBackend: eosartifact.BackendCUDA,
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         3,
+			TensorUpdateCalls:    11,
+			UpdateCalls:          3,
+			DeferredSyncUpdates:  5,
+			SyncCalls:            2,
+			ForcedSyncCalls:      2,
+			LastForcedSyncReason: "right-capacity",
+			ResidentParams:       4,
+		},
+	}
+
+	merged := addTrainProfileDelta(left, right)
+	assertOptimizerProfileCounters(t, merged.Optimizer, backend.OptimizerAcceleratorStats{
+		LogicalSteps:         5,
+		TensorUpdateCalls:    20,
+		UpdateCalls:          5,
+		DeferredSyncUpdates:  12,
+		SyncCalls:            3,
+		ForcedSyncCalls:      3,
+		LastForcedSyncReason: "right-capacity",
+		ResidentParams:       4,
+	})
+
+	base := EmbeddingTrainProfile{
+		Version:          EmbeddingTrainProfileVersion,
+		OptimizerBackend: eosartifact.BackendKind("host"),
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         10,
+			TensorUpdateCalls:    100,
+			UpdateCalls:          10,
+			DeferredSyncUpdates:  50,
+			SyncCalls:            10,
+			ForcedSyncCalls:      4,
+			LastForcedSyncReason: "base-sync",
+			ResidentParams:       8,
+		},
+	}
+	applied := applyTrainProfileDelta(base, right)
+	assertOptimizerProfileCounters(t, applied.Optimizer, backend.OptimizerAcceleratorStats{
+		LogicalSteps:         13,
+		TensorUpdateCalls:    111,
+		UpdateCalls:          13,
+		DeferredSyncUpdates:  55,
+		SyncCalls:            12,
+		ForcedSyncCalls:      6,
+		LastForcedSyncReason: "right-capacity",
+		ResidentParams:       4,
+	})
+}
+
+func TestTrainProfileRestoreBestMergePreservesOptimizerCounters(t *testing.T) {
+	start := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		Step:    10,
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         10,
+			TensorUpdateCalls:    100,
+			UpdateCalls:          10,
+			DeferredSyncUpdates:  80,
+			SyncCalls:            2,
+			ForcedSyncCalls:      1,
+			LastForcedSyncReason: "startup",
+			ResidentParams:       2,
+		},
+	}
+	preRestoreEnd := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		Step:    14,
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         14,
+			TensorUpdateCalls:    140,
+			UpdateCalls:          14,
+			DeferredSyncUpdates:  120,
+			SyncCalls:            5,
+			ForcedSyncCalls:      2,
+			LastForcedSyncReason: "pre-restore-pressure",
+			ResidentParams:       4,
+		},
+	}
+	restoreStart := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		Step:    12,
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         12,
+			TensorUpdateCalls:    120,
+			UpdateCalls:          12,
+			DeferredSyncUpdates:  96,
+			SyncCalls:            3,
+			ForcedSyncCalls:      1,
+			LastForcedSyncReason: "startup",
+			ResidentParams:       3,
+		},
+	}
+	final := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		Step:    13,
+		Optimizer: backend.OptimizerAcceleratorStats{
+			LogicalSteps:         13,
+			TensorUpdateCalls:    133,
+			UpdateCalls:          13,
+			DeferredSyncUpdates:  108,
+			SyncCalls:            4,
+			ForcedSyncCalls:      2,
+			LastForcedSyncReason: "final-eval-sync",
+			ResidentParams:       5,
+		},
+	}
+
+	preRestoreDelta := diffTrainProfile(start, preRestoreEnd)
+	postRestoreDelta := diffTrainProfile(restoreStart, final)
+	mergedDelta := addTrainProfileDelta(preRestoreDelta, postRestoreDelta)
+	endProfile := applyTrainProfileDelta(preRestoreEnd, postRestoreDelta)
+
+	assertOptimizerProfileCounters(t, mergedDelta.Optimizer, backend.OptimizerAcceleratorStats{
+		LogicalSteps:         5,
+		TensorUpdateCalls:    53,
+		UpdateCalls:          5,
+		DeferredSyncUpdates:  52,
+		SyncCalls:            4,
+		ForcedSyncCalls:      2,
+		LastForcedSyncReason: "final-eval-sync",
+		ResidentParams:       5,
+	})
+	assertOptimizerProfileCounters(t, endProfile.Optimizer, backend.OptimizerAcceleratorStats{
+		LogicalSteps:         15,
+		TensorUpdateCalls:    153,
+		UpdateCalls:          15,
+		DeferredSyncUpdates:  132,
+		SyncCalls:            6,
+		ForcedSyncCalls:      3,
+		LastForcedSyncReason: "final-eval-sync",
+		ResidentParams:       5,
+	})
+}
+
+func TestTrainProfileOptimizerCounterActivity(t *testing.T) {
+	cases := []struct {
+		name  string
+		stats backend.OptimizerAcceleratorStats
+	}{
+		{name: "logical steps", stats: backend.OptimizerAcceleratorStats{LogicalSteps: 1}},
+		{name: "tensor update calls", stats: backend.OptimizerAcceleratorStats{TensorUpdateCalls: 1}},
+		{name: "deferred sync updates", stats: backend.OptimizerAcceleratorStats{DeferredSyncUpdates: 1}},
+		{name: "forced sync calls", stats: backend.OptimizerAcceleratorStats{ForcedSyncCalls: 1}},
+		{name: "last forced sync reason", stats: backend.OptimizerAcceleratorStats{LastForcedSyncReason: "memory-pressure"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !hasTrainProfileActivity(EmbeddingTrainProfile{Optimizer: tc.stats}) {
+				t.Fatal("expected optimizer counter activity")
+			}
+		})
+	}
+}
+
+func assertOptimizerProfileCounters(t *testing.T, got, want backend.OptimizerAcceleratorStats) {
+	t.Helper()
+	if got.LogicalSteps != want.LogicalSteps {
+		t.Fatalf("logical steps = %d, want %d", got.LogicalSteps, want.LogicalSteps)
+	}
+	if got.TensorUpdateCalls != want.TensorUpdateCalls {
+		t.Fatalf("tensor update calls = %d, want %d", got.TensorUpdateCalls, want.TensorUpdateCalls)
+	}
+	if got.UpdateCalls != want.UpdateCalls {
+		t.Fatalf("update calls = %d, want %d", got.UpdateCalls, want.UpdateCalls)
+	}
+	if got.DeferredSyncUpdates != want.DeferredSyncUpdates {
+		t.Fatalf("deferred sync updates = %d, want %d", got.DeferredSyncUpdates, want.DeferredSyncUpdates)
+	}
+	if got.SyncCalls != want.SyncCalls {
+		t.Fatalf("sync calls = %d, want %d", got.SyncCalls, want.SyncCalls)
+	}
+	if got.ForcedSyncCalls != want.ForcedSyncCalls {
+		t.Fatalf("forced sync calls = %d, want %d", got.ForcedSyncCalls, want.ForcedSyncCalls)
+	}
+	if got.LastForcedSyncReason != want.LastForcedSyncReason {
+		t.Fatalf("last forced sync reason = %q, want %q", got.LastForcedSyncReason, want.LastForcedSyncReason)
+	}
+	if got.ResidentParams != want.ResidentParams {
+		t.Fatalf("resident params = %d, want %d", got.ResidentParams, want.ResidentParams)
 	}
 }

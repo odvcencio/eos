@@ -5270,6 +5270,7 @@ func runTrainEmbed(args []string) error {
 	var vectorDistillTrain bool
 	var vectorDistillDefaultRole string
 	var vectorDistillRelationalWeight float64
+	var vectorDistillOptimizerSync string
 	var movementDiagnostics bool
 	var allowResearchOnlyScoreSpectrum bool
 	var allowResearchOnlyListwiseGeometry bool
@@ -5337,6 +5338,7 @@ func runTrainEmbed(args []string) error {
 	fs.BoolVar(&vectorDistillTrain, "vector-distill-train", false, "treat the training JSONL as (text, teacher_vector) vector-distillation examples")
 	fs.StringVar(&vectorDistillDefaultRole, "vector-distill-default-role", eosruntime.EmbeddingRoleQuery, "role (query, document, or raw) applied to vector-distill JSONL rows that omit an explicit \"role\" field")
 	fs.Float64Var(&vectorDistillRelationalWeight, "vector-distill-relational-weight", 0, "weight for an opt-in in-batch relational (similarity-matrix) distillation term over raw student vectors (0 disables); requires --vector-distill-train")
+	fs.StringVar(&vectorDistillOptimizerSync, "vector-distill-optimizer-sync", eosruntime.VectorDistillOptimizerSyncDeferred, "vector-distill optimizer host sync mode: deferred or immediate")
 	fs.BoolVar(&movementDiagnostics, "movement-diagnostics", false, "record aggregate gradient and parameter-delta movement diagnostics for listwise geometry training")
 	fs.BoolVar(&allowResearchOnlyScoreSpectrum, "allow-research-only-score-spectrum", false, "allow research-only score-spectrum training rows")
 	fs.BoolVar(&allowResearchOnlyListwiseGeometry, "allow-research-only-listwise-geometry", false, "allow research-only listwise geometry training rows")
@@ -5576,6 +5578,13 @@ func runTrainEmbed(args []string) error {
 	if vectorDistillRelationalWeight != 0 && !vectorDistillTrain {
 		return fmt.Errorf("--vector-distill-relational-weight requires --vector-distill-train")
 	}
+	parsedVectorDistillOptimizerSync, parseErr := eosruntime.NormalizeVectorDistillOptimizerSyncMode(vectorDistillOptimizerSync)
+	if parseErr != nil {
+		return fmt.Errorf("vector-distill-optimizer-sync: %w", parseErr)
+	}
+	if flagWasProvided(fs, "vector-distill-optimizer-sync") && !vectorDistillTrain {
+		return fmt.Errorf("--vector-distill-optimizer-sync requires --vector-distill-train")
+	}
 	parsedVectorDistillDefaultRole, parseErr := normalizeVectorDistillRoleForCLI(vectorDistillDefaultRole)
 	if parseErr != nil {
 		return fmt.Errorf("vector-distill-default-role: %w", parseErr)
@@ -5713,6 +5722,7 @@ func runTrainEmbed(args []string) error {
 		VectorDistillTrain:                vectorDistillTrain,
 		VectorDistillDefaultRole:          parsedVectorDistillDefaultRole,
 		VectorDistillRelationalWeight:     float32(vectorDistillRelationalWeight),
+		VectorDistillOptimizerSync:        parsedVectorDistillOptimizerSync,
 		MovementDiagnostics:               movementDiagnostics,
 		AllowResearchOnlyScoreSpectrum:    allowResearchOnlyScoreSpectrum,
 		AllowResearchOnlyListwiseGeometry: allowResearchOnlyListwiseGeometry,
@@ -6881,6 +6891,7 @@ type trainRunConfigJSON struct {
 	ScoreSpectrumTrain                bool                                   `json:"score_spectrum_train"`
 	ListwiseGeometryTrain             bool                                   `json:"listwise_geometry_train"`
 	VectorDistillTrain                bool                                   `json:"vector_distill_train,omitempty"`
+	VectorDistillOptimizerSync        string                                 `json:"vector_distill_optimizer_sync,omitempty"`
 	MovementDiagnostics               bool                                   `json:"movement_diagnostics"`
 	AllowResearchOnlyListwiseGeometry bool                                   `json:"allow_research_only_listwise_geometry,omitempty"`
 	AllowResearchOnlyVectorDistill    bool                                   `json:"allow_research_only_vector_distill,omitempty"`
@@ -7149,6 +7160,8 @@ func trainRunConfigPayload(cfg eosruntime.EmbeddingTrainRunConfig, effectiveLear
 		HardNegativeTrain:                 cfg.HardNegativeTrain,
 		ScoreSpectrumTrain:                cfg.ScoreSpectrumTrain,
 		ListwiseGeometryTrain:             cfg.ListwiseGeometryTrain,
+		VectorDistillTrain:                cfg.VectorDistillTrain,
+		VectorDistillOptimizerSync:        cfg.VectorDistillOptimizerSync,
 		MovementDiagnostics:               cfg.MovementDiagnostics,
 		AllowResearchOnlyListwiseGeometry: cfg.AllowResearchOnlyListwiseGeometry,
 		MaxListwiseGeometryTrainPairs:     cfg.MaxListwiseGeometryTrainPairs,
