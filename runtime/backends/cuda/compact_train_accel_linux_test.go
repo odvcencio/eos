@@ -101,6 +101,9 @@ func TestCompactTrainForwardPooledParityAndAccounting(t *testing.T) {
 			if stats.ForwardCalls != 1 || stats.HandlesCreated != 1 || stats.LiveHandles != 1 {
 				t.Fatalf("forward/handle stats = %+v", stats)
 			}
+			if wantLaunches := expectedCompactTrainForwardLaunches(shape); stats.LastForwardLaunches != wantLaunches || stats.LastForwardSyncs != expectedCompactCUDASyncsForLaunches(wantLaunches) {
+				t.Fatalf("forward launch stats = %+v, want launches %d syncs %d", stats, wantLaunches, expectedCompactCUDASyncsForLaunches(wantLaunches))
+			}
 			if stats.PooledDownloadedBytes != int64(shape.Batch*shape.OutputDim*4) {
 				t.Fatalf("pooled downloaded bytes = %d, want %d", stats.PooledDownloadedBytes, shape.Batch*shape.OutputDim*4)
 			}
@@ -128,6 +131,164 @@ func TestCompactTrainForwardPooledParityAndAccounting(t *testing.T) {
 				t.Fatalf("packed stats changed on compact train path: %+v", base)
 			}
 		})
+	}
+}
+
+func TestCompactTrainForwardDeviceStatusFailuresPublishCountersAndReleaseArena(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		tokens     [][]int32
+		roles      []int32
+		wantStatus int32
+	}{
+		{name: "invalid_token", tokens: [][]int32{{5, 1}}, roles: []int32{0}, wantStatus: 1},
+		{name: "invalid_role", tokens: [][]int32{{2, 1}}, roles: []int32{3}, wantStatus: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, true)
+			defer cleanup()
+			shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 3, HasOutputProjection: true}
+			refs := compactTrainResidentRefsForTest(t, accel, shape)
+			if err := accel.BeginCompactTrainStep(77, refs); err != nil {
+				t.Fatalf("begin step: %v", err)
+			}
+			req := backend.CompactTrainForwardRequest{
+				Shape:        shape,
+				Tokens:       tc.tokens,
+				Masks:        [][]int32{{1, 1}},
+				Roles:        tc.roles,
+				ResidentRefs: refs,
+				StepID:       77,
+			}
+			_, err := accel.RunCompactTrainForward(req)
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("gather status %d", tc.wantStatus)) {
+				t.Fatalf("status error = %v, want status %d", err, tc.wantStatus)
+			}
+			stats := accel.CompactTrainStats()
+			wantLaunches := expectedCompactTrainForwardLaunches(shape)
+			wantSyncs := expectedCompactCUDASyncsForLaunches(wantLaunches)
+			wantUpload := int64((shape.Batch*shape.Tokens + shape.Batch*shape.Tokens + shape.Batch + 1) * 4)
+			if stats.ForwardCalls != 0 || stats.HandlesCreated != 0 || stats.LiveHandles != 0 || stats.FallbackOrUnhandled != 1 {
+				t.Fatalf("status failure lifecycle stats = %+v, want no handles and one failure", stats)
+			}
+			if stats.KernelLaunches != wantLaunches || stats.KernelSynchronizations != wantSyncs || stats.LastForwardLaunches != wantLaunches || stats.LastForwardSyncs != wantSyncs {
+				t.Fatalf("status failure launch stats = %+v, want launches/syncs %d/%d", stats, wantLaunches, wantSyncs)
+			}
+			if stats.UploadedBytes != wantUpload || stats.DownloadedBytes != 4 || stats.StatusDownloadedBytes != 4 || stats.PooledDownloadedBytes != 0 {
+				t.Fatalf("status failure transfer stats = %+v, want upload %d status-only D2H", stats, wantUpload)
+			}
+			if stats.ActivationArenaBytes != 0 || len(accel.arenas) != 0 {
+				t.Fatalf("status failure retained arena bytes=%d arenas=%d", stats.ActivationArenaBytes, len(accel.arenas))
+			}
+			if err := accel.AbortCompactTrainStep(77); err != nil {
+				t.Fatalf("abort after status failure: %v", err)
+			}
+			if err := accel.BeginCompactTrainStep(78, refs); err != nil {
+				t.Fatalf("rebegin after status failure abort: %v", err)
+			}
+			good := req
+			good.StepID = 78
+			good.Tokens = [][]int32{{2, 1}}
+			good.Roles = []int32{0}
+			forward, err := accel.RunCompactTrainForward(good)
+			if err != nil {
+				t.Fatalf("recovery forward: %v", err)
+			}
+			if err := accel.ReleaseCompactTrainHandle(forward.Handle); err != nil {
+				t.Fatalf("release recovery handle: %v", err)
+			}
+			if err := accel.EndCompactTrainStep(78); err != nil {
+				t.Fatalf("end recovery step: %v", err)
+			}
+		})
+	}
+}
+
+func TestCompactTrainForwardMidSequenceErrorDrainsBeforeAbortAndRebegin(t *testing.T) {
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, true)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 3, HasOutputProjection: true}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(81, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		StepID:       81,
+	}
+	accel.debugForceForwardFailureAfterFirstLayer = true
+	_, err := accel.RunCompactTrainForward(req)
+	if err == nil || !strings.Contains(err.Error(), "forced forward failure after first layer") {
+		t.Fatalf("forced train forward err = %v, want mid-sequence forced failure", err)
+	}
+	stats := accel.CompactTrainStats()
+	if stats.ForwardCalls != 0 || stats.HandlesCreated != 0 || stats.LiveHandles != 0 || stats.FallbackOrUnhandled != 1 || stats.KernelLaunches == 0 || stats.KernelSynchronizations != expectedCompactCUDASyncsForLaunches(stats.KernelLaunches) {
+		t.Fatalf("forced train forward stats = %+v, want drained failed launches and no live handles", stats)
+	}
+	if stats.ActivationArenaBytes != 0 || len(accel.arenas) != 0 {
+		t.Fatalf("forced train forward retained arena bytes=%d arenas=%d", stats.ActivationArenaBytes, len(accel.arenas))
+	}
+	accel.debugForceForwardFailureAfterFirstLayer = false
+	if err := accel.AbortCompactTrainStep(81); err != nil {
+		t.Fatalf("abort after forced forward failure: %v", err)
+	}
+	if err := accel.BeginCompactTrainStep(82, refs); err != nil {
+		t.Fatalf("rebegin after forced forward failure: %v", err)
+	}
+	req.StepID = 82
+	forward, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("recovery forward: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainHandle(forward.Handle); err != nil {
+		t.Fatalf("release recovery handle: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(82); err != nil {
+		t.Fatalf("end recovery step: %v", err)
+	}
+}
+
+func TestCompactTrainSyncEachLaunchExactForwardBackward(t *testing.T) {
+	t.Setenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH", "1")
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, true, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(83, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		StepID:       83,
+	}
+	forward, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("sync-each forward: %v", err)
+	}
+	got, err := accel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{
+		Handle:     forward.Handle,
+		GradPooled: backend.NewTensorF32([]int{1, 4}, seqData(4, 0.031, -0.047)),
+	})
+	if err != nil {
+		t.Fatalf("sync-each backward: %v", err)
+	}
+	assertResidentGradientRefsUniqueAndComplete(t, got.ResidentGradRefs, accel.requiredResidentNames(shape))
+	if err := accel.EndCompactTrainStep(83); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	wantForward := expectedCompactTrainForwardLaunches(shape)
+	wantBackward := expectedCompactTrainBackwardLaunches(shape, true)
+	if stats.LastForwardLaunches != wantForward || stats.LastForwardSyncs != wantForward || stats.LastBackwardLaunches != wantBackward || stats.LastBackwardSyncs != wantBackward || stats.KernelLaunches != wantForward+wantBackward || stats.KernelSynchronizations != wantForward+wantBackward {
+		t.Fatalf("sync-each train stats = %+v, want forward %d/%d backward %d/%d total %d/%d", stats, wantForward, wantForward, wantBackward, wantBackward, wantForward+wantBackward, wantForward+wantBackward)
 	}
 }
 
@@ -745,7 +906,8 @@ func TestCompactTrainPublicBackwardPostMutationFailurePoisonsStep(t *testing.T) 
 	if !forward.Handle.Token.Alive() {
 		t.Fatal("poisoned backward consumed handle")
 	}
-	if after.FallbackOrUnhandled != before.FallbackOrUnhandled+1 || after.KernelLaunches <= before.KernelLaunches || after.KernelSynchronizations <= before.KernelSynchronizations || after.LastBackwardLaunches <= 0 || after.LastBackwardSyncs <= 0 {
+	wantBackwardSyncs := expectedCompactCUDASyncsForLaunches(after.LastBackwardLaunches)
+	if after.FallbackOrUnhandled != before.FallbackOrUnhandled+1 || after.KernelLaunches <= before.KernelLaunches || after.KernelSynchronizations != before.KernelSynchronizations+wantBackwardSyncs || after.LastBackwardLaunches <= 0 || after.LastBackwardSyncs != wantBackwardSyncs {
 		t.Fatalf("poisoned failure stats before=%+v after=%+v", before, after)
 	}
 	if poisonedRef.Token.Alive() {
@@ -772,6 +934,12 @@ func TestCompactTrainPublicBackwardPostMutationFailurePoisonsStep(t *testing.T) 
 	if _, err := accel.copyResidentGradientForDebug(poisonedRef); err == nil || !strings.Contains(err.Error(), "poisoned") {
 		t.Fatalf("poisoned resident grad after release/end err = %v, want poisoned", err)
 	}
+	if err := accel.AbortCompactTrainStep(41); err != nil {
+		t.Fatalf("abort poisoned step: %v", err)
+	}
+	if stats := accel.CompactTrainStats(); stats.LiveHandles != 0 || stats.ResidentGradBytes != 0 || stats.ActivationArenaBytes != 0 || stats.WorkspaceArenaBytes != 0 {
+		t.Fatalf("post-abort poisoned stats = %+v, want released resources", stats)
+	}
 	accel.debugForceBackwardFailureAfterGradMutation = false
 	if err := accel.BeginCompactTrainStep(41, refs); err != nil {
 		t.Fatalf("begin recovery step with reused step id: %v", err)
@@ -796,6 +964,10 @@ func TestCompactTrainPublicBackwardPostMutationFailurePoisonsStep(t *testing.T) 
 	assertResidentGradientRefsUniqueAndComplete(t, got.ResidentGradRefs, accel.requiredResidentNames(shape))
 	if err := accel.EndCompactTrainStep(41); err != nil {
 		t.Fatalf("end recovery step: %v", err)
+	}
+	accel.Close()
+	if stats := accel.CompactTrainStats(); stats.LiveHandles != 0 || stats.ResidentGradBytes != 0 || stats.ActivationArenaBytes != 0 || stats.WorkspaceArenaBytes != 0 {
+		t.Fatalf("post-close poisoned recovery stats = %+v, want released resources", stats)
 	}
 	if base := accel.CompactForwardAccelerator.Stats(); base.PackedDownloads != 0 || base.PackedBytes != 0 {
 		t.Fatalf("packed stats changed on poisoned compact train path: %+v", base)
@@ -946,6 +1118,9 @@ func TestCompactTrainResidualLayerNormBackwardKernelParity(t *testing.T) {
 	if err := accel.launchLayerNormBackward(gradPtr, normPtr, prePtr, outPtr, rows, cols); err != nil {
 		t.Fatalf("launch layernorm backward: %v", err)
 	}
+	if err := accel.synchronizeKernelBoundary(); err != nil {
+		t.Fatalf("sync layernorm backward: %v", err)
+	}
 	got := make([]float32, rows*cols)
 	if err := accel.device.downloadFloat32(got, outPtr); err != nil {
 		t.Fatalf("download layernorm backward: %v", err)
@@ -982,6 +1157,12 @@ func TestCompactTrainGELUBackwardKernelExactAndFastParity(t *testing.T) {
 			accel.device.freeBuffer(prePtr)
 			accel.device.freeBuffer(outPtr)
 			t.Fatalf("launch gelu backward fast=%v: %v", fast, err)
+		}
+		if err := accel.synchronizeKernelBoundary(); err != nil {
+			accel.device.freeBuffer(gradPtr)
+			accel.device.freeBuffer(prePtr)
+			accel.device.freeBuffer(outPtr)
+			t.Fatalf("sync gelu backward fast=%v: %v", fast, err)
 		}
 		got := make([]float32, len(preAct))
 		if err := accel.device.downloadFloat32(got, outPtr); err != nil {
@@ -1080,6 +1261,9 @@ func TestCompactTrainAttentionBackwardKernelParity(t *testing.T) {
 			defer accel.device.freeBuffer(gradVPtr)
 			if err := accel.launchAttentionBackward(gradMixedPtr, qPtr, kPtr, vPtr, probsPtr, gradQPtr, gradKPtr, gradVPtr, tc.shape); err != nil {
 				t.Fatalf("launch attention backward: %v", err)
+			}
+			if err := accel.synchronizeKernelBoundary(); err != nil {
+				t.Fatalf("sync attention backward: %v", err)
 			}
 			gotQ := make([]float32, len(wantQ))
 			if err := accel.device.downloadFloat32(gotQ, gradQPtr); err != nil {
@@ -1670,6 +1854,9 @@ func TestCompactTrainPublicBackwardActualShapeFullParity(t *testing.T) {
 	}
 	wantWorkspaceBytes := int64((shape.Batch*shape.OutputDim + shape.Batch*shape.Tokens*shape.OutputDim + 10*shape.Batch*shape.Tokens*shape.ModelDim + 2*shape.Batch*shape.Tokens*shape.FFNDim) * 4)
 	wantUploadedBytes := int64((shape.Tokens + shape.Tokens + shape.Batch + 1 + shape.OutputDim) * 4)
+	if wantForward, wantBackward := expectedCompactTrainForwardLaunches(shape), expectedCompactTrainBackwardLaunches(shape, true); stats.LastForwardLaunches != wantForward || stats.LastForwardSyncs != expectedCompactCUDASyncsForLaunches(wantForward) || stats.LastBackwardLaunches != wantBackward || stats.LastBackwardSyncs != expectedCompactCUDASyncsForLaunches(wantBackward) {
+		t.Fatalf("actual-shape launch stats = %+v, want forward %d/%d backward %d/%d", stats, wantForward, expectedCompactCUDASyncsForLaunches(wantForward), wantBackward, expectedCompactCUDASyncsForLaunches(wantBackward))
+	}
 	if stats.ResidentGradBytes != wantBytes || stats.WorkspaceArenaBytes != wantWorkspaceBytes || stats.UploadedBytes != wantUploadedBytes || stats.GradPooledUploadedBytes != int64(shape.OutputDim*4) || stats.LiveHandles != 0 || stats.BackwardCalls != 1 || stats.FallbackOrUnhandled != 0 {
 		t.Fatalf("actual-shape stats = %+v want resident bytes %d", stats, wantBytes)
 	}
@@ -2589,6 +2776,29 @@ func compactTrainRMSE(got, want []float32) float32 {
 		sum += d * d
 	}
 	return float32(math.Sqrt(sum / float64(len(got))))
+}
+
+func expectedCompactTrainForwardLaunches(shape backend.CompactForwardShape) int64 {
+	launches := int64(1) // gather
+	launches += int64(shape.Layers) * 10
+	launches++ // final normalization/pool
+	if shape.HasOutputProjection {
+		launches += 2 // projection matmul and output pool
+	}
+	return launches
+}
+
+func expectedCompactTrainBackwardLaunches(shape backend.CompactForwardShape, rope bool) int64 {
+	launches := int64(1) // final pooled/output-row gradient
+	if shape.HasOutputProjection {
+		launches++ // output projection gradient
+	}
+	launches += int64(shape.Layers) * 20
+	if rope {
+		launches++
+	}
+	launches++ // token/role scatter
+	return launches
 }
 
 func assertFloatSlicesClose(t *testing.T, got, want []float32, tol float32) {

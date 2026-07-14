@@ -65,11 +65,6 @@ static int eos_compact_train_launch(EosCudaRuntime* rt, EosCudaKernel* kernel, u
 		*err = eos_compact_train_dup_cu_error("cuLaunchKernel", res);
 		return 1;
 	}
-	res = cuStreamSynchronize(rt->stream);
-	if (res != CUDA_SUCCESS) {
-		*err = eos_compact_train_dup_cu_error("cuStreamSynchronize", res);
-		return 1;
-	}
 	return 0;
 }
 
@@ -993,6 +988,9 @@ func (a *CompactTrainAccelerator) RunCompactTrainBackward(req backend.CompactTra
 	if err := a.runInputScatterBackwardLocked(scatterInput, arena, shape); err != nil {
 		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, start)
 	}
+	if err := a.synchronizeKernelBoundary(); err != nil {
+		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, start)
+	}
 	if err := a.consumeHandleLocked(req.Handle); err != nil {
 		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, start)
 	}
@@ -1011,6 +1009,7 @@ func (a *CompactTrainAccelerator) poisonBackwardErrorLocked(err error, launchesB
 	if err == nil {
 		return nil
 	}
+	err = a.drainKernelError(err)
 	backwardLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
 	backwardSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
 	a.stepPoisoned = true
@@ -1085,6 +1084,9 @@ func (a *CompactTrainAccelerator) runCompactTrainFinalOutputBackwardForDebug(req
 			return compactTrainFinalOutputDebugResult{}, err
 		}
 	}
+	if err := a.synchronizeKernelBoundary(); err != nil {
+		return compactTrainFinalOutputDebugResult{}, err
+	}
 	hidden := make([]float32, shape.Batch*shape.Tokens*shape.ModelDim)
 	if err := a.device.downloadFloat32(hidden, arena.gradHidden); err != nil {
 		return compactTrainFinalOutputDebugResult{}, err
@@ -1129,6 +1131,9 @@ func (a *CompactTrainAccelerator) runCompactTrainFFNBackwardForDebug(req backend
 	}
 	layerIdx := shape.Layers - 1
 	if err := a.runLayerFFNBackwardLocked(layerIdx, arena, shape); err != nil {
+		return compactTrainFFNBackwardDebugResult{}, err
+	}
+	if err := a.synchronizeKernelBoundary(); err != nil {
 		return compactTrainFFNBackwardDebugResult{}, err
 	}
 	hidden := make([]float32, shape.Batch*shape.Tokens*shape.ModelDim)
@@ -1186,6 +1191,9 @@ func (a *CompactTrainAccelerator) runCompactTrainLayerBackwardForDebug(req backe
 	if err := a.runLayerAttentionBackwardLocked(layerIdx, arena, shape); err != nil {
 		return compactTrainLayerBackwardDebugResult{}, err
 	}
+	if err := a.synchronizeKernelBoundary(); err != nil {
+		return compactTrainLayerBackwardDebugResult{}, err
+	}
 	layerInput := make([]float32, shape.Batch*shape.Tokens*shape.ModelDim)
 	if err := a.device.downloadFloat32(layerInput, arena.gradHidden); err != nil {
 		return compactTrainLayerBackwardDebugResult{}, err
@@ -1193,6 +1201,9 @@ func (a *CompactTrainAccelerator) runCompactTrainLayerBackwardForDebug(req backe
 	var ropeInput []float32
 	if layerIdx == 0 && a.useRoPE {
 		if err := a.launchRoPETranspose(arena.gradHidden, arena.gradRoPE, shape.Batch*shape.Tokens, shape.ModelDim, shape.Tokens); err != nil {
+			return compactTrainLayerBackwardDebugResult{}, err
+		}
+		if err := a.synchronizeKernelBoundary(); err != nil {
 			return compactTrainLayerBackwardDebugResult{}, err
 		}
 		ropeInput = make([]float32, shape.Batch*shape.Tokens*shape.ModelDim)
@@ -1763,8 +1774,7 @@ func (a *CompactTrainAccelerator) launchFinalProjectionGrad(normalized, gradRows
 	if C.eosCudaLaunchCompactTrainFinalProjectionGrad(a.device.ptr, a.trainKernels.finalProjectionGrad.ptr, grid, block, normalized, gradRows, gradOutProjection, C.int(rows), C.int(modelDim), C.int(outDim), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchFinalHiddenGrad(projected, normalized, outputProjection, gradPooled, masks, active, gradRows, gradNormalized, gradHidden C.CUdeviceptr, shape backend.CompactForwardShape) error {
@@ -1780,8 +1790,7 @@ func (a *CompactTrainAccelerator) launchFinalHiddenGrad(projected, normalized, o
 	if C.eosCudaLaunchCompactTrainFinalHiddenGrad(a.device.ptr, a.trainKernels.finalHiddenGrad.ptr, grid, block, projected, normalized, outputProjection, gradPooled, masks, active, gradRows, gradNormalized, gradHidden, C.int(shape.Batch), C.int(shape.Tokens), C.int(shape.ModelDim), C.int(shape.OutputDim), C.int(hasProjection), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchLayerNormBackward(gradOut, normalized, pre, out C.CUdeviceptr, rows, cols int) error {
@@ -1793,8 +1802,7 @@ func (a *CompactTrainAccelerator) launchLayerNormBackward(gradOut, normalized, p
 	if C.eosCudaLaunchCompactTrainLayerNormBackward(a.device.ptr, a.trainKernels.layerNormBackward.ptr, grid, block, gradOut, normalized, pre, out, C.int(rows), C.int(cols), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchMatMulLeftTransposeAccum(lhs, gradOut, gradWeight C.CUdeviceptr, rows, inDim, outDim int) error {
@@ -1806,8 +1814,7 @@ func (a *CompactTrainAccelerator) launchMatMulLeftTransposeAccum(lhs, gradOut, g
 	if C.eosCudaLaunchCompactTrainMatMulLeftTransposeAccum(a.device.ptr, a.trainKernels.matMulLeftTAccum.ptr, grid, block, lhs, gradOut, gradWeight, C.int(rows), C.int(inDim), C.int(outDim), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchMatMulRightTranspose(gradOut, weight, gradIn C.CUdeviceptr, rows, inDim, outDim int) error {
@@ -1819,8 +1826,7 @@ func (a *CompactTrainAccelerator) launchMatMulRightTranspose(gradOut, weight, gr
 	if C.eosCudaLaunchCompactTrainMatMulRightTranspose(a.device.ptr, a.trainKernels.matMulRightT.ptr, grid, block, gradOut, weight, gradIn, C.int(rows), C.int(inDim), C.int(outDim), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchGELUBackward(gradOut, preAct, out C.CUdeviceptr, elements int, fast bool) error {
@@ -1836,8 +1842,7 @@ func (a *CompactTrainAccelerator) launchGELUBackward(gradOut, preAct, out C.CUde
 	if C.eosCudaLaunchCompactTrainGELUBackward(a.device.ptr, a.trainKernels.geluBackward.ptr, grid, block, gradOut, preAct, out, C.int(elements), C.int(fastFlag), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchAttentionBackward(gradMixed, q, k, v, probs, gradQ, gradK, gradV C.CUdeviceptr, shape backend.CompactForwardShape) error {
@@ -1849,8 +1854,7 @@ func (a *CompactTrainAccelerator) launchAttentionBackward(gradMixed, q, k, v, pr
 	if C.eosCudaLaunchCompactTrainAttentionBackward(a.device.ptr, a.trainKernels.attentionBackward.ptr, grid, block, gradMixed, q, k, v, probs, gradQ, gradK, gradV, C.int(shape.Batch), C.int(shape.Tokens), C.int(shape.ModelDim), C.int(shape.Heads), C.int(shape.HeadDim), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchRoPETranspose(src, out C.CUdeviceptr, rows, cols, seq int) error {
@@ -1863,8 +1867,7 @@ func (a *CompactTrainAccelerator) launchRoPETranspose(src, out C.CUdeviceptr, ro
 	if C.eosCudaLaunchCompactTrainRoPETranspose(a.device.ptr, a.trainKernels.ropeTranspose.ptr, grid, block, src, out, C.int(rows), C.int(cols), C.int(seq), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchInputScatter(gradInput, tokens, roles, gradToken, gradRole C.CUdeviceptr, batch, seq, modelDim, vocab, roleRows int) error {
@@ -1881,8 +1884,7 @@ func (a *CompactTrainAccelerator) launchInputScatter(gradInput, tokens, roles, g
 	if C.eosCudaLaunchCompactTrainInputScatter(a.device.ptr, a.trainKernels.inputScatter.ptr, grid, block, gradInput, tokens, roles, gradToken, gradRole, C.int(batch), C.int(seq), C.int(modelDim), C.int(vocab), C.int(roleRows), C.int(useRole), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) launchAdd(left, right, out C.CUdeviceptr, elements int) error {
@@ -1894,8 +1896,7 @@ func (a *CompactTrainAccelerator) launchAdd(left, right, out C.CUdeviceptr, elem
 	if C.eosCudaLaunchCompactTrainAdd(a.device.ptr, a.trainKernels.add.ptr, grid, block, left, right, out, C.int(elements), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactTrainAccelerator) RunCompactTrainForward(req backend.CompactTrainForwardRequest) (backend.CompactTrainForwardResult, error) {
@@ -1914,9 +1915,37 @@ func (a *CompactTrainAccelerator) RunCompactTrainForward(req backend.CompactTrai
 	return result, nil
 }
 
-func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.CompactTrainForwardRequest) (backend.CompactTrainForwardResult, error) {
+func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.CompactTrainForwardRequest) (result backend.CompactTrainForwardResult, err error) {
 	if a.device == nil || a.closed {
 		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train accelerator is closed")
+	}
+	shape := req.Shape
+	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
+	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
+	var uploaded, pooledBytes, statusBytes, activeBytes int64
+	statsPublished := false
+	publishForwardStats := func(failed bool) {
+		if statsPublished {
+			return
+		}
+		statsPublished = true
+		forwardLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
+		forwardSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
+		if failed && forwardLaunches == 0 && forwardSyncs == 0 && uploaded == 0 && pooledBytes == 0 && statusBytes == 0 && activeBytes == 0 {
+			return
+		}
+		a.stats.UploadedBytes += uploaded
+		a.stats.DownloadedBytes += pooledBytes + statusBytes + activeBytes
+		a.stats.PooledDownloadedBytes += pooledBytes
+		a.stats.StatusDownloadedBytes += statusBytes + activeBytes
+		a.stats.KernelLaunches += forwardLaunches
+		a.stats.KernelSynchronizations += forwardSyncs
+		a.stats.LastShape = shape
+		a.stats.LastForwardLaunches = forwardLaunches
+		a.stats.LastForwardSyncs = forwardSyncs
+		if failed {
+			a.stats.FallbackOrUnhandled++
+		}
 	}
 	if !a.stepActive {
 		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train step is not active")
@@ -1945,14 +1974,17 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 			a.freeArena(arena)
 		}
 	}()
+	defer func() {
+		if err != nil {
+			err = a.drainKernelError(err)
+			publishForwardStats(true)
+		}
+	}()
 	a.nextHandleID++
 	arena.id = a.nextHandleID
 	arena.generation = a.nextHandleID
-	shape := req.Shape
 	geluFast, _ := compactForwardGELUFast(req.GELUMode)
 	arena.geluFast = geluFast
-	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
-	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
 	B, T, D, H, L, O := shape.Batch, shape.Tokens, shape.ModelDim, shape.FFNDim, shape.Layers, shape.OutputDim
 	rows := B * T
 	tokensFlat := flattenInt32(req.Tokens)
@@ -1969,7 +2001,7 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	if err := a.replaceUploadedInt32(&arena.status, []int32{0}); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	uploaded := int64((len(tokensFlat) + len(masksFlat) + len(req.Roles) + 1) * 4)
+	uploaded = int64((len(tokensFlat) + len(masksFlat) + len(req.Roles) + 1) * 4)
 	if err := a.launchGather(a.bindings.token, a.bindings.role, arena.tokens, arena.roles, arena.input, arena.status, shape); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
@@ -2010,6 +2042,9 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		if err := a.launchResidualLayerNorm(ffnOut, saved.hidden, saved.projected, saved.ffnResidual, rows, D); err != nil {
 			return backend.CompactTrainForwardResult{}, err
 		}
+		if layerIdx == 0 && a.debugForceForwardFailureAfterFirstLayer {
+			return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forced forward failure after first layer")
+		}
 		current = saved.projected
 	}
 	firstPooled := arena.finalPooled
@@ -2030,10 +2065,14 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		}
 	}
 	_ = outputRows
+	if err := a.synchronizeKernelBoundary(); err != nil {
+		return backend.CompactTrainForwardResult{}, err
+	}
 	status := []int32{0}
 	if err := a.device.downloadInt32(status, arena.status); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
+	statusBytes = int64(4)
 	if status[0] != 0 {
 		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train gather status %d", status[0])
 	}
@@ -2041,34 +2080,23 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	if err := a.device.downloadFloat32(pooled, arena.finalPooled); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
+	pooledBytes = int64(len(pooled) * 4)
 	activeCounts := make([]int32, B)
 	if err := a.device.downloadInt32(activeCounts, arena.active); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
+	activeBytes = int64(len(activeCounts) * 4)
 	token := &compactTrainHandleToken{owner: a, backend: eosartifact.BackendCUDA, generation: arena.generation, stepID: a.stepID, id: arena.id}
 	token.alive.Store(true)
 	arena.token = token
 	arena.live = true
 	a.arenas[token] = arena
 	keepArena = true
-	pooledBytes := int64(len(pooled) * 4)
-	statusBytes := int64(4)
-	activeBytes := int64(len(activeCounts) * 4)
 	_, packedFloats, _ := compactForwardPackedLayout(shape)
 	a.stats.HandlesCreated++
 	a.stats.LiveHandles++
-	a.stats.UploadedBytes += uploaded
-	a.stats.DownloadedBytes += pooledBytes + statusBytes + activeBytes
-	a.stats.PooledDownloadedBytes += pooledBytes
-	a.stats.StatusDownloadedBytes += statusBytes + activeBytes
 	a.stats.PackedBytesAvoided += int64(packedFloats * 4)
-	forwardLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
-	forwardSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
-	a.stats.KernelLaunches += forwardLaunches
-	a.stats.KernelSynchronizations += forwardSyncs
-	a.stats.LastShape = shape
-	a.stats.LastForwardLaunches = forwardLaunches
-	a.stats.LastForwardSyncs = forwardSyncs
+	publishForwardStats(false)
 	a.refreshArenaStatsLocked()
 	return backend.CompactTrainForwardResult{
 		Handle: backend.CompactTrainHandle{

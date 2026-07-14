@@ -4,6 +4,7 @@ package eosruntime
 
 import (
 	"math"
+	"os"
 	"testing"
 
 	_ "m31labs.dev/eos/runtime/backends/cuda"
@@ -54,8 +55,11 @@ func TestVectorDistillCompactResidentTrainCUDAOneAndTwoStepParity(t *testing.T) 
 	assertCompactTrainerStateClose(t, "host_vs_resident_immediate", host, residentImmediate, 3e-8, 1e-6)
 	assertCompactTrainerStateClose(t, "host_vs_resident_deferred", host, residentDeferred, 3e-8, 1e-6)
 	assertCompactTrainerStateClose(t, "resident_immediate_vs_deferred", residentImmediate, residentDeferred, 0, 0)
-	if residentImmediateSummary.DeltaProfile.CompactTrain == nil || residentImmediateSummary.DeltaProfile.CompactTrain.BackwardCalls != 2 || residentImmediateSummary.DeltaProfile.CompactTrain.LiveHandles != 0 {
+	if residentImmediateSummary.DeltaProfile.CompactTrain == nil || residentImmediateSummary.DeltaProfile.CompactTrain.BackwardCalls != 2 || residentImmediateSummary.DeltaProfile.CompactTrain.LiveHandles != 0 || residentImmediateSummary.DeltaProfile.CompactTrain.FallbackOrUnhandled != 0 {
 		t.Fatalf("resident immediate compact train profile = %+v", residentImmediateSummary.DeltaProfile.CompactTrain)
+	}
+	if wantLaunches, wantSyncs := int64(136), expectedRuntimeCompactTrainSyncs(136, 4); residentImmediateSummary.DeltaProfile.CompactTrain.KernelLaunches != wantLaunches || residentImmediateSummary.DeltaProfile.CompactTrain.KernelSynchronizations != wantSyncs {
+		t.Fatalf("resident immediate compact train launch/sync = %d/%d, want %d/%d: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.KernelLaunches, residentImmediateSummary.DeltaProfile.CompactTrain.KernelSynchronizations, wantLaunches, wantSyncs, *residentImmediateSummary.DeltaProfile.CompactTrain)
 	}
 	if residentImmediateSummary.DeltaProfile.CompactForward != nil && (residentImmediateSummary.DeltaProfile.CompactForward.PackedDownloads != 0 || residentImmediateSummary.DeltaProfile.CompactForward.PackedBytes != 0) {
 		t.Fatalf("resident immediate packed counters = %+v", residentImmediateSummary.DeltaProfile.CompactForward)
@@ -68,6 +72,9 @@ func TestVectorDistillCompactResidentTrainCUDAOneAndTwoStepParity(t *testing.T) 
 	}
 	if residentDeferredSummary.DeltaProfile.CompactTrain == nil || residentDeferredSummary.DeltaProfile.CompactTrain.LiveHandles != 0 || residentDeferredSummary.DeltaProfile.CompactTrain.FallbackOrUnhandled != 0 {
 		t.Fatalf("resident deferred compact train profile = %+v", residentDeferredSummary.DeltaProfile.CompactTrain)
+	}
+	if wantLaunches, wantSyncs := int64(136), expectedRuntimeCompactTrainSyncs(136, 4); residentDeferredSummary.DeltaProfile.CompactTrain.KernelLaunches != wantLaunches || residentDeferredSummary.DeltaProfile.CompactTrain.KernelSynchronizations != wantSyncs {
+		t.Fatalf("resident deferred compact train launch/sync = %d/%d, want %d/%d: %+v", residentDeferredSummary.DeltaProfile.CompactTrain.KernelLaunches, residentDeferredSummary.DeltaProfile.CompactTrain.KernelSynchronizations, wantLaunches, wantSyncs, *residentDeferredSummary.DeltaProfile.CompactTrain)
 	}
 	t.Logf("A host/immediate optimizer_uploaded=%d optimizer_resident_grad_updates=%d", hostSummary.DeltaProfile.Optimizer.UploadedBytes, hostSummary.DeltaProfile.Optimizer.ResidentGradUpdateCalls)
 	t.Logf("B resident/immediate compact_train=%+v optimizer=%+v", *residentImmediateSummary.DeltaProfile.CompactTrain, residentImmediateSummary.DeltaProfile.Optimizer)
@@ -128,10 +135,24 @@ func TestVectorDistillCompactResidentTrainCUDAVaryingTWholeBatchParity(t *testin
 	if stats.FallbackOrUnhandled != 0 {
 		t.Fatalf("varying-T fallback/unhandled = %d, want 0", stats.FallbackOrUnhandled)
 	}
+	if wantLaunches, wantSyncs := int64(204), expectedRuntimeCompactTrainSyncs(204, 6); stats.KernelLaunches != wantLaunches || stats.KernelSynchronizations != wantSyncs {
+		t.Fatalf("varying-T kernel launch/sync = %d/%d, want %d/%d: %+v", stats.KernelLaunches, stats.KernelSynchronizations, wantLaunches, wantSyncs, *stats)
+	}
 	if profile.CompactForward != nil && (profile.CompactForward.PackedDownloads != 0 || profile.CompactForward.PackedBytes != 0) {
 		t.Fatalf("varying-T packed-state D2H = %+v", *profile.CompactForward)
 	}
 	t.Logf("varying-T CUDA exact buckets=2,3,4 aliases=1 compact_train=%+v", *stats)
+}
+
+func compactCUDASyncEachLaunchForTest() bool {
+	return os.Getenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH") == "1"
+}
+
+func expectedRuntimeCompactTrainSyncs(launches, defaultSyncs int64) int64 {
+	if compactCUDASyncEachLaunchForTest() {
+		return launches
+	}
+	return defaultSyncs
 }
 
 func assertCompactTrainerStateClose(t *testing.T, label string, left, right *EmbeddingTrainer, target, hard float32) {

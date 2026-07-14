@@ -60,11 +60,6 @@ static int eos_compact_launch(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigne
 		*err = eos_compact_dup_cu_error("cuLaunchKernel", res);
 		return 1;
 	}
-	res = cuStreamSynchronize(rt->stream);
-	if (res != CUDA_SUCCESS) {
-		*err = eos_compact_dup_cu_error("cuStreamSynchronize", res);
-		return 1;
-	}
 	return 0;
 }
 
@@ -111,6 +106,7 @@ static int eosCudaLaunchCompactPackInt(EosCudaRuntime* rt, EosCudaKernel* kernel
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -336,17 +332,20 @@ extern "C" __global__ void eos_compact_pack_int(const int* src, float* dst, int 
 `
 
 type CompactForwardAccelerator struct {
-	mu        sync.Mutex
-	device    *deviceRuntime
-	kernels   compactForwardKernels
-	bindings  compactForwardBindings
-	stats     backend.CompactForwardAcceleratorStats
-	useRoPE   bool
-	tokenName string
-	roleName  string
-	layers    []CompactForwardLayerNames
-	outName   string
-	bridged   map[string]*optimizerResidentParameterToken
+	mu                                      sync.Mutex
+	device                                  *deviceRuntime
+	kernels                                 compactForwardKernels
+	bindings                                compactForwardBindings
+	stats                                   backend.CompactForwardAcceleratorStats
+	useRoPE                                 bool
+	syncEachLaunch                          bool
+	launchesSinceBoundary                   int64
+	debugForceForwardFailureAfterFirstLayer bool
+	tokenName                               string
+	roleName                                string
+	layers                                  []CompactForwardLayerNames
+	outName                                 string
+	bridged                                 map[string]*optimizerResidentParameterToken
 }
 
 type CompactForwardLayerNames struct {
@@ -437,9 +436,10 @@ func NewCompactForwardAccelerator() (*CompactForwardAccelerator, error) {
 		return nil, err
 	}
 	return &CompactForwardAccelerator{
-		device:  device,
-		kernels: compactForwardKernels{gather: gather, mm: mm, attn: attn, ln: ln, gelu: gelu, final: final, pack: pack, packI: packI},
-		bridged: map[string]*optimizerResidentParameterToken{},
+		device:         device,
+		kernels:        compactForwardKernels{gather: gather, mm: mm, attn: attn, ln: ln, gelu: gelu, final: final, pack: pack, packI: packI},
+		syncEachLaunch: cudaEnvFlagEnabled("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH"),
+		bridged:        map[string]*optimizerResidentParameterToken{},
 	}, nil
 }
 
@@ -625,6 +625,7 @@ func (a *CompactForwardAccelerator) RunCompactForward(req backend.CompactForward
 	start := time.Now()
 	result, err := a.runCompactForwardLocked(req)
 	if err != nil {
+		err = a.drainKernelError(err)
 		a.stats.UnhandledCalls++
 		return backend.CompactForwardResult{}, err
 	}
@@ -633,7 +634,7 @@ func (a *CompactForwardAccelerator) RunCompactForward(req backend.CompactForward
 	return result, nil
 }
 
-func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactForwardRequest) (backend.CompactForwardResult, error) {
+func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactForwardRequest) (result backend.CompactForwardResult, err error) {
 	if a.device == nil {
 		return backend.CompactForwardResult{}, fmt.Errorf("cuda compact forward accelerator is closed")
 	}
@@ -765,6 +766,11 @@ func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactF
 		return backend.CompactForwardResult{}, err
 	}
 	defer a.device.freeBuffer(activeBuf)
+	defer func() {
+		if err != nil {
+			err = a.drainKernelError(err)
+		}
+	}()
 
 	if err := a.launchGather(a.bindings.token, a.bindings.role, tokBuf, roleBuf, input, statusBuf, shape); err != nil {
 		return backend.CompactForwardResult{}, err
@@ -834,6 +840,9 @@ func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactF
 		if err := a.packLayer(layout, packed, srcs, activeBuf, shape, layerIdx); err != nil {
 			return backend.CompactForwardResult{}, err
 		}
+		if layerIdx == 0 && a.debugForceForwardFailureAfterFirstLayer {
+			return backend.CompactForwardResult{}, fmt.Errorf("cuda compact forward forced failure after first layer")
+		}
 		current = projected
 	}
 	if err := a.launchFinalize(current, maskBuf, finalNorm, finalPooled, activeBuf, B, T, D, true); err != nil {
@@ -854,6 +863,9 @@ func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactF
 		return backend.CompactForwardResult{}, err
 	}
 	if err := a.packCopy(packed, downloadPacked, 0, 1, total); err != nil {
+		return backend.CompactForwardResult{}, err
+	}
+	if err := a.synchronizeKernelBoundary(); err != nil {
 		return backend.CompactForwardResult{}, err
 	}
 	download := make([]float32, total+1)
@@ -1082,8 +1094,7 @@ func (a *CompactForwardAccelerator) launchGather(token, role residentMatrix, tok
 	if C.eosCudaLaunchCompactGather(a.device.ptr, a.kernels.gather.ptr, grid, block, token.ptr, role.ptr, tokens, roles, out, status, C.int(shape.Batch), C.int(shape.Tokens), C.int(shape.ModelDim), C.int(token.rows), C.int(role.rows), C.int(useRole), C.int(useRoPE), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) launchMM(lhs C.CUdeviceptr, rhs residentMatrix, out C.CUdeviceptr, rows, inner, cols int) error {
@@ -1095,8 +1106,7 @@ func (a *CompactForwardAccelerator) launchMM(lhs C.CUdeviceptr, rhs residentMatr
 	if C.eosCudaLaunchCompactMatmul(a.device.ptr, a.kernels.mm.ptr, grid, block, lhs, rhs.ptr, out, C.int(rows), C.int(inner), C.int(cols), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) launchAttention(q, k, v, masks, scores, mixed C.CUdeviceptr, shape backend.CompactForwardShape) error {
@@ -1108,8 +1118,7 @@ func (a *CompactForwardAccelerator) launchAttention(q, k, v, masks, scores, mixe
 	if C.eosCudaLaunchCompactAttention(a.device.ptr, a.kernels.attn.ptr, grid, block, q, k, v, masks, scores, mixed, C.int(shape.Batch), C.int(shape.Tokens), C.int(shape.ModelDim), C.int(shape.Heads), C.int(shape.HeadDim), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) launchResidualLayerNorm(src, residual, out, residualOut C.CUdeviceptr, rows, cols int) error {
@@ -1121,8 +1130,7 @@ func (a *CompactForwardAccelerator) launchResidualLayerNorm(src, residual, out, 
 	if C.eosCudaLaunchCompactResidualLayerNorm(a.device.ptr, a.kernels.ln.ptr, grid, block, src, residual, out, residualOut, C.int(rows), C.int(cols), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) launchGELU(src, dst C.CUdeviceptr, elements int, fast bool) error {
@@ -1138,8 +1146,7 @@ func (a *CompactForwardAccelerator) launchGELU(src, dst C.CUdeviceptr, elements 
 	if C.eosCudaLaunchCompactGELU(a.device.ptr, a.kernels.gelu.ptr, grid, block, src, dst, C.int(elements), C.int(fastFlag), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) launchFinalize(projected, masks, normalized, pooled, active C.CUdeviceptr, batch, seq, width int, normalize bool) error {
@@ -1155,8 +1162,7 @@ func (a *CompactForwardAccelerator) launchFinalize(projected, masks, normalized,
 	if C.eosCudaLaunchCompactFinalize(a.device.ptr, a.kernels.final.ptr, grid, block, projected, masks, normalized, pooled, active, C.int(batch), C.int(seq), C.int(width), C.int(normalizeFlag), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) packCopy(src, dst C.CUdeviceptr, srcOffset, dstOffset, elements int) error {
@@ -1171,8 +1177,7 @@ func (a *CompactForwardAccelerator) packCopy(src, dst C.CUdeviceptr, srcOffset, 
 	if C.eosCudaLaunchCompactPack(a.device.ptr, a.kernels.pack.ptr, grid, block, src, dst, C.int(srcOffset), C.int(dstOffset), C.int(elements), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
-	return nil
+	return a.recordKernelLaunch()
 }
 
 func (a *CompactForwardAccelerator) packIntCopy(src, dst C.CUdeviceptr, srcOffset, dstOffset, elements int) error {
@@ -1187,13 +1192,50 @@ func (a *CompactForwardAccelerator) packIntCopy(src, dst C.CUdeviceptr, srcOffse
 	if C.eosCudaLaunchCompactPackInt(a.device.ptr, a.kernels.packI.ptr, grid, block, src, dst, C.int(srcOffset), C.int(dstOffset), C.int(elements), &errStr) != 0 {
 		return cStringError(errStr)
 	}
-	a.recordKernelLaunch()
+	return a.recordKernelLaunch()
+}
+
+func (a *CompactForwardAccelerator) recordKernelLaunch() error {
+	a.stats.KernelLaunches++
+	a.launchesSinceBoundary++
+	if a.syncEachLaunch {
+		if err := a.device.synchronize(); err != nil {
+			return err
+		}
+		a.recordKernelSynchronization()
+	}
 	return nil
 }
 
-func (a *CompactForwardAccelerator) recordKernelLaunch() {
-	a.stats.KernelLaunches++
+func (a *CompactForwardAccelerator) recordKernelSynchronization() {
 	a.stats.KernelSynchronizations++
+	a.launchesSinceBoundary = 0
+}
+
+func (a *CompactForwardAccelerator) synchronizeKernelBoundary() error {
+	if a.syncEachLaunch {
+		return nil
+	}
+	if a.launchesSinceBoundary == 0 {
+		return nil
+	}
+	if err := a.device.synchronize(); err != nil {
+		return err
+	}
+	a.recordKernelSynchronization()
+	return nil
+}
+
+func (a *CompactForwardAccelerator) drainKernelError(err error) error {
+	if err == nil || a == nil || a.device == nil || a.launchesSinceBoundary == 0 {
+		return err
+	}
+	drainErr := a.device.synchronize()
+	if drainErr != nil {
+		return errors.Join(err, drainErr)
+	}
+	a.recordKernelSynchronization()
+	return err
 }
 
 func (a *CompactForwardAccelerator) packLayer(layout backend.CompactForwardPackedStateLayout, packed C.CUdeviceptr, srcs map[string]C.CUdeviceptr, active C.CUdeviceptr, shape backend.CompactForwardShape, layer int) error {

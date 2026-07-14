@@ -3,7 +3,9 @@
 package cuda
 
 import (
+	"fmt"
 	"math"
+	"os"
 	"strings"
 	"testing"
 
@@ -47,8 +49,8 @@ func TestCompactForwardAcceleratorPackedParity(t *testing.T) {
 	if stats.LastPackedFloats != len(got.Data) || stats.LastPackedBytes != int64(len(got.Data)*4) || stats.LastDownloadBytes != int64((len(got.Data)+1)*4) {
 		t.Fatalf("packed stats = %+v data=%d", stats, len(got.Data))
 	}
-	if wantLaunches := expectedCompactForwardLaunches(req.Shape); stats.LastKernelLaunches != wantLaunches || stats.LastKernelSynchronizations != wantLaunches {
-		t.Fatalf("launch stats = %+v, want launches/syncs %d", stats, wantLaunches)
+	if wantLaunches := expectedCompactForwardLaunches(req.Shape); stats.LastKernelLaunches != wantLaunches || stats.LastKernelSynchronizations != expectedCompactCUDASyncsForLaunches(wantLaunches) {
+		t.Fatalf("launch stats = %+v, want launches %d syncs %d", stats, wantLaunches, expectedCompactCUDASyncsForLaunches(wantLaunches))
 	}
 	got.Data[0] = 777
 	again, err := accel.RunCompactForward(req)
@@ -57,6 +59,99 @@ func TestCompactForwardAcceleratorPackedParity(t *testing.T) {
 	}
 	if again.Data[0] == 777 {
 		t.Fatalf("compact result reused caller-mutated data backing")
+	}
+}
+
+func TestCompactForwardAcceleratorDeviceStatusFailuresPublishCounters(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		tokens     [][]int32
+		roles      []int32
+		wantStatus int32
+	}{
+		{name: "invalid_token", tokens: [][]int32{{5, 1}}, roles: []int32{0}, wantStatus: 1},
+		{name: "invalid_role", tokens: [][]int32{{2, 1}}, roles: []int32{3}, wantStatus: 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			accel, cleanup := newBoundCompactForwardTestAccelerator(t, false, true)
+			defer cleanup()
+			shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 3, HasOutputProjection: true}
+			req := backend.CompactForwardRequest{
+				Shape:        shape,
+				Tokens:       tc.tokens,
+				Masks:        [][]int32{{1, 1}},
+				Roles:        tc.roles,
+				ResidentRefs: compactForwardResidentRefsForTest(t, accel, shape),
+			}
+			_, err := accel.RunCompactForward(req)
+			if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("gather status %d", tc.wantStatus)) {
+				t.Fatalf("status error = %v, want status %d", err, tc.wantStatus)
+			}
+			stats := accel.Stats()
+			_, total, layoutErr := compactForwardPackedLayout(shape)
+			if layoutErr != nil {
+				t.Fatalf("packed layout: %v", layoutErr)
+			}
+			wantLaunches := expectedCompactForwardLaunches(shape)
+			wantSyncs := expectedCompactCUDASyncsForLaunches(wantLaunches)
+			if stats.RunCalls != 0 || stats.UnhandledCalls != 1 || stats.KernelLaunches != wantLaunches || stats.KernelSynchronizations != wantSyncs || stats.LastKernelLaunches != wantLaunches || stats.LastKernelSynchronizations != wantSyncs {
+				t.Fatalf("status failure launch stats = %+v, want run/unhandled 0/1 launches/syncs %d/%d", stats, wantLaunches, wantSyncs)
+			}
+			if stats.StatusDownloadedBytes != 4 || stats.LastStatusDownloadedBytes != 4 || stats.PackedDownloads != 1 || stats.PackedBytes != int64(total*4) || stats.DownloadedBytes != int64((total+1)*4) {
+				t.Fatalf("status failure transfer stats = %+v, want status 4 packed floats %d", stats, total)
+			}
+		})
+	}
+}
+
+func TestCompactForwardAcceleratorMidSequenceErrorDrainsBeforeReuse(t *testing.T) {
+	accel, cleanup := newBoundCompactForwardTestAccelerator(t, false, true)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 3, HasOutputProjection: true}
+	req := backend.CompactForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{1, 2}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: compactForwardResidentRefsForTest(t, accel, shape),
+	}
+	accel.debugForceForwardFailureAfterFirstLayer = true
+	_, err := accel.RunCompactForward(req)
+	if err == nil || !strings.Contains(err.Error(), "forced failure after first layer") {
+		t.Fatalf("forced forward err = %v, want mid-sequence forced failure", err)
+	}
+	stats := accel.Stats()
+	if stats.UnhandledCalls != 1 || stats.RunCalls != 0 || stats.KernelLaunches == 0 || stats.KernelSynchronizations != expectedCompactCUDASyncsForLaunches(stats.KernelLaunches) {
+		t.Fatalf("forced forward stats = %+v, want drained failed launches", stats)
+	}
+	accel.debugForceForwardFailureAfterFirstLayer = false
+	got, err := accel.RunCompactForward(req)
+	if err != nil {
+		t.Fatalf("forward after drained forced failure: %v", err)
+	}
+	want := hostCompactForwardForCUDATest(req, false, true)
+	assertCompactForwardResultClose(t, got, want, 1e-6)
+}
+
+func TestCompactForwardAcceleratorSyncEachLaunchExact(t *testing.T) {
+	t.Setenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH", "1")
+	accel, cleanup := newBoundCompactForwardTestAccelerator(t, false, true)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 3, HasOutputProjection: true}
+	req := backend.CompactForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{1, 2}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: compactForwardResidentRefsForTest(t, accel, shape),
+	}
+	if _, err := accel.RunCompactForward(req); err != nil {
+		t.Fatalf("sync-each compact forward: %v", err)
+	}
+	stats := accel.Stats()
+	wantLaunches := expectedCompactForwardLaunches(shape)
+	if stats.LastKernelLaunches != wantLaunches || stats.LastKernelSynchronizations != wantLaunches || stats.KernelLaunches != wantLaunches || stats.KernelSynchronizations != wantLaunches {
+		t.Fatalf("sync-each launch stats = %+v, want launches=syncs=%d", stats, wantLaunches)
 	}
 }
 
@@ -457,6 +552,20 @@ func expectedCompactForwardLaunches(shape backend.CompactForwardShape) int64 {
 	launches += int64(shape.Batch) * perSeqFinal
 	launches += 2 // status word plus final packed copy into the downloaded buffer
 	return launches
+}
+
+func expectedCompactCUDASyncsForLaunches(launches int64) int64 {
+	if compactCUDASyncEachLaunchForCUDATest() {
+		return launches
+	}
+	if launches > 0 {
+		return 1
+	}
+	return 0
+}
+
+func compactCUDASyncEachLaunchForCUDATest() bool {
+	return os.Getenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH") == "1"
 }
 
 func gatherHost(token, role *backend.Tensor, tokens []int32, roleID int32, rope bool) []float32 {
