@@ -99,6 +99,27 @@ func TestBERTCUDAFoundationRejectsBadShape(t *testing.T) {
 	}
 }
 
+func TestBERTCUDAFoundationRejectsInvalidIDValues(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		mutate func(inputs []*backend.Tensor)
+		want   string
+	}{
+		{name: "token", mutate: func(inputs []*backend.Tensor) { inputs[0].I32[1] = bgeSmallVocabSize }, want: "input_ids[1]"},
+		{name: "token type", mutate: func(inputs []*backend.Tensor) { inputs[2].I32[1] = bgeSmallTypeVocabSize }, want: "token_type_ids[1]"},
+		{name: "mask", mutate: func(inputs []*backend.Tensor) { inputs[1].I32[1] = 2 }, want: "attention_mask[1]"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			step, inputs := validBGEFoundationFixture(t)
+			tt.mutate(inputs)
+			_, err := validateBGEPretrainedBERTEmbedderStep(step, inputs)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want invalid-ID rejection mentioning %q", err, tt.want)
+			}
+		})
+	}
+}
+
 func validBGEFoundationFixture(t *testing.T) (eosartifact.Step, []*backend.Tensor) {
 	t.Helper()
 	specs := bgeCUDAWeightSpecs()

@@ -33,7 +33,7 @@ func newBERTCUDAEncoderFoundationStatus() bertCUDAEncoderFoundationStatus {
 	return bertCUDAEncoderFoundationStatus{
 		Contract:          pretrainedBERTCUDAFoundationContract,
 		FullDeviceReady:   false,
-		MissingComponents: []string{"dense self-attention context", "no-download resident GEMM composition", "full StepBERTEmbedder CUDA dispatch"},
+		MissingComponents: []string{"full 12-layer StepBERTEmbedder CUDA dispatch", "public fail-closed device encoder claim"},
 	}
 }
 
@@ -109,6 +109,9 @@ func validateBGEPretrainedBERTEmbedderStep(step eosartifact.Step, inputs []*back
 	}
 	if inputs[0].Shape[1] > bgeSmallMaxPositions {
 		return status, fmt.Errorf("BGE CUDA encoder token length %d exceeds max positions %d", inputs[0].Shape[1], bgeSmallMaxPositions)
+	}
+	if err := validateBGEInputIDValues(inputs[0], inputs[1], inputs[2]); err != nil {
+		return status, err
 	}
 	for _, check := range bgeCUDAWeightSpecs()[:5] {
 		if err := validateBGEFloatTensor(inputs[check.inputIndex], check.slot, check.shape); err != nil {
@@ -227,6 +230,27 @@ func bertStepFloatAttr(attrs map[string]string, name string, defaultValue float6
 func validateBGEInputIDs(t *backend.Tensor, name string) error {
 	if t == nil || t.DType != "i32" || len(t.Shape) != 2 || t.Shape[0] <= 0 || t.Shape[1] <= 0 || t.Elements() != len(t.I32) {
 		return fmt.Errorf("BGE CUDA encoder %s must be i32 [B,T] with matching backing data", name)
+	}
+	return nil
+}
+
+func validateBGEInputIDValues(inputIDs, attentionMask, tokenTypeIDs *backend.Tensor) error {
+	for i, tokenID := range inputIDs.I32 {
+		if tokenID < 0 || int(tokenID) >= bgeSmallVocabSize {
+			return fmt.Errorf("BGE CUDA encoder input_ids[%d]=%d out of range [0,%d)", i, tokenID, bgeSmallVocabSize)
+		}
+		positionID := i % inputIDs.Shape[1]
+		if positionID < 0 || positionID >= bgeSmallMaxPositions {
+			return fmt.Errorf("BGE CUDA encoder implicit position_ids[%d]=%d out of range [0,%d)", i, positionID, bgeSmallMaxPositions)
+		}
+		tokenTypeID := tokenTypeIDs.I32[i]
+		if tokenTypeID < 0 || int(tokenTypeID) >= bgeSmallTypeVocabSize {
+			return fmt.Errorf("BGE CUDA encoder token_type_ids[%d]=%d out of range [0,%d)", i, tokenTypeID, bgeSmallTypeVocabSize)
+		}
+		mask := attentionMask.I32[i]
+		if mask != 0 && mask != 1 {
+			return fmt.Errorf("BGE CUDA encoder attention_mask[%d]=%d is invalid, want 0 or 1", i, mask)
+		}
 	}
 	return nil
 }

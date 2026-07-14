@@ -513,6 +513,16 @@ static int eosCudaLaunchBERTCLSL2(EosCudaRuntime* rt, EosCudaKernel* kernel, uns
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
 }
 
+static int eosCudaLaunchBERTBiasAdd(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr data, CUdeviceptr bias, int rows, int cols, char** err) {
+	void* args[] = {&data, &bias, &rows, &cols};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchBERTAttentionContext(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr query, CUdeviceptr key, CUdeviceptr value, CUdeviceptr attentionMask, CUdeviceptr out0, int batch, int tokens, int hidden, int heads, int headDim, char** err) {
+	void* args[] = {&query, &key, &value, &attentionMask, &out0, &batch, &tokens, &hidden, &heads, &headDim};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
 static int eosCudaLaunchQuantizeInPlace(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr data, int elements, float levels, float scale, char** err) {
 	void* args[] = {&data, &elements, &levels, &scale};
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
@@ -2028,9 +2038,114 @@ extern "C" __global__ void manta_bert_cls_l2(
 }
 `
 
+const bertBiasAddKernelSource = `
+extern "C" __global__ void manta_bert_bias_add(
+    float* data,
+    const float* bias,
+    int rows,
+    int cols
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int elements = rows * cols;
+    if (idx >= elements) {
+        return;
+    }
+    int col = idx % cols;
+    data[idx] += bias[col];
+}
+`
+
+const bertAttentionContextKernelSource = `
+extern "C" __global__ void manta_bert_attention_context(
+    const float* query,
+    const float* key,
+    const float* value,
+    const int* attention_mask,
+    float* out0,
+    int batch,
+    int tokens,
+    int hidden,
+    int heads,
+    int head_dim
+) {
+    int job = blockIdx.x * blockDim.x + threadIdx.x;
+    int jobs = batch * tokens * heads;
+    if (job >= jobs) {
+        return;
+    }
+    int head = job % heads;
+    int query_index = job / heads;
+    int b = query_index / tokens;
+    int query_token = query_index % tokens;
+    int query_row = b * tokens + query_token;
+    int head_base = head * head_dim;
+    double scale = rsqrt((double)head_dim);
+    double max_logit = -1.0 / 0.0;
+    int active_keys = 0;
+
+    for (int key_token = 0; key_token < tokens; ++key_token) {
+        if (attention_mask[b * tokens + key_token] == 0) {
+            continue;
+        }
+        int key_row = b * tokens + key_token;
+        double dot = 0.0;
+        for (int d = 0; d < head_dim; ++d) {
+            int idx = head_base + d;
+            dot += (double)query[query_row * hidden + idx] * (double)key[key_row * hidden + idx];
+        }
+        double logit = dot * scale;
+        if (logit > max_logit) {
+            max_logit = logit;
+        }
+        ++active_keys;
+    }
+
+    int out_base = query_row * hidden + head_base;
+    if (active_keys == 0) {
+        for (int d = 0; d < head_dim; ++d) {
+            out0[out_base + d] = 0.0f;
+        }
+        return;
+    }
+
+    double sum_exp = 0.0;
+    for (int key_token = 0; key_token < tokens; ++key_token) {
+        if (attention_mask[b * tokens + key_token] == 0) {
+            continue;
+        }
+        int key_row = b * tokens + key_token;
+        double dot = 0.0;
+        for (int d = 0; d < head_dim; ++d) {
+            int idx = head_base + d;
+            dot += (double)query[query_row * hidden + idx] * (double)key[key_row * hidden + idx];
+        }
+        sum_exp += exp(dot * scale - max_logit);
+    }
+
+    for (int d = 0; d < head_dim; ++d) {
+        double acc = 0.0;
+        for (int key_token = 0; key_token < tokens; ++key_token) {
+            if (attention_mask[b * tokens + key_token] == 0) {
+                continue;
+            }
+            int key_row = b * tokens + key_token;
+            double dot = 0.0;
+            for (int kd = 0; kd < head_dim; ++kd) {
+                int idx = head_base + kd;
+                dot += (double)query[query_row * hidden + idx] * (double)key[key_row * hidden + idx];
+            }
+            double prob = exp(dot * scale - max_logit) / sum_exp;
+            acc += prob * (double)value[key_row * hidden + head_base + d];
+        }
+        out0[out_base + d] = (float)acc;
+    }
+}
+`
+
 type deviceRuntime struct {
 	ptr                         *C.EosCudaRuntime
 	residentMatrices            map[string]residentMatrix
+	bertResidentTensors         map[string]residentTensor
 	matMulScratch               map[string]deviceScratchBuffer
 	quantizeKernel              *auxKernel
 	gdnKernel                   *auxKernel
@@ -2049,6 +2164,8 @@ type deviceRuntime struct {
 	bertExactGELUKernel         *auxKernel
 	bertResidualLayerNormKernel *auxKernel
 	bertCLSL2Kernel             *auxKernel
+	bertBiasAddKernel           *auxKernel
+	bertAttentionContextKernel  *auxKernel
 	matMulStats                 backend.MatMulAcceleratorStats
 	graphCache                  map[string]*cudaGraph
 }
@@ -2057,6 +2174,12 @@ type residentMatrix struct {
 	ptr      C.CUdeviceptr
 	rows     int
 	cols     int
+	elements int
+}
+
+type residentTensor struct {
+	ptr      C.CUdeviceptr
+	shape    []int
 	elements int
 }
 
@@ -2095,7 +2218,7 @@ func newDeviceRuntime() (*deviceRuntime, error) {
 	if C.eosCudaRuntimeCreate(&rt, &errStr) != 0 {
 		return nil, cStringError(errStr)
 	}
-	return &deviceRuntime{ptr: rt, residentMatrices: map[string]residentMatrix{}, matMulScratch: map[string]deviceScratchBuffer{}, graphCache: map[string]*cudaGraph{}}, nil
+	return &deviceRuntime{ptr: rt, residentMatrices: map[string]residentMatrix{}, bertResidentTensors: map[string]residentTensor{}, matMulScratch: map[string]deviceScratchBuffer{}, graphCache: map[string]*cudaGraph{}}, nil
 }
 
 func (rt *deviceRuntime) close() {
@@ -2105,6 +2228,10 @@ func (rt *deviceRuntime) close() {
 	for name, resident := range rt.residentMatrices {
 		_ = rt.freeBuffer(resident.ptr)
 		delete(rt.residentMatrices, name)
+	}
+	for name, resident := range rt.bertResidentTensors {
+		_ = rt.freeBuffer(resident.ptr)
+		delete(rt.bertResidentTensors, name)
 	}
 	for name, scratch := range rt.matMulScratch {
 		_ = rt.freeBuffer(scratch.ptr)
@@ -2144,6 +2271,10 @@ func (rt *deviceRuntime) close() {
 	rt.bertResidualLayerNormKernel = nil
 	rt.destroyAuxKernel(rt.bertCLSL2Kernel)
 	rt.bertCLSL2Kernel = nil
+	rt.destroyAuxKernel(rt.bertBiasAddKernel)
+	rt.bertBiasAddKernel = nil
+	rt.destroyAuxKernel(rt.bertAttentionContextKernel)
+	rt.bertAttentionContextKernel = nil
 	for sig, g := range rt.graphCache {
 		g.destroy()
 		delete(rt.graphCache, sig)
@@ -4768,6 +4899,780 @@ func (rt *deviceRuntime) runBERTCLSL2(hiddenStates *backend.Tensor) (*backend.Te
 		return nil, err
 	}
 	return backend.NewTensorF32([]int{batch, hidden}, out), nil
+}
+
+type bertCUDAOneLayerTransferStats struct {
+	UploadedBytes                 int64
+	DownloadedBytes               int64
+	FinalDownloadedBytes          int64
+	StatusDownloadedBytes         int64
+	IntermediateDownloadedBytes   int64
+	ResidentWeightBytesReferenced int64
+}
+
+type bertCUDAOneLayerPreflight struct {
+	batch                         int
+	tokens                        int
+	rows                          int
+	hidden                        int
+	intermediate                  int
+	hiddenElements                int
+	intermediateElements          int
+	residentWeightBytesReferenced int64
+}
+
+func (rt *deviceRuntime) bindBERTResidentTensor(name string, tensor *backend.Tensor) error {
+	if rt == nil || rt.ptr == nil {
+		return fmt.Errorf("cuda runtime is not initialized")
+	}
+	if name == "" {
+		return fmt.Errorf("cuda bert resident tensor name is required")
+	}
+	if err := validateCUDAF32CompatibleTensor(tensor, "cuda bert resident tensor "+name); err != nil {
+		return err
+	}
+	elements := len(tensor.F32)
+	if resident, ok := rt.bertResidentTensors[name]; ok {
+		if resident.elements == elements {
+			if err := rt.copyFloat32ToBuffer(resident.ptr, tensor.F32); err != nil {
+				return err
+			}
+			resident.shape = append(resident.shape[:0], tensor.Shape...)
+			rt.bertResidentTensors[name] = resident
+			return nil
+		}
+		_ = rt.freeBuffer(resident.ptr)
+		delete(rt.bertResidentTensors, name)
+	}
+	ptr, err := rt.uploadFloat32(tensor.F32)
+	if err != nil {
+		return err
+	}
+	rt.bertResidentTensors[name] = residentTensor{ptr: ptr, shape: append([]int(nil), tensor.Shape...), elements: elements}
+	return nil
+}
+
+func (rt *deviceRuntime) residentBERTTensor(name string) (residentTensor, error) {
+	resident, ok := rt.bertResidentTensors[name]
+	if !ok {
+		return residentTensor{}, fmt.Errorf("cuda bert resident tensor %q is not bound", name)
+	}
+	return resident, nil
+}
+
+func (rt *deviceRuntime) ensureBERTBiasAddKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.bertBiasAddKernel != nil {
+		return rt.bertBiasAddKernel, nil
+	}
+	kernel, err := rt.compileAuxKernel(bertBiasAddKernelSource, "manta_bert_bias_add")
+	if err != nil {
+		return nil, err
+	}
+	rt.bertBiasAddKernel = kernel
+	return kernel, nil
+}
+
+func (rt *deviceRuntime) ensureBERTAttentionContextKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.bertAttentionContextKernel != nil {
+		return rt.bertAttentionContextKernel, nil
+	}
+	kernel, err := rt.compileAuxKernel(bertAttentionContextKernelSource, "manta_bert_attention_context")
+	if err != nil {
+		return nil, err
+	}
+	rt.bertAttentionContextKernel = kernel
+	return kernel, nil
+}
+
+func (rt *deviceRuntime) runBERTEmbeddingAffineLayerNormDevice(tokenEmbeddingsName, positionEmbeddingsName, tokenTypeEmbeddingsName, gammaName, betaName string, inputIDs, tokenTypeIDs, outBuf, statusBuf C.CUdeviceptr, batch, tokens int, epsilon float64) error {
+	tokenEmbeddings, err := rt.residentBERTTensor(tokenEmbeddingsName)
+	if err != nil {
+		return err
+	}
+	positionEmbeddings, err := rt.residentBERTTensor(positionEmbeddingsName)
+	if err != nil {
+		return err
+	}
+	tokenTypeEmbeddings, err := rt.residentBERTTensor(tokenTypeEmbeddingsName)
+	if err != nil {
+		return err
+	}
+	gamma, err := rt.residentBERTTensor(gammaName)
+	if err != nil {
+		return err
+	}
+	beta, err := rt.residentBERTTensor(betaName)
+	if err != nil {
+		return err
+	}
+	if len(tokenEmbeddings.shape) != 2 || len(positionEmbeddings.shape) != 2 || len(tokenTypeEmbeddings.shape) != 2 || len(gamma.shape) != 1 || len(beta.shape) != 1 {
+		return fmt.Errorf("cuda bert embedding resident tensors have invalid rank")
+	}
+	hidden := tokenEmbeddings.shape[1]
+	if hidden <= 0 || positionEmbeddings.shape[1] != hidden || tokenTypeEmbeddings.shape[1] != hidden || gamma.shape[0] != hidden || beta.shape[0] != hidden {
+		return fmt.Errorf("cuda bert embedding resident hidden size mismatch")
+	}
+	rows, err := checkedProduct("cuda bert embedding device rows", batch, tokens)
+	if err != nil {
+		return err
+	}
+	for _, guard := range []struct {
+		label string
+		dims  []int
+	}{
+		{"cuda bert embedding device row offset", []int{batch, tokens}},
+		{"cuda bert embedding device output offset", []int{rows, hidden}},
+		{"cuda bert embedding device token embedding offset", []int{tokenEmbeddings.shape[0], hidden}},
+		{"cuda bert embedding device position embedding offset", []int{positionEmbeddings.shape[0], hidden}},
+		{"cuda bert embedding device type embedding offset", []int{tokenTypeEmbeddings.shape[0], hidden}},
+	} {
+		if err := checkedInt32Product(guard.label, guard.dims...); err != nil {
+			return err
+		}
+	}
+	grid, block, err := checkedLaunch1D("cuda bert embedding device", rows, 128)
+	if err != nil {
+		return err
+	}
+	rowsArg, err := checkedCInt("cuda bert embedding device rows", rows)
+	if err != nil {
+		return err
+	}
+	tokensArg, err := checkedCInt("cuda bert embedding device tokens", tokens)
+	if err != nil {
+		return err
+	}
+	hiddenArg, err := checkedCInt("cuda bert embedding device hidden", hidden)
+	if err != nil {
+		return err
+	}
+	vocabArg, err := checkedCInt("cuda bert embedding device vocab", tokenEmbeddings.shape[0])
+	if err != nil {
+		return err
+	}
+	positionsArg, err := checkedCInt("cuda bert embedding device max positions", positionEmbeddings.shape[0])
+	if err != nil {
+		return err
+	}
+	typeVocabArg, err := checkedCInt("cuda bert embedding device type vocab", tokenTypeEmbeddings.shape[0])
+	if err != nil {
+		return err
+	}
+	if rt.bertEmbeddingKernel == nil {
+		kernel, err := rt.compileAuxKernel(bertEmbeddingAffineLayerNormKernelSource, "manta_bert_embedding_affine_layernorm")
+		if err != nil {
+			return err
+		}
+		rt.bertEmbeddingKernel = kernel
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchBERTEmbeddingAffineLayerNorm(rt.ptr, rt.bertEmbeddingKernel.ptr, grid, block, tokenEmbeddings.ptr, positionEmbeddings.ptr, tokenTypeEmbeddings.ptr, gamma.ptr, beta.ptr, inputIDs, tokenTypeIDs, outBuf, statusBuf, rowsArg, tokensArg, hiddenArg, vocabArg, positionsArg, typeVocabArg, C.double(epsilon), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) runBERTBiasAddDevice(data C.CUdeviceptr, biasName string, rows, cols int) error {
+	bias, err := rt.residentBERTTensor(biasName)
+	if err != nil {
+		return err
+	}
+	if len(bias.shape) != 1 || bias.shape[0] != cols {
+		return fmt.Errorf("cuda bert bias %q shape %v does not match cols=%d", biasName, bias.shape, cols)
+	}
+	elements, err := checkedProduct("cuda bert bias add elements", rows, cols)
+	if err != nil {
+		return err
+	}
+	if err := checkedInt32Product("cuda bert bias add offset", rows, cols); err != nil {
+		return err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert bias add", elements, 256)
+	if err != nil {
+		return err
+	}
+	rowsArg, err := checkedCInt("cuda bert bias add rows", rows)
+	if err != nil {
+		return err
+	}
+	colsArg, err := checkedCInt("cuda bert bias add cols", cols)
+	if err != nil {
+		return err
+	}
+	kernel, err := rt.ensureBERTBiasAddKernel()
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchBERTBiasAdd(rt.ptr, kernel.ptr, grid, block, data, bias.ptr, rowsArg, colsArg, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) runBERTExactGELUDevice(src, dst C.CUdeviceptr, elements int) error {
+	if err := checkedInt32Product("cuda bert exact gelu device element offset", elements); err != nil {
+		return err
+	}
+	elementsArg, err := checkedCInt("cuda bert exact gelu device elements", elements)
+	if err != nil {
+		return err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert exact gelu device", elements, 256)
+	if err != nil {
+		return err
+	}
+	if rt.bertExactGELUKernel == nil {
+		kernel, err := rt.compileAuxKernel(bertExactGELUKernelSource, "manta_bert_exact_gelu")
+		if err != nil {
+			return err
+		}
+		rt.bertExactGELUKernel = kernel
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchBERTExactGELU(rt.ptr, rt.bertExactGELUKernel.ptr, grid, block, src, dst, elementsArg, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) runBERTResidualAffineLayerNormDevice(src, residual C.CUdeviceptr, gammaName, betaName string, out C.CUdeviceptr, rows, hidden int, epsilon float64) error {
+	gamma, err := rt.residentBERTTensor(gammaName)
+	if err != nil {
+		return err
+	}
+	beta, err := rt.residentBERTTensor(betaName)
+	if err != nil {
+		return err
+	}
+	if len(gamma.shape) != 1 || gamma.shape[0] != hidden || len(beta.shape) != 1 || beta.shape[0] != hidden {
+		return fmt.Errorf("cuda bert residual layernorm gamma/beta shape mismatch")
+	}
+	if err := checkedInt32Product("cuda bert residual layernorm device row-hidden offset", rows, hidden); err != nil {
+		return err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert residual layernorm device", rows, 128)
+	if err != nil {
+		return err
+	}
+	rowsArg, err := checkedCInt("cuda bert residual layernorm device rows", rows)
+	if err != nil {
+		return err
+	}
+	hiddenArg, err := checkedCInt("cuda bert residual layernorm device hidden", hidden)
+	if err != nil {
+		return err
+	}
+	if rt.bertResidualLayerNormKernel == nil {
+		kernel, err := rt.compileAuxKernel(bertResidualAffineLayerNormKernelSource, "manta_bert_residual_affine_layernorm")
+		if err != nil {
+			return err
+		}
+		rt.bertResidualLayerNormKernel = kernel
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchBERTResidualAffineLayerNorm(rt.ptr, rt.bertResidualLayerNormKernel.ptr, grid, block, src, residual, gamma.ptr, beta.ptr, out, rowsArg, hiddenArg, C.double(epsilon), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) runBERTAttentionContextDevice(query, key, value, attentionMask, out C.CUdeviceptr, batch, tokens, hidden, heads int) error {
+	if heads <= 0 || hidden%heads != 0 {
+		return fmt.Errorf("cuda bert attention hidden=%d must be divisible by heads=%d", hidden, heads)
+	}
+	headDim := hidden / heads
+	jobs, err := checkedProduct("cuda bert attention jobs", batch, tokens, heads)
+	if err != nil {
+		return err
+	}
+	for _, guard := range []struct {
+		label string
+		dims  []int
+	}{
+		{"cuda bert attention job offset", []int{batch, tokens, heads}},
+		{"cuda bert attention hidden offset", []int{batch, tokens, hidden}},
+		{"cuda bert attention head offset", []int{heads, headDim}},
+	} {
+		if err := checkedInt32Product(guard.label, guard.dims...); err != nil {
+			return err
+		}
+	}
+	grid, block, err := checkedLaunch1D("cuda bert attention context", jobs, 128)
+	if err != nil {
+		return err
+	}
+	batchArg, err := checkedCInt("cuda bert attention batch", batch)
+	if err != nil {
+		return err
+	}
+	tokensArg, err := checkedCInt("cuda bert attention tokens", tokens)
+	if err != nil {
+		return err
+	}
+	hiddenArg, err := checkedCInt("cuda bert attention hidden", hidden)
+	if err != nil {
+		return err
+	}
+	headsArg, err := checkedCInt("cuda bert attention heads", heads)
+	if err != nil {
+		return err
+	}
+	headDimArg, err := checkedCInt("cuda bert attention head_dim", headDim)
+	if err != nil {
+		return err
+	}
+	kernel, err := rt.ensureBERTAttentionContextKernel()
+	if err != nil {
+		return err
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchBERTAttentionContext(rt.ptr, kernel.ptr, grid, block, query, key, value, attentionMask, out, batchArg, tokensArg, hiddenArg, headsArg, headDimArg, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) runResidentBERTGEMM(lhs C.CUdeviceptr, lhsRows, lhsCols int, rightName string, out C.CUdeviceptr, transposeRight bool) error {
+	resident, ok := rt.residentMatrices[rightName]
+	if !ok {
+		return fmt.Errorf("cuda bert GEMM resident matrix %q is not bound", rightName)
+	}
+	lhsRowsArg, err := checkedCInt("cuda bert GEMM lhs rows", lhsRows)
+	if err != nil {
+		return err
+	}
+	lhsColsArg, err := checkedCInt("cuda bert GEMM lhs cols", lhsCols)
+	if err != nil {
+		return err
+	}
+	rhsRowsArg, err := checkedCInt("cuda bert GEMM rhs rows", resident.rows)
+	if err != nil {
+		return err
+	}
+	rhsColsArg, err := checkedCInt("cuda bert GEMM rhs cols", resident.cols)
+	if err != nil {
+		return err
+	}
+	return rt.matMulCublasWithBetaNoSync(lhs, resident.ptr, out, lhsRowsArg, lhsColsArg, rhsRowsArg, rhsColsArg, false, transposeRight, 0)
+}
+
+func (rt *deviceRuntime) preflightBERTOneLayerResidentFixture(inputIDs, attentionMask, tokenTypeIDs *backend.Tensor, names map[string]string, heads int) (bertCUDAOneLayerPreflight, error) {
+	var pre bertCUDAOneLayerPreflight
+	if rt == nil || rt.ptr == nil {
+		return pre, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if inputIDs == nil || attentionMask == nil || tokenTypeIDs == nil || inputIDs.DType != "i32" || attentionMask.DType != "i32" || tokenTypeIDs.DType != "i32" || len(inputIDs.Shape) != 2 || !inputIDs.EqualShape(attentionMask) || !inputIDs.EqualShape(tokenTypeIDs) {
+		return pre, fmt.Errorf("cuda bert one-layer fixture expects matching i32 [B,T] input tensors")
+	}
+	batch, tokens := inputIDs.Shape[0], inputIDs.Shape[1]
+	if batch <= 0 || tokens <= 0 || inputIDs.Elements() != len(inputIDs.I32) || attentionMask.Elements() != len(attentionMask.I32) || tokenTypeIDs.Elements() != len(tokenTypeIDs.I32) {
+		return pre, fmt.Errorf("cuda bert one-layer fixture input backing length mismatch")
+	}
+	rows, err := checkedProduct("cuda bert one-layer rows", batch, tokens)
+	if err != nil {
+		return pre, err
+	}
+	if err := checkedInt32Product("cuda bert one-layer input row offset", batch, tokens); err != nil {
+		return pre, err
+	}
+	if _, _, err := checkedLaunch1D("cuda bert one-layer preflight rows", rows, 128); err != nil {
+		return pre, err
+	}
+
+	requiredTensor := []string{
+		"token_embeddings", "position_embeddings", "token_type_embeddings", "embedding_layernorm_weight", "embedding_layernorm_bias",
+		"attention_query_bias", "attention_key_bias", "attention_value_bias", "attention_output_bias",
+		"attention_layernorm_weight", "attention_layernorm_bias", "intermediate_bias", "output_bias", "output_layernorm_weight", "output_layernorm_bias",
+	}
+	requiredMatrix := []string{
+		"attention_query_weight", "attention_key_weight", "attention_value_weight", "attention_output_weight", "intermediate_weight", "output_weight",
+	}
+	seenNames := map[string]string{}
+	requireName := func(slot string) (string, error) {
+		name := names[slot]
+		if name == "" {
+			return "", fmt.Errorf("cuda bert one-layer fixture missing resident name for %s", slot)
+		}
+		if previous, ok := seenNames[name]; ok {
+			return "", fmt.Errorf("cuda bert one-layer fixture resident name %q is duplicated for %s and %s", name, previous, slot)
+		}
+		seenNames[name] = slot
+		return name, nil
+	}
+	tensors := map[string]residentTensor{}
+	for _, slot := range requiredTensor {
+		name, err := requireName(slot)
+		if err != nil {
+			return pre, err
+		}
+		resident, ok := rt.bertResidentTensors[name]
+		if !ok {
+			if _, wrongKind := rt.residentMatrices[name]; wrongKind {
+				return pre, fmt.Errorf("cuda bert one-layer fixture %s resident name %q is bound as matrix, want tensor", slot, name)
+			}
+			return pre, fmt.Errorf("cuda bert one-layer fixture %s resident name %q is not bound", slot, name)
+		}
+		if err := validateResidentTensorShapeProduct("cuda bert one-layer fixture "+slot, resident); err != nil {
+			return pre, err
+		}
+		tensors[slot] = resident
+		pre.residentWeightBytesReferenced += int64(resident.elements * 4)
+	}
+	matrices := map[string]residentMatrix{}
+	for _, slot := range requiredMatrix {
+		name, err := requireName(slot)
+		if err != nil {
+			return pre, err
+		}
+		resident, ok := rt.residentMatrices[name]
+		if !ok {
+			if _, wrongKind := rt.bertResidentTensors[name]; wrongKind {
+				return pre, fmt.Errorf("cuda bert one-layer fixture %s resident name %q is bound as tensor, want matrix", slot, name)
+			}
+			return pre, fmt.Errorf("cuda bert one-layer fixture %s resident name %q is not bound", slot, name)
+		}
+		if err := validateResidentMatrixShapeProduct("cuda bert one-layer fixture "+slot, resident); err != nil {
+			return pre, err
+		}
+		matrices[slot] = resident
+		pre.residentWeightBytesReferenced += int64(resident.elements * 4)
+	}
+
+	tokenEmb := tensors["token_embeddings"]
+	positionEmb := tensors["position_embeddings"]
+	typeEmb := tensors["token_type_embeddings"]
+	if len(tokenEmb.shape) != 2 || len(positionEmb.shape) != 2 || len(typeEmb.shape) != 2 {
+		return pre, fmt.Errorf("cuda bert one-layer fixture embedding tensors must be rank-2")
+	}
+	hidden := tokenEmb.shape[1]
+	if hidden <= 0 || positionEmb.shape[1] != hidden || typeEmb.shape[1] != hidden || positionEmb.shape[0] < tokens {
+		return pre, fmt.Errorf("cuda bert one-layer fixture embedding shape mismatch token=%v position=%v type=%v tokens=%d", tokenEmb.shape, positionEmb.shape, typeEmb.shape, tokens)
+	}
+	if heads <= 0 || hidden%heads != 0 {
+		return pre, fmt.Errorf("cuda bert one-layer fixture hidden=%d must be divisible by heads=%d", hidden, heads)
+	}
+	if typeEmb.shape[0] <= 0 || tokenEmb.shape[0] <= 0 {
+		return pre, fmt.Errorf("cuda bert one-layer fixture embedding vocab sizes must be positive")
+	}
+
+	vectorShape := func(slot string, want int) error {
+		resident := tensors[slot]
+		if len(resident.shape) != 1 || resident.shape[0] != want || resident.elements != want {
+			return fmt.Errorf("cuda bert one-layer fixture %s shape %v elements=%d, want [%d]", slot, resident.shape, resident.elements, want)
+		}
+		return nil
+	}
+	for _, slot := range []string{"embedding_layernorm_weight", "embedding_layernorm_bias", "attention_query_bias", "attention_key_bias", "attention_value_bias", "attention_output_bias", "attention_layernorm_weight", "attention_layernorm_bias", "output_bias", "output_layernorm_weight", "output_layernorm_bias"} {
+		if err := vectorShape(slot, hidden); err != nil {
+			return pre, err
+		}
+	}
+	for _, slot := range []string{"attention_query_weight", "attention_key_weight", "attention_value_weight", "attention_output_weight"} {
+		resident := matrices[slot]
+		if resident.rows != hidden || resident.cols != hidden {
+			return pre, fmt.Errorf("cuda bert one-layer fixture %s shape [%d,%d], want [%d,%d]", slot, resident.rows, resident.cols, hidden, hidden)
+		}
+	}
+	intermediate := matrices["intermediate_weight"].rows
+	if intermediate <= 0 || matrices["intermediate_weight"].cols != hidden {
+		return pre, fmt.Errorf("cuda bert one-layer fixture intermediate_weight shape [%d,%d], want [I,%d]", matrices["intermediate_weight"].rows, matrices["intermediate_weight"].cols, hidden)
+	}
+	if err := vectorShape("intermediate_bias", intermediate); err != nil {
+		return pre, err
+	}
+	outputWeight := matrices["output_weight"]
+	if outputWeight.rows != hidden || outputWeight.cols != intermediate {
+		return pre, fmt.Errorf("cuda bert one-layer fixture output_weight shape [%d,%d], want [%d,%d]", outputWeight.rows, outputWeight.cols, hidden, intermediate)
+	}
+
+	for i, tokenID := range inputIDs.I32 {
+		if tokenID < 0 || int(tokenID) >= tokenEmb.shape[0] {
+			return pre, fmt.Errorf("cuda bert one-layer fixture input_ids[%d]=%d out of range [0,%d)", i, tokenID, tokenEmb.shape[0])
+		}
+		positionID := i % tokens
+		if positionID < 0 || positionID >= positionEmb.shape[0] {
+			return pre, fmt.Errorf("cuda bert one-layer fixture implicit position_ids[%d]=%d out of range [0,%d)", i, positionID, positionEmb.shape[0])
+		}
+		tokenTypeID := tokenTypeIDs.I32[i]
+		if tokenTypeID < 0 || int(tokenTypeID) >= typeEmb.shape[0] {
+			return pre, fmt.Errorf("cuda bert one-layer fixture token_type_ids[%d]=%d out of range [0,%d)", i, tokenTypeID, typeEmb.shape[0])
+		}
+		mask := attentionMask.I32[i]
+		if mask != 0 && mask != 1 {
+			return pre, fmt.Errorf("cuda bert one-layer fixture attention_mask[%d]=%d is invalid, want 0 or 1", i, mask)
+		}
+	}
+
+	hiddenElements, err := checkedProduct("cuda bert one-layer hidden elements", rows, hidden)
+	if err != nil {
+		return pre, err
+	}
+	intermediateElements, err := checkedProduct("cuda bert one-layer intermediate elements", rows, intermediate)
+	if err != nil {
+		return pre, err
+	}
+	attentionJobs, err := checkedProduct("cuda bert one-layer attention jobs", batch, tokens, heads)
+	if err != nil {
+		return pre, err
+	}
+	for _, guard := range []struct {
+		label string
+		dims  []int
+	}{
+		{"cuda bert one-layer hidden offset", []int{rows, hidden}},
+		{"cuda bert one-layer intermediate offset", []int{rows, intermediate}},
+		{"cuda bert one-layer attention jobs", []int{batch, tokens, heads}},
+		{"cuda bert one-layer token embedding offset", []int{tokenEmb.shape[0], hidden}},
+		{"cuda bert one-layer position embedding offset", []int{positionEmb.shape[0], hidden}},
+		{"cuda bert one-layer type embedding offset", []int{typeEmb.shape[0], hidden}},
+	} {
+		if err := checkedInt32Product(guard.label, guard.dims...); err != nil {
+			return pre, err
+		}
+	}
+	for _, launch := range []struct {
+		label    string
+		elements int
+		block    uint
+	}{
+		{"cuda bert one-layer embedding launch", rows, 128},
+		{"cuda bert one-layer qkv bias launch", hiddenElements, 256},
+		{"cuda bert one-layer attention launch", attentionJobs, 128},
+		{"cuda bert one-layer gelu launch", intermediateElements, 256},
+		{"cuda bert one-layer residual layernorm launch", rows, 128},
+	} {
+		if _, _, err := checkedLaunch1D(launch.label, launch.elements, launch.block); err != nil {
+			return pre, err
+		}
+	}
+	if _, err := checkedCUDABytes("cuda bert one-layer input upload bytes", len(inputIDs.I32)+len(attentionMask.I32)+len(tokenTypeIDs.I32)+1, 4); err != nil {
+		return pre, err
+	}
+	if _, err := checkedCUDABytes("cuda bert one-layer hidden buffer bytes", hiddenElements, 4); err != nil {
+		return pre, err
+	}
+	if _, err := checkedCUDABytes("cuda bert one-layer intermediate buffer bytes", intermediateElements, 4); err != nil {
+		return pre, err
+	}
+
+	pre.batch = batch
+	pre.tokens = tokens
+	pre.rows = rows
+	pre.hidden = hidden
+	pre.intermediate = intermediate
+	pre.hiddenElements = hiddenElements
+	pre.intermediateElements = intermediateElements
+	return pre, nil
+}
+
+func validateResidentTensorShapeProduct(label string, resident residentTensor) error {
+	elements, err := checkedProduct(label+" shape product", resident.shape...)
+	if err != nil {
+		return err
+	}
+	if elements != resident.elements {
+		return fmt.Errorf("%s shape %v has %d elements, resident backing has %d", label, resident.shape, elements, resident.elements)
+	}
+	return nil
+}
+
+func validateResidentMatrixShapeProduct(label string, resident residentMatrix) error {
+	elements, err := checkedProduct(label+" shape product", resident.rows, resident.cols)
+	if err != nil {
+		return err
+	}
+	if elements != resident.elements {
+		return fmt.Errorf("%s shape [%d,%d] has %d elements, resident backing has %d", label, resident.rows, resident.cols, elements, resident.elements)
+	}
+	return nil
+}
+
+type bertCUDAOneLayerFixtureOptions struct {
+	InjectStatusBeforeDownload int32
+}
+
+func (rt *deviceRuntime) runBERTOneLayerResidentFixture(inputIDs, attentionMask, tokenTypeIDs *backend.Tensor, names map[string]string, heads int, epsilon float64) (*backend.Tensor, bertCUDAOneLayerTransferStats, error) {
+	return rt.runBERTOneLayerResidentFixtureWithOptions(inputIDs, attentionMask, tokenTypeIDs, names, heads, epsilon, bertCUDAOneLayerFixtureOptions{})
+}
+
+func (rt *deviceRuntime) runBERTOneLayerResidentFixtureWithOptions(inputIDs, attentionMask, tokenTypeIDs *backend.Tensor, names map[string]string, heads int, epsilon float64, options bertCUDAOneLayerFixtureOptions) (*backend.Tensor, bertCUDAOneLayerTransferStats, error) {
+	stats := bertCUDAOneLayerTransferStats{}
+	pre, err := rt.preflightBERTOneLayerResidentFixture(inputIDs, attentionMask, tokenTypeIDs, names, heads)
+	if err != nil {
+		return nil, stats, err
+	}
+	stats.ResidentWeightBytesReferenced = pre.residentWeightBytesReferenced
+	batch, tokens := pre.batch, pre.tokens
+	rows, hidden, intermediate := pre.rows, pre.hidden, pre.intermediate
+	hiddenElements, intermediateElements := pre.hiddenElements, pre.intermediateElements
+	launched := false
+	inputBuf, err := rt.uploadInt32(inputIDs.I32)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(inputBuf)
+	maskBuf, err := rt.uploadInt32(attentionMask.I32)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(maskBuf)
+	typeBuf, err := rt.uploadInt32(tokenTypeIDs.I32)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(typeBuf)
+	stats.UploadedBytes += int64((len(inputIDs.I32) + len(attentionMask.I32) + len(tokenTypeIDs.I32)) * 4)
+
+	hiddenBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(hiddenBuf)
+	qBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(qBuf)
+	kBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(kBuf)
+	vBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(vBuf)
+	contextBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(contextBuf)
+	attentionProjectedBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(attentionProjectedBuf)
+	attentionLayerBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(attentionLayerBuf)
+	intermediateBuf, err := rt.allocFloat32(intermediateElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(intermediateBuf)
+	intermediateGELUBuf, err := rt.allocFloat32(intermediateElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(intermediateGELUBuf)
+	outputProjectedBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(outputProjectedBuf)
+	outputLayerBuf, err := rt.allocFloat32(hiddenElements)
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(outputLayerBuf)
+	statusBuf, err := rt.uploadInt32([]int32{0})
+	if err != nil {
+		return nil, stats, err
+	}
+	defer rt.freeBuffer(statusBuf)
+	stats.UploadedBytes += 4
+	defer func() {
+		if launched {
+			_ = rt.synchronize()
+		}
+	}()
+
+	if err := rt.runBERTEmbeddingAffineLayerNormDevice(names["token_embeddings"], names["position_embeddings"], names["token_type_embeddings"], names["embedding_layernorm_weight"], names["embedding_layernorm_bias"], inputBuf, typeBuf, hiddenBuf, statusBuf, batch, tokens, epsilon); err != nil {
+		return nil, stats, err
+	}
+	launched = true
+	for _, item := range []struct {
+		weight string
+		bias   string
+		out    C.CUdeviceptr
+	}{
+		{"attention_query_weight", "attention_query_bias", qBuf},
+		{"attention_key_weight", "attention_key_bias", kBuf},
+		{"attention_value_weight", "attention_value_bias", vBuf},
+	} {
+		if err := rt.runResidentBERTGEMM(hiddenBuf, rows, hidden, names[item.weight], item.out, true); err != nil {
+			return nil, stats, err
+		}
+		if err := rt.runBERTBiasAddDevice(item.out, names[item.bias], rows, hidden); err != nil {
+			return nil, stats, err
+		}
+	}
+	if err := rt.runBERTAttentionContextDevice(qBuf, kBuf, vBuf, maskBuf, contextBuf, batch, tokens, hidden, heads); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runResidentBERTGEMM(contextBuf, rows, hidden, names["attention_output_weight"], attentionProjectedBuf, true); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runBERTBiasAddDevice(attentionProjectedBuf, names["attention_output_bias"], rows, hidden); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runBERTResidualAffineLayerNormDevice(attentionProjectedBuf, hiddenBuf, names["attention_layernorm_weight"], names["attention_layernorm_bias"], attentionLayerBuf, rows, hidden, epsilon); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runResidentBERTGEMM(attentionLayerBuf, rows, hidden, names["intermediate_weight"], intermediateBuf, true); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runBERTBiasAddDevice(intermediateBuf, names["intermediate_bias"], rows, intermediate); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runBERTExactGELUDevice(intermediateBuf, intermediateGELUBuf, intermediateElements); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runResidentBERTGEMM(intermediateGELUBuf, rows, intermediate, names["output_weight"], outputProjectedBuf, true); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runBERTBiasAddDevice(outputProjectedBuf, names["output_bias"], rows, hidden); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.runBERTResidualAffineLayerNormDevice(outputProjectedBuf, attentionLayerBuf, names["output_layernorm_weight"], names["output_layernorm_bias"], outputLayerBuf, rows, hidden, epsilon); err != nil {
+		return nil, stats, err
+	}
+	if err := rt.synchronize(); err != nil {
+		return nil, stats, err
+	}
+	launched = false
+	if options.InjectStatusBeforeDownload != 0 {
+		if err := rt.copyInt32ToBuffer(statusBuf, []int32{options.InjectStatusBeforeDownload}); err != nil {
+			return nil, stats, err
+		}
+		stats.UploadedBytes += 4
+	}
+	status := []int32{0}
+	if err := rt.downloadInt32(status, statusBuf); err != nil {
+		return nil, stats, err
+	}
+	stats.StatusDownloadedBytes = 4
+	stats.DownloadedBytes += stats.StatusDownloadedBytes
+	if status[0] != 0 {
+		return nil, stats, fmt.Errorf("cuda bert one-layer fixture embedding status=%d", status[0])
+	}
+	out := make([]float32, hiddenElements)
+	if err := rt.downloadFloat32(out, outputLayerBuf); err != nil {
+		return nil, stats, err
+	}
+	stats.FinalDownloadedBytes = int64(hiddenElements * 4)
+	stats.DownloadedBytes += stats.FinalDownloadedBytes
+	return backend.NewTensorF32([]int{batch, tokens, hidden}, out), stats, nil
 }
 
 // runCapturedGEMMBatch executes a batch of stream GEMMs. On a cache hit for
