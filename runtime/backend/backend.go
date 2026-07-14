@@ -177,6 +177,91 @@ type ContrastiveGradResult struct {
 	ScoreSum      float32
 }
 
+const CompactForwardPackedStateVersion = 1
+
+const (
+	CompactForwardGELUExact = "exact"
+	CompactForwardGELUFast  = "fast"
+)
+
+// CompactForwardShape describes one exact-length compact-forward bucket.
+// Tokens, masks, and roles are supplied by the caller; packed state data is
+// exclusively float32 tensors needed by host backward reconstruction.
+type CompactForwardShape struct {
+	Batch               int
+	Tokens              int
+	ModelDim            int
+	FFNDim              int
+	Heads               int
+	HeadDim             int
+	Layers              int
+	OutputDim           int
+	HasOutputProjection bool
+}
+
+// CompactForwardResidentRef carries backend-neutral liveness metadata for a
+// resident compact-forward parameter. Accelerators may use these opaque owner
+// and generation refs for preflight without leaking backend-specific types into
+// the runtime ABI.
+type CompactForwardResidentRef struct {
+	Name     string
+	Backend  eosartifact.BackendKind
+	Token    CompactForwardResidentToken
+	Elements int
+}
+
+// CompactForwardResidentToken is implemented by backend-private resident
+// parameter tokens. The runtime only depends on liveness and generation checks;
+// backend packages may type-assert to their private token implementation.
+type CompactForwardResidentToken interface {
+	CompactForwardResidentToken()
+	Backend() eosartifact.BackendKind
+	Generation() uint64
+	Alive() bool
+}
+
+// CompactForwardStateSpan names one contiguous slice inside a packed compact
+// forward result.
+type CompactForwardStateSpan struct {
+	Name   string
+	Offset int
+	Len    int
+}
+
+// CompactForwardPackedStateLayout is the versioned ABI for reconstructing host
+// compact forward state views from one packed float32 backing.
+type CompactForwardPackedStateLayout struct {
+	Version int
+	Shape   CompactForwardShape
+	Spans   []CompactForwardStateSpan
+}
+
+// CompactForwardRequest asks an accelerator to run a compact bucket. The
+// concrete backend owns how resident parameters are represented; this contract
+// intentionally avoids CUDA-specific types.
+type CompactForwardRequest struct {
+	Shape        CompactForwardShape
+	Tokens       [][]int32
+	Masks        [][]int32
+	Roles        []int32
+	ResidentRefs []CompactForwardResidentRef
+	// GELUMode selects the host-compatible FFN activation mode. Empty means
+	// CompactForwardGELUExact for backward compatibility with existing callers.
+	GELUMode string
+}
+
+// CompactForwardResult returns a packed state buffer and the exact layout used
+// to describe it. Accelerators transfer ownership of Data to the caller and
+// must not mutate, recycle, or pool that backing until the caller has finished
+// with the result. Callers must treat Data as immutable and validate the layout
+// against the request shape before slicing it. Host reconstruction defensively
+// copies Data once so reconstructed states remain stable if a backend violates
+// the no-reuse contract.
+type CompactForwardResult struct {
+	Layout CompactForwardPackedStateLayout
+	Data   []float32
+}
+
 // MatMulAccelerator exposes a backend-owned matmul fast path for non-plan callers.
 type MatMulAccelerator interface {
 	Backend() eosartifact.BackendKind
@@ -207,6 +292,14 @@ type SharedLeftMatMulAccelerator interface {
 // resident-right matmuls with distinct left inputs into one accumulated output.
 type AccumulatedBoundRightMatMulAccelerator interface {
 	RunAccumulatedMatMulsWithBoundRights(lhs []*Tensor, rightNames []string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (StepDispatchResult, error)
+}
+
+// CompactForwardAccelerator optionally executes compact forward for an
+// exact-length bucket and returns the versioned packed state ABI consumed by
+// host reconstruction/backward.
+type CompactForwardAccelerator interface {
+	Backend() eosartifact.BackendKind
+	RunCompactForward(req CompactForwardRequest) (CompactForwardResult, error)
 }
 
 // OptimizerAccelerator exposes a backend-owned optimizer update fast path.

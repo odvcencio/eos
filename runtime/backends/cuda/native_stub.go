@@ -40,6 +40,8 @@ type optimizerResidentParameterToken struct{}
 
 func (t *optimizerResidentParameterToken) OptimizerResidentParameterToken() {}
 
+func (t *optimizerResidentParameterToken) CompactForwardResidentToken() {}
+
 func (t *optimizerResidentParameterToken) Backend() eosartifact.BackendKind {
 	return eosartifact.BackendCUDA
 }
