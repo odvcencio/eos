@@ -74,6 +74,9 @@ type countingMatMulAccelerator struct {
 	maxSharedLeftRHS  int
 	maxAccumTerms     int
 	maxRunOutputCols  int
+	uploadedBytes     int64
+	downloadedBytes   int64
+	bindUploadedBytes int64
 	bound             map[string]*backend.Tensor
 }
 
@@ -93,6 +96,8 @@ func (a *countingMatMulAccelerator) RunMatMul(inputs []*backend.Tensor, outputTy
 				a.maxRunOutputCols = rhs.Shape[2]
 			}
 			out := make([]float32, lhs.Shape[0]*lhs.Shape[1]*rhs.Shape[2])
+			a.uploadedBytes += int64((len(lhs.F32) + len(rhs.F32)) * 4)
+			a.downloadedBytes += int64(len(out) * 4)
 			for batch := 0; batch < lhs.Shape[0]; batch++ {
 				lhsBase := batch * lhs.Shape[1] * lhs.Shape[2]
 				rhsBase := batch * rhs.Shape[1] * rhs.Shape[2]
@@ -129,6 +134,8 @@ func (a *countingMatMulAccelerator) RunMatMulWithTranspose(inputs []*backend.Ten
 				a.maxRunOutputCols = outCols
 			}
 			out := make([]float32, lhs.Shape[0]*outRows*outCols)
+			a.uploadedBytes += int64((len(lhs.F32) + len(rhs.F32)) * 4)
+			a.downloadedBytes += int64(len(out) * 4)
 			for batch := 0; batch < lhs.Shape[0]; batch++ {
 				lhsBase := batch * lhsRows * lhsCols
 				rhsBase := batch * rhsRows * rhsCols
@@ -161,6 +168,8 @@ func (a *countingMatMulAccelerator) RunMatMulWithTranspose(inputs []*backend.Ten
 				a.maxRunOutputCols = outCols
 			}
 			out := make([]float32, outRows*outCols)
+			a.uploadedBytes += int64((len(lhs.F32) + len(rhs.F32)) * 4)
+			a.downloadedBytes += int64(len(out) * 4)
 			fillHostMatMulTranspose(lhs.F32, lhsRows, lhsCols, rhs.F32, rhsRows, rhsCols, transposeLeft, transposeRight, out)
 			return backend.StepDispatchResult{Outputs: []*backend.Tensor{
 				backend.NewTensorF32([]int{outRows, outCols}, out),
@@ -175,6 +184,9 @@ func (a *countingMatMulAccelerator) BindMatrix(name string, tensor *backend.Tens
 	}
 	a.bindCalls++
 	a.bound[name] = tensor
+	if tensor != nil {
+		a.bindUploadedBytes += int64(len(tensor.F32) * 4)
+	}
 	return nil
 }
 func (a *countingMatMulAccelerator) UnbindMatrix(name string) error {
@@ -182,20 +194,43 @@ func (a *countingMatMulAccelerator) UnbindMatrix(name string) error {
 	return nil
 }
 func (a *countingMatMulAccelerator) RunMatMulWithBoundLeft(leftName string, rhs *backend.Tensor, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
+	a.runCalls++
 	return backend.StepDispatchResult{}, nil
 }
 func (a *countingMatMulAccelerator) RunMatMulWithBoundRight(lhs *backend.Tensor, rightName string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
+	a.runCalls++
 	a.boundRightRuns++
 	if lhs != nil && len(lhs.Shape) > 0 && lhs.Shape[0] > a.maxBoundRightRows {
 		a.maxBoundRightRows = lhs.Shape[0]
 	}
-	return backend.StepDispatchResult{}, nil
+	if lhs == nil || len(lhs.Shape) != 2 || a.bound == nil {
+		return backend.StepDispatchResult{}, nil
+	}
+	rhs := a.bound[rightName]
+	if rhs == nil || len(rhs.Shape) != 2 {
+		return backend.StepDispatchResult{}, nil
+	}
+	outRows, outCols, ok := trainerMatMulShape(lhs.Shape[0], lhs.Shape[1], rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight)
+	if !ok {
+		return backend.StepDispatchResult{}, nil
+	}
+	out := make([]float32, outRows*outCols)
+	fillHostMatMulTranspose(lhs.F32, lhs.Shape[0], lhs.Shape[1], rhs.F32, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight, out)
+	a.uploadedBytes += int64(len(lhs.F32) * 4)
+	a.downloadedBytes += int64(len(out) * 4)
+	return backend.StepDispatchResult{Outputs: []*backend.Tensor{
+		backend.NewTensorF32([]int{outRows, outCols}, out),
+	}}, nil
 }
 func (a *countingMatMulAccelerator) RunMatMulWithBoundRights(lhs *backend.Tensor, rightNames []string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) ([]backend.StepDispatchResult, error) {
+	a.runCalls += len(rightNames)
 	a.multiBoundRuns++
 	a.boundRightRuns += len(rightNames)
 	if lhs != nil && len(lhs.Shape) > 0 && lhs.Shape[0] > a.maxBoundRightRows {
 		a.maxBoundRightRows = lhs.Shape[0]
+	}
+	if lhs != nil {
+		a.uploadedBytes += int64(len(lhs.F32) * 4)
 	}
 	results := make([]backend.StepDispatchResult, len(rightNames))
 	rows := 0
@@ -206,18 +241,32 @@ func (a *countingMatMulAccelerator) RunMatMulWithBoundRights(lhs *backend.Tensor
 	}
 	for i, name := range rightNames {
 		cols := inner
+		resultRows := rows
+		var out []float32
 		if a.bound != nil {
 			if rhs := a.bound[name]; rhs != nil && len(rhs.Shape) == 2 {
 				cols = rhs.Shape[1]
+				outRows, outCols, ok := trainerMatMulShape(rows, inner, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight)
+				if ok {
+					resultRows = outRows
+					cols = outCols
+					out = make([]float32, outRows*outCols)
+					fillHostMatMulTranspose(lhs.F32, lhs.Shape[0], lhs.Shape[1], rhs.F32, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight, out)
+					a.downloadedBytes += int64(len(out) * 4)
+				}
 			}
 		}
+		if out == nil {
+			out = make([]float32, resultRows*cols)
+		}
 		results[i] = backend.StepDispatchResult{Outputs: []*backend.Tensor{
-			backend.NewTensorF32([]int{rows, cols}, make([]float32, rows*cols)),
-		}}
+			backend.NewTensorF32([]int{resultRows, cols}, out),
+		}, Metadata: map[string]any{"rhs_binding": name}}
 	}
 	return results, nil
 }
 func (a *countingMatMulAccelerator) RunAccumulatedMatMulsWithBoundRights(lhsInputs []*backend.Tensor, rightNames []string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
+	a.runCalls++
 	a.accumulatedRuns++
 	a.boundRightRuns += len(rightNames)
 	if len(rightNames) > a.maxAccumTerms {
@@ -254,6 +303,8 @@ func (a *countingMatMulAccelerator) RunAccumulatedMatMulsWithBoundRights(lhsInpu
 		}
 		step := make([]float32, outRows*outCols)
 		fillHostMatMulTranspose(lhs.F32, lhs.Shape[0], lhs.Shape[1], rhs.F32, rhs.Shape[0], rhs.Shape[1], transposeLeft, transposeRight, step)
+		a.uploadedBytes += int64(len(lhs.F32) * 4)
+		a.downloadedBytes += int64(len(step) * 4)
 		addFloat32Slice(out, step)
 	}
 	return backend.StepDispatchResult{Outputs: []*backend.Tensor{
@@ -261,6 +312,7 @@ func (a *countingMatMulAccelerator) RunAccumulatedMatMulsWithBoundRights(lhsInpu
 	}}, nil
 }
 func (a *countingMatMulAccelerator) RunMatMulsWithSharedLeft(lhs *backend.Tensor, rhs []*backend.Tensor, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) ([]backend.StepDispatchResult, error) {
+	a.runCalls++
 	a.sharedLeftRuns++
 	if len(rhs) > a.maxSharedLeftRHS {
 		a.maxSharedLeftRHS = len(rhs)
@@ -291,10 +343,13 @@ func (a *countingMatMulAccelerator) RunMatMulsWithSharedLeft(lhs *backend.Tensor
 }
 func (a *countingMatMulAccelerator) Stats() backend.MatMulAcceleratorStats {
 	return backend.MatMulAcceleratorStats{
-		BindCalls:       int64(a.bindCalls),
-		BoundMatrices:   int64(len(a.bound)),
-		RunCalls:        int64(a.boundRightRuns + a.runCalls),
-		BoundRightCalls: int64(a.boundRightRuns),
+		BindCalls:          int64(a.bindCalls),
+		UploadedBytes:      a.bindUploadedBytes,
+		BoundMatrices:      int64(len(a.bound)),
+		RunCalls:           int64(a.runCalls),
+		BoundRightCalls:    int64(a.boundRightRuns),
+		RunUploadedBytes:   a.uploadedBytes,
+		RunDownloadedBytes: a.downloadedBytes,
 	}
 }
 func (a *countingMatMulAccelerator) Close() {}
@@ -1225,6 +1280,22 @@ func TestLoadCompactEmbeddingTrainStateFromCheckpointOutputProjectionContract(t 
 	}
 }
 
+func TestLoadCompactEmbeddingTrainStateFromCheckpointRejectsDuplicateTensorNames(t *testing.T) {
+	checkpoint := compactTrainStateTestCheckpoint(6)
+	checkpoint.Manifest.OutputProjectionParam = "layer0_ffn_up"
+	checkpoint.Tensors["layer0_ffn_up"] = backend.NewTensorF32([]int{4, 6}, make([]float32, 24))
+	checkpoint.MomentTensors["layer0_ffn_up_moment_1"] = backend.NewTensorF32([]int{4, 6}, make([]float32, 24))
+	checkpoint.MomentTensors["layer0_ffn_up_moment_2"] = backend.NewTensorF32([]int{4, 6}, make([]float32, 24))
+	delete(checkpoint.Tensors, "output_projection")
+	delete(checkpoint.MomentTensors, "output_projection_moment_1")
+	delete(checkpoint.MomentTensors, "output_projection_moment_2")
+
+	_, err := LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint, checkpoint.Manifest)
+	if err == nil || !strings.Contains(err.Error(), `tensor name "layer0_ffn_up" is used by both layer0_ffn_up and output_projection`) {
+		t.Fatalf("LoadCompactEmbeddingTrainStateFromCheckpoint error = %v, want duplicate output projection name rejection", err)
+	}
+}
+
 func compactTrainStateTestCheckpoint(outputDim int) EmbeddingTrainCheckpoint {
 	manifest := EmbeddingManifest{
 		Name:                  "compact",
@@ -1299,7 +1370,7 @@ func compactTrainStateTestTensor(shape []int, scale float32) *backend.Tensor {
 	return backend.NewTensorF32(shape, data)
 }
 
-func newCompactEmbeddingTrainerForTest(t *testing.T, outputDim int) *EmbeddingTrainer {
+func newCompactEmbeddingTrainerForTest(t testing.TB, outputDim int) *EmbeddingTrainer {
 	t.Helper()
 	checkpoint := compactTrainStateTestCheckpoint(outputDim)
 	state, err := LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint, checkpoint.Manifest)
@@ -2255,8 +2326,17 @@ func TestCompactEmbeddingTrainerEvaluatePairsSkipsLegacyBatchedForwardWithAccele
 	if !compactTestFinite(metrics.Loss) || !compactTestFinite(metrics.AverageScore) || metrics.PairCount != len(batch) {
 		t.Fatalf("compact eval metrics = %+v, want finite pair metrics", metrics)
 	}
-	if fake.bindCalls != 0 || fake.boundRightRuns != 0 || fake.multiBoundRuns != 0 || fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
-		t.Fatalf("compact eval used legacy batched accelerator path: %+v", fake)
+	if fake.bindCalls == 0 {
+		t.Fatalf("compact eval did not bind compact forward weights: %+v", fake)
+	}
+	if fake.boundRightRuns == 0 {
+		t.Fatalf("compact eval did not use bound-right compact matmuls: %+v", fake)
+	}
+	if fake.multiBoundRuns == 0 {
+		t.Fatalf("compact eval did not coalesce compact q/k/v matmuls: %+v", fake)
+	}
+	if fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
+		t.Fatalf("compact eval used non-forward compact accelerator path: %+v", fake)
 	}
 }
 
@@ -2278,8 +2358,17 @@ func TestCompactEmbeddingTrainerEncodeSequenceInputsSkipsLegacyBatchedForwardWit
 	if len(seqs) != 2 || len(seqs[0].pooled) != 3 || len(seqs[1].pooled) != 3 {
 		t.Fatalf("encoded compact sequences = %+v, want two pooled dim-3 sequences", seqs)
 	}
-	if fake.bindCalls != 0 || fake.boundRightRuns != 0 || fake.multiBoundRuns != 0 || fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
-		t.Fatalf("compact encodeSequenceInputs used legacy batched accelerator path: %+v", fake)
+	if fake.bindCalls == 0 {
+		t.Fatalf("compact encodeSequenceInputs did not bind compact forward weights: %+v", fake)
+	}
+	if fake.boundRightRuns == 0 {
+		t.Fatalf("compact encodeSequenceInputs did not use bound-right compact matmuls: %+v", fake)
+	}
+	if fake.multiBoundRuns == 0 {
+		t.Fatalf("compact encodeSequenceInputs did not coalesce compact q/k/v matmuls: %+v", fake)
+	}
+	if fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
+		t.Fatalf("compact encodeSequenceInputs used non-forward compact accelerator path: %+v", fake)
 	}
 }
 

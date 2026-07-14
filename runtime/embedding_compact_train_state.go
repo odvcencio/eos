@@ -134,6 +134,9 @@ func LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint EmbeddingTrainCheck
 	if manifest.Tokenizer.VocabSize <= 0 {
 		return nil, fmt.Errorf("compact train state tokenizer.vocab_size must be positive")
 	}
+	if err := validateCompactTrainTensorNames(manifest); err != nil {
+		return nil, err
+	}
 
 	state := &CompactEmbeddingTrainState{
 		Manifest: manifest,
@@ -179,6 +182,49 @@ func LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint EmbeddingTrainCheck
 		}
 	}
 	return state, nil
+}
+
+func validateCompactTrainTensorNames(manifest EmbeddingManifest) error {
+	names := []struct {
+		role string
+		name string
+	}{
+		{role: "token_embedding", name: compactTokenEmbeddingName(manifest)},
+	}
+	if manifest.roleConditioned() {
+		names = append(names, struct {
+			role string
+			name string
+		}{role: "role_embedding", name: compactRoleEmbeddingName(manifest)})
+	}
+	for i := 0; i < manifest.EncoderRepeats; i++ {
+		for _, suffix := range []string{"attn_q", "attn_k", "attn_v", "attn_o", "ffn_up", "ffn_down"} {
+			names = append(names, struct {
+				role string
+				name string
+			}{
+				role: fmt.Sprintf("layer%d_%s", i, suffix),
+				name: compactLayerTensorName(i, suffix),
+			})
+		}
+	}
+	if manifest.OutputDim != manifest.ModelDim {
+		names = append(names, struct {
+			role string
+			name string
+		}{role: "output_projection", name: compactOutputProjectionName(manifest)})
+	}
+	seen := map[string]string{}
+	for _, item := range names {
+		if item.name == "" {
+			return fmt.Errorf("compact train state tensor name for %s is required", item.role)
+		}
+		if prior, ok := seen[item.name]; ok {
+			return fmt.Errorf("compact train state tensor name %q is used by both %s and %s", item.name, prior, item.role)
+		}
+		seen[item.name] = item.role
+	}
+	return nil
 }
 
 func loadCompactTrainLayer(checkpoint EmbeddingTrainCheckpoint, index, modelDim, ffnDim int) (CompactEmbeddingTrainLayer, error) {

@@ -388,6 +388,112 @@ func TestVectorDistillProjectionRoutesMatMulsAndOptimizerThroughAccelerators(t *
 	}
 }
 
+func TestVectorDistillCompactForwardResidencyAndQKVCounters(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	if trainer.forwardMatMul != nil {
+		trainer.forwardMatMul.Close()
+	}
+	fake := &countingMatMulAccelerator{}
+	trainer.forwardMatMul = fake
+	trainer.forwardBackend = eosartifact.BackendCUDA
+	trainer.optimizerAccel = nil
+
+	batch := []EmbeddingTokenizedVectorDistillExample{
+		vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+		vectorDistillTestExample("b", EmbeddingRoleDocument, []int32{3, 2, 1}, []float32{-0.1, 0.4, 0.2, -0.05}),
+	}
+	metrics, proj, err := trainer.trainVectorDistillBatch(batch, nil, 4, EmbeddingRoleQuery, 0)
+	if err != nil {
+		t.Fatalf("trainVectorDistillBatch: %v", err)
+	}
+	if proj == nil || !compactTestFinite(metrics.Loss) {
+		t.Fatalf("metrics=%+v projection=%v, want finite loss and projection", metrics, proj)
+	}
+
+	stats := trainer.ForwardResidencyStats()
+	if stats.MatMul.BindCalls == 0 {
+		t.Fatalf("matmul bind calls = %d, want compact forward weights resident", stats.MatMul.BindCalls)
+	}
+	if stats.MatMul.BoundRightCalls == 0 {
+		t.Fatalf("bound-right calls = %d, want resident compact weights used", stats.MatMul.BoundRightCalls)
+	}
+	if fake.multiBoundRuns == 0 {
+		t.Fatalf("q/k/v multi-bound runs = %d, want coalesced compact QKV", fake.multiBoundRuns)
+	}
+	if stats.MatMul.RunCalls == 0 {
+		t.Fatalf("run calls = %d, want accelerated compact matmuls recorded", stats.MatMul.RunCalls)
+	}
+
+	bindCallsAfterStep := fake.bindCalls
+	forward := trainer.prepareForwardWeights()
+	if forward == nil || forward.compact == nil {
+		t.Fatal("missing compact forward cache")
+	}
+	if fake.bindCalls <= bindCallsAfterStep {
+		t.Fatalf("bind calls after post-update prepare = %d, want > %d", fake.bindCalls, bindCallsAfterStep)
+	}
+	mask, err := trainer.prepareMask([]int32{1, 2, 3}, nil)
+	if err != nil {
+		t.Fatalf("prepare mask: %v", err)
+	}
+	accelerated, err := trainer.encodeSequence([]int32{1, 2, 3}, mask, trainer.queryRoleIndex(), nil, nil, nil, nil, nil, nil, nil, nil, false)
+	if err != nil {
+		t.Fatalf("accelerated encode after update: %v", err)
+	}
+	trainer.forwardMatMul = nil
+	host, err := trainer.encodeSequence([]int32{1, 2, 3}, mask, trainer.queryRoleIndex(), nil, nil, nil, nil, nil, nil, nil, nil, false)
+	if err != nil {
+		t.Fatalf("host encode after update: %v", err)
+	}
+	assertTensorClose(t, backend.NewTensorF32([]int{1, len(accelerated.pooled)}, accelerated.pooled), []int{1, len(host.pooled)}, host.pooled)
+	trainer.forwardMatMul = fake
+
+	bindCalls := fake.bindCalls
+	trainer.prepareForwardWeights()
+	if fake.bindCalls != bindCalls {
+		t.Fatalf("redundant compact bind calls = %d, want %d", fake.bindCalls, bindCalls)
+	}
+	if trainer.ForwardResidencyStats().BindSkips == 0 {
+		t.Fatalf("bind skips = %d, want compact residency reuse recorded", trainer.ForwardResidencyStats().BindSkips)
+	}
+}
+
+func TestVectorDistillCompactQKVMultiBoundFallbacks(t *testing.T) {
+	for _, mode := range []string{"wrong_order", "wrong_shape", "backend_error"} {
+		t.Run(mode, func(t *testing.T) {
+			trainer := newCompactEmbeddingTrainerForTest(t, 3)
+			if trainer.forwardMatMul != nil {
+				trainer.forwardMatMul.Close()
+			}
+			fake := &qkvFallbackMatMulAccelerator{mode: mode}
+			trainer.forwardMatMul = fake
+			trainer.forwardBackend = eosartifact.BackendCUDA
+
+			mask, err := trainer.prepareMask([]int32{1, 2, 3}, nil)
+			if err != nil {
+				t.Fatalf("prepare mask: %v", err)
+			}
+			accelerated, err := trainer.encodeSequence([]int32{1, 2, 3}, mask, trainer.queryRoleIndex(), nil, nil, nil, nil, nil, nil, nil, nil, false)
+			if err != nil {
+				t.Fatalf("accelerated encode with %s qkv fallback: %v", mode, err)
+			}
+			if fake.multiBoundRuns == 0 {
+				t.Fatalf("multi-bound runs = %d, want attempted QKV coalescing", fake.multiBoundRuns)
+			}
+			if fake.boundRightRuns <= 3 {
+				t.Fatalf("bound-right runs = %d, want fallback single-RHS matmuls after failed QKV coalescing", fake.boundRightRuns)
+			}
+
+			trainer.forwardMatMul = nil
+			host, err := trainer.encodeSequence([]int32{1, 2, 3}, mask, trainer.queryRoleIndex(), nil, nil, nil, nil, nil, nil, nil, nil, false)
+			if err != nil {
+				t.Fatalf("host encode: %v", err)
+			}
+			assertTensorClose(t, backend.NewTensorF32([]int{1, len(accelerated.pooled)}, accelerated.pooled), []int{1, len(host.pooled)}, host.pooled)
+		})
+	}
+}
+
 func TestVectorDistillRelationalLossRoutesSimilarityMatricesThroughMatMul(t *testing.T) {
 	trainer := newCompactEmbeddingTrainerForTest(t, 3)
 	matmulAccel := &fakeVectorDistillMatMulAccelerator{}
@@ -424,6 +530,53 @@ func TestVectorDistillRelationalLossRoutesSimilarityMatricesThroughMatMul(t *tes
 	}
 	for i := range gotGrads {
 		assertExactFloat32Slice(t, fmt.Sprintf("grad row %d", i), gotGrads[i], wantGrads[i])
+	}
+}
+
+func BenchmarkVectorDistillCompactForwardResidencyCounters(b *testing.B) {
+	for _, tc := range []struct {
+		name       string
+		disableQKV string
+	}{
+		{name: "qkv_multi_disabled", disableQKV: "1"},
+		{name: "qkv_multi_enabled", disableQKV: ""},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.Setenv("EOS_TRAIN_DISABLE_QKV_MULTI_BOUND", tc.disableQKV)
+			trainer := newCompactEmbeddingTrainerForTest(b, 3)
+			if trainer.forwardMatMul != nil {
+				trainer.forwardMatMul.Close()
+			}
+			fake := &countingMatMulAccelerator{}
+			trainer.forwardMatMul = fake
+			trainer.forwardBackend = eosartifact.BackendCUDA
+			trainer.optimizerAccel = nil
+			batch := []EmbeddingTokenizedVectorDistillExample{
+				vectorDistillTestExample("a", EmbeddingRoleQuery, []int32{1, 2, 3}, []float32{0.2, -0.1, 0.05, 0.3}),
+				vectorDistillTestExample("b", EmbeddingRoleDocument, []int32{3, 2, 1}, []float32{-0.1, 0.4, 0.2, -0.05}),
+			}
+			var proj *vectorDistillProjectionState
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				var err error
+				if _, proj, err = trainer.trainVectorDistillBatch(batch, proj, 4, EmbeddingRoleQuery, 0); err != nil {
+					b.Fatalf("trainVectorDistillBatch: %v", err)
+				}
+			}
+			b.StopTimer()
+			stats := trainer.ForwardResidencyStats()
+			steps := float64(b.N)
+			if steps == 0 {
+				steps = 1
+			}
+			b.ReportMetric(float64(stats.MatMul.BindCalls)/steps, "bind_calls/step")
+			b.ReportMetric(float64(stats.BindSkips)/steps, "bind_skips/step")
+			b.ReportMetric(float64(stats.MatMul.RunCalls)/steps, "matmul_rhs_runs/step")
+			b.ReportMetric(float64(stats.MatMul.BoundRightCalls)/steps, "bound_right/step")
+			b.ReportMetric(float64(stats.MatMul.RunUploadedBytes)/steps, "run_upload_B/step")
+			b.ReportMetric(float64(stats.MatMul.RunDownloadedBytes)/steps, "run_download_B/step")
+			b.ReportMetric(float64(fake.multiBoundRuns)/steps, "qkv_multi_dispatches/step")
+		})
 	}
 }
 
@@ -577,6 +730,35 @@ func (a *fakeVectorDistillMatMulAccelerator) Stats() backend.MatMulAcceleratorSt
 }
 
 func (a *fakeVectorDistillMatMulAccelerator) Close() {}
+
+type qkvFallbackMatMulAccelerator struct {
+	countingMatMulAccelerator
+	mode string
+}
+
+func (a *qkvFallbackMatMulAccelerator) RunMatMulWithBoundRights(lhs *backend.Tensor, rightNames []string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) ([]backend.StepDispatchResult, error) {
+	if a.mode == "backend_error" {
+		a.runCalls += len(rightNames)
+		a.multiBoundRuns++
+		a.boundRightRuns += len(rightNames)
+		return nil, fmt.Errorf("forced qkv multi-bound error")
+	}
+	results, err := a.countingMatMulAccelerator.RunMatMulWithBoundRights(lhs, rightNames, outputType, transposeLeft, transposeRight)
+	if err != nil {
+		return nil, err
+	}
+	switch a.mode {
+	case "wrong_order":
+		if len(results) >= 2 {
+			results[0], results[1] = results[1], results[0]
+		}
+	case "wrong_shape":
+		if len(results) > 0 && len(results[0].Outputs) == 1 && results[0].Outputs[0] != nil {
+			results[0].Outputs[0] = backend.NewTensorF32([]int{1, 1}, []float32{0})
+		}
+	}
+	return results, nil
+}
 
 type fakeVectorDistillOptimizerAccelerator struct {
 	stats backend.OptimizerAcceleratorStats

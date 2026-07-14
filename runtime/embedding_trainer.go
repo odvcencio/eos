@@ -339,6 +339,12 @@ type embeddingForwardWeights struct {
 }
 
 type compactEmbeddingForwardLayer struct {
+	attnQName      string
+	attnKName      string
+	attnVName      string
+	attnOName      string
+	ffnUpName      string
+	ffnDownName    string
 	attnQ          *backend.Tensor
 	attnK          *backend.Tensor
 	attnV          *backend.Tensor
@@ -350,10 +356,11 @@ type compactEmbeddingForwardLayer struct {
 }
 
 type compactEmbeddingForwardWeights struct {
-	token            *backend.Tensor
-	role             *backend.Tensor
-	layers           []compactEmbeddingForwardLayer
-	outputProjection *backend.Tensor
+	token                *backend.Tensor
+	role                 *backend.Tensor
+	layers               []compactEmbeddingForwardLayer
+	outputProjectionName string
+	outputProjection     *backend.Tensor
 }
 
 type compactEmbeddingGradLayer struct {
@@ -871,6 +878,46 @@ func (t *EmbeddingTrainer) primeForwardWeightResidency(attnQForward, attnKForwar
 		hidden: hiddenForward,
 		proj:   projForward,
 	}
+	t.forwardNeedsBind = false
+}
+
+func (t *EmbeddingTrainer) primeCompactForwardWeightResidency(forward *compactEmbeddingForwardWeights) {
+	if t == nil || t.forwardMatMul == nil || forward == nil {
+		return
+	}
+	if !t.forwardNeedsBind && t.boundForward.compact == forward {
+		t.forwardBindSkips++
+		return
+	}
+	for _, layer := range forward.layers {
+		bindings := []struct {
+			name   string
+			tensor *backend.Tensor
+		}{
+			{name: layer.attnQName, tensor: layer.attnQ},
+			{name: layer.attnKName, tensor: layer.attnK},
+			{name: layer.attnVName, tensor: layer.attnV},
+			{name: layer.attnOName, tensor: layer.attnO},
+			{name: layer.ffnUpName, tensor: layer.ffnUp},
+			{name: layer.ffnDownName, tensor: layer.ffnDown},
+		}
+		for _, binding := range bindings {
+			if binding.name == "" || binding.tensor == nil {
+				continue
+			}
+			if err := t.forwardMatMul.BindMatrix(binding.name, binding.tensor); err != nil {
+				t.Close()
+				return
+			}
+		}
+	}
+	if forward.outputProjectionName != "" && forward.outputProjection != nil {
+		if err := t.forwardMatMul.BindMatrix(forward.outputProjectionName, forward.outputProjection); err != nil {
+			t.Close()
+			return
+		}
+	}
+	t.boundForward = embeddingForwardWeights{compact: forward}
 	t.forwardNeedsBind = false
 }
 
@@ -6691,6 +6738,7 @@ func (t *EmbeddingTrainer) prepareCompactForwardWeights() *compactEmbeddingForwa
 		return nil
 	}
 	if t.compactForwardCache != nil && !t.forwardDirty {
+		t.primeCompactForwardWeightResidency(t.compactForwardCache)
 		return t.compactForwardCache
 	}
 	state := t.compactState
@@ -6703,6 +6751,12 @@ func (t *EmbeddingTrainer) prepareCompactForwardWeights() *compactEmbeddingForwa
 	}
 	for i, layer := range state.Layers {
 		forward.layers[i] = compactEmbeddingForwardLayer{
+			attnQName:      layer.AttentionQuery.Name,
+			attnKName:      layer.AttentionKey.Name,
+			attnVName:      layer.AttentionValue.Name,
+			attnOName:      layer.AttentionOutput.Name,
+			ffnUpName:      layer.FFNUp.Name,
+			ffnDownName:    layer.FFNDown.Name,
 			attnQ:          tensorAsMasterF32(layer.AttentionQuery.Tensor),
 			attnK:          tensorAsMasterF32(layer.AttentionKey.Tensor),
 			attnV:          tensorAsMasterF32(layer.AttentionValue.Tensor),
@@ -6714,10 +6768,12 @@ func (t *EmbeddingTrainer) prepareCompactForwardWeights() *compactEmbeddingForwa
 		}
 	}
 	if state.OutputProjection != nil {
+		forward.outputProjectionName = state.OutputProjection.Name
 		forward.outputProjection = tensorAsMasterF32(state.OutputProjection.Tensor)
 	}
 	t.compactForwardCache = forward
 	t.forwardDirty = false
+	t.primeCompactForwardWeightResidency(forward)
 	return forward
 }
 
@@ -7126,23 +7182,25 @@ func (t *EmbeddingTrainer) encodeCompactLayer(tokens, mask []int32, input []floa
 		normalized:   make([]float32, len(tokens)*d),
 		pooled:       make([]float32, d),
 	}
-	if out, ok := t.tryForwardMatMul(input, len(tokens), d, layer.attnQ, d); ok {
-		copy(state.attnQ, out)
-	} else {
-		fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnQ), d, state.attnQ)
-	}
-	if out, ok := t.tryForwardMatMul(input, len(tokens), d, layer.attnK, d); ok {
-		copy(state.attnK, out)
-	} else {
-		fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnK), d, state.attnK)
-	}
-	if out, ok := t.tryForwardMatMul(input, len(tokens), d, layer.attnV, d); ok {
-		copy(state.attnV, out)
-	} else {
-		fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnV), d, state.attnV)
+	if !t.fillCompactForwardQKVMatMul(state, len(tokens), d, layer) {
+		if out, ok := t.tryForwardWeightMatMul(input, len(tokens), d, layer.attnQName, layer.attnQ, d); ok {
+			copy(state.attnQ, out)
+		} else {
+			fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnQ), d, state.attnQ)
+		}
+		if out, ok := t.tryForwardWeightMatMul(input, len(tokens), d, layer.attnKName, layer.attnK, d); ok {
+			copy(state.attnK, out)
+		} else {
+			fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnK), d, state.attnK)
+		}
+		if out, ok := t.tryForwardWeightMatMul(input, len(tokens), d, layer.attnVName, layer.attnV, d); ok {
+			copy(state.attnV, out)
+		} else {
+			fillHostMatMul(input, len(tokens), d, forwardMatMulHostData(layer.attnV), d, state.attnV)
+		}
 	}
 	fillCompactMultiHeadAttention(state, len(tokens), d, heads, headDim, mask)
-	if out, ok := t.tryForwardMatMul(state.attnMixed, len(tokens), d, layer.attnO, d); ok {
+	if out, ok := t.tryForwardWeightMatMul(state.attnMixed, len(tokens), d, layer.attnOName, layer.attnO, d); ok {
 		copy(state.attnOutput, out)
 	} else {
 		fillHostMatMul(state.attnMixed, len(tokens), d, forwardMatMulHostData(layer.attnO), d, state.attnOutput)
@@ -7154,13 +7212,13 @@ func (t *EmbeddingTrainer) encodeCompactLayer(tokens, mask []int32, input []floa
 		base := row * d
 		layerNormRow(state.hidden[base:base+d], state.attnResidual[base:base+d])
 	}
-	if out, ok := t.tryForwardMatMul(state.hidden, len(tokens), d, layer.ffnUp, h); ok {
+	if out, ok := t.tryForwardWeightMatMul(state.hidden, len(tokens), d, layer.ffnUpName, layer.ffnUp, h); ok {
 		copy(state.ffnHidden, out)
 	} else {
 		fillHostMatMul(state.hidden, len(tokens), d, forwardMatMulHostData(layer.ffnUp), h, state.ffnHidden)
 	}
 	fillGELUForward(state.activated, state.ffnHidden, fastGELUEnabled())
-	if out, ok := t.tryForwardMatMul(state.activated, len(tokens), h, layer.ffnDown, d); ok {
+	if out, ok := t.tryForwardWeightMatMul(state.activated, len(tokens), h, layer.ffnDownName, layer.ffnDown, d); ok {
 		copy(state.ffnOutput, out)
 	} else {
 		fillHostMatMul(state.activated, len(tokens), h, forwardMatMulHostData(layer.ffnDown), d, state.ffnOutput)
@@ -7173,6 +7231,62 @@ func (t *EmbeddingTrainer) encodeCompactLayer(tokens, mask []int32, input []floa
 		layerNormRow(state.projected[base:base+d], state.ffnResidual[base:base+d])
 	}
 	return state, nil
+}
+
+func (t *EmbeddingTrainer) fillCompactForwardQKVMatMul(state *embeddingSequenceState, rows, width int, layer compactEmbeddingForwardLayer) bool {
+	if t == nil || t.forwardMatMul == nil || state == nil || rows == 0 || width == 0 || !qkvMultiBoundRightEnabled() {
+		return false
+	}
+	multi, ok := t.forwardMatMul.(backend.MultiBoundRightMatMulAccelerator)
+	if !ok {
+		return false
+	}
+	if layer.attnQName == "" || layer.attnKName == "" || layer.attnVName == "" {
+		return false
+	}
+	for _, tensor := range []*backend.Tensor{layer.attnQ, layer.attnK, layer.attnV} {
+		if tensor == nil || len(tensor.Shape) != 2 || tensor.Shape[0] != width || tensor.Shape[1] != width {
+			return false
+		}
+	}
+	perMatrix := rows * width
+	if len(state.input) != perMatrix || len(state.attnQ) != perMatrix || len(state.attnK) != perMatrix || len(state.attnV) != perMatrix {
+		return false
+	}
+	results, err := multi.RunMatMulWithBoundRights(
+		tensorF32View([]int{rows, width}, state.input),
+		[]string{layer.attnQName, layer.attnKName, layer.attnVName},
+		trainerF32TensorValueType(),
+		false,
+		false,
+	)
+	if err != nil || len(results) != 3 {
+		return false
+	}
+	targets := [][]float32{state.attnQ, state.attnK, state.attnV}
+	names := []string{layer.attnQName, layer.attnKName, layer.attnVName}
+	for i, result := range results {
+		if len(result.Outputs) != 1 || result.Outputs[0] == nil || len(result.Outputs[0].F32) != perMatrix {
+			return false
+		}
+		if !matMulResultMatchesRightBinding(result, names[i]) {
+			return false
+		}
+		copy(targets[i], result.Outputs[0].F32)
+	}
+	return true
+}
+
+func matMulResultMatchesRightBinding(result backend.StepDispatchResult, name string) bool {
+	if name == "" || result.Metadata == nil {
+		return true
+	}
+	got, ok := result.Metadata["rhs_binding"]
+	if !ok {
+		return true
+	}
+	binding, ok := got.(string)
+	return ok && binding == name
 }
 
 func compactLayerModelDim(layer compactEmbeddingForwardLayer) int {
@@ -7299,7 +7413,11 @@ func (t *EmbeddingTrainer) compactFinalOutputRows(hidden []float32, rows, modelD
 		return nil, fmt.Errorf("output_projection shape %v, want [%d O]", outputProjection.Shape, modelDim)
 	}
 	out := make([]float32, rows*outputProjection.Shape[1])
-	if accelerated, ok := t.tryForwardMatMul(normalized, rows, modelDim, outputProjection, outputProjection.Shape[1]); ok {
+	outputProjectionName := ""
+	if t != nil && t.compactForwardCache != nil && t.compactForwardCache.outputProjection == outputProjection {
+		outputProjectionName = t.compactForwardCache.outputProjectionName
+	}
+	if accelerated, ok := t.tryForwardWeightMatMul(normalized, rows, modelDim, outputProjectionName, outputProjection, outputProjection.Shape[1]); ok {
 		copy(out, accelerated)
 	} else {
 		fillHostMatMul(normalized, rows, modelDim, forwardMatMulHostData(outputProjection), outputProjection.Shape[1], out)
