@@ -817,6 +817,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -2144,8 +2145,11 @@ extern "C" __global__ void manta_bert_attention_context(
 
 type deviceRuntime struct {
 	ptr                         *C.EosCudaRuntime
+	bgeFullEncoderMu            sync.Mutex
 	residentMatrices            map[string]residentMatrix
 	bertResidentTensors         map[string]residentTensor
+	bertResidentCache           map[string]bertCUDAResidentBindingCache
+	bertSelectedContractCache   map[string]bertCUDASelectedContract
 	matMulScratch               map[string]deviceScratchBuffer
 	quantizeKernel              *auxKernel
 	gdnKernel                   *auxKernel
@@ -2218,7 +2222,7 @@ func newDeviceRuntime() (*deviceRuntime, error) {
 	if C.eosCudaRuntimeCreate(&rt, &errStr) != 0 {
 		return nil, cStringError(errStr)
 	}
-	return &deviceRuntime{ptr: rt, residentMatrices: map[string]residentMatrix{}, bertResidentTensors: map[string]residentTensor{}, matMulScratch: map[string]deviceScratchBuffer{}, graphCache: map[string]*cudaGraph{}}, nil
+	return &deviceRuntime{ptr: rt, residentMatrices: map[string]residentMatrix{}, bertResidentTensors: map[string]residentTensor{}, bertResidentCache: map[string]bertCUDAResidentBindingCache{}, bertSelectedContractCache: map[string]bertCUDASelectedContract{}, matMulScratch: map[string]deviceScratchBuffer{}, graphCache: map[string]*cudaGraph{}}, nil
 }
 
 func (rt *deviceRuntime) close() {
@@ -2232,6 +2236,12 @@ func (rt *deviceRuntime) close() {
 	for name, resident := range rt.bertResidentTensors {
 		_ = rt.freeBuffer(resident.ptr)
 		delete(rt.bertResidentTensors, name)
+	}
+	for name := range rt.bertResidentCache {
+		delete(rt.bertResidentCache, name)
+	}
+	for name := range rt.bertSelectedContractCache {
+		delete(rt.bertSelectedContractCache, name)
 	}
 	for name, scratch := range rt.matMulScratch {
 		_ = rt.freeBuffer(scratch.ptr)
@@ -4901,6 +4911,49 @@ func (rt *deviceRuntime) runBERTCLSL2(hiddenStates *backend.Tensor) (*backend.Te
 	return backend.NewTensorF32([]int{batch, hidden}, out), nil
 }
 
+func (rt *deviceRuntime) runBERTCLSL2Device(hiddenStates, out C.CUdeviceptr, batch, tokens, hidden int) error {
+	if rt == nil || rt.ptr == nil {
+		return fmt.Errorf("cuda runtime is not initialized")
+	}
+	if batch <= 0 || tokens <= 0 || hidden <= 0 {
+		return fmt.Errorf("cuda bert cls l2 device shape must be positive")
+	}
+	if err := checkedInt32Product("cuda bert cls l2 device hidden state offset", batch, tokens, hidden); err != nil {
+		return err
+	}
+	if err := checkedInt32Product("cuda bert cls l2 device output offset", batch, hidden); err != nil {
+		return err
+	}
+	batchArg, err := checkedCInt("cuda bert cls l2 device batch", batch)
+	if err != nil {
+		return err
+	}
+	tokensArg, err := checkedCInt("cuda bert cls l2 device tokens", tokens)
+	if err != nil {
+		return err
+	}
+	hiddenArg, err := checkedCInt("cuda bert cls l2 device hidden", hidden)
+	if err != nil {
+		return err
+	}
+	grid, block, err := checkedLaunch1D("cuda bert cls l2 device", batch, 128)
+	if err != nil {
+		return err
+	}
+	if rt.bertCLSL2Kernel == nil {
+		kernel, err := rt.compileAuxKernel(bertCLSL2KernelSource, "manta_bert_cls_l2")
+		if err != nil {
+			return err
+		}
+		rt.bertCLSL2Kernel = kernel
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchBERTCLSL2(rt.ptr, rt.bertCLSL2Kernel.ptr, grid, block, hiddenStates, out, batchArg, tokensArg, hiddenArg, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
 type bertCUDAOneLayerTransferStats struct {
 	UploadedBytes                 int64
 	DownloadedBytes               int64
@@ -5673,6 +5726,378 @@ func (rt *deviceRuntime) runBERTOneLayerResidentFixtureWithOptions(inputIDs, att
 	stats.FinalDownloadedBytes = int64(hiddenElements * 4)
 	stats.DownloadedBytes += stats.FinalDownloadedBytes
 	return backend.NewTensorF32([]int{batch, tokens, hidden}, out), stats, nil
+}
+
+func (rt *deviceRuntime) preflightBGEFullEncoder(step eosartifact.Step, inputs []*backend.Tensor) (bertCUDAResidentWeightPlan, bertCUDAFullEncoderTransferStats, error) {
+	stats := bertCUDAFullEncoderTransferStats{Layers: bgeSmallLayers}
+	plan, _, err := planBGEPretrainedBERTResidentWeights(step, inputs)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	if len(inputs) < 3 {
+		return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder expects token inputs")
+	}
+	batch, tokens := inputs[0].Shape[0], inputs[0].Shape[1]
+	maxBatchTokens, err := bertCUDAMaxBatchTokensFromEnv(bgeSmallMaxPositions * 64)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	stats.MaxBatchTokens = maxBatchTokens
+	rows, err := checkedProduct("cuda BGE full encoder batch tokens", batch, tokens)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	if rows > maxBatchTokens {
+		return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder batch tokens %d exceed EOS_BERT_CUDA_MAX_BATCH_TOKENS=%d", rows, maxBatchTokens)
+	}
+	for _, weight := range plan.Weights {
+		switch weight.Role {
+		case bertCUDAWeightDenseMatrix:
+			resident, ok := rt.residentMatrices[weight.Name]
+			if !ok {
+				if _, wrongKind := rt.bertResidentTensors[weight.Name]; wrongKind {
+					return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder %s is bound as tensor, want matrix", weight.Name)
+				}
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder resident matrix %q is not bound", weight.Name)
+			}
+			if err := validateResidentMatrixShapeProduct("cuda BGE full encoder "+weight.Name, resident); err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, err
+			}
+			if resident.rows != weight.Shape[0] || resident.cols != weight.Shape[1] {
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder matrix %q shape [%d,%d], want %v", weight.Name, resident.rows, resident.cols, weight.Shape)
+			}
+			bytes, err := checkedCUDABytes("cuda BGE full encoder resident matrix bytes "+weight.Name, resident.elements, 4)
+			if err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, err
+			}
+			stats.ResidentWeightBytesReferenced += int64(bytes)
+		default:
+			resident, ok := rt.bertResidentTensors[weight.Name]
+			if !ok {
+				if _, wrongKind := rt.residentMatrices[weight.Name]; wrongKind {
+					return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder %s is bound as matrix, want tensor", weight.Name)
+				}
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder resident tensor %q is not bound", weight.Name)
+			}
+			if err := validateResidentTensorShapeProduct("cuda BGE full encoder "+weight.Name, resident); err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, err
+			}
+			if len(resident.shape) != len(weight.Shape) {
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder tensor %q rank %d, want %d", weight.Name, len(resident.shape), len(weight.Shape))
+			}
+			for i := range weight.Shape {
+				if resident.shape[i] != weight.Shape[i] {
+					return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder tensor %q shape %v, want %v", weight.Name, resident.shape, weight.Shape)
+				}
+			}
+			bytes, err := checkedCUDABytes("cuda BGE full encoder resident tensor bytes "+weight.Name, resident.elements, 4)
+			if err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, err
+			}
+			stats.ResidentWeightBytesReferenced += int64(bytes)
+		}
+	}
+	hiddenElements, err := checkedProduct("cuda BGE full encoder hidden elements", rows, bgeSmallHiddenSize)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	intermediateElements, err := checkedProduct("cuda BGE full encoder intermediate elements", rows, bgeSmallIntermediateSize)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	hiddenWorkspaceElements, err := checkedProduct("cuda BGE full encoder hidden workspace elements", hiddenElements, 9)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	intermediateWorkspaceElements, err := checkedProduct("cuda BGE full encoder intermediate workspace elements", intermediateElements, 2)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	finalElements, err := checkedProduct("cuda BGE full encoder final elements", batch, bgeSmallHiddenSize)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	workspaceElements := 0
+	for _, addend := range []int{hiddenWorkspaceElements, intermediateWorkspaceElements, finalElements} {
+		if workspaceElements > int(^uint(0)>>1)-addend {
+			return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder workspace elements sum overflows int")
+		}
+		workspaceElements += addend
+	}
+	if workspaceBytes, err := checkedCUDABytes("cuda BGE full encoder workspace bytes", workspaceElements, 4); err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	} else {
+		stats.WorkspaceBytes = int64(workspaceBytes)
+	}
+	attentionJobs, err := checkedProduct("cuda BGE full encoder attention jobs", rows, bgeSmallHeads)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	for _, launch := range []struct {
+		label    string
+		elements int
+		block    uint
+	}{
+		{"cuda BGE full encoder embedding launch", rows, 128},
+		{"cuda BGE full encoder qkv bias launch", hiddenElements, 256},
+		{"cuda BGE full encoder attention launch", attentionJobs, 128},
+		{"cuda BGE full encoder gelu launch", intermediateElements, 256},
+		{"cuda BGE full encoder residual layernorm launch", rows, 128},
+		{"cuda BGE full encoder cls l2 launch", batch, 128},
+	} {
+		if _, _, err := checkedLaunch1D(launch.label, launch.elements, launch.block); err != nil {
+			return bertCUDAResidentWeightPlan{}, stats, err
+		}
+	}
+	return plan, stats, nil
+}
+
+func (rt *deviceRuntime) runBGEFullEncoderHidden(step eosartifact.Step, outputType eosartifact.ValueType, inputs []*backend.Tensor) (backend.StepDispatchResult, bertCUDAFullEncoderTransferStats, error) {
+	runStart := time.Now()
+	_, stats, err := rt.preflightBGEFullEncoder(step, inputs)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	inputIDs, attentionMask, tokenTypeIDs := inputs[0], inputs[1], inputs[2]
+	batch, tokens := inputIDs.Shape[0], inputIDs.Shape[1]
+	rows, err := checkedProduct("cuda BGE full encoder rows", batch, tokens)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	hiddenElements, err := checkedProduct("cuda BGE full encoder hidden elements", rows, bgeSmallHiddenSize)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	intermediateElements, err := checkedProduct("cuda BGE full encoder intermediate elements", rows, bgeSmallIntermediateSize)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	finalElements, err := checkedProduct("cuda BGE full encoder output elements", batch, bgeSmallHiddenSize)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+
+	inputBuf, err := rt.uploadInt32(inputIDs.I32)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	defer rt.freeBuffer(inputBuf)
+	maskBuf, err := rt.uploadInt32(attentionMask.I32)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	defer rt.freeBuffer(maskBuf)
+	typeBuf, err := rt.uploadInt32(tokenTypeIDs.I32)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	defer rt.freeBuffer(typeBuf)
+	statusBuf, err := rt.uploadInt32([]int32{0})
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	defer rt.freeBuffer(statusBuf)
+	inputUploadElements := 0
+	for _, addend := range []int{len(inputIDs.I32), len(attentionMask.I32), len(tokenTypeIDs.I32), 1} {
+		if inputUploadElements > int(^uint(0)>>1)-addend {
+			return backend.StepDispatchResult{}, stats, fmt.Errorf("cuda BGE full encoder input upload elements sum overflows int")
+		}
+		inputUploadElements += addend
+	}
+	inputUploadBytes, err := checkedCUDABytes("cuda BGE full encoder input upload bytes", inputUploadElements, 4)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	stats.InputUploadedBytes += int64(inputUploadBytes)
+	stats.UploadedBytes += stats.InputUploadedBytes
+
+	hiddenA, err := rt.matMulScratchFloat32("bge12_hidden_a", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	hiddenB, err := rt.matMulScratchFloat32("bge12_hidden_b", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	qBuf, err := rt.matMulScratchFloat32("bge12_q", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	kBuf, err := rt.matMulScratchFloat32("bge12_k", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	vBuf, err := rt.matMulScratchFloat32("bge12_v", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	contextBuf, err := rt.matMulScratchFloat32("bge12_context", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	attentionProjectedBuf, err := rt.matMulScratchFloat32("bge12_attention_projected", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	attentionLayerBuf, err := rt.matMulScratchFloat32("bge12_attention_layer", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	intermediateBuf, err := rt.matMulScratchFloat32("bge12_intermediate", intermediateElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	intermediateGELUBuf, err := rt.matMulScratchFloat32("bge12_intermediate_gelu", intermediateElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	outputProjectedBuf, err := rt.matMulScratchFloat32("bge12_output_projected", hiddenElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	finalBuf, err := rt.matMulScratchFloat32("bge12_final_embeddings", finalElements)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+
+	launched := false
+	defer func() {
+		if launched {
+			_ = rt.synchronize()
+		}
+	}()
+	if err := rt.runBERTEmbeddingAffineLayerNormDevice(step.Inputs[3], step.Inputs[4], step.Inputs[5], step.Inputs[6], step.Inputs[7], inputBuf, typeBuf, hiddenA, statusBuf, batch, tokens, bgeSmallLayerNormEpsilon); err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	launched = true
+	cur, next := hiddenA, hiddenB
+	layerSlot := func(layer int, offset int) string {
+		return step.Inputs[8+layer*16+offset]
+	}
+	for layer := 0; layer < bgeSmallLayers; layer++ {
+		for _, item := range []struct {
+			weightOffset int
+			biasOffset   int
+			out          C.CUdeviceptr
+		}{
+			{0, 1, qBuf},
+			{2, 3, kBuf},
+			{4, 5, vBuf},
+		} {
+			if err := rt.runResidentBERTGEMM(cur, rows, bgeSmallHiddenSize, layerSlot(layer, item.weightOffset), item.out, true); err != nil {
+				return backend.StepDispatchResult{}, stats, err
+			}
+			if err := rt.runBERTBiasAddDevice(item.out, layerSlot(layer, item.biasOffset), rows, bgeSmallHiddenSize); err != nil {
+				return backend.StepDispatchResult{}, stats, err
+			}
+		}
+		if err := rt.runBERTAttentionContextDevice(qBuf, kBuf, vBuf, maskBuf, contextBuf, batch, tokens, bgeSmallHiddenSize, bgeSmallHeads); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runResidentBERTGEMM(contextBuf, rows, bgeSmallHiddenSize, layerSlot(layer, 6), attentionProjectedBuf, true); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runBERTBiasAddDevice(attentionProjectedBuf, layerSlot(layer, 7), rows, bgeSmallHiddenSize); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runBERTResidualAffineLayerNormDevice(attentionProjectedBuf, cur, layerSlot(layer, 8), layerSlot(layer, 9), attentionLayerBuf, rows, bgeSmallHiddenSize, bgeSmallLayerNormEpsilon); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runResidentBERTGEMM(attentionLayerBuf, rows, bgeSmallHiddenSize, layerSlot(layer, 10), intermediateBuf, true); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runBERTBiasAddDevice(intermediateBuf, layerSlot(layer, 11), rows, bgeSmallIntermediateSize); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runBERTExactGELUDevice(intermediateBuf, intermediateGELUBuf, intermediateElements); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runResidentBERTGEMM(intermediateGELUBuf, rows, bgeSmallIntermediateSize, layerSlot(layer, 12), outputProjectedBuf, true); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runBERTBiasAddDevice(outputProjectedBuf, layerSlot(layer, 13), rows, bgeSmallHiddenSize); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		if err := rt.runBERTResidualAffineLayerNormDevice(outputProjectedBuf, attentionLayerBuf, layerSlot(layer, 14), layerSlot(layer, 15), next, rows, bgeSmallHiddenSize, bgeSmallLayerNormEpsilon); err != nil {
+			return backend.StepDispatchResult{}, stats, err
+		}
+		cur, next = next, cur
+	}
+	if err := rt.runBERTCLSL2Device(cur, finalBuf, batch, tokens, bgeSmallHiddenSize); err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	if err := rt.synchronize(); err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	launched = false
+	status := []int32{0}
+	if err := rt.downloadInt32(status, statusBuf); err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	stats.StatusDownloadedBytes = 4
+	stats.DownloadedBytes += 4
+	if status[0] != 0 {
+		return backend.StepDispatchResult{}, stats, fmt.Errorf("cuda BGE full encoder device status=%d", status[0])
+	}
+	out := make([]float32, finalElements)
+	if err := rt.downloadFloat32(out, finalBuf); err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	finalDownloadedBytes, err := checkedCUDABytes("cuda BGE full encoder final download bytes", len(out), 4)
+	if err != nil {
+		return backend.StepDispatchResult{}, stats, err
+	}
+	stats.FinalDownloadedBytes = int64(finalDownloadedBytes)
+	stats.DownloadedBytes += stats.FinalDownloadedBytes
+	stats.RunNanos = time.Since(runStart).Nanoseconds()
+	tensor := backend.NewTensorF32([]int{batch, bgeSmallHiddenSize}, out)
+	if outputType.Tensor != nil {
+		if outputType.Tensor.DType != "" && outputType.Tensor.DType != "f32" && outputType.Tensor.DType != "f16" {
+			return backend.StepDispatchResult{}, stats, fmt.Errorf("cuda BGE full encoder output dtype %q is not f32-compatible", outputType.Tensor.DType)
+		}
+		if len(outputType.Tensor.Shape) != 0 && len(outputType.Tensor.Shape) != len(tensor.Shape) {
+			return backend.StepDispatchResult{}, stats, fmt.Errorf("cuda BGE full encoder output rank %d does not match shape %v", len(outputType.Tensor.Shape), tensor.Shape)
+		}
+	}
+	return backend.StepDispatchResult{
+		Outputs:      []*backend.Tensor{tensor},
+		VariantEntry: "__builtin_cuda_bge_small_12layer_hidden_resident",
+		Metadata: map[string]any{
+			"execution_mode":                      "pretrained_bert_cuda_hidden_resident_12layer",
+			"selected_backend":                    "cuda",
+			"full_device_execution":               false,
+			"validated_device_encoder":            false,
+			"device_encoder_contract":             pretrainedBERTCUDAFoundationContract,
+			"device_encoder_contract_satisfied":   false,
+			"hidden_gate":                         "EOS_BERT_CUDA_12LAYER_HIDDEN",
+			"pooling":                             "cls",
+			"normalization":                       "l2",
+			"layers":                              bgeSmallLayers,
+			"hidden":                              bgeSmallHiddenSize,
+			"heads":                               bgeSmallHeads,
+			"intermediate":                        bgeSmallIntermediateSize,
+			"resident_uploaded_bytes":             stats.ResidentUploadedBytes,
+			"input_uploaded_bytes":                stats.InputUploadedBytes,
+			"uploaded_bytes":                      stats.UploadedBytes,
+			"downloaded_bytes":                    stats.DownloadedBytes,
+			"final_downloaded_bytes":              stats.FinalDownloadedBytes,
+			"status_downloaded_bytes":             stats.StatusDownloadedBytes,
+			"intermediate_downloaded_bytes":       stats.IntermediateDownloadedBytes,
+			"resident_weight_bytes_referenced":    stats.ResidentWeightBytesReferenced,
+			"resident_cache_hits":                 stats.ResidentCacheHits,
+			"resident_cache_misses":               stats.ResidentCacheMisses,
+			"resident_bind_nanos":                 stats.ResidentBindNanos,
+			"run_nanos":                           stats.RunNanos,
+			"cold_resident_bind":                  stats.ColdResidentBind,
+			"warm_resident_cache":                 !stats.ColdResidentBind,
+			"contract_fingerprint_sha256":         stats.ContractFingerprint,
+			"weight_fingerprint_sha256":           stats.WeightFingerprint,
+			"workspace_bytes":                     stats.WorkspaceBytes,
+			"max_batch_tokens":                    stats.MaxBatchTokens,
+			"opportunistic_device_ops_ignored":    true,
+			"public_device_encoder_claim_blocked": true,
+		},
+	}, stats, nil
 }
 
 // runCapturedGEMMBatch executes a batch of stream GEMMs. On a cache hit for

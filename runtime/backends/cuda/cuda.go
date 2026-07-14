@@ -6,6 +6,7 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"time"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
 	"m31labs.dev/eos/runtime/backend"
@@ -169,6 +170,125 @@ func bindResidentMatMulParams(mod *eosartifact.Module, weights map[string]backen
 	return resident, nil
 }
 
+func bindBGEPretrainedBERTResidents(device *deviceRuntime, step eosartifact.Step, inputs []*backend.Tensor, contract bertCUDASelectedContract) (bertCUDAResidentWeightPlan, bertCUDAResidentBindStats, error) {
+	start := time.Now()
+	stats := bertCUDAResidentBindStats{}
+	if device == nil {
+		return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("cuda BGE full encoder requires device runtime")
+	}
+	plan, _, err := planBGEPretrainedBERTResidentWeights(step, inputs)
+	if err != nil {
+		return bertCUDAResidentWeightPlan{}, stats, err
+	}
+	if device.bertResidentCache == nil {
+		device.bertResidentCache = map[string]bertCUDAResidentBindingCache{}
+	}
+	for _, weight := range plan.Weights {
+		tensor := inputs[weight.InputIndex]
+		bytes, err := checkedResidentTensorBytes(weight.Name, tensor)
+		if err != nil {
+			return bertCUDAResidentWeightPlan{}, stats, err
+		}
+		stats.ResidentWeightBytes += bytes
+		fingerprint := contract.WeightFingerprints[weight.InputIndex]
+		if fingerprint == "" {
+			fingerprint, err = tensorF32ContentFingerprint(tensor)
+			if err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("fingerprint BGE CUDA resident %q: %w", weight.Name, err)
+			}
+		}
+		if cached, ok := device.bertResidentCache[weight.Name]; ok && cached.DType == tensor.DType && cached.Fingerprint == fingerprint && cached.WeightSetGeneration == contract.Provenance.WeightSetGeneration && equalIntSlices(cached.Shape, tensor.Shape) && cachedResidentStillBound(device, weight) {
+			stats.CacheHits++
+			continue
+		}
+		stats.CacheMisses++
+		stats.UploadedBytes += bytes
+		switch weight.Role {
+		case bertCUDAWeightDenseMatrix:
+			if err := device.bindMatMulRight(weight.Name, tensor); err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("bind BGE CUDA resident matrix %q: %w", weight.Name, err)
+			}
+		default:
+			if err := device.bindBERTResidentTensor(weight.Name, tensor); err != nil {
+				return bertCUDAResidentWeightPlan{}, stats, fmt.Errorf("bind BGE CUDA resident tensor %q: %w", weight.Name, err)
+			}
+		}
+		device.bertResidentCache[weight.Name] = bertCUDAResidentBindingCache{
+			DType:               tensor.DType,
+			Shape:               append([]int(nil), tensor.Shape...),
+			Fingerprint:         fingerprint,
+			WeightSetGeneration: contract.Provenance.WeightSetGeneration,
+			Bytes:               bytes,
+		}
+	}
+	stats.ColdBind = stats.CacheMisses > 0
+	stats.BindNanos = time.Since(start).Nanoseconds()
+	return plan, stats, nil
+}
+
+func validateSelectedBGECUDAContractCached(device *deviceRuntime, mod *eosartifact.Module, step eosartifact.Step, inputs []*backend.Tensor) (bertCUDASelectedContract, error) {
+	if device == nil {
+		return bertCUDASelectedContract{}, fmt.Errorf("cuda BGE full encoder requires device runtime")
+	}
+	contract, err := validateSelectedBGECUDAContract(mod, step, inputs)
+	if err != nil {
+		return bertCUDASelectedContract{}, err
+	}
+	cacheKey, err := bgeSelectedContractCacheKey(mod, step, inputs, contract.Provenance, contract.WeightFingerprint)
+	if err != nil {
+		return bertCUDASelectedContract{}, err
+	}
+	if device.bertSelectedContractCache == nil {
+		device.bertSelectedContractCache = map[string]bertCUDASelectedContract{}
+	}
+	if cached, ok := device.bertSelectedContractCache[cacheKey]; ok {
+		if cached.ContractFingerprint != contract.ContractFingerprint || cached.WeightFingerprint != contract.WeightFingerprint || cached.Provenance.WeightSetGeneration != contract.Provenance.WeightSetGeneration {
+			return bertCUDASelectedContract{}, fmt.Errorf("selected BGE CUDA contract cache entry mismatch")
+		}
+		cached.CacheHit = true
+		return cached, nil
+	}
+	contract.CacheKey = cacheKey
+	device.bertSelectedContractCache[cacheKey] = contract
+	return contract, nil
+}
+
+func checkedResidentTensorBytes(name string, tensor *backend.Tensor) (int64, error) {
+	if tensor == nil {
+		return 0, fmt.Errorf("BGE CUDA resident %q tensor is nil", name)
+	}
+	if err := checkedShapeProduct("BGE CUDA resident "+name, tensor.Shape, len(tensor.F32)); err != nil {
+		return 0, err
+	}
+	if len(tensor.F32) > int(^uint(0)>>1)/4 {
+		return 0, fmt.Errorf("BGE CUDA resident %q byte count overflows int", name)
+	}
+	return int64(len(tensor.F32) * 4), nil
+}
+
+func cachedResidentStillBound(device *deviceRuntime, weight bertCUDAResidentWeight) bool {
+	switch weight.Role {
+	case bertCUDAWeightDenseMatrix:
+		_, ok := device.residentMatrices[weight.Name]
+		return ok
+	default:
+		_, ok := device.bertResidentTensors[weight.Name]
+		return ok
+	}
+}
+
+func equalIntSlices(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func matMulParamInputs(mod *eosartifact.Module) map[string]bool {
 	params := make(map[string]bool, len(mod.Params))
 	for _, param := range mod.Params {
@@ -270,6 +390,65 @@ func (e *executor) dispatchKernel(_ context.Context, kernel eosartifact.Kernel, 
 
 func (e *executor) dispatchStep(_ context.Context, step eosartifact.Step, outputType eosartifact.ValueType, inputs []*backend.Tensor) (backend.StepDispatchResult, bool, error) {
 	switch step.Kind {
+	case eosartifact.StepBERTEmbedder:
+		if !bertCUDA12LayerHiddenGateEnabled() {
+			return backend.StepDispatchResult{}, false, nil
+		}
+		if e.device == nil {
+			return backend.StepDispatchResult{}, true, fmt.Errorf("cuda BGE full encoder hidden gate requested but device runtime is unavailable")
+		}
+		e.device.bgeFullEncoderMu.Lock()
+		defer e.device.bgeFullEncoderMu.Unlock()
+		contract, err := validateSelectedBGECUDAContractCached(e.device, e.module, step, inputs)
+		if err != nil {
+			return backend.StepDispatchResult{}, true, err
+		}
+		_, bindStats, err := bindBGEPretrainedBERTResidents(e.device, step, inputs, contract)
+		if err != nil {
+			return backend.StepDispatchResult{}, true, err
+		}
+		result, stats, err := e.device.runBGEFullEncoderHidden(step, outputType, inputs)
+		if err != nil {
+			return backend.StepDispatchResult{}, true, err
+		}
+		if result.Metadata == nil {
+			result.Metadata = map[string]any{}
+		}
+		stats.ResidentUploadedBytes = bindStats.UploadedBytes
+		stats.ResidentWeightBytesReferenced = bindStats.ResidentWeightBytes
+		stats.ResidentCacheHits = bindStats.CacheHits
+		stats.ResidentCacheMisses = bindStats.CacheMisses
+		stats.ResidentBindNanos = bindStats.BindNanos
+		stats.ColdResidentBind = bindStats.ColdBind
+		stats.ContractFingerprint = contract.ContractFingerprint
+		stats.WeightFingerprint = contract.WeightFingerprint
+		stats.UploadedBytes += stats.ResidentUploadedBytes
+		result.Metadata["resident_uploaded_bytes"] = stats.ResidentUploadedBytes
+		result.Metadata["uploaded_bytes"] = stats.UploadedBytes
+		result.Metadata["resident_weight_bytes_referenced"] = stats.ResidentWeightBytesReferenced
+		result.Metadata["resident_cache_hits"] = stats.ResidentCacheHits
+		result.Metadata["resident_cache_misses"] = stats.ResidentCacheMisses
+		result.Metadata["resident_bind_nanos"] = stats.ResidentBindNanos
+		result.Metadata["cold_resident_bind"] = stats.ColdResidentBind
+		result.Metadata["warm_resident_cache"] = !stats.ColdResidentBind
+		result.Metadata["contract_fingerprint_sha256"] = stats.ContractFingerprint
+		result.Metadata["weight_fingerprint_sha256"] = stats.WeightFingerprint
+		result.Metadata["contract_cache_hit"] = contract.CacheHit
+		result.Metadata["package_sha256"] = contract.Provenance.PackageSHA256
+		result.Metadata["package_identity_sha256"] = contract.Provenance.PackageIdentity
+		result.Metadata["module_sha256"] = contract.Provenance.ModuleSHA256
+		result.Metadata["weights_sha256"] = contract.Provenance.WeightsSHA256
+		result.Metadata["weight_set_generation"] = contract.Provenance.WeightSetGeneration
+		result.Metadata["retrieval_role_schema"] = contract.Provenance.RoleSchema
+		result.Metadata["retrieval_query_role"] = contract.Provenance.QueryRole
+		result.Metadata["retrieval_document_role"] = contract.Provenance.DocumentRole
+		result.Metadata["retrieval_query_prefix"] = contract.Provenance.QueryPrefix
+		result.Metadata["retrieval_document_prefix"] = contract.Provenance.DocumentPrefix
+		result.Metadata["pooling"] = contract.Provenance.Pooling
+		result.Metadata["normalization"] = contract.Provenance.Normalization
+		result.Metadata["max_length"] = contract.Provenance.MaxLength
+		result.Metadata["native_dim"] = contract.Provenance.NativeDim
+		return result, true, nil
 	case eosartifact.StepMatMul:
 		if e.device == nil {
 			return backend.StepDispatchResult{}, false, nil

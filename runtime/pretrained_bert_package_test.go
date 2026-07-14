@@ -1,6 +1,9 @@
 package eosruntime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"os"
 	"strings"
 	"testing"
 )
@@ -164,5 +167,48 @@ func TestPretrainedBERTPackageIdentityIncludesRetrievalRoleContract(t *testing.T
 	withoutContract := pkg.IdentityHash()
 	if withContract == withoutContract {
 		t.Fatalf("identity did not change when retrieval contract was removed: %q", withContract)
+	}
+}
+
+func TestLoadPretrainedBERTPackageRuntimeArtifactsAttachesVerifiedProvenance(t *testing.T) {
+	sourceDir, modulePath, weightsPath := writeTinyPretrainedBERTExportFixture(t)
+	packagePath := writeTinyPretrainedBERTPackageFromFixture(t, sourceDir, modulePath, weightsPath)
+	artifacts, err := LoadPretrainedBERTPackageRuntimeArtifacts(packagePath)
+	if err != nil {
+		t.Fatalf("load runtime artifacts: %v", err)
+	}
+	data, err := os.ReadFile(packagePath)
+	if err != nil {
+		t.Fatalf("read package: %v", err)
+	}
+	sum := sha256.Sum256(data)
+	wantPackageSHA := hex.EncodeToString(sum[:])
+	if artifacts.PackageSHA256 != wantPackageSHA {
+		t.Fatalf("package sha = %s, want %s", artifacts.PackageSHA256, wantPackageSHA)
+	}
+	if artifacts.WeightSetGeneration == "" {
+		t.Fatal("weight generation is empty")
+	}
+	meta := artifacts.Module.Metadata
+	if meta[PretrainedBERTPackageMetadataVerified] != true {
+		t.Fatalf("verified metadata = %v, want true", meta[PretrainedBERTPackageMetadataVerified])
+	}
+	for _, item := range []struct {
+		key  string
+		want string
+	}{
+		{PretrainedBERTPackageMetadataProvenanceVersion, PretrainedBERTPackageRuntimeProvenanceVersion},
+		{PretrainedBERTPackageMetadataSHA256, artifacts.PackageSHA256},
+		{PretrainedBERTPackageMetadataIdentitySHA256, artifacts.Package.IdentitySHA256},
+		{PretrainedBERTPackageMetadataModuleSHA256, artifacts.Package.ModuleSHA256},
+		{PretrainedBERTPackageMetadataWeightsSHA256, artifacts.Package.WeightsSHA256},
+		{PretrainedBERTPackageMetadataWeightGeneration, artifacts.WeightSetGeneration},
+	} {
+		if got, _ := meta[item.key].(string); got != item.want {
+			t.Fatalf("%s metadata = %q, want %q", item.key, got, item.want)
+		}
+	}
+	if _, _, err := artifacts.Package.moduleWithRuntimeProvenance("not-a-sha"); err == nil || !strings.Contains(err.Error(), "package sha256") {
+		t.Fatalf("moduleWithRuntimeProvenance malformed sha err = %v, want package sha256 rejection", err)
 	}
 }

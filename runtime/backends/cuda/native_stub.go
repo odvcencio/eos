@@ -3,11 +3,58 @@
 package cuda
 
 import (
+	"fmt"
+	"sync"
+
 	eosartifact "m31labs.dev/eos/artifact/eos"
 	"m31labs.dev/eos/runtime/backend"
 )
 
-type deviceRuntime struct{}
+type deviceRuntime struct {
+	bgeFullEncoderMu          sync.Mutex
+	residentMatrices          map[string]residentMatrix
+	bertResidentTensors       map[string]residentTensor
+	bertResidentCache         map[string]bertCUDAResidentBindingCache
+	bertSelectedContractCache map[string]bertCUDASelectedContract
+}
+
+type residentMatrix struct {
+	ptr      uintptr
+	rows     int
+	cols     int
+	elements int
+}
+
+type residentTensor struct {
+	shape    []int
+	elements int
+}
+
+type residentOptimizerState struct {
+	param      uintptr
+	elements   int
+	generation uint64
+}
+
+type optimizerResidentParameterToken struct{}
+
+func (t *optimizerResidentParameterToken) OptimizerResidentParameterToken() {}
+
+func (t *optimizerResidentParameterToken) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (t *optimizerResidentParameterToken) Generation() uint64 {
+	return 0
+}
+
+func (t *optimizerResidentParameterToken) Alive() bool {
+	return false
+}
+
+func (t *optimizerResidentParameterToken) lockCurrent() (residentOptimizerState, func(), error) {
+	return residentOptimizerState{}, nil, fmt.Errorf("cuda optimizer resident token is unavailable without linux cgo")
+}
 
 func newDeviceRuntime() (*deviceRuntime, error) {
 	return nil, nil
@@ -88,6 +135,10 @@ func (rt *deviceRuntime) bindMatMulRight(name string, tensor *backend.Tensor) er
 	return nil
 }
 
+func (rt *deviceRuntime) bindBERTResidentTensor(name string, tensor *backend.Tensor) error {
+	return nil
+}
+
 func (rt *deviceRuntime) unbindMatMulRight(name string) error {
 	return nil
 }
@@ -110,4 +161,8 @@ func (rt *deviceRuntime) runAccumulatedMatMulsWithBoundRights(lhs []*backend.Ten
 
 func (rt *deviceRuntime) runMatMulWithBoundLeft(leftName string, rhs *backend.Tensor, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (backend.StepDispatchResult, error) {
 	return backend.StepDispatchResult{}, nil
+}
+
+func (rt *deviceRuntime) runBGEFullEncoderHidden(step eosartifact.Step, outputType eosartifact.ValueType, inputs []*backend.Tensor) (backend.StepDispatchResult, bertCUDAFullEncoderTransferStats, error) {
+	return backend.StepDispatchResult{}, bertCUDAFullEncoderTransferStats{}, nil
 }

@@ -17,6 +17,26 @@ import (
 
 const PretrainedBERTPackageVersion = "manta/pretrained-bert-package/v0alpha1"
 const PretrainedBERTRetrievalRoleContractSchema = "manta.pretrained_bert_retrieval_role_contract.v1"
+const PretrainedBERTPackageRuntimeProvenanceVersion = "manta/pretrained-bert-package-runtime-provenance/v1"
+
+const (
+	PretrainedBERTPackageMetadataProvenanceVersion = "pretrained_bert_package_provenance_version"
+	PretrainedBERTPackageMetadataVerified          = "pretrained_bert_package_provenance_verified"
+	PretrainedBERTPackageMetadataSHA256            = "pretrained_bert_package_sha256"
+	PretrainedBERTPackageMetadataIdentitySHA256    = "pretrained_bert_package_identity_sha256"
+	PretrainedBERTPackageMetadataModuleSHA256      = "pretrained_bert_package_module_sha256"
+	PretrainedBERTPackageMetadataWeightsSHA256     = "pretrained_bert_package_weights_sha256"
+	PretrainedBERTPackageMetadataWeightGeneration  = "pretrained_bert_package_weight_set_generation"
+	PretrainedBERTPackageMetadataRoleSchema        = "pretrained_bert_retrieval_role_schema"
+	PretrainedBERTPackageMetadataQueryRole         = "pretrained_bert_retrieval_query_role"
+	PretrainedBERTPackageMetadataDocumentRole      = "pretrained_bert_retrieval_document_role"
+	PretrainedBERTPackageMetadataQueryPrefix       = "pretrained_bert_retrieval_query_prefix"
+	PretrainedBERTPackageMetadataDocumentPrefix    = "pretrained_bert_retrieval_document_prefix"
+	PretrainedBERTPackageMetadataContractPooling   = "pretrained_bert_retrieval_pooling"
+	PretrainedBERTPackageMetadataNormalization     = "pretrained_bert_retrieval_normalization"
+	PretrainedBERTPackageMetadataMaxLength         = "pretrained_bert_retrieval_max_length"
+	PretrainedBERTPackageMetadataNativeDim         = "pretrained_bert_retrieval_native_dim"
+)
 
 var tagXPBT = [4]byte{'X', 'P', 'B', 'T'}
 
@@ -65,6 +85,14 @@ type PretrainedBERTPackage struct {
 	STPoolingConfigJSON    []byte                               `json:"sentence_transformers_pooling_config_json,omitempty"`
 	SentenceBERTConfigJSON []byte                               `json:"sentence_bert_config_json,omitempty"`
 	IdentitySHA256         string                               `json:"identity_sha256"`
+}
+
+type PretrainedBERTPackageRuntimeArtifacts struct {
+	Package             PretrainedBERTPackage
+	PackageSHA256       string
+	Module              *eosartifact.Module
+	Weights             WeightFile
+	WeightSetGeneration string
 }
 
 type PretrainedBERTPackageExportReport struct {
@@ -223,6 +251,28 @@ func ReadPretrainedBERTPackageFile(path string) (PretrainedBERTPackage, error) {
 	return pkg, err
 }
 
+func LoadPretrainedBERTPackageRuntimeArtifacts(path string) (PretrainedBERTPackageRuntimeArtifacts, error) {
+	pkg, packageSHA, err := readPretrainedBERTPackageFileWithSHA256(path)
+	if err != nil {
+		return PretrainedBERTPackageRuntimeArtifacts{}, err
+	}
+	module, generation, err := pkg.moduleWithRuntimeProvenance(packageSHA)
+	if err != nil {
+		return PretrainedBERTPackageRuntimeArtifacts{}, err
+	}
+	weights, err := pkg.Weights()
+	if err != nil {
+		return PretrainedBERTPackageRuntimeArtifacts{}, err
+	}
+	return PretrainedBERTPackageRuntimeArtifacts{
+		Package:             pkg,
+		PackageSHA256:       packageSHA,
+		Module:              module,
+		Weights:             weights,
+		WeightSetGeneration: generation,
+	}, nil
+}
+
 func readPretrainedBERTPackageFileWithSHA256(path string) (PretrainedBERTPackage, string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -252,11 +302,109 @@ func readPretrainedBERTPackageFileWithSHA256(path string) (PretrainedBERTPackage
 	return pkg, sha256BytesHex(data), nil
 }
 
+func validatePretrainedBERTPackageSHA256(label, value string) error {
+	if len(value) != sha256.Size*2 {
+		return fmt.Errorf("pretrained BERT %s sha256 must be %d hex chars", label, sha256.Size*2)
+	}
+	sum, err := hex.DecodeString(value)
+	if err != nil {
+		return fmt.Errorf("pretrained BERT %s sha256 is invalid: %w", label, err)
+	}
+	if len(sum) != sha256.Size {
+		return fmt.Errorf("pretrained BERT %s sha256 bytes = %d, want %d", label, len(sum), sha256.Size)
+	}
+	return nil
+}
+
 func (p PretrainedBERTPackage) Module() (*eosartifact.Module, error) {
 	if len(p.ModuleBytes) == 0 {
 		return nil, fmt.Errorf("pretrained BERT package missing module bytes")
 	}
 	return eosartifact.DecodeMLL(p.ModuleBytes)
+}
+
+func (p PretrainedBERTPackage) moduleWithRuntimeProvenance(packageSHA string) (*eosartifact.Module, string, error) {
+	if err := validatePretrainedBERTPackageSHA256("package", packageSHA); err != nil {
+		return nil, "", err
+	}
+	if err := p.Validate(); err != nil {
+		return nil, "", err
+	}
+	module, err := p.Module()
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := p.Weights(); err != nil {
+		return nil, "", err
+	}
+	generation, err := p.weightSetGeneration(packageSHA)
+	if err != nil {
+		return nil, "", err
+	}
+	if module.Metadata == nil {
+		module.Metadata = map[string]any{}
+	}
+	module.Metadata[PretrainedBERTPackageMetadataProvenanceVersion] = PretrainedBERTPackageRuntimeProvenanceVersion
+	module.Metadata[PretrainedBERTPackageMetadataVerified] = true
+	module.Metadata[PretrainedBERTPackageMetadataSHA256] = packageSHA
+	module.Metadata[PretrainedBERTPackageMetadataIdentitySHA256] = p.IdentitySHA256
+	module.Metadata[PretrainedBERTPackageMetadataModuleSHA256] = p.ModuleSHA256
+	module.Metadata[PretrainedBERTPackageMetadataWeightsSHA256] = p.WeightsSHA256
+	module.Metadata[PretrainedBERTPackageMetadataWeightGeneration] = generation
+	module.Metadata[PretrainedBERTPackageMetadataNormalization] = p.Normalization
+	module.Metadata[PretrainedBERTPackageMetadataMaxLength] = p.MaxLength
+	module.Metadata[PretrainedBERTPackageMetadataNativeDim] = p.NativeDim
+	if p.RetrievalRoleContract != nil {
+		module.Metadata[PretrainedBERTPackageMetadataRoleSchema] = p.RetrievalRoleContract.Schema
+		module.Metadata[PretrainedBERTPackageMetadataQueryRole] = p.RetrievalRoleContract.QueryRole
+		module.Metadata[PretrainedBERTPackageMetadataDocumentRole] = p.RetrievalRoleContract.DocumentRole
+		module.Metadata[PretrainedBERTPackageMetadataQueryPrefix] = p.RetrievalRoleContract.QueryPrefix
+		module.Metadata[PretrainedBERTPackageMetadataDocumentPrefix] = p.RetrievalRoleContract.DocumentPrefix
+		module.Metadata[PretrainedBERTPackageMetadataContractPooling] = p.RetrievalRoleContract.Pooling
+	}
+	return module, generation, nil
+}
+
+func (p PretrainedBERTPackage) weightSetGeneration(packageSHA string) (string, error) {
+	if err := validatePretrainedBERTPackageSHA256("package", packageSHA); err != nil {
+		return "", err
+	}
+	if err := p.Validate(); err != nil {
+		return "", err
+	}
+	payload := struct {
+		Version               string                               `json:"version"`
+		PackageSHA256         string                               `json:"package_sha256"`
+		IdentitySHA256        string                               `json:"identity_sha256"`
+		ModuleSHA256          string                               `json:"module_sha256"`
+		WeightsSHA256         string                               `json:"weights_sha256"`
+		ModelName             string                               `json:"model_name,omitempty"`
+		Architecture          string                               `json:"architecture,omitempty"`
+		Pooling               string                               `json:"pooling,omitempty"`
+		Normalization         string                               `json:"normalization,omitempty"`
+		MaxLength             int                                  `json:"max_length"`
+		NativeDim             int                                  `json:"native_dim"`
+		RetrievalRoleContract *PretrainedBERTRetrievalRoleContract `json:"retrieval_role_contract,omitempty"`
+	}{
+		Version:               PretrainedBERTPackageRuntimeProvenanceVersion,
+		PackageSHA256:         packageSHA,
+		IdentitySHA256:        p.IdentitySHA256,
+		ModuleSHA256:          p.ModuleSHA256,
+		WeightsSHA256:         p.WeightsSHA256,
+		ModelName:             p.ModelName,
+		Architecture:          p.Architecture,
+		Pooling:               p.Pooling,
+		Normalization:         p.Normalization,
+		MaxLength:             p.MaxLength,
+		NativeDim:             p.NativeDim,
+		RetrievalRoleContract: clonePretrainedBERTRetrievalRoleContract(p.RetrievalRoleContract),
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (p PretrainedBERTPackage) Weights() (WeightFile, error) {

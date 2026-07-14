@@ -268,7 +268,7 @@ func loadPretrainedBERTTextEmbedderFromValidatedPackage(ctx context.Context, cfg
 	if err != nil {
 		return nil, err
 	}
-	module, err := pkg.Module()
+	module, _, err := pkg.moduleWithRuntimeProvenance(packageSHA)
 	if err != nil {
 		return nil, err
 	}
