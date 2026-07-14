@@ -5,6 +5,8 @@ import (
 	"m31labs.dev/eos/runtime/backend"
 )
 
-func newTrainerMatMulAccelerator() (backend.MatMulAccelerator, eosartifact.BackendKind, error) {
+var newTrainerMatMulAccelerator = defaultTrainerMatMulAccelerator
+
+func defaultTrainerMatMulAccelerator() (backend.MatMulAccelerator, eosartifact.BackendKind, error) {
 	return backend.NewPreferredMatMulAccelerator(eosartifact.BackendCUDA, eosartifact.BackendMetal)
 }

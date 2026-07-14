@@ -340,7 +340,7 @@ type CompactForwardAccelerator struct {
 	device    *deviceRuntime
 	kernels   compactForwardKernels
 	bindings  compactForwardBindings
-	stats     CompactForwardStats
+	stats     backend.CompactForwardAcceleratorStats
 	useRoPE   bool
 	tokenName string
 	roleName  string
@@ -356,27 +356,6 @@ type CompactForwardLayerNames struct {
 	AttentionO string
 	FFNUp      string
 	FFNDown    string
-}
-
-type CompactForwardStats struct {
-	RunCalls                    int64
-	UnhandledCalls              int64
-	UploadedBytes               int64
-	DownloadedBytes             int64
-	StatusDownloadedBytes       int64
-	IntermediateDownloadedBytes int64
-	PackedDownloads             int64
-	IntermediateD2H             int64
-	KernelLaunches              int64
-	KernelSynchronizations      int64
-	RunNanos                    int64
-	LastPackedFloats            int
-	LastPackedBytes             int64
-	LastUploadBytes             int64
-	LastDownloadBytes           int64
-	LastStatusDownloadedBytes   int64
-	LastKernelLaunches          int64
-	LastKernelSynchronizations  int64
 }
 
 type compactForwardKernels struct {
@@ -404,6 +383,12 @@ type compactForwardLayerBinding struct {
 	o    residentMatrix
 	up   residentMatrix
 	down residentMatrix
+}
+
+func init() {
+	backend.RegisterCompactForwardAccelerator(eosartifact.BackendCUDA, func() (backend.CompactForwardAccelerator, error) {
+		return NewCompactForwardAccelerator()
+	})
 }
 
 func NewCompactForwardAccelerator() (*CompactForwardAccelerator, error) {
@@ -481,13 +466,23 @@ func (a *CompactForwardAccelerator) Close() {
 	a.device = nil
 }
 
-func (a *CompactForwardAccelerator) Stats() CompactForwardStats {
+func (a *CompactForwardAccelerator) Stats() backend.CompactForwardAcceleratorStats {
 	if a == nil {
-		return CompactForwardStats{}
+		return backend.CompactForwardAcceleratorStats{}
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.stats
+}
+
+func (a *CompactForwardAccelerator) ConfigureCompactForward(names []backend.CompactForwardLayerConfig, tokenName, roleName, outputProjectionName string, useRoPE bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.layers = append(a.layers[:0], compactForwardLayerNamesFromBackend(names)...)
+	a.tokenName = tokenName
+	a.roleName = roleName
+	a.outName = outputProjectionName
+	a.useRoPE = useRoPE
 }
 
 func (a *CompactForwardAccelerator) Configure(names []CompactForwardLayerNames, tokenName, roleName, outputProjectionName string, useRoPE bool) {
@@ -500,6 +495,25 @@ func (a *CompactForwardAccelerator) Configure(names []CompactForwardLayerNames, 
 	a.useRoPE = useRoPE
 }
 
+func compactForwardLayerNamesFromBackend(names []backend.CompactForwardLayerConfig) []CompactForwardLayerNames {
+	out := make([]CompactForwardLayerNames, len(names))
+	for i, name := range names {
+		out[i] = CompactForwardLayerNames{
+			AttentionQ: name.AttentionQ,
+			AttentionK: name.AttentionK,
+			AttentionV: name.AttentionV,
+			AttentionO: name.AttentionO,
+			FFNUp:      name.FFNUp,
+			FFNDown:    name.FFNDown,
+		}
+	}
+	return out
+}
+
+func (a *CompactForwardAccelerator) BindCompactForwardResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
+	return a.BindResident(name, tensor, ref)
+}
+
 func (a *CompactForwardAccelerator) BindResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
 	if a == nil {
 		return fmt.Errorf("cuda compact forward accelerator is not initialized")
@@ -507,6 +521,38 @@ func (a *CompactForwardAccelerator) BindResident(name string, tensor *backend.Te
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.bindResidentLocked(name, tensor, ref)
+}
+
+func (a *CompactForwardAccelerator) PreflightCompactForward(req backend.CompactForwardRequest) error {
+	if a == nil {
+		return fmt.Errorf("cuda compact forward accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.device == nil {
+		return fmt.Errorf("cuda compact forward accelerator is closed")
+	}
+	shape := req.Shape
+	if err := validateCompactForwardShape(shape); err != nil {
+		return err
+	}
+	if err := validateCompactForwardInputs(shape, req.Tokens, req.Masks, req.Roles); err != nil {
+		return err
+	}
+	if _, err := compactForwardGELUFast(req.GELUMode); err != nil {
+		return err
+	}
+	if len(a.layers) != shape.Layers || len(a.bindings.layer) != shape.Layers {
+		return fmt.Errorf("cuda compact forward layer bindings %d, want %d", len(a.layers), shape.Layers)
+	}
+	if err := a.validateBindings(shape); err != nil {
+		return err
+	}
+	if err := a.preflightResidentRefs(req.ResidentRefs, shape); err != nil {
+		return err
+	}
+	_, _, err := compactForwardPackedLayout(shape)
+	return err
 }
 
 func (a *CompactForwardAccelerator) bindResidentLocked(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
@@ -823,6 +869,7 @@ func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactF
 	a.stats.DownloadedBytes += downloaded
 	a.stats.StatusDownloadedBytes += statusBytes
 	a.stats.PackedDownloads++
+	a.stats.PackedBytes += packedBytes
 	a.stats.LastPackedFloats = total
 	a.stats.LastPackedBytes = packedBytes
 	a.stats.LastUploadBytes = uploaded

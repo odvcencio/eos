@@ -17,17 +17,20 @@ var tagXTPR = [4]byte{'X', 'T', 'P', 'R'}
 
 // EmbeddingTrainProfile captures trainer-side residency and backend prep activity at a point in time.
 type EmbeddingTrainProfile struct {
-	Version             string                              `json:"version"`
-	Step                int                                 `json:"step"`
-	ForwardBackend      eosartifact.BackendKind             `json:"forward_backend,omitempty"`
-	OptimizerBackend    eosartifact.BackendKind             `json:"optimizer_backend,omitempty"`
-	ActivationBackend   eosartifact.BackendKind             `json:"activation_backend,omitempty"`
-	ContrastiveBackend  eosartifact.BackendKind             `json:"contrastive_backend,omitempty"`
-	ForwardResidency    EmbeddingForwardResidencyStats      `json:"forward_residency"`
-	VectorDistillPhases EmbeddingVectorDistillPhaseTimers   `json:"vector_distill_phases,omitempty"`
-	Optimizer           backend.OptimizerAcceleratorStats   `json:"optimizer"`
-	Activation          backend.ActivationAcceleratorStats  `json:"activation"`
-	Contrastive         backend.ContrastiveAcceleratorStats `json:"contrastive"`
+	Version               string                                  `json:"version"`
+	Step                  int                                     `json:"step"`
+	ForwardBackend        eosartifact.BackendKind                 `json:"forward_backend,omitempty"`
+	OptimizerBackend      eosartifact.BackendKind                 `json:"optimizer_backend,omitempty"`
+	ActivationBackend     eosartifact.BackendKind                 `json:"activation_backend,omitempty"`
+	ContrastiveBackend    eosartifact.BackendKind                 `json:"contrastive_backend,omitempty"`
+	CompactForwardBackend eosartifact.BackendKind                 `json:"compact_forward_backend,omitempty"`
+	ForwardResidency      EmbeddingForwardResidencyStats          `json:"forward_residency"`
+	CompactForwardTrainer embeddingCompactForwardTrainerStats     `json:"compact_forward_trainer"`
+	CompactForward        *backend.CompactForwardAcceleratorStats `json:"compact_forward,omitempty"`
+	VectorDistillPhases   EmbeddingVectorDistillPhaseTimers       `json:"vector_distill_phases,omitempty"`
+	Optimizer             backend.OptimizerAcceleratorStats       `json:"optimizer"`
+	Activation            backend.ActivationAcceleratorStats      `json:"activation"`
+	Contrastive           backend.ContrastiveAcceleratorStats     `json:"contrastive"`
 }
 
 // EmbeddingVectorDistillPhaseTimers captures host-observed compact vector-distill phase time.
@@ -94,6 +97,7 @@ func encodeEmbeddingTrainProfileMLL(profile EmbeddingTrainProfile) ([]byte, erro
 			headStringMeta(strg, "optimizer_backend", string(profile.OptimizerBackend)),
 			headStringMeta(strg, "activation_backend", string(profile.ActivationBackend)),
 			headStringMeta(strg, "contrastive_backend", string(profile.ContrastiveBackend)),
+			headStringMeta(strg, "compact_forward_backend", string(profile.CompactForwardBackend)),
 			headIntMeta(strg, "step", int64(profile.Step)),
 		},
 	}
@@ -241,6 +245,70 @@ func diffForwardResidencyStats(start, end EmbeddingForwardResidencyStats) Embedd
 	}
 }
 
+func diffCompactForwardTrainerStats(start, end embeddingCompactForwardTrainerStats) embeddingCompactForwardTrainerStats {
+	return embeddingCompactForwardTrainerStats{
+		AttemptedCalls:      end.AttemptedCalls - start.AttemptedCalls,
+		BucketCount:         end.BucketCount - start.BucketCount,
+		FallbackOrUnhandled: end.FallbackOrUnhandled - start.FallbackOrUnhandled,
+		PreflightFailures:   end.PreflightFailures - start.PreflightFailures,
+		ResidentRefCount:    end.ResidentRefCount,
+	}
+}
+
+func diffCompactForwardStats(start, end *backend.CompactForwardAcceleratorStats) *backend.CompactForwardAcceleratorStats {
+	if end == nil {
+		return nil
+	}
+	out := *end
+	if start != nil {
+		out.RunCalls -= start.RunCalls
+		out.UnhandledCalls -= start.UnhandledCalls
+		out.UploadedBytes -= start.UploadedBytes
+		out.DownloadedBytes -= start.DownloadedBytes
+		out.StatusDownloadedBytes -= start.StatusDownloadedBytes
+		out.PackedDownloads -= start.PackedDownloads
+		out.PackedBytes -= start.PackedBytes
+		out.IntermediateD2H -= start.IntermediateD2H
+		out.IntermediateDownloadedBytes -= start.IntermediateDownloadedBytes
+		out.KernelLaunches -= start.KernelLaunches
+		out.KernelSynchronizations -= start.KernelSynchronizations
+		out.RunNanos -= start.RunNanos
+	}
+	return &out
+}
+
+func addCompactForwardStats(left, right *backend.CompactForwardAcceleratorStats) *backend.CompactForwardAcceleratorStats {
+	if left == nil && right == nil {
+		return nil
+	}
+	out := backend.CompactForwardAcceleratorStats{}
+	if left != nil {
+		out = *left
+	}
+	if right != nil {
+		out.RunCalls += right.RunCalls
+		out.UnhandledCalls += right.UnhandledCalls
+		out.UploadedBytes += right.UploadedBytes
+		out.DownloadedBytes += right.DownloadedBytes
+		out.StatusDownloadedBytes += right.StatusDownloadedBytes
+		out.PackedDownloads += right.PackedDownloads
+		out.PackedBytes += right.PackedBytes
+		out.IntermediateD2H += right.IntermediateD2H
+		out.IntermediateDownloadedBytes += right.IntermediateDownloadedBytes
+		out.KernelLaunches += right.KernelLaunches
+		out.KernelSynchronizations += right.KernelSynchronizations
+		out.RunNanos += right.RunNanos
+		out.LastPackedFloats = right.LastPackedFloats
+		out.LastPackedBytes = right.LastPackedBytes
+		out.LastUploadBytes = right.LastUploadBytes
+		out.LastDownloadBytes = right.LastDownloadBytes
+		out.LastStatusDownloadedBytes = right.LastStatusDownloadedBytes
+		out.LastKernelLaunches = right.LastKernelLaunches
+		out.LastKernelSynchronizations = right.LastKernelSynchronizations
+	}
+	return &out
+}
+
 func diffVectorDistillPhaseTimers(start, end EmbeddingVectorDistillPhaseTimers) EmbeddingVectorDistillPhaseTimers {
 	return EmbeddingVectorDistillPhaseTimers{
 		EncodeNanos:         end.EncodeNanos - start.EncodeNanos,
@@ -265,6 +333,12 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 		profile.ForwardResidency.MatMul.RunUploadedBytes != 0 ||
 		profile.ForwardResidency.MatMul.RunDownloadedBytes != 0 ||
 		profile.ForwardResidency.MatMul.RunNanos != 0 ||
+		profile.CompactForwardTrainer.AttemptedCalls != 0 ||
+		profile.CompactForwardTrainer.BucketCount != 0 ||
+		profile.CompactForwardTrainer.FallbackOrUnhandled != 0 ||
+		profile.CompactForwardTrainer.PreflightFailures != 0 ||
+		profile.CompactForwardTrainer.ResidentRefCount != 0 ||
+		profile.CompactForward != nil ||
 		profile.VectorDistillPhases.EncodeNanos != 0 ||
 		profile.VectorDistillPhases.ProjectionLossNanos != 0 ||
 		profile.VectorDistillPhases.BackwardNanos != 0 ||
@@ -296,12 +370,13 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfile {
 	hasRight := hasTrainProfileActivity(right)
 	out := EmbeddingTrainProfile{
-		Version:            EmbeddingTrainProfileVersion,
-		Step:               left.Step + right.Step,
-		ForwardBackend:     left.ForwardBackend,
-		OptimizerBackend:   left.OptimizerBackend,
-		ActivationBackend:  left.ActivationBackend,
-		ContrastiveBackend: left.ContrastiveBackend,
+		Version:               EmbeddingTrainProfileVersion,
+		Step:                  left.Step + right.Step,
+		ForwardBackend:        left.ForwardBackend,
+		OptimizerBackend:      left.OptimizerBackend,
+		ActivationBackend:     left.ActivationBackend,
+		ContrastiveBackend:    left.ContrastiveBackend,
+		CompactForwardBackend: left.CompactForwardBackend,
 		ForwardResidency: EmbeddingForwardResidencyStats{
 			BindSkips: left.ForwardResidency.BindSkips + right.ForwardResidency.BindSkips,
 			MatMul: backend.MatMulAcceleratorStats{
@@ -320,6 +395,14 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 				RunNanos:           left.ForwardResidency.MatMul.RunNanos + right.ForwardResidency.MatMul.RunNanos,
 			},
 		},
+		CompactForwardTrainer: embeddingCompactForwardTrainerStats{
+			AttemptedCalls:      left.CompactForwardTrainer.AttemptedCalls + right.CompactForwardTrainer.AttemptedCalls,
+			BucketCount:         left.CompactForwardTrainer.BucketCount + right.CompactForwardTrainer.BucketCount,
+			FallbackOrUnhandled: left.CompactForwardTrainer.FallbackOrUnhandled + right.CompactForwardTrainer.FallbackOrUnhandled,
+			PreflightFailures:   left.CompactForwardTrainer.PreflightFailures + right.CompactForwardTrainer.PreflightFailures,
+			ResidentRefCount:    left.CompactForwardTrainer.ResidentRefCount,
+		},
+		CompactForward: addCompactForwardStats(left.CompactForward, right.CompactForward),
 		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
 			EncodeNanos:         left.VectorDistillPhases.EncodeNanos + right.VectorDistillPhases.EncodeNanos,
 			ProjectionLossNanos: left.VectorDistillPhases.ProjectionLossNanos + right.VectorDistillPhases.ProjectionLossNanos,
@@ -368,8 +451,12 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 	if out.ContrastiveBackend == "" {
 		out.ContrastiveBackend = right.ContrastiveBackend
 	}
+	if out.CompactForwardBackend == "" {
+		out.CompactForwardBackend = right.CompactForwardBackend
+	}
 	if hasRight {
 		out.ForwardResidency.MatMul.BoundMatrices = right.ForwardResidency.MatMul.BoundMatrices
+		out.CompactForwardTrainer.ResidentRefCount = right.CompactForwardTrainer.ResidentRefCount
 		if right.Optimizer.LastForcedSyncReason != "" {
 			out.Optimizer.LastForcedSyncReason = right.Optimizer.LastForcedSyncReason
 		} else {
@@ -385,12 +472,13 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 
 func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainProfile {
 	out := EmbeddingTrainProfile{
-		Version:            EmbeddingTrainProfileVersion,
-		Step:               base.Step + delta.Step,
-		ForwardBackend:     base.ForwardBackend,
-		OptimizerBackend:   base.OptimizerBackend,
-		ActivationBackend:  base.ActivationBackend,
-		ContrastiveBackend: base.ContrastiveBackend,
+		Version:               EmbeddingTrainProfileVersion,
+		Step:                  base.Step + delta.Step,
+		ForwardBackend:        base.ForwardBackend,
+		OptimizerBackend:      base.OptimizerBackend,
+		ActivationBackend:     base.ActivationBackend,
+		ContrastiveBackend:    base.ContrastiveBackend,
+		CompactForwardBackend: base.CompactForwardBackend,
 		ForwardResidency: EmbeddingForwardResidencyStats{
 			BindSkips: base.ForwardResidency.BindSkips + delta.ForwardResidency.BindSkips,
 			MatMul: backend.MatMulAcceleratorStats{
@@ -409,6 +497,14 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 				RunNanos:           base.ForwardResidency.MatMul.RunNanos + delta.ForwardResidency.MatMul.RunNanos,
 			},
 		},
+		CompactForwardTrainer: embeddingCompactForwardTrainerStats{
+			AttemptedCalls:      base.CompactForwardTrainer.AttemptedCalls + delta.CompactForwardTrainer.AttemptedCalls,
+			BucketCount:         base.CompactForwardTrainer.BucketCount + delta.CompactForwardTrainer.BucketCount,
+			FallbackOrUnhandled: base.CompactForwardTrainer.FallbackOrUnhandled + delta.CompactForwardTrainer.FallbackOrUnhandled,
+			PreflightFailures:   base.CompactForwardTrainer.PreflightFailures + delta.CompactForwardTrainer.PreflightFailures,
+			ResidentRefCount:    base.CompactForwardTrainer.ResidentRefCount,
+		},
+		CompactForward: addCompactForwardStats(base.CompactForward, delta.CompactForward),
 		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
 			EncodeNanos:         base.VectorDistillPhases.EncodeNanos + delta.VectorDistillPhases.EncodeNanos,
 			ProjectionLossNanos: base.VectorDistillPhases.ProjectionLossNanos + delta.VectorDistillPhases.ProjectionLossNanos,
@@ -457,8 +553,12 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 	if out.ContrastiveBackend == "" {
 		out.ContrastiveBackend = delta.ContrastiveBackend
 	}
+	if out.CompactForwardBackend == "" {
+		out.CompactForwardBackend = delta.CompactForwardBackend
+	}
 	if hasTrainProfileActivity(delta) {
 		out.ForwardResidency.MatMul.BoundMatrices = delta.ForwardResidency.MatMul.BoundMatrices
+		out.CompactForwardTrainer.ResidentRefCount = delta.CompactForwardTrainer.ResidentRefCount
 		if delta.Optimizer.LastForcedSyncReason != "" {
 			out.Optimizer.LastForcedSyncReason = delta.Optimizer.LastForcedSyncReason
 		} else {
@@ -474,14 +574,17 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 
 func diffTrainProfile(start, end EmbeddingTrainProfile) EmbeddingTrainProfile {
 	return EmbeddingTrainProfile{
-		Version:             EmbeddingTrainProfileVersion,
-		Step:                end.Step - start.Step,
-		ForwardBackend:      end.ForwardBackend,
-		OptimizerBackend:    end.OptimizerBackend,
-		ActivationBackend:   end.ActivationBackend,
-		ContrastiveBackend:  end.ContrastiveBackend,
-		ForwardResidency:    diffForwardResidencyStats(start.ForwardResidency, end.ForwardResidency),
-		VectorDistillPhases: diffVectorDistillPhaseTimers(start.VectorDistillPhases, end.VectorDistillPhases),
+		Version:               EmbeddingTrainProfileVersion,
+		Step:                  end.Step - start.Step,
+		ForwardBackend:        end.ForwardBackend,
+		OptimizerBackend:      end.OptimizerBackend,
+		ActivationBackend:     end.ActivationBackend,
+		ContrastiveBackend:    end.ContrastiveBackend,
+		CompactForwardBackend: end.CompactForwardBackend,
+		ForwardResidency:      diffForwardResidencyStats(start.ForwardResidency, end.ForwardResidency),
+		CompactForwardTrainer: diffCompactForwardTrainerStats(start.CompactForwardTrainer, end.CompactForwardTrainer),
+		CompactForward:        diffCompactForwardStats(start.CompactForward, end.CompactForward),
+		VectorDistillPhases:   diffVectorDistillPhaseTimers(start.VectorDistillPhases, end.VectorDistillPhases),
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:         end.Optimizer.LogicalSteps - start.Optimizer.LogicalSteps,
 			TensorUpdateCalls:    end.Optimizer.TensorUpdateCalls - start.Optimizer.TensorUpdateCalls,

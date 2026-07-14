@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -169,6 +170,32 @@ type ContrastiveAcceleratorStats struct {
 	RunNanos        int64
 }
 
+// CompactForwardAcceleratorStats summarizes backend-owned compact forward
+// activity. Negative values are not used; unavailable stats are represented by
+// a nil stats provider at the trainer/profile layer, distinct from a zeroed
+// available provider.
+type CompactForwardAcceleratorStats struct {
+	RunCalls                    int64
+	UnhandledCalls              int64
+	UploadedBytes               int64
+	DownloadedBytes             int64
+	StatusDownloadedBytes       int64
+	PackedDownloads             int64
+	PackedBytes                 int64
+	IntermediateD2H             int64
+	IntermediateDownloadedBytes int64
+	KernelLaunches              int64
+	KernelSynchronizations      int64
+	RunNanos                    int64
+	LastPackedFloats            int
+	LastPackedBytes             int64
+	LastUploadBytes             int64
+	LastDownloadBytes           int64
+	LastStatusDownloadedBytes   int64
+	LastKernelLaunches          int64
+	LastKernelSynchronizations  int64
+}
+
 // ContrastiveGradResult contains pooled embedding gradients and unnormalized row metrics.
 type ContrastiveGradResult struct {
 	QueryGrads    *Tensor
@@ -262,6 +289,17 @@ type CompactForwardResult struct {
 	Data   []float32
 }
 
+// CompactForwardLayerConfig names one compact transformer layer's resident
+// parameters for accelerator configuration.
+type CompactForwardLayerConfig struct {
+	AttentionQ string
+	AttentionK string
+	AttentionV string
+	AttentionO string
+	FFNUp      string
+	FFNDown    string
+}
+
 // MatMulAccelerator exposes a backend-owned matmul fast path for non-plan callers.
 type MatMulAccelerator interface {
 	Backend() eosartifact.BackendKind
@@ -302,6 +340,29 @@ type CompactForwardAccelerator interface {
 	RunCompactForward(req CompactForwardRequest) (CompactForwardResult, error)
 }
 
+// CompactForwardStatsProvider exposes compact-forward counters when the
+// selected accelerator can report them.
+type CompactForwardStatsProvider interface {
+	Stats() CompactForwardAcceleratorStats
+}
+
+// CompactForwardConfigurator configures model-specific compact-forward names.
+type CompactForwardConfigurator interface {
+	ConfigureCompactForward(layers []CompactForwardLayerConfig, tokenName, roleName, outputProjectionName string, useRoPE bool)
+}
+
+// CompactForwardResidentBinder binds compact-forward parameters from resident
+// optimizer state.
+type CompactForwardResidentBinder interface {
+	BindCompactForwardResident(name string, tensor *Tensor, ref OptimizerResidentParameter) error
+}
+
+// CompactForwardPreflight validates a request before it is selected for the
+// fail-closed packed path.
+type CompactForwardPreflight interface {
+	PreflightCompactForward(req CompactForwardRequest) error
+}
+
 // OptimizerAccelerator exposes a backend-owned optimizer update fast path.
 type OptimizerAccelerator interface {
 	Backend() eosartifact.BackendKind
@@ -321,6 +382,12 @@ type ForcedOptimizerSyncAccelerator interface {
 // buffers for another accelerator from the same backend.
 type ResidentOptimizerParameterProvider interface {
 	ResidentParameter(name string) (OptimizerResidentParameter, bool)
+}
+
+// ResidentOptimizerParameterSeeder ensures a parameter is resident without
+// applying an optimizer update.
+type ResidentOptimizerParameterSeeder interface {
+	EnsureResidentParameter(name string, tensor, mom1, mom2 *Tensor) error
 }
 
 // DeviceResidentMatrixBinder optionally binds a matrix directly from a
@@ -357,6 +424,7 @@ var matMulAcceleratorFactories []matMulAcceleratorFactory
 var optimizerAcceleratorFactories []optimizerAcceleratorFactory
 var activationAcceleratorFactories []activationAcceleratorFactory
 var contrastiveAcceleratorFactories []contrastiveAcceleratorFactory
+var compactForwardAcceleratorFactories []compactForwardAcceleratorFactory
 
 type matMulAcceleratorFactory struct {
 	kind    eosartifact.BackendKind
@@ -376,6 +444,11 @@ type activationAcceleratorFactory struct {
 type contrastiveAcceleratorFactory struct {
 	kind    eosartifact.BackendKind
 	factory func() (ContrastiveAccelerator, error)
+}
+
+type compactForwardAcceleratorFactory struct {
+	kind    eosartifact.BackendKind
+	factory func() (CompactForwardAccelerator, error)
 }
 
 // KernelDispatcher executes a launch_kernel step through a backend-owned path.
@@ -500,6 +573,17 @@ func RegisterContrastiveAccelerator(kind eosartifact.BackendKind, factory func()
 	})
 }
 
+// RegisterCompactForwardAccelerator registers an optional backend-owned compact forward fast path.
+func RegisterCompactForwardAccelerator(kind eosartifact.BackendKind, factory func() (CompactForwardAccelerator, error)) {
+	if factory == nil {
+		return
+	}
+	compactForwardAcceleratorFactories = append(compactForwardAcceleratorFactories, compactForwardAcceleratorFactory{
+		kind:    kind,
+		factory: factory,
+	})
+}
+
 // NewPreferredMatMulAccelerator returns the first available registered accelerator.
 func NewPreferredMatMulAccelerator(preferred ...eosartifact.BackendKind) (MatMulAccelerator, eosartifact.BackendKind, error) {
 	for _, kind := range preferred {
@@ -572,6 +656,30 @@ func NewPreferredActivationAccelerator(preferred ...eosartifact.BackendKind) (Ac
 				return accel, kind, nil
 			}
 		}
+	}
+	return nil, "", nil
+}
+
+// NewPreferredCompactForwardAccelerator returns the first available registered compact-forward accelerator.
+func NewPreferredCompactForwardAccelerator(preferred ...eosartifact.BackendKind) (CompactForwardAccelerator, eosartifact.BackendKind, error) {
+	var errs []error
+	for _, kind := range preferred {
+		for _, candidate := range compactForwardAcceleratorFactories {
+			if candidate.kind != kind {
+				continue
+			}
+			accel, err := candidate.factory()
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", kind, err))
+				continue
+			}
+			if accel != nil {
+				return accel, kind, nil
+			}
+		}
+	}
+	if len(errs) != 0 {
+		return nil, "", fmt.Errorf("compact forward accelerator factory failed: %w", errors.Join(errs...))
 	}
 	return nil, "", nil
 }

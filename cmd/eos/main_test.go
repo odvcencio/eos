@@ -5974,6 +5974,56 @@ func TestTrainMetricsPayloadIncludesEffectiveLearningRateAndMovement(t *testing.
 	}
 }
 
+func TestTrainMetricsPayloadCompactForwardAcceleratorJSON(t *testing.T) {
+	payload := trainMetricsPayload(
+		"train-embed",
+		"train",
+		"model.mll",
+		"",
+		eosruntime.EmbeddingTrainRunSummary{
+			EndProfile: eosruntime.EmbeddingTrainProfile{},
+		},
+		eosruntime.EmbeddingTrainPackagePaths{},
+		nil,
+	)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal metrics payload: %v", err)
+	}
+	if strings.Contains(string(data), `"compact_forward"`) {
+		t.Fatalf("compact_forward present for absent compact backend: %s", string(data))
+	}
+
+	payload = trainMetricsPayload(
+		"train-embed",
+		"train",
+		"model.mll",
+		"",
+		eosruntime.EmbeddingTrainRunSummary{
+			EndProfile: eosruntime.EmbeddingTrainProfile{
+				CompactForwardBackend: eosartifact.BackendCUDA,
+			},
+		},
+		eosruntime.EmbeddingTrainPackagePaths{},
+		nil,
+	)
+	data, err = json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal cuda metrics payload: %v", err)
+	}
+	var got struct {
+		Accelerators struct {
+			CompactForward string `json:"compact_forward"`
+		} `json:"accelerators"`
+	}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("unmarshal metrics payload: %v\n%s", err, string(data))
+	}
+	if got.Accelerators.CompactForward != "cuda" {
+		t.Fatalf("compact_forward = %q, want cuda\n%s", got.Accelerators.CompactForward, string(data))
+	}
+}
+
 func TestEvalMetricsPayloadIncludesRetrievalMetrics(t *testing.T) {
 	payload := evalMetricsPayload(&eosruntime.EmbeddingEvalMetrics{
 		RetrievalNDCGAt10:    0.14,

@@ -90,6 +90,7 @@ type countingMatMulAccelerator struct {
 	downloadedBytes   int64
 	bindUploadedBytes int64
 	bound             map[string]*backend.Tensor
+	closed            bool
 }
 
 type fakeResidentOptimizerToken struct {
@@ -99,6 +100,8 @@ type fakeResidentOptimizerToken struct {
 }
 
 func (t *fakeResidentOptimizerToken) OptimizerResidentParameterToken() {}
+
+func (t *fakeResidentOptimizerToken) CompactForwardResidentToken() {}
 
 func (t *fakeResidentOptimizerToken) Backend() eosartifact.BackendKind {
 	return eosartifact.BackendCUDA
@@ -192,9 +195,120 @@ func (a *fakeResidentOptimizerAccelerator) ResidentParameter(name string) (backe
 	return backend.OptimizerResidentParameter{Backend: eosartifact.BackendCUDA, Token: token, Elements: len(token.tensor.F32)}, true
 }
 
+func (a *fakeResidentOptimizerAccelerator) EnsureResidentParameter(name string, tensor, mom1, mom2 *backend.Tensor) error {
+	if tensor == nil {
+		return fmt.Errorf("fake resident seed %q requires tensor", name)
+	}
+	if a.resident == nil {
+		a.resident = map[string]*fakeResidentOptimizerToken{}
+	}
+	if existing := a.resident[name]; existing != nil && existing.tensor != nil && existing.alive {
+		return nil
+	}
+	a.resident[name] = &fakeResidentOptimizerToken{tensor: tensor.Clone(), generation: uint64(len(a.resident) + 1), alive: true}
+	return nil
+}
+
 type residentAwareCountingMatMulAccelerator struct {
 	countingMatMulAccelerator
 	residentBindCalls int
+}
+
+type fakeCompactForwardAccelerator struct {
+	trainer        *EmbeddingTrainer
+	forward        *compactEmbeddingForwardWeights
+	configured     bool
+	bound          map[string]backend.OptimizerResidentParameter
+	preflightErr   error
+	runErr         error
+	corruptResult  bool
+	preflightCalls int64
+	stats          backend.CompactForwardAcceleratorStats
+}
+
+func (a *fakeCompactForwardAccelerator) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (a *fakeCompactForwardAccelerator) ConfigureCompactForward(layers []backend.CompactForwardLayerConfig, tokenName, roleName, outputProjectionName string, useRoPE bool) {
+	a.configured = true
+}
+
+func (a *fakeCompactForwardAccelerator) BindCompactForwardResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
+	if a.bound == nil {
+		a.bound = map[string]backend.OptimizerResidentParameter{}
+	}
+	a.bound[name] = ref
+	return nil
+}
+
+func (a *fakeCompactForwardAccelerator) PreflightCompactForward(req backend.CompactForwardRequest) error {
+	a.preflightCalls++
+	if a.preflightErr != nil {
+		return a.preflightErr
+	}
+	if !a.configured {
+		return fmt.Errorf("fake compact forward was not configured")
+	}
+	if len(a.bound) == 0 {
+		return fmt.Errorf("fake compact forward has no resident bindings")
+	}
+	if len(req.ResidentRefs) == 0 {
+		return fmt.Errorf("fake compact forward request has no resident refs")
+	}
+	return validateCompactForwardPackedInputs(req.Shape, req.Tokens, req.Masks, req.Roles)
+}
+
+func (a *fakeCompactForwardAccelerator) RunCompactForward(req backend.CompactForwardRequest) (backend.CompactForwardResult, error) {
+	if a.runErr != nil {
+		a.stats.UnhandledCalls++
+		return backend.CompactForwardResult{}, a.runErr
+	}
+	if a.trainer == nil || a.forward == nil {
+		a.stats.UnhandledCalls++
+		return backend.CompactForwardResult{}, fmt.Errorf("fake compact forward is missing host encoder")
+	}
+	seqs := make([]*embeddingEncodedSequence, len(req.Tokens))
+	var finalRows [][]float32
+	if req.Shape.HasOutputProjection {
+		finalRows = make([][]float32, len(req.Tokens))
+	}
+	for i := range req.Tokens {
+		seq, err := a.trainer.encodeCompactSequence(req.Tokens[i], req.Masks[i], req.Roles[i], a.forward)
+		if err != nil {
+			a.stats.UnhandledCalls++
+			return backend.CompactForwardResult{}, err
+		}
+		seqs[i] = seq
+		if req.Shape.HasOutputProjection {
+			d := req.Shape.ModelDim
+			current := seq.finalLayer().projected
+			rows, err := a.trainer.compactFinalOutputRows(current, req.Shape.Tokens, d, a.forward.outputProjection)
+			if err != nil {
+				a.stats.UnhandledCalls++
+				return backend.CompactForwardResult{}, err
+			}
+			finalRows[i] = rows
+		}
+	}
+	result, err := packCompactForwardEncodedSequences(req.Shape, seqs, finalRows)
+	if err != nil {
+		a.stats.UnhandledCalls++
+		return backend.CompactForwardResult{}, err
+	}
+	if a.corruptResult && len(result.Data) > 0 {
+		result.Data = result.Data[:len(result.Data)-1]
+	}
+	a.stats.RunCalls++
+	a.stats.PackedDownloads++
+	a.stats.PackedBytes += int64(len(result.Data) * 4)
+	a.stats.DownloadedBytes += int64(len(result.Data) * 4)
+	a.stats.StatusDownloadedBytes += 4
+	return result, nil
+}
+
+func (a *fakeCompactForwardAccelerator) Stats() backend.CompactForwardAcceleratorStats {
+	return a.stats
 }
 
 func (a *residentAwareCountingMatMulAccelerator) BindMatrixFromResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
@@ -497,7 +611,33 @@ func (a *countingMatMulAccelerator) Stats() backend.MatMulAcceleratorStats {
 		RunDownloadedBytes: a.downloadedBytes,
 	}
 }
-func (a *countingMatMulAccelerator) Close() {}
+func (a *countingMatMulAccelerator) Close() {
+	a.closed = true
+}
+
+type fakeContrastiveAccelerator struct {
+	closed bool
+}
+
+func (a *fakeContrastiveAccelerator) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (a *fakeContrastiveAccelerator) RunInfoNCE(query, positive *backend.Tensor, cfg backend.ContrastiveLossConfig) (backend.ContrastiveGradResult, error) {
+	return backend.ContrastiveGradResult{}, fmt.Errorf("fake contrastive accelerator is not implemented")
+}
+
+func (a *fakeContrastiveAccelerator) RunInfoNCEWithTargets(query, candidates *backend.Tensor, targetIndexes []int, cfg backend.ContrastiveLossConfig) (backend.ContrastiveGradResult, error) {
+	return backend.ContrastiveGradResult{}, fmt.Errorf("fake contrastive accelerator is not implemented")
+}
+
+func (a *fakeContrastiveAccelerator) Stats() backend.ContrastiveAcceleratorStats {
+	return backend.ContrastiveAcceleratorStats{}
+}
+
+func (a *fakeContrastiveAccelerator) Close() {
+	a.closed = true
+}
 
 type countingActivationAccelerator struct {
 	bindCalls              int
@@ -506,6 +646,7 @@ type countingActivationAccelerator struct {
 	softmaxBackwardCalls   int
 	layerNormBackwardCalls int
 	bound                  map[string]*backend.Tensor
+	closed                 bool
 }
 
 func (a *countingActivationAccelerator) Backend() eosartifact.BackendKind {
@@ -594,7 +735,9 @@ func (a *countingActivationAccelerator) Stats() backend.ActivationAcceleratorSta
 	}
 }
 
-func (a *countingActivationAccelerator) Close() {}
+func (a *countingActivationAccelerator) Close() {
+	a.closed = true
+}
 
 func TestEmbeddingTrainerRejectsNonTrainableParams(t *testing.T) {
 	src := []byte(`
@@ -2514,6 +2657,264 @@ func TestCompactEmbeddingTrainerEncodeSequenceInputsSkipsLegacyBatchedForwardWit
 	}
 	if fake.sharedLeftRuns != 0 || fake.accumulatedRuns != 0 {
 		t.Fatalf("compact encodeSequenceInputs used non-forward compact accelerator path: %+v", fake)
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardGateOffUsesHostPath(t *testing.T) {
+	t.Setenv(compactPackedForwardEnv, "")
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	if trainer.compactForwardAccel != nil {
+		t.Fatalf("compact packed accelerator instantiated with gate off")
+	}
+	start := trainer.TrainProfile()
+	seqs, err := trainer.encodeSequenceInputs([]embeddingSequenceInput{
+		{tokens: []int32{1, 2, 3}, role: trainer.rawRoleIndex()},
+		{tokens: []int32{1, 2, 3}, role: trainer.rawRoleIndex()},
+	}, trainer.prepareForwardWeights(), true)
+	if err != nil {
+		t.Fatalf("host compact encode inputs: %v", err)
+	}
+	defer trainer.releaseEncodedSequences(seqs)
+	delta := diffTrainProfile(start, trainer.TrainProfile())
+	if delta.CompactForward != nil {
+		t.Fatalf("gate-off compact forward stats = %+v, want unavailable nil", delta.CompactForward)
+	}
+	if delta.CompactForwardTrainer.AttemptedCalls != 0 || delta.CompactForwardTrainer.BucketCount != 0 {
+		t.Fatalf("gate-off trainer compact stats = %+v, want no selected packed attempts", delta.CompactForwardTrainer)
+	}
+}
+
+func overrideTrainerConstructorsForTest(
+	t *testing.T,
+	matmul func() (backend.MatMulAccelerator, eosartifact.BackendKind, error),
+	optimizer func() (backend.OptimizerAccelerator, eosartifact.BackendKind, error),
+	activation func() (backend.ActivationAccelerator, eosartifact.BackendKind, trainerActivationAccelMode, error),
+	compactForward func() (backend.CompactForwardAccelerator, eosartifact.BackendKind, error),
+) {
+	t.Helper()
+	prevMatMul := newTrainerMatMulAccelerator
+	prevOptimizer := newTrainerOptimizerAccelerator
+	prevActivation := newTrainerActivationAccelerator
+	prevCompactForward := newTrainerCompactForwardAccelerator
+	if matmul != nil {
+		newTrainerMatMulAccelerator = matmul
+	}
+	if optimizer != nil {
+		newTrainerOptimizerAccelerator = optimizer
+	}
+	if activation != nil {
+		newTrainerActivationAccelerator = activation
+	}
+	if compactForward != nil {
+		newTrainerCompactForwardAccelerator = compactForward
+	}
+	t.Cleanup(func() {
+		newTrainerMatMulAccelerator = prevMatMul
+		newTrainerOptimizerAccelerator = prevOptimizer
+		newTrainerActivationAccelerator = prevActivation
+		newTrainerCompactForwardAccelerator = prevCompactForward
+	})
+}
+
+func TestEmbeddingTrainerCompactPackedForwardGateOnDoesNotInstantiateForNoncompact(t *testing.T) {
+	t.Setenv(compactPackedForwardEnv, "1")
+	compactConstructorCalls := 0
+	overrideTrainerConstructorsForTest(t, nil, nil, nil,
+		func() (backend.CompactForwardAccelerator, eosartifact.BackendKind, error) {
+			compactConstructorCalls++
+			return &fakeCompactForwardAccelerator{}, eosartifact.BackendCUDA, nil
+		},
+	)
+
+	trainer := newTinyTrainableFFNEmbeddingTrainer(t, 0.05)
+	t.Cleanup(trainer.Close)
+	if compactConstructorCalls != 0 {
+		t.Fatalf("noncompact constructor called compact constructor %d times", compactConstructorCalls)
+	}
+	if trainer.compactForwardAccel != nil || trainer.compactForwardBackend != "" {
+		t.Fatalf("noncompact compact forward accel/backend = %T/%q, want nil/empty", trainer.compactForwardAccel, trainer.compactForwardBackend)
+	}
+	profile := trainer.TrainProfile()
+	if profile.CompactForwardBackend != "" || profile.CompactForward != nil {
+		t.Fatalf("noncompact compact profile backend/stats = %q/%+v, want empty/nil", profile.CompactForwardBackend, profile.CompactForward)
+	}
+	if profile.CompactForwardTrainer != (embeddingCompactForwardTrainerStats{}) {
+		t.Fatalf("noncompact compact trainer stats = %+v, want zero", profile.CompactForwardTrainer)
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardGateOnNoRegisteredImplementationIsNoop(t *testing.T) {
+	t.Setenv(compactPackedForwardEnv, "1")
+	compactConstructorCalls := 0
+	overrideTrainerConstructorsForTest(t, nil, nil, nil,
+		func() (backend.CompactForwardAccelerator, eosartifact.BackendKind, error) {
+			compactConstructorCalls++
+			return nil, "", nil
+		},
+	)
+
+	checkpoint := compactTrainStateTestCheckpoint(3)
+	state, err := LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint, checkpoint.Manifest)
+	if err != nil {
+		t.Fatalf("load compact state: %v", err)
+	}
+	trainer, err := newCompactEmbeddingTrainerFromTrainState(&eosartifact.Module{Name: "compact"}, state)
+	if err != nil {
+		t.Fatalf("new compact trainer with no compact factory: %v", err)
+	}
+	t.Cleanup(trainer.Close)
+	if compactConstructorCalls != 1 {
+		t.Fatalf("compact constructor calls = %d, want 1", compactConstructorCalls)
+	}
+	if trainer.compactForwardAccel != nil || trainer.compactForwardBackend != "" {
+		t.Fatalf("no registered compact implementation accel/backend = %T/%q, want nil/empty", trainer.compactForwardAccel, trainer.compactForwardBackend)
+	}
+	profile := trainer.TrainProfile()
+	if profile.CompactForwardBackend != "" || profile.CompactForward != nil {
+		t.Fatalf("no registered compact profile backend/stats = %q/%+v, want empty/nil", profile.CompactForwardBackend, profile.CompactForward)
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardFactoryFailureFailsClosedAndCleansUp(t *testing.T) {
+	t.Setenv(compactPackedForwardEnv, "1")
+	t.Setenv("EOS_TRAIN_ENABLE_ACTIVATION_ACCEL", "1")
+	t.Setenv("EOS_TRAIN_ENABLE_SOFTMAX_BACKWARD_ACCEL", "")
+	matmul := &countingMatMulAccelerator{}
+	optimizer := &fakeResidentOptimizerAccelerator{}
+	activation := &countingActivationAccelerator{}
+	overrideTrainerConstructorsForTest(t,
+		func() (backend.MatMulAccelerator, eosartifact.BackendKind, error) {
+			return matmul, eosartifact.BackendCUDA, nil
+		},
+		func() (backend.OptimizerAccelerator, eosartifact.BackendKind, error) {
+			return optimizer, eosartifact.BackendCUDA, nil
+		},
+		func() (backend.ActivationAccelerator, eosartifact.BackendKind, trainerActivationAccelMode, error) {
+			return activation, eosartifact.BackendCUDA, trainerActivationAccelMode{fullBackward: true}, nil
+		},
+		func() (backend.CompactForwardAccelerator, eosartifact.BackendKind, error) {
+			return nil, "", fmt.Errorf("forced compact factory failure")
+		},
+	)
+
+	checkpoint := compactTrainStateTestCheckpoint(3)
+	state, err := LoadCompactEmbeddingTrainStateFromCheckpoint(checkpoint, checkpoint.Manifest)
+	if err != nil {
+		t.Fatalf("load compact state: %v", err)
+	}
+	trainer, err := newCompactEmbeddingTrainerFromTrainState(&eosartifact.Module{Name: "compact"}, state)
+	if err == nil {
+		t.Cleanup(trainer.Close)
+		t.Fatal("new compact trainer succeeded, want compact factory failure")
+	}
+	if !strings.Contains(err.Error(), "forced compact factory failure") {
+		t.Fatalf("constructor error = %v, want forced compact factory failure", err)
+	}
+	if !matmul.closed || !optimizer.closed || !activation.closed {
+		t.Fatalf("constructor cleanup matmul/optimizer/activation closed = %t/%t/%t, want all true", matmul.closed, optimizer.closed, activation.closed)
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardGroupsRestoresOrderAndStats(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	opt := &fakeResidentOptimizerAccelerator{}
+	fake := &fakeCompactForwardAccelerator{trainer: host, forward: host.prepareCompactForwardWeights()}
+	trainer.optimizerAccel = opt
+	trainer.compactForwardAccel = fake
+	trainer.compactForwardBackend = eosartifact.BackendCUDA
+
+	inputs := []embeddingSequenceInput{
+		{tokens: []int32{1, 2, 3}, mask: []int32{1, 1, 1}, role: trainer.rawRoleIndex()},
+		{tokens: []int32{3, 4}, mask: []int32{1, 0}, role: trainer.queryRoleIndex()},
+		{tokens: []int32{1, 2, 3}, mask: []int32{2, 7, 1}, role: trainer.rawRoleIndex()},
+		{tokens: []int32{2, 4}, mask: []int32{1, 1}, role: trainer.documentRoleIndex()},
+	}
+	seqs, err := trainer.encodeSequenceInputs(inputs, trainer.prepareForwardWeights(), true)
+	if err != nil {
+		t.Fatalf("packed compact encode inputs: %v", err)
+	}
+	defer trainer.releaseEncodedSequences(seqs)
+	if len(seqs) != len(inputs) || seqs[0] != seqs[2] {
+		t.Fatalf("dedupe/order restore failed: len=%d shared=%t", len(seqs), len(seqs) == len(inputs) && seqs[0] == seqs[2])
+	}
+	if seqs[1] == seqs[3] || seqs[1].role != trainer.queryRoleIndex() || seqs[3].role != trainer.documentRoleIndex() {
+		t.Fatalf("role/order restore failed")
+	}
+	profile := trainer.TrainProfile()
+	if profile.CompactForward == nil {
+		t.Fatal("compact forward stats unavailable after fake packed path")
+	}
+	if profile.CompactForward.RunCalls != 2 || fake.preflightCalls != 2 {
+		t.Fatalf("run/preflight calls = %d/%d, want two exact-length buckets", profile.CompactForward.RunCalls, fake.preflightCalls)
+	}
+	if profile.CompactForwardTrainer.AttemptedCalls != 1 || profile.CompactForwardTrainer.BucketCount != 2 || profile.CompactForwardTrainer.FallbackOrUnhandled != 0 || profile.CompactForwardTrainer.PreflightFailures != 0 {
+		t.Fatalf("trainer compact stats = %+v", profile.CompactForwardTrainer)
+	}
+	if profile.CompactForwardTrainer.ResidentRefCount == 0 {
+		t.Fatalf("resident refs = %d, want non-zero", profile.CompactForwardTrainer.ResidentRefCount)
+	}
+	if !trainer.compactForwardSelected {
+		t.Fatal("packed compact forward did not mark selected path active")
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardPreflightFailsClosed(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{}
+	trainer.compactForwardAccel = &fakeCompactForwardAccelerator{trainer: host, forward: host.prepareCompactForwardWeights(), preflightErr: fmt.Errorf("forced preflight")}
+	_, err := trainer.encodeSequenceInputs([]embeddingSequenceInput{{tokens: []int32{1, 2, 3}, role: trainer.rawRoleIndex()}}, trainer.prepareForwardWeights(), true)
+	if err == nil || !strings.Contains(err.Error(), "forced preflight") {
+		t.Fatalf("packed preflight err = %v, want forced preflight", err)
+	}
+	if trainer.compactForwardTrainer.PreflightFailures != 1 || trainer.compactForwardTrainer.FallbackOrUnhandled != 0 {
+		t.Fatalf("preflight stats = %+v", trainer.compactForwardTrainer)
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardRunFailureKeepsSelectedFalse(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{}
+	trainer.compactForwardAccel = &fakeCompactForwardAccelerator{trainer: host, forward: host.prepareCompactForwardWeights(), runErr: fmt.Errorf("forced run failure")}
+	trainer.compactForwardSelected = true
+	_, err := trainer.encodeSequenceInputs([]embeddingSequenceInput{{tokens: []int32{1, 2, 3}, role: trainer.rawRoleIndex()}}, trainer.prepareForwardWeights(), true)
+	if err == nil || !strings.Contains(err.Error(), "forced run failure") {
+		t.Fatalf("packed run err = %v, want forced run failure", err)
+	}
+	if trainer.compactForwardSelected {
+		t.Fatal("packed run failure left compactForwardSelected=true")
+	}
+	if !trainer.optimizerParamRequiresHostForwardRead(trainer.compactState.TokenEmbedding.Name) {
+		t.Fatal("packed run failure allowed token resident deferral")
+	}
+	if !trainer.optimizerParamRequiresHostForwardRead(trainer.compactState.RoleEmbedding.Name) {
+		t.Fatal("packed run failure allowed role resident deferral")
+	}
+	if trainer.compactForwardTrainer.FallbackOrUnhandled != 1 {
+		t.Fatalf("fallback/unhandled = %d, want 1", trainer.compactForwardTrainer.FallbackOrUnhandled)
+	}
+}
+
+func TestCompactEmbeddingTrainerPackedForwardReconstructFailureKeepsSelectedFalse(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	host := newCompactEmbeddingTrainerForTest(t, 3)
+	trainer.optimizerAccel = &fakeResidentOptimizerAccelerator{}
+	trainer.compactForwardAccel = &fakeCompactForwardAccelerator{trainer: host, forward: host.prepareCompactForwardWeights(), corruptResult: true}
+	trainer.compactForwardSelected = true
+	_, err := trainer.encodeSequenceInputs([]embeddingSequenceInput{{tokens: []int32{1, 2, 3}, role: trainer.rawRoleIndex()}}, trainer.prepareForwardWeights(), true)
+	if err == nil || !strings.Contains(err.Error(), "reconstruct") {
+		t.Fatalf("packed reconstruct err = %v, want reconstruct failure", err)
+	}
+	if trainer.compactForwardSelected {
+		t.Fatal("packed reconstruct failure left compactForwardSelected=true")
+	}
+	if !trainer.optimizerParamRequiresHostForwardRead(trainer.compactState.TokenEmbedding.Name) {
+		t.Fatal("packed reconstruct failure allowed token resident deferral")
+	}
+	if trainer.compactForwardTrainer.FallbackOrUnhandled != 1 {
+		t.Fatalf("fallback/unhandled = %d, want 1", trainer.compactForwardTrainer.FallbackOrUnhandled)
 	}
 }
 

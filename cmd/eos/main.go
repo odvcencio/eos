@@ -7019,21 +7019,39 @@ type trainThroughputJSON struct {
 }
 
 type trainAcceleratorsJSON struct {
-	Forward     string `json:"forward"`
-	Optimizer   string `json:"optimizer"`
-	Activation  string `json:"activation"`
-	Contrastive string `json:"contrastive"`
+	Forward        string `json:"forward"`
+	Optimizer      string `json:"optimizer"`
+	Activation     string `json:"activation"`
+	Contrastive    string `json:"contrastive"`
+	CompactForward string `json:"compact_forward,omitempty"`
 }
 
 type trainProfileDeltaJSON struct {
-	MatMulBindCalls     int64   `json:"matmul_bind_calls"`
-	MatMulRuns          int64   `json:"matmul_runs"`
-	MatMulRunUploadMB   float64 `json:"matmul_run_upload_mb"`
-	MatMulRunDownloadMB float64 `json:"matmul_run_download_mb"`
-	OptimizerUpdates    int64   `json:"optimizer_updates"`
-	OptimizerSyncs      int64   `json:"optimizer_syncs"`
-	ActivationCalls     int64   `json:"activation_calls"`
-	ContrastiveCalls    int64   `json:"contrastive_calls"`
+	MatMulBindCalls                           int64   `json:"matmul_bind_calls"`
+	MatMulRuns                                int64   `json:"matmul_runs"`
+	MatMulRunUploadMB                         float64 `json:"matmul_run_upload_mb"`
+	MatMulRunDownloadMB                       float64 `json:"matmul_run_download_mb"`
+	CompactForwardAttemptedCalls              int64   `json:"compact_forward_attempted_calls"`
+	CompactForwardBucketCount                 int64   `json:"compact_forward_bucket_count"`
+	CompactForwardFallbackOrUnhandled         int64   `json:"compact_forward_fallback_or_unhandled"`
+	CompactForwardPreflightFailures           int64   `json:"compact_forward_preflight_failures"`
+	CompactForwardResidentRefCount            int64   `json:"compact_forward_resident_ref_count"`
+	CompactForwardStatsAvailable              bool    `json:"compact_forward_stats_available"`
+	CompactForwardRunCalls                    int64   `json:"compact_forward_run_calls"`
+	CompactForwardUploadedBytes               int64   `json:"compact_forward_uploaded_bytes"`
+	CompactForwardDownloadedBytes             int64   `json:"compact_forward_downloaded_bytes"`
+	CompactForwardStatusDownloadedBytes       int64   `json:"compact_forward_status_downloaded_bytes"`
+	CompactForwardPackedDownloads             int64   `json:"compact_forward_packed_downloads"`
+	CompactForwardPackedBytes                 int64   `json:"compact_forward_packed_bytes"`
+	CompactForwardIntermediateD2H             int64   `json:"compact_forward_intermediate_d2h"`
+	CompactForwardIntermediateDownloadedBytes int64   `json:"compact_forward_intermediate_downloaded_bytes"`
+	CompactForwardKernelLaunches              int64   `json:"compact_forward_kernel_launches"`
+	CompactForwardKernelSynchronizations      int64   `json:"compact_forward_kernel_synchronizations"`
+	CompactForwardRunNanos                    int64   `json:"compact_forward_run_nanos"`
+	OptimizerUpdates                          int64   `json:"optimizer_updates"`
+	OptimizerSyncs                            int64   `json:"optimizer_syncs"`
+	ActivationCalls                           int64   `json:"activation_calls"`
+	ContrastiveCalls                          int64   `json:"contrastive_calls"`
 }
 
 type trainPackagePathsJSON struct {
@@ -7347,25 +7365,49 @@ func trainThroughputPayload(summary eosruntime.EmbeddingTrainRunSummary) trainTh
 }
 
 func trainAcceleratorsPayload(profile eosruntime.EmbeddingTrainProfile) trainAcceleratorsJSON {
-	return trainAcceleratorsJSON{
+	payload := trainAcceleratorsJSON{
 		Forward:     displayTrainBackend(profile.ForwardBackend),
 		Optimizer:   displayTrainBackend(profile.OptimizerBackend),
 		Activation:  displayTrainBackend(profile.ActivationBackend),
 		Contrastive: displayTrainBackend(profile.ContrastiveBackend),
 	}
+	if profile.CompactForwardBackend != "" {
+		payload.CompactForward = displayTrainBackend(profile.CompactForwardBackend)
+	}
+	return payload
 }
 
 func trainProfileDeltaPayload(profile eosruntime.EmbeddingTrainProfile) trainProfileDeltaJSON {
-	return trainProfileDeltaJSON{
-		MatMulBindCalls:     profile.ForwardResidency.MatMul.BindCalls,
-		MatMulRuns:          profile.ForwardResidency.MatMul.RunCalls,
-		MatMulRunUploadMB:   bytesToMiB(profile.ForwardResidency.MatMul.RunUploadedBytes),
-		MatMulRunDownloadMB: bytesToMiB(profile.ForwardResidency.MatMul.RunDownloadedBytes),
-		OptimizerUpdates:    profile.Optimizer.UpdateCalls,
-		OptimizerSyncs:      profile.Optimizer.SyncCalls,
-		ActivationCalls:     profile.Activation.GELUBackwardCalls + profile.Activation.SoftmaxBackwardCalls + profile.Activation.LayerNormBackwardCalls,
-		ContrastiveCalls:    profile.Contrastive.RunCalls,
+	payload := trainProfileDeltaJSON{
+		MatMulBindCalls:                   profile.ForwardResidency.MatMul.BindCalls,
+		MatMulRuns:                        profile.ForwardResidency.MatMul.RunCalls,
+		MatMulRunUploadMB:                 bytesToMiB(profile.ForwardResidency.MatMul.RunUploadedBytes),
+		MatMulRunDownloadMB:               bytesToMiB(profile.ForwardResidency.MatMul.RunDownloadedBytes),
+		CompactForwardAttemptedCalls:      profile.CompactForwardTrainer.AttemptedCalls,
+		CompactForwardBucketCount:         profile.CompactForwardTrainer.BucketCount,
+		CompactForwardFallbackOrUnhandled: profile.CompactForwardTrainer.FallbackOrUnhandled,
+		CompactForwardPreflightFailures:   profile.CompactForwardTrainer.PreflightFailures,
+		CompactForwardResidentRefCount:    profile.CompactForwardTrainer.ResidentRefCount,
+		OptimizerUpdates:                  profile.Optimizer.UpdateCalls,
+		OptimizerSyncs:                    profile.Optimizer.SyncCalls,
+		ActivationCalls:                   profile.Activation.GELUBackwardCalls + profile.Activation.SoftmaxBackwardCalls + profile.Activation.LayerNormBackwardCalls,
+		ContrastiveCalls:                  profile.Contrastive.RunCalls,
 	}
+	if profile.CompactForward != nil {
+		payload.CompactForwardStatsAvailable = true
+		payload.CompactForwardRunCalls = profile.CompactForward.RunCalls
+		payload.CompactForwardUploadedBytes = profile.CompactForward.UploadedBytes
+		payload.CompactForwardDownloadedBytes = profile.CompactForward.DownloadedBytes
+		payload.CompactForwardStatusDownloadedBytes = profile.CompactForward.StatusDownloadedBytes
+		payload.CompactForwardPackedDownloads = profile.CompactForward.PackedDownloads
+		payload.CompactForwardPackedBytes = profile.CompactForward.PackedBytes
+		payload.CompactForwardIntermediateD2H = profile.CompactForward.IntermediateD2H
+		payload.CompactForwardIntermediateDownloadedBytes = profile.CompactForward.IntermediateDownloadedBytes
+		payload.CompactForwardKernelLaunches = profile.CompactForward.KernelLaunches
+		payload.CompactForwardKernelSynchronizations = profile.CompactForward.KernelSynchronizations
+		payload.CompactForwardRunNanos = profile.CompactForward.RunNanos
+	}
+	return payload
 }
 
 func trainPackagePathsPayload(paths eosruntime.EmbeddingTrainPackagePaths) trainPackagePathsJSON {

@@ -235,11 +235,15 @@ type EmbeddingTrainer struct {
 	softmaxBackwardAccel    bool
 	contrastiveAccel        backend.ContrastiveAccelerator
 	contrastiveBackend      eosartifact.BackendKind
+	compactForwardAccel     backend.CompactForwardAccelerator
+	compactForwardBackend   eosartifact.BackendKind
+	compactForwardSelected  bool
 	sequenceBindingID       int
 	momentsDirty            bool
 	deferOptimizerSync      bool
 	closeErr                error
 	compactOptimizerUpdates int64
+	compactForwardTrainer   embeddingCompactForwardTrainerStats
 	forwardCache            *embeddingForwardWeights
 	compactState            *CompactEmbeddingTrainState
 	compactForwardCache     *compactEmbeddingForwardWeights
@@ -252,6 +256,14 @@ type EmbeddingTrainer struct {
 	// vectorDistillDefaultRoleWarned tracks whether FitVectorDistill has already
 	// logged the one-time warning about rows falling back to the default role.
 	vectorDistillDefaultRoleWarned bool
+}
+
+type embeddingCompactForwardTrainerStats struct {
+	AttemptedCalls      int64 `json:"attempted_calls"`
+	BucketCount         int64 `json:"bucket_count"`
+	FallbackOrUnhandled int64 `json:"fallback_or_unhandled"`
+	PreflightFailures   int64 `json:"preflight_failures"`
+	ResidentRefCount    int64 `json:"resident_ref_count"`
 }
 
 // SetScoreSpectrumLineage records score-spectrum provenance that must follow
@@ -548,6 +560,19 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 		}
 		return nil, err
 	}
+	compactForwardAccel, compactForwardBackend, err := newTrainerCompactForwardAccelerator()
+	if err != nil {
+		if accel != nil {
+			accel.Close()
+		}
+		if optimizerAccel != nil {
+			optimizerAccel.Close()
+		}
+		if activationAccel != nil {
+			activationAccel.Close()
+		}
+		return nil, err
+	}
 	if accelBackend == "" {
 		accelBackend = eosartifact.BackendKind("host")
 	}
@@ -558,21 +583,23 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 		activationBackend = eosartifact.BackendKind("host")
 	}
 	return &EmbeddingTrainer{
-		module:               mod,
-		manifest:             manifest,
-		config:               cfg,
-		step:                 state.Step,
-		compactState:         state,
-		forwardMatMul:        accel,
-		forwardBackend:       accelBackend,
-		optimizerAccel:       optimizerAccel,
-		optimizerBackend:     optimizerBackend,
-		activationAccel:      activationAccel,
-		activationBackend:    activationBackend,
-		activationAccelFull:  activationMode.fullBackward,
-		softmaxBackwardAccel: activationMode.softmaxBackward,
-		forwardDirty:         true,
-		forwardNeedsBind:     true,
+		module:                mod,
+		manifest:              manifest,
+		config:                cfg,
+		step:                  state.Step,
+		compactState:          state,
+		forwardMatMul:         accel,
+		forwardBackend:        accelBackend,
+		optimizerAccel:        optimizerAccel,
+		optimizerBackend:      optimizerBackend,
+		activationAccel:       activationAccel,
+		activationBackend:     activationBackend,
+		activationAccelFull:   activationMode.fullBackward,
+		softmaxBackwardAccel:  activationMode.softmaxBackward,
+		compactForwardAccel:   compactForwardAccel,
+		compactForwardBackend: compactForwardBackend,
+		forwardDirty:          true,
+		forwardNeedsBind:      true,
 	}, nil
 }
 
@@ -806,6 +833,14 @@ func (t *EmbeddingTrainer) CloseWithError() error {
 		t.contrastiveAccel = nil
 		t.contrastiveBackend = ""
 	}
+	if t.compactForwardAccel != nil {
+		if closer, ok := t.compactForwardAccel.(interface{ Close() }); ok {
+			closer.Close()
+		}
+		t.compactForwardAccel = nil
+		t.compactForwardBackend = ""
+		t.compactForwardSelected = false
+	}
 	t.closeErr = nil
 	return nil
 }
@@ -930,6 +965,9 @@ func (t *EmbeddingTrainer) optimizerParamRequiresHostForwardRead(name string) bo
 		return true
 	}
 	if t.compactState != nil {
+		if t.compactForwardSelected {
+			return false
+		}
 		if name == t.compactState.TokenEmbedding.Name {
 			return true
 		}
@@ -1129,14 +1167,16 @@ func (t *EmbeddingTrainer) TrainProfile() EmbeddingTrainProfile {
 		return EmbeddingTrainProfile{Version: EmbeddingTrainProfileVersion}
 	}
 	profile := EmbeddingTrainProfile{
-		Version:             EmbeddingTrainProfileVersion,
-		Step:                t.step,
-		ForwardBackend:      t.forwardBackend,
-		OptimizerBackend:    t.optimizerBackend,
-		ActivationBackend:   t.activationBackend,
-		ContrastiveBackend:  t.contrastiveBackend,
-		ForwardResidency:    t.ForwardResidencyStats(),
-		VectorDistillPhases: t.vectorDistillPhases,
+		Version:               EmbeddingTrainProfileVersion,
+		Step:                  t.step,
+		ForwardBackend:        t.forwardBackend,
+		OptimizerBackend:      t.optimizerBackend,
+		ActivationBackend:     t.activationBackend,
+		ContrastiveBackend:    t.contrastiveBackend,
+		CompactForwardBackend: t.compactForwardBackend,
+		ForwardResidency:      t.ForwardResidencyStats(),
+		CompactForwardTrainer: t.compactForwardTrainer,
+		VectorDistillPhases:   t.vectorDistillPhases,
 	}
 	if t.optimizerAccel != nil {
 		profile.Optimizer = t.optimizerAccel.Stats()
@@ -1151,6 +1191,10 @@ func (t *EmbeddingTrainer) TrainProfile() EmbeddingTrainProfile {
 	}
 	if t.contrastiveAccel != nil {
 		profile.Contrastive = t.contrastiveAccel.Stats()
+	}
+	if provider, ok := t.compactForwardAccel.(backend.CompactForwardStatsProvider); ok {
+		stats := provider.Stats()
+		profile.CompactForward = &stats
 	}
 	return profile
 }
@@ -3937,7 +3981,7 @@ func (t *EmbeddingTrainer) encodeSequenceInputs(inputs []embeddingSequenceInput,
 
 func (t *EmbeddingTrainer) tryEncodeSequenceInputsBatchedForward(inputs []embeddingSequenceInput, forward *embeddingForwardWeights, captureBindings bool) ([]*embeddingEncodedSequence, bool, error) {
 	if t.isCompactTrainer() {
-		return nil, false, nil
+		return t.tryEncodeCompactSequenceInputsPacked(inputs, forward, captureBindings)
 	}
 	if t == nil || t.forwardMatMul == nil || forward == nil || len(inputs) == 0 || !batchedContrastiveForwardEnabled() {
 		return nil, false, nil
@@ -3969,6 +4013,276 @@ func (t *EmbeddingTrainer) tryEncodeSequenceInputsBatchedForward(inputs []embedd
 	return out, true, nil
 }
 
+type compactPackedForwardBucket struct {
+	seqLen int
+	slots  []int
+	req    backend.CompactForwardRequest
+}
+
+func (t *EmbeddingTrainer) tryEncodeCompactSequenceInputsPacked(inputs []embeddingSequenceInput, forward *embeddingForwardWeights, captureBindings bool) ([]*embeddingEncodedSequence, bool, error) {
+	if t == nil || !t.isCompactTrainer() || t.compactForwardAccel == nil || forward == nil || forward.compact == nil || len(inputs) == 0 {
+		return nil, false, nil
+	}
+	t.compactForwardTrainer.AttemptedCalls++
+	t.compactForwardSelected = false
+	compactForward := forward.compact
+	if err := t.prepareCompactForwardAccelerator(compactForward); err != nil {
+		t.compactForwardTrainer.PreflightFailures++
+		return nil, true, err
+	}
+	out := make([]*embeddingEncodedSequence, len(inputs))
+	sequenceCache := map[string]int{}
+	groupOrder := make([]int, 0)
+	groups := map[int][]int{}
+	tokensByUnique := make([][]int32, 0, len(inputs))
+	masksByUnique := make([][]int32, 0, len(inputs))
+	rolesByUnique := make([]int32, 0, len(inputs))
+	uniqueForInput := make([]int, len(inputs))
+	for i, input := range inputs {
+		mask, err := t.prepareMask(input.tokens, input.mask)
+		if err != nil {
+			t.compactForwardTrainer.PreflightFailures++
+			return nil, true, fmt.Errorf("%s: %w", embeddingSequenceInputLabel(input, i), err)
+		}
+		normalizedMask := normalizeCompactForwardMask(mask)
+		key := embeddingBatchSequenceKey(input.tokens, normalizedMask, input.role)
+		unique, ok := sequenceCache[key]
+		if !ok {
+			unique = len(tokensByUnique)
+			sequenceCache[key] = unique
+			tokensByUnique = append(tokensByUnique, append([]int32(nil), input.tokens...))
+			masksByUnique = append(masksByUnique, normalizedMask)
+			rolesByUnique = append(rolesByUnique, input.role)
+			seqLen := len(input.tokens)
+			if _, exists := groups[seqLen]; !exists {
+				groupOrder = append(groupOrder, seqLen)
+			}
+			groups[seqLen] = append(groups[seqLen], unique)
+		}
+		uniqueForInput[i] = unique
+	}
+	sort.Ints(groupOrder)
+	refs, err := t.compactForwardResidentRefs(compactForward)
+	if err != nil {
+		t.compactForwardTrainer.PreflightFailures++
+		return nil, true, err
+	}
+	t.compactForwardTrainer.ResidentRefCount = int64(len(refs))
+	buckets := make([]compactPackedForwardBucket, 0, len(groupOrder))
+	for _, seqLen := range groupOrder {
+		uniqueSlots := groups[seqLen]
+		req := backend.CompactForwardRequest{
+			Shape:        t.compactForwardShape(compactForward, len(uniqueSlots), seqLen),
+			Tokens:       make([][]int32, len(uniqueSlots)),
+			Masks:        make([][]int32, len(uniqueSlots)),
+			Roles:        make([]int32, len(uniqueSlots)),
+			ResidentRefs: refs,
+			GELUMode:     compactForwardGELUMode(),
+		}
+		for i, unique := range uniqueSlots {
+			req.Tokens[i] = tokensByUnique[unique]
+			req.Masks[i] = masksByUnique[unique]
+			req.Roles[i] = rolesByUnique[unique]
+		}
+		if preflight, ok := t.compactForwardAccel.(backend.CompactForwardPreflight); ok {
+			if err := preflight.PreflightCompactForward(req); err != nil {
+				t.compactForwardTrainer.PreflightFailures++
+				return nil, true, fmt.Errorf("compact packed forward preflight T=%d B=%d: %w", seqLen, len(uniqueSlots), err)
+			}
+		}
+		buckets = append(buckets, compactPackedForwardBucket{seqLen: seqLen, slots: uniqueSlots, req: req})
+	}
+	t.compactForwardTrainer.BucketCount += int64(len(buckets))
+	uniqueEncoded := make([]*embeddingEncodedSequence, len(tokensByUnique))
+	for _, bucket := range buckets {
+		result, err := t.compactForwardAccel.RunCompactForward(bucket.req)
+		if err != nil {
+			t.compactForwardTrainer.FallbackOrUnhandled++
+			t.compactForwardSelected = false
+			return nil, true, fmt.Errorf("compact packed forward T=%d B=%d: %w", bucket.seqLen, len(bucket.slots), err)
+		}
+		encoded, err := reconstructCompactForwardPackedState(bucket.req.Shape, result, bucket.req.Tokens, bucket.req.Masks, bucket.req.Roles)
+		if err != nil {
+			t.compactForwardTrainer.FallbackOrUnhandled++
+			t.compactForwardSelected = false
+			return nil, true, fmt.Errorf("compact packed forward reconstruct T=%d B=%d: %w", bucket.seqLen, len(bucket.slots), err)
+		}
+		for i, unique := range bucket.slots {
+			uniqueEncoded[unique] = encoded[i]
+		}
+	}
+	for i, unique := range uniqueForInput {
+		out[i] = uniqueEncoded[unique]
+	}
+	t.compactForwardSelected = true
+	return out, true, nil
+}
+
+func normalizeCompactForwardMask(mask []int32) []int32 {
+	out := make([]int32, len(mask))
+	for i, value := range mask {
+		if value != 0 {
+			out[i] = 1
+		}
+	}
+	return out
+}
+
+func compactForwardGELUMode() string {
+	if fastGELUEnabled() {
+		return backend.CompactForwardGELUFast
+	}
+	return backend.CompactForwardGELUExact
+}
+
+func (t *EmbeddingTrainer) compactForwardShape(forward *compactEmbeddingForwardWeights, batch, tokens int) backend.CompactForwardShape {
+	shape := backend.CompactForwardShape{Batch: batch, Tokens: tokens}
+	if forward == nil || len(forward.layers) == 0 || forward.token == nil || len(forward.token.Shape) != 2 {
+		return shape
+	}
+	first := forward.layers[0]
+	heads, headDim, _ := compactLayerAttentionLayout(first, forward.token.Shape[1])
+	shape.ModelDim = forward.token.Shape[1]
+	shape.FFNDim = compactLayerFFNDim(first)
+	shape.Heads = heads
+	shape.HeadDim = headDim
+	shape.Layers = len(forward.layers)
+	shape.OutputDim = shape.ModelDim
+	if forward.outputProjection != nil && len(forward.outputProjection.Shape) == 2 {
+		shape.OutputDim = forward.outputProjection.Shape[1]
+		shape.HasOutputProjection = true
+	}
+	return shape
+}
+
+func (t *EmbeddingTrainer) prepareCompactForwardAccelerator(forward *compactEmbeddingForwardWeights) error {
+	if t == nil || t.compactForwardAccel == nil || forward == nil {
+		return fmt.Errorf("compact forward accelerator is not initialized")
+	}
+	if configurator, ok := t.compactForwardAccel.(backend.CompactForwardConfigurator); ok {
+		layers := make([]backend.CompactForwardLayerConfig, len(forward.layers))
+		for i, layer := range forward.layers {
+			layers[i] = backend.CompactForwardLayerConfig{
+				AttentionQ: layer.attnQName,
+				AttentionK: layer.attnKName,
+				AttentionV: layer.attnVName,
+				AttentionO: layer.attnOName,
+				FFNUp:      layer.ffnUpName,
+				FFNDown:    layer.ffnDownName,
+			}
+		}
+		roleName := ""
+		if forward.role != nil && t.compactState != nil && t.compactState.RoleEmbedding != nil {
+			roleName = t.compactState.RoleEmbedding.Name
+		}
+		configurator.ConfigureCompactForward(layers, t.compactState.TokenEmbedding.Name, roleName, forward.outputProjectionName, t.manifest.PositionEncoding == EmbeddingPositionEncodingRoPE)
+	}
+	for _, item := range compactTrainStateOptimizerItems(t.compactState) {
+		if item == nil || item.Tensor == nil {
+			continue
+		}
+		if item.Moment1 == nil {
+			item.Moment1 = zeroLikeMaster(item.Tensor)
+		}
+		if item.Moment2 == nil {
+			item.Moment2 = zeroLikeMaster(item.Tensor)
+		}
+	}
+	items := t.compactForwardResidentItems(forward)
+	if seeder, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterSeeder); ok {
+		for _, item := range items {
+			if item.name == "" || item.tensor == nil {
+				continue
+			}
+			if err := seeder.EnsureResidentParameter(item.name, item.tensor, item.mom1, item.mom2); err != nil {
+				return err
+			}
+		}
+	}
+	provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider)
+	if !ok {
+		return fmt.Errorf("compact packed forward requires resident optimizer provider")
+	}
+	binder, ok := t.compactForwardAccel.(backend.CompactForwardResidentBinder)
+	if !ok {
+		return fmt.Errorf("compact packed forward accelerator cannot bind resident parameters")
+	}
+	for _, item := range items {
+		if item.name == "" || item.tensor == nil {
+			continue
+		}
+		ref, ok := provider.ResidentParameter(item.name)
+		if !ok {
+			return fmt.Errorf("compact packed forward resident ref %q is unavailable", item.name)
+		}
+		if err := binder.BindCompactForwardResident(item.name, item.tensor, ref); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type compactForwardResidentItem struct {
+	name   string
+	tensor *backend.Tensor
+	mom1   *backend.Tensor
+	mom2   *backend.Tensor
+}
+
+func (t *EmbeddingTrainer) compactForwardResidentItems(forward *compactEmbeddingForwardWeights) []compactForwardResidentItem {
+	if t == nil || t.compactState == nil || forward == nil {
+		return nil
+	}
+	items := []compactForwardResidentItem{{name: t.compactState.TokenEmbedding.Name, tensor: t.compactState.TokenEmbedding.Tensor, mom1: t.compactState.TokenEmbedding.Moment1, mom2: t.compactState.TokenEmbedding.Moment2}}
+	if t.compactState.RoleEmbedding != nil {
+		items = append(items, compactForwardResidentItem{name: t.compactState.RoleEmbedding.Name, tensor: t.compactState.RoleEmbedding.Tensor, mom1: t.compactState.RoleEmbedding.Moment1, mom2: t.compactState.RoleEmbedding.Moment2})
+	}
+	for i := range t.compactState.Layers {
+		layer := &t.compactState.Layers[i]
+		items = append(items,
+			compactForwardResidentItem{name: layer.AttentionQuery.Name, tensor: layer.AttentionQuery.Tensor, mom1: layer.AttentionQuery.Moment1, mom2: layer.AttentionQuery.Moment2},
+			compactForwardResidentItem{name: layer.AttentionKey.Name, tensor: layer.AttentionKey.Tensor, mom1: layer.AttentionKey.Moment1, mom2: layer.AttentionKey.Moment2},
+			compactForwardResidentItem{name: layer.AttentionValue.Name, tensor: layer.AttentionValue.Tensor, mom1: layer.AttentionValue.Moment1, mom2: layer.AttentionValue.Moment2},
+			compactForwardResidentItem{name: layer.AttentionOutput.Name, tensor: layer.AttentionOutput.Tensor, mom1: layer.AttentionOutput.Moment1, mom2: layer.AttentionOutput.Moment2},
+			compactForwardResidentItem{name: layer.FFNUp.Name, tensor: layer.FFNUp.Tensor, mom1: layer.FFNUp.Moment1, mom2: layer.FFNUp.Moment2},
+			compactForwardResidentItem{name: layer.FFNDown.Name, tensor: layer.FFNDown.Tensor, mom1: layer.FFNDown.Moment1, mom2: layer.FFNDown.Moment2},
+		)
+	}
+	if t.compactState.OutputProjection != nil {
+		items = append(items, compactForwardResidentItem{name: t.compactState.OutputProjection.Name, tensor: t.compactState.OutputProjection.Tensor, mom1: t.compactState.OutputProjection.Moment1, mom2: t.compactState.OutputProjection.Moment2})
+	}
+	return items
+}
+
+func (t *EmbeddingTrainer) compactForwardResidentRefs(forward *compactEmbeddingForwardWeights) ([]backend.CompactForwardResidentRef, error) {
+	provider, ok := t.optimizerAccel.(backend.ResidentOptimizerParameterProvider)
+	if !ok {
+		return nil, fmt.Errorf("compact packed forward requires resident optimizer provider")
+	}
+	items := t.compactForwardResidentItems(forward)
+	refs := make([]backend.CompactForwardResidentRef, 0, len(items))
+	for _, item := range items {
+		if item.name == "" || item.tensor == nil {
+			continue
+		}
+		ref, ok := provider.ResidentParameter(item.name)
+		if !ok {
+			return nil, fmt.Errorf("compact packed forward resident ref %q is unavailable", item.name)
+		}
+		compactToken, ok := ref.Token.(backend.CompactForwardResidentToken)
+		if !ok {
+			return nil, fmt.Errorf("compact packed forward resident ref %q cannot be used for compact forward", item.name)
+		}
+		refs = append(refs, backend.CompactForwardResidentRef{
+			Name:     item.name,
+			Backend:  ref.Backend,
+			Token:    compactToken,
+			Elements: ref.Elements,
+		})
+	}
+	return refs, nil
+}
+
 func embeddingSequenceInputLabel(input embeddingSequenceInput, index int) string {
 	if input.label != "" {
 		return input.label
@@ -3978,7 +4292,26 @@ func embeddingSequenceInputLabel(input embeddingSequenceInput, index int) string
 
 func (t *EmbeddingTrainer) tryEncodeContrastiveBatchBatchedForward(batch []EmbeddingContrastiveExample, forward *embeddingForwardWeights, captureBindings bool) ([]*embeddingEncodedSequence, []*embeddingEncodedSequence, bool, error) {
 	if t.isCompactTrainer() {
-		return nil, nil, false, nil
+		inputs := make([]embeddingSequenceInput, 0, len(batch)*2)
+		queryIndexes := make([]int, len(batch))
+		positiveIndexes := make([]int, len(batch))
+		for i, example := range batch {
+			queryIndexes[i] = len(inputs)
+			inputs = append(inputs, embeddingSequenceInput{tokens: example.QueryTokens, mask: example.QueryMask, role: t.queryRoleIndex(), label: fmt.Sprintf("batch %d query", i)})
+			positiveIndexes[i] = len(inputs)
+			inputs = append(inputs, embeddingSequenceInput{tokens: example.PositiveTokens, mask: example.PositiveMask, role: t.documentRoleIndex(), label: fmt.Sprintf("batch %d positive", i)})
+		}
+		seqs, ok, err := t.tryEncodeCompactSequenceInputsPacked(inputs, forward, captureBindings)
+		if !ok || err != nil {
+			return nil, nil, ok, err
+		}
+		queries := make([]*embeddingEncodedSequence, len(batch))
+		positives := make([]*embeddingEncodedSequence, len(batch))
+		for i := range batch {
+			queries[i] = seqs[queryIndexes[i]]
+			positives[i] = seqs[positiveIndexes[i]]
+		}
+		return queries, positives, true, nil
 	}
 	if t == nil || t.forwardMatMul == nil || forward == nil || len(batch) == 0 || !batchedContrastiveForwardEnabled() {
 		return nil, nil, false, nil
@@ -4023,7 +4356,26 @@ func (t *EmbeddingTrainer) tryEncodeContrastiveBatchBatchedForward(batch []Embed
 
 func (t *EmbeddingTrainer) tryEncodePairBatchBatchedForward(batch []EmbeddingPairExample, forward *embeddingForwardWeights, captureBindings bool) ([]*embeddingEncodedSequence, []*embeddingEncodedSequence, bool, error) {
 	if t.isCompactTrainer() {
-		return nil, nil, false, nil
+		inputs := make([]embeddingSequenceInput, 0, len(batch)*2)
+		leftIndexes := make([]int, len(batch))
+		rightIndexes := make([]int, len(batch))
+		for i, example := range batch {
+			leftIndexes[i] = len(inputs)
+			inputs = append(inputs, embeddingSequenceInput{tokens: example.LeftTokens, mask: example.LeftMask, role: t.rawRoleIndex(), label: fmt.Sprintf("batch %d left", i)})
+			rightIndexes[i] = len(inputs)
+			inputs = append(inputs, embeddingSequenceInput{tokens: example.RightTokens, mask: example.RightMask, role: t.rawRoleIndex(), label: fmt.Sprintf("batch %d right", i)})
+		}
+		seqs, ok, err := t.tryEncodeCompactSequenceInputsPacked(inputs, forward, captureBindings)
+		if !ok || err != nil {
+			return nil, nil, ok, err
+		}
+		lefts := make([]*embeddingEncodedSequence, len(batch))
+		rights := make([]*embeddingEncodedSequence, len(batch))
+		for i := range batch {
+			lefts[i] = seqs[leftIndexes[i]]
+			rights[i] = seqs[rightIndexes[i]]
+		}
+		return lefts, rights, true, nil
 	}
 	if t == nil || t.forwardMatMul == nil || forward == nil || len(batch) == 0 || !batchedContrastiveForwardEnabled() {
 		return nil, nil, false, nil

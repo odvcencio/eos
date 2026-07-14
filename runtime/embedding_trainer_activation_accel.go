@@ -25,7 +25,9 @@ func trainerActivationAccelModeFromEnv() trainerActivationAccelMode {
 	}
 }
 
-func newTrainerActivationAccelerator() (backend.ActivationAccelerator, eosartifact.BackendKind, trainerActivationAccelMode, error) {
+var newTrainerActivationAccelerator = defaultTrainerActivationAccelerator
+
+func defaultTrainerActivationAccelerator() (backend.ActivationAccelerator, eosartifact.BackendKind, trainerActivationAccelMode, error) {
 	mode := trainerActivationAccelModeFromEnv()
 	if !mode.fullBackward && !mode.softmaxBackward {
 		return nil, "", mode, nil

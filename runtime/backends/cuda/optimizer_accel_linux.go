@@ -361,6 +361,42 @@ func (a *optimizerAccelerator) ResidentParameter(name string) (backend.Optimizer
 	}, true
 }
 
+func (a *optimizerAccelerator) EnsureResidentParameter(name string, tensor, mom1, mom2 *backend.Tensor) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.device == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	if name == "" {
+		return fmt.Errorf("cuda optimizer resident seed requires a parameter name")
+	}
+	if tensor == nil {
+		return fmt.Errorf("cuda optimizer resident seed %q requires tensor", name)
+	}
+	elements := len(tensor.F32)
+	if elements == 0 {
+		return nil
+	}
+	if mom1 == nil || mom2 == nil {
+		return fmt.Errorf("cuda optimizer resident seed %q requires moments", name)
+	}
+	if len(mom1.F32) != elements || len(mom2.F32) != elements {
+		return fmt.Errorf("cuda optimizer resident seed %q moment sizes do not match tensor size %d", name, elements)
+	}
+	_, transient, err := a.ensureResidentState(name, tensor, mom1, mom2, elements, true)
+	if err != nil {
+		return err
+	}
+	if transient {
+		return fmt.Errorf("cuda optimizer resident seed %q unexpectedly created transient state", name)
+	}
+	a.updatePerStepStats()
+	return nil
+}
+
 func (a *optimizerAccelerator) updatePerStepStats() {
 	if a == nil || a.stats.UpdateCalls == 0 {
 		return
