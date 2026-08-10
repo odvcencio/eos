@@ -11,6 +11,72 @@ import (
 	"m31labs.dev/eos/runtime/backend"
 )
 
+func TestCompactTrainCublasRowMajorMatMulNoSyncParity(t *testing.T) {
+	rt, err := newDeviceRuntime()
+	if err != nil {
+		t.Skipf("cuda runtime unavailable: %v", err)
+	}
+	defer rt.close()
+	cases := []struct {
+		name           string
+		lhsRows        int
+		lhsCols        int
+		rhsRows        int
+		rhsCols        int
+		transposeLeft  bool
+		transposeRight bool
+		beta           float32
+	}{
+		{name: "forward_a_w_beta0", lhsRows: 3, lhsCols: 4, rhsRows: 4, rhsCols: 2},
+		{name: "forward_actual_ffn_up_beta0", lhsRows: 75, lhsCols: 128, rhsRows: 128, rhsCols: 512},
+		{name: "forward_actual_ffn_down_beta0", lhsRows: 75, lhsCols: 512, rhsRows: 512, rhsCols: 128},
+		{name: "grad_w_left_t_beta1", lhsRows: 3, lhsCols: 4, rhsRows: 3, rhsCols: 2, transposeLeft: true, beta: 1},
+		{name: "grad_in_right_t_beta0", lhsRows: 3, lhsCols: 2, rhsRows: 4, rhsCols: 2, transposeRight: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lhs := seqData(tc.lhsRows*tc.lhsCols, 0.017, -0.031)
+			rhs := seqData(tc.rhsRows*tc.rhsCols, -0.011, 0.023)
+			rows := tc.lhsRows
+			if tc.transposeLeft {
+				rows = tc.lhsCols
+			}
+			cols := tc.rhsCols
+			if tc.transposeRight {
+				cols = tc.rhsRows
+			}
+			initial := seqData(rows*cols, 0.003, -0.007)
+			want := hostRowMajorMatMulForCUDATest(lhs, rhs, initial, tc.lhsRows, tc.lhsCols, tc.rhsRows, tc.rhsCols, tc.transposeLeft, tc.transposeRight, tc.beta)
+			lhsPtr, err := rt.uploadFloat32(lhs)
+			if err != nil {
+				t.Fatalf("upload lhs: %v", err)
+			}
+			defer rt.freeBuffer(lhsPtr)
+			rhsPtr, err := rt.uploadFloat32(rhs)
+			if err != nil {
+				t.Fatalf("upload rhs: %v", err)
+			}
+			defer rt.freeBuffer(rhsPtr)
+			outPtr, err := rt.uploadFloat32(initial)
+			if err != nil {
+				t.Fatalf("upload out: %v", err)
+			}
+			defer rt.freeBuffer(outPtr)
+			if err := rt.matMulCublasWithBetaNoSyncInts(lhsPtr, rhsPtr, outPtr, tc.lhsRows, tc.lhsCols, tc.rhsRows, tc.rhsCols, tc.transposeLeft, tc.transposeRight, tc.beta); err != nil {
+				t.Fatalf("cublas no-sync gemm: %v", err)
+			}
+			if err := rt.synchronize(); err != nil {
+				t.Fatalf("sync cublas no-sync gemm: %v", err)
+			}
+			got := make([]float32, rows*cols)
+			if err := rt.downloadFloat32(got, outPtr); err != nil {
+				t.Fatalf("download out: %v", err)
+			}
+			assertFloatSlicesClose(t, got, want, 1e-6)
+		})
+	}
+}
+
 func TestCompactTrainForwardPooledParityAndAccounting(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -1865,6 +1931,120 @@ func TestCompactTrainPublicBackwardActualShapeFullParity(t *testing.T) {
 	}
 }
 
+func TestCompactTrainCublasGateActualShapeFullParityAndAccounting(t *testing.T) {
+	t.Setenv("EOS_CUDA_COMPACT_TRAIN_CUBLAS", "1")
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 75, ModelDim: 128, FFNDim: 512, Heads: 2, HeadDim: 64, Layers: 2, OutputDim: 128}
+	weights := compactTrainShapeTestWeights(shape, false)
+	accel, cleanup := newBoundCompactTrainShapeTestAccelerator(t, shape, true, false, weights)
+	defer cleanup()
+	if !accel.compactTrainCublas {
+		t.Fatal("compact train cuBLAS gate is off")
+	}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(102, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	tokens := make([]int32, shape.Tokens)
+	masks := make([]int32, shape.Tokens)
+	for i := range tokens {
+		tokens[i] = int32(i%5 + 1)
+		masks[i] = 1
+		if i%11 == 7 {
+			masks[i] = 0
+		}
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{tokens},
+		Masks:        [][]int32{masks},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		GELUMode:     backend.CompactForwardGELUFast,
+		StepID:       102,
+	}
+	forward, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("cublas forward actual shape: %v", err)
+	}
+	wantPacked := hostCompactForwardWithWeightsForCUDATest(backend.CompactForwardRequest{
+		Shape:        req.Shape,
+		Tokens:       req.Tokens,
+		Masks:        req.Masks,
+		Roles:        req.Roles,
+		ResidentRefs: req.ResidentRefs,
+		GELUMode:     req.GELUMode,
+	}, true, false, weights)
+	finalPooledSpan := compactForwardSpanByName(wantPacked.Layout, compactForwardSequenceSpanName(0, "final.pooled"))
+	wantPooled := wantPacked.Data[finalPooledSpan.Offset : finalPooledSpan.Offset+finalPooledSpan.Len]
+	assertFloatSlicesClose(t, forward.Pooled.F32, wantPooled, 1e-6)
+	gradPooled := backend.NewTensorF32([]int{shape.Batch, shape.OutputDim}, seqData(shape.Batch*shape.OutputDim, 0.00031, -0.00047))
+	got, err := accel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{Handle: forward.Handle, GradPooled: gradPooled})
+	if err != nil {
+		t.Fatalf("cublas public backward actual shape: %v", err)
+	}
+	want := hostCompactTrainFullBackwardWithWeightsForCUDATest(req, true, false, gradPooled.F32, weights)
+	assertCompactTrainResidentGradientsClose(t, accel, got.ResidentGradRefs, want, 1e-6)
+	if err := accel.EndCompactTrainStep(102); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	wantForwardCublas := int64(shape.Layers * 2)
+	wantBackwardCublas := int64(shape.Layers * 4)
+	wantForwardLaunches := expectedCompactTrainForwardLaunches(shape) - wantForwardCublas
+	wantBackwardLaunches := expectedCompactTrainBackwardLaunches(shape, true) - wantBackwardCublas
+	if stats.LastForwardLaunches != wantForwardLaunches || stats.LastForwardCublasGemmCalls != wantForwardCublas || stats.LastBackwardLaunches != wantBackwardLaunches || stats.LastBackwardCublasGemmCalls != wantBackwardCublas {
+		t.Fatalf("cublas actual-shape launch/gemm stats = %+v, want forward custom/cublas %d/%d backward custom/cublas %d/%d", stats, wantForwardLaunches, wantForwardCublas, wantBackwardLaunches, wantBackwardCublas)
+	}
+	if stats.LastForwardSyncs != expectedCompactCUDASyncsForLaunches(expectedCompactTrainForwardLaunches(shape)) || stats.LastBackwardSyncs != expectedCompactCUDASyncsForLaunches(expectedCompactTrainBackwardLaunches(shape, true)) {
+		t.Fatalf("cublas actual-shape sync stats = %+v", stats)
+	}
+	if stats.CublasGemmCalls != wantForwardCublas+wantBackwardCublas || stats.FallbackOrUnhandled != 0 || stats.LiveHandles != 0 {
+		t.Fatalf("cublas actual-shape stats = %+v, want cublas %d no fallback/live handles", stats, wantForwardCublas+wantBackwardCublas)
+	}
+}
+
+func TestCompactTrainCublasGateProjectedForwardBackwardParity(t *testing.T) {
+	t.Setenv("EOS_CUDA_COMPACT_TRAIN_CUBLAS", "1")
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 3, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 6, HasOutputProjection: true}
+	weights := compactTrainShapeTestWeights(shape, true)
+	accel, cleanup := newBoundCompactTrainShapeTestAccelerator(t, shape, false, true, weights)
+	defer cleanup()
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(103, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1, 3}},
+		Masks:        [][]int32{{1, 0, 1}},
+		Roles:        []int32{2},
+		ResidentRefs: refs,
+		GELUMode:     backend.CompactForwardGELUFast,
+		StepID:       103,
+	}
+	forward, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("cublas projected forward: %v", err)
+	}
+	assertFloatSlicesClose(t, forward.Pooled.F32, hostCompactTrainPooledForCUDATest(req, weights), 1e-6)
+	gradPooled := backend.NewTensorF32([]int{shape.Batch, shape.OutputDim}, seqData(shape.Batch*shape.OutputDim, 0.031, -0.047))
+	got, err := accel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{Handle: forward.Handle, GradPooled: gradPooled})
+	if err != nil {
+		t.Fatalf("cublas projected backward: %v", err)
+	}
+	want := hostCompactTrainFullBackwardWithWeightsForCUDATest(req, false, true, gradPooled.F32, weights)
+	assertCompactTrainResidentGradientsClose(t, accel, got.ResidentGradRefs, want, 1e-6)
+	if err := accel.EndCompactTrainStep(103); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	wantForwardCublas := int64(shape.Layers*2 + 1)
+	wantBackwardCublas := int64(shape.Layers*4 + 2)
+	if stats.LastForwardCublasGemmCalls != wantForwardCublas || stats.LastBackwardCublasGemmCalls != wantBackwardCublas || stats.CublasGemmCalls != wantForwardCublas+wantBackwardCublas {
+		t.Fatalf("projected cublas stats = %+v, want forward/backward cublas %d/%d", stats, wantForwardCublas, wantBackwardCublas)
+	}
+}
+
 func TestCompactTrainHandleReleaseAfterCloseFailsClosed(t *testing.T) {
 	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
 	defer cleanup()
@@ -2799,6 +2979,47 @@ func expectedCompactTrainBackwardLaunches(shape backend.CompactForwardShape, rop
 	}
 	launches++ // token/role scatter
 	return launches
+}
+
+func hostRowMajorMatMulForCUDATest(lhs, rhs, initial []float32, lhsRows, lhsCols, rhsRows, rhsCols int, transposeLeft, transposeRight bool, beta float32) []float32 {
+	rows := lhsRows
+	inner := lhsCols
+	if transposeLeft {
+		rows = lhsCols
+		inner = lhsRows
+	}
+	rhsInner := rhsRows
+	cols := rhsCols
+	if transposeRight {
+		rhsInner = rhsCols
+		cols = rhsRows
+	}
+	if inner != rhsInner {
+		panic("hostRowMajorMatMulForCUDATest shape mismatch")
+	}
+	out := make([]float32, rows*cols)
+	for r := 0; r < rows; r++ {
+		for c := 0; c < cols; c++ {
+			sum := float32(0)
+			for k := 0; k < inner; k++ {
+				var lv float32
+				if transposeLeft {
+					lv = lhs[k*lhsCols+r]
+				} else {
+					lv = lhs[r*lhsCols+k]
+				}
+				var rv float32
+				if transposeRight {
+					rv = rhs[c*rhsCols+k]
+				} else {
+					rv = rhs[k*rhsCols+c]
+				}
+				sum += lv * rv
+			}
+			out[r*cols+c] = sum + beta*initial[r*cols+c]
+		}
+	}
+	return out
 }
 
 func assertFloatSlicesClose(t *testing.T, got, want []float32, tol float32) {

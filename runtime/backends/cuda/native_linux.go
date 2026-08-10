@@ -184,18 +184,36 @@ static int eosCudaRuntimeCreate(EosCudaRuntime** out, char** err) {
 		*err = manta_dup_cu_error("cuStreamCreate", cuRes);
 		return 1;
 	}
-	blasRes = cublasSetStream(blas, rt->stream);
-	if (blasRes != CUBLAS_STATUS_SUCCESS) {
-		cuStreamDestroy(rt->stream);
-		cublasDestroy(blas);
-		cuDevicePrimaryCtxRelease(device);
-		free(rt);
-		*err = manta_dup_cublas_error("cublasSetStream", blasRes);
-		return 1;
+		blasRes = cublasSetStream(blas, rt->stream);
+		if (blasRes != CUBLAS_STATUS_SUCCESS) {
+			cuStreamDestroy(rt->stream);
+			cublasDestroy(blas);
+			cuDevicePrimaryCtxRelease(device);
+			free(rt);
+			*err = manta_dup_cublas_error("cublasSetStream", blasRes);
+			return 1;
+		}
+		blasRes = cublasSetMathMode(blas, CUBLAS_PEDANTIC_MATH);
+		if (blasRes != CUBLAS_STATUS_SUCCESS) {
+			cuStreamDestroy(rt->stream);
+			cublasDestroy(blas);
+			cuDevicePrimaryCtxRelease(device);
+			free(rt);
+			*err = manta_dup_cublas_error("cublasSetMathMode(CUBLAS_PEDANTIC_MATH)", blasRes);
+			return 1;
+		}
+		blasRes = cublasSetAtomicsMode(blas, CUBLAS_ATOMICS_NOT_ALLOWED);
+		if (blasRes != CUBLAS_STATUS_SUCCESS) {
+			cuStreamDestroy(rt->stream);
+			cublasDestroy(blas);
+			cuDevicePrimaryCtxRelease(device);
+			free(rt);
+			*err = manta_dup_cublas_error("cublasSetAtomicsMode(CUBLAS_ATOMICS_NOT_ALLOWED)", blasRes);
+			return 1;
+		}
+		*out = rt;
+		return 0;
 	}
-	*out = rt;
-	return 0;
-}
 
 static void eosCudaRuntimeDestroy(EosCudaRuntime* rt) {
 	if (rt == NULL) {
@@ -4490,6 +4508,10 @@ func (rt *deviceRuntime) matMulCublasWithBetaNoSync(lhs, rhs, out0 C.CUdeviceptr
 		return cStringError(errStr)
 	}
 	return nil
+}
+
+func (rt *deviceRuntime) matMulCublasWithBetaNoSyncInts(lhs, rhs, out0 C.CUdeviceptr, lhsRows, lhsCols, rhsRows, rhsCols int, transposeLeft, transposeRight bool, beta float32) error {
+	return rt.matMulCublasWithBetaNoSync(lhs, rhs, out0, C.int(lhsRows), C.int(lhsCols), C.int(rhsRows), C.int(rhsCols), transposeLeft, transposeRight, beta)
 }
 
 func (rt *deviceRuntime) matMulCublasStridedBatched(lhs, rhs, out0 C.CUdeviceptr, batches, lhsRows, lhsCols, rhsRows, rhsCols C.int, transposeLeft, transposeRight bool) error {
