@@ -725,8 +725,8 @@ func TestRunPlanMultiVectorStorageWritesTSVAndJSON(t *testing.T) {
 		"dim\tbaseline_dim\tbits\tobjects\tvectors_per_object\tdense_parent_bytes",
 		"quantized_vector_bytes\tvector_overhead_bytes\tdense_vector_storage_bytes\tquantized_vector_storage_bytes\ttotal_quantized_bytes\tpacked_object_overhead_bytes\tpacked_quantized_storage_bytes\tpacked_total_quantized_bytes",
 		"packed_vectors_that_fit_in_one_dense_vector\tpacked_fits_in_one_dense_vector_storage\tpacked_storage_multiple_of_dense_parent_cost",
-		"128\t3072\t2\t1000\t1\t12288\t12288000\t12288\t12288000\t36\tnone\t0\t36\t0\t12288\t36\t36000\t0\t36\t36000\t341.333333\t341.333333\t341.333333\t341\ttrue\t0.002930\t341\ttrue\t0.002930",
-		"128\t3072\t4\t1000\t16\t12288\t12288000\t12288\t12288000\t68\tnone\t0\t68\t0\t12288\t68\t1088000\t0\t1088\t1088000\t180.705882\t11.294118\t11.294118\t180\ttrue\t0.088542\t180\ttrue\t0.088542",
+		"128\t3072\t2\t1000\t1\t12288\t12288000\t12288\t12288000\t40\tnone\t0\t40\t0\t12288\t40\t40000\t0\t40\t40000\t307.200000\t307.200000\t307.200000\t307\ttrue\t0.003255\t307\ttrue\t0.003255",
+		"128\t3072\t4\t1000\t16\t12288\t12288000\t12288\t12288000\t72\tnone\t0\t72\t0\t12288\t72\t1152000\t0\t1152\t1152000\t170.666667\t10.666667\t10.666667\t170\ttrue\t0.093750\t170\ttrue\t0.093750",
 		"json: " + jsonPath,
 		"summary: rows=4 dim=128 baseline_dim=3072 objects=1000 sidecar_storage=none vector_overhead_bytes=0 packed_object_overhead_bytes=0",
 	} {
@@ -754,10 +754,10 @@ func TestRunPlanMultiVectorStorageWritesTSVAndJSON(t *testing.T) {
 	if plan.Config.PackedObjectOverheadBytes != 0 || plan.Rows[0].PackedObjectOverheadBytes != 0 {
 		t.Fatalf("packed object overhead = config:%d row:%d", plan.Config.PackedObjectOverheadBytes, plan.Rows[0].PackedObjectOverheadBytes)
 	}
-	if plan.Rows[0].VectorsThatFitInOneDenseVector != 341 {
+	if plan.Rows[0].VectorsThatFitInOneDenseVector != 307 {
 		t.Fatalf("vectors_that_fit = %d", plan.Rows[0].VectorsThatFitInOneDenseVector)
 	}
-	if plan.Rows[0].PackedVectorsThatFitInOneDenseVector != 341 {
+	if plan.Rows[0].PackedVectorsThatFitInOneDenseVector != 307 {
 		t.Fatalf("packed_vectors_that_fit = %d", plan.Rows[0].PackedVectorsThatFitInOneDenseVector)
 	}
 }
@@ -776,9 +776,9 @@ func TestRunPlanMultiVectorStorageAccountsForVectorOverhead(t *testing.T) {
 		"--json", jsonPath,
 	})
 	for _, want := range []string{
-		"128\t3072\t2\t1000\t64\t12288\t12320000\t12288\t12320000\t36\tnone\t0\t36\t32\t12320\t68\t4352000\t32\t2336\t2336000\t181.176471\t2.830882\t5.273973\t181\ttrue\t0.353247\t341\ttrue\t0.189610",
-		"128\t3072\t2\t1000\t128\t12288\t12320000\t12288\t12320000\t36\tnone\t0\t36\t32\t12320\t68\t8704000\t32\t4640\t4640000\t181.176471\t1.415441\t2.655172\t181\ttrue\t0.706494\t341\ttrue\t0.376623",
-		"128\t3072\t2\t1000\t256\t12288\t12320000\t12288\t12320000\t36\tnone\t0\t36\t32\t12320\t68\t17408000\t32\t9248\t9248000\t181.176471\t0.707721\t1.332180\t181\tfalse\t1.412987\t341\ttrue\t0.750649",
+		"128\t3072\t2\t1000\t64\t12288\t12320000\t12288\t12320000\t40\tnone\t0\t40\t32\t12320\t72\t4608000\t32\t2592\t2592000\t171.111111\t2.673611\t4.753086\t171\ttrue\t0.374026\t307\ttrue\t0.210390",
+		"128\t3072\t2\t1000\t128\t12288\t12320000\t12288\t12320000\t40\tnone\t0\t40\t32\t12320\t72\t9216000\t32\t5152\t5152000\t171.111111\t1.336806\t2.391304\t171\ttrue\t0.748052\t307\ttrue\t0.418182",
+		"128\t3072\t2\t1000\t256\t12288\t12320000\t12288\t12320000\t40\tnone\t0\t40\t32\t12320\t72\t18432000\t32\t10272\t10272000\t171.111111\t0.668403\t1.199377\t171\tfalse\t1.496104\t307\ttrue\t0.833766",
 		"json: " + jsonPath,
 	} {
 		if !strings.Contains(output, want) {
@@ -797,10 +797,10 @@ func TestRunPlanMultiVectorStorageAccountsForVectorOverhead(t *testing.T) {
 	if plan.Config.VectorOverheadBytes != 32 || row.VectorOverheadBytes != 32 || plan.Config.PackedObjectOverheadBytes != 32 || row.PackedObjectOverheadBytes != 32 {
 		t.Fatalf("overhead = vector config:%d row:%d packed config:%d row:%d", plan.Config.VectorOverheadBytes, row.VectorOverheadBytes, plan.Config.PackedObjectOverheadBytes, row.PackedObjectOverheadBytes)
 	}
-	if row.DenseVectorStorageBytes != 12320 || row.QuantizedVectorStorageBytes != 68 {
+	if row.DenseVectorStorageBytes != 12320 || row.QuantizedVectorStorageBytes != 72 {
 		t.Fatalf("storage bytes = dense:%d quantized:%d", row.DenseVectorStorageBytes, row.QuantizedVectorStorageBytes)
 	}
-	if row.PackedQuantizedStorageBytes != 2336 || row.PackedTotalQuantizedBytes != 2336000 || row.PackedVectorsThatFitInOneDenseVector != 341 {
+	if row.PackedQuantizedStorageBytes != 2592 || row.PackedTotalQuantizedBytes != 2592000 || row.PackedVectorsThatFitInOneDenseVector != 307 {
 		t.Fatalf("packed storage = per_parent:%d total:%d fit:%d", row.PackedQuantizedStorageBytes, row.PackedTotalQuantizedBytes, row.PackedVectorsThatFitInOneDenseVector)
 	}
 }
@@ -833,9 +833,9 @@ func TestRunPlanMultiVectorStorageAccountsForPackedParentOverheadByBitWidth(t *t
 		packedStorage int64
 		packedFits    bool
 	}{
-		{bits: 2, currentFit: 181, packedFit: 341, packedStorage: 3632, packedFits: true},
-		{bits: 4, currentFit: 123, packedFit: 180, packedStorage: 6832, packedFits: true},
-		{bits: 8, currentFit: 75, packedFit: 93, packedStorage: 13232, packedFits: false},
+		{bits: 2, currentFit: 171, packedFit: 307, packedStorage: 4032, packedFits: true},
+		{bits: 4, currentFit: 118, packedFit: 170, packedStorage: 7232, packedFits: true},
+		{bits: 8, currentFit: 73, packedFit: 90, packedStorage: 13632, packedFits: false},
 	}
 	for i, tt := range tests {
 		row := plan.Rows[i]
@@ -865,8 +865,8 @@ func TestRunPlanMultiVectorStorageDerivesTimeSeriesWindows(t *testing.T) {
 	})
 	for _, want := range []string{
 		"packed_storage_multiple_of_dense_parent_cost\tseries_length\twindow_size\twindow_stride\tderived_window_count",
-		"128\t3072\t2\t1000\t13\t12288\t12320000\t12288\t12320000\t36\tnone\t0\t36\t32\t12320\t68\t884000\t32\t500\t500000\t181.176471\t13.936652\t24.640000\t181\ttrue\t0.071753\t341\ttrue\t0.040584\t256\t64\t16\t13",
-		"128\t3072\t2\t1000\t61\t12288\t12320000\t12288\t12320000\t36\tnone\t0\t36\t32\t12320\t68\t4148000\t32\t2228\t2228000\t181.176471\t2.970106\t5.529623\t181\ttrue\t0.336688\t341\ttrue\t0.180844\t1024\t64\t16\t61",
+		"128\t3072\t2\t1000\t13\t12288\t12320000\t12288\t12320000\t40\tnone\t0\t40\t32\t12320\t72\t936000\t32\t552\t552000\t171.111111\t13.162393\t22.318841\t171\ttrue\t0.075974\t307\ttrue\t0.044805\t256\t64\t16\t13",
+		"128\t3072\t2\t1000\t61\t12288\t12320000\t12288\t12320000\t40\tnone\t0\t40\t32\t12320\t72\t4392000\t32\t2472\t2472000\t171.111111\t2.805100\t4.983819\t171\ttrue\t0.356494\t307\ttrue\t0.200649\t1024\t64\t16\t61",
 		"json: " + jsonPath,
 	} {
 		if !strings.Contains(output, want) {
@@ -6138,6 +6138,7 @@ func compactTrainProfileDeltaCounterKeysForTest() []string {
 		"compact_train_packed_bytes_avoided",
 		"compact_train_host_grad_upload_bytes_avoided",
 		"compact_train_kernel_launches",
+		"compact_train_cublas_gemm_calls",
 		"compact_train_kernel_synchronizations",
 		"compact_train_graph_captures",
 		"compact_train_graph_replays",

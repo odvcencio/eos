@@ -96,7 +96,7 @@
     "bits": 4,
     "rerank_overfetch": 200,
     "rerank_storage": "fp16",
-    "total_compression_ratio": 1.5900621118,
+    "total_compression_ratio": 1.5802469136,
     "strict_current_compact_non_regression": true,
     "gate_evidence": {
       "baseline": "runs/eos-frontier-teacher-sentinel-balance-sweep-v1-s40-20260620T154736Z/compact-q4-fp16-overfetch200-scoreboard/scoreboard.json",
@@ -133,7 +133,7 @@
       "max_queries": 20,
       "ndcg_at_10": 0.7846268033,
       "recall_at_100": 0.95,
-      "total_compression_ratio": 1.5900621118,
+      "total_compression_ratio": 1.5802469136,
       "p95_ms": 0.98495
     },
     "note": "q4/fp16/rerank-overfetch=200 remains the promoted compact profile. This narrow candidate passes strict seeded compact non-regression against the s40 q4/fp16/o200 compact anchor across SciFact, NFCorpus, and FiQA."
