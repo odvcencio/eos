@@ -438,8 +438,8 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 	rows := []TurboQuantRetrievalBitMetrics{{
 		Bits:                bitWidth,
 		Method:              fmt.Sprintf("turboquant_ip_b%d", bitWidth),
-		TurboQuantVersion:   turboquant.Version,
-		CodebookVersion:     turboquant.Version, // no separate codebook-version symbol; codebook is bound to the module version.
+		TurboQuantVersion:   turboquantModuleVersion(),
+		CodebookVersion:     turboquantModuleVersion(), // no separate codebook-version symbol; codebook is bound to the module version.
 		Quality:             quality,
 		NDCGAt10Delta:       quality.NDCGAt10 - denseQuality.NDCGAt10,
 		RecallAt100Delta:    quality.RecallAt100 - denseQuality.RecallAt100,
@@ -494,8 +494,8 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 		rows = append(rows, TurboQuantRetrievalBitMetrics{
 			Bits:                bitWidth,
 			Method:              method,
-			TurboQuantVersion:   turboquant.Version,
-			CodebookVersion:     turboquant.Version, // no separate codebook-version symbol; codebook is bound to the module version.
+			TurboQuantVersion:   turboquantModuleVersion(),
+			CodebookVersion:     turboquantModuleVersion(), // no separate codebook-version symbol; codebook is bound to the module version.
 			RerankOverfetch:     overfetch,
 			Quality:             rerankQuality,
 			NDCGAt10Delta:       rerankQuality.NDCGAt10 - denseQuality.NDCGAt10,
