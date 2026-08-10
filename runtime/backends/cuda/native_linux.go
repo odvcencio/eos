@@ -621,6 +621,50 @@ static int eosCudaLaunchContrastiveGrad(EosCudaRuntime* rt, EosCudaKernel* kerne
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
 }
 
+// eosCudaLaunchContrastiveNormalizeRows launches manta_contrastive_normalize_rows
+// (S1a): writes both the row-normalized copy of data and its row norms, so
+// the GEMM-based InfoNCE path (runInfoNCEGEMM) never re-derives host-side
+// row norms (tensorRowNorms) the way the retired atomic path still does.
+static int eosCudaLaunchContrastiveNormalizeRows(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr data, CUdeviceptr normalized, CUdeviceptr norms, int rows, int width, char** err) {
+	void* args[] = {&data, &normalized, &norms, &rows, &width};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+// eosCudaLaunchContrastiveAxisReduce launches manta_contrastive_axis_reduce
+// (S1a): reduces the elementwise product of scores and scales along either
+// axis (outerStride/innerStride pick the axis), producing rowSum (query
+// axis) or colSum (candidate axis) for the gradient correction kernel.
+static int eosCudaLaunchContrastiveAxisReduce(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr scores, CUdeviceptr scales, CUdeviceptr out0, int outerCount, int innerCount, int outerStride, int innerStride, char** err) {
+	void* args[] = {&scores, &scales, &out0, &outerCount, &innerCount, &outerStride, &innerStride};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+// eosCudaLaunchContrastiveGradCorrection launches
+// manta_contrastive_grad_correction (S1a): applies the rank-1 correction and
+// the final division by the stored row norm, in place, to the GEMM output
+// (grad), completing the algebra documented above runInfoNCEGEMM.
+static int eosCudaLaunchContrastiveGradCorrection(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr grad, CUdeviceptr hat, CUdeviceptr axisSum, CUdeviceptr norms, int rows, int width, char** err) {
+	void* args[] = {&grad, &hat, &axisSum, &norms, &rows, &width};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+// eosCudaMemsetD32 zero-fills a device buffer directly (S1a) instead of the
+// host-side make([]float32, n) + cuMemcpyHtoD pattern used by the retired
+// atomic path's gradient buffer zeroing.
+static int eosCudaMemsetD32(EosCudaRuntime* rt, CUdeviceptr ptr, unsigned int value, size_t count, char** err) {
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	cuRes = cuMemsetD32(ptr, value, count);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemsetD32", cuRes);
+		return 1;
+	}
+	return 0;
+}
+
 static int eosCudaMatMulCublasWithBetaNoSync(EosCudaRuntime* rt, CUdeviceptr lhs, CUdeviceptr rhs, CUdeviceptr out0, int lhsRows, int lhsCols, int rhsRows, int rhsCols, int transposeLeft, int transposeRight, float betaValue, char** err) {
 	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
 	if (cuRes != CUDA_SUCCESS) {
@@ -4469,6 +4513,56 @@ func (rt *deviceRuntime) launchAuxContrastiveGrad(kernel *auxKernel, grid, block
 	}
 	var errStr *C.char
 	if C.eosCudaLaunchContrastiveGrad(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), query, positive, queryNorms, positiveNorms, scores, scales, queryGrads, positiveGrads, C.int(queryRows), C.int(candidateRows), C.int(width), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) launchAuxContrastiveNormalizeRows(kernel *auxKernel, grid, block uint, data, normalized, norms C.CUdeviceptr, rows, width int) error {
+	if kernel == nil || kernel.ptr == nil {
+		return fmt.Errorf("cuda auxiliary contrastive normalize kernel is not initialized")
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchContrastiveNormalizeRows(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), data, normalized, norms, C.int(rows), C.int(width), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) launchAuxContrastiveAxisReduce(kernel *auxKernel, grid, block uint, scores, scales, out0 C.CUdeviceptr, outerCount, innerCount, outerStride, innerStride int) error {
+	if kernel == nil || kernel.ptr == nil {
+		return fmt.Errorf("cuda auxiliary contrastive axis reduce kernel is not initialized")
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchContrastiveAxisReduce(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), scores, scales, out0, C.int(outerCount), C.int(innerCount), C.int(outerStride), C.int(innerStride), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) launchAuxContrastiveGradCorrection(kernel *auxKernel, grid, block uint, grad, hat, axisSum, norms C.CUdeviceptr, rows, width int) error {
+	if kernel == nil || kernel.ptr == nil {
+		return fmt.Errorf("cuda auxiliary contrastive grad correction kernel is not initialized")
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchContrastiveGradCorrection(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), grad, hat, axisSum, norms, C.int(rows), C.int(width), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+// memsetFloat32Zero zero-fills a device float32 buffer via cuMemsetD32 (S1a),
+// replacing the host-side zero-array-and-upload pattern the retired atomic
+// contrastive path still uses for its gradient accumulators.
+func (rt *deviceRuntime) memsetFloat32Zero(ptr C.CUdeviceptr, elements int) error {
+	if rt == nil || rt.ptr == nil {
+		return fmt.Errorf("cuda runtime is not initialized")
+	}
+	if elements <= 0 {
+		return nil
+	}
+	var errStr *C.char
+	if C.eosCudaMemsetD32(rt.ptr, ptr, 0, C.size_t(elements), &errStr) != 0 {
 		return cStringError(errStr)
 	}
 	return nil
