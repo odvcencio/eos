@@ -203,35 +203,38 @@ type CompactForwardAcceleratorStats struct {
 // activity. A nil stats provider means unavailable; a zero-valued available
 // stats struct means the implementation exists but has not run.
 type CompactTrainAcceleratorStats struct {
-	ForwardCalls               int64
-	BackwardCalls              int64
-	HandlesCreated             int64
-	HandlesReleased            int64
-	LiveHandles                int64
-	GradientZeroCalls          int64
-	ResidentGradBytes          int64
-	ActivationArenaBytes       int64
-	WorkspaceArenaBytes        int64
-	UploadedBytes              int64
-	DownloadedBytes            int64
-	PooledDownloadedBytes      int64
-	GradPooledUploadedBytes    int64
-	StatusDownloadedBytes      int64
-	PackedBytesAvoided         int64
-	HostGradUploadBytesAvoided int64
-	KernelLaunches             int64
-	KernelSynchronizations     int64
-	GraphCaptures              int64
-	GraphReplays               int64
-	FallbackOrUnhandled        int64
-	ForwardNanos               int64
-	BackwardNanos              int64
-	OptimizerResidentGradNanos int64
-	LastShape                  CompactForwardShape
-	LastForwardLaunches        int64
-	LastBackwardLaunches       int64
-	LastForwardSyncs           int64
-	LastBackwardSyncs          int64
+	ForwardCalls                int64
+	BackwardCalls               int64
+	HandlesCreated              int64
+	HandlesReleased             int64
+	LiveHandles                 int64
+	GradientZeroCalls           int64
+	ResidentGradBytes           int64
+	ActivationArenaBytes        int64
+	WorkspaceArenaBytes         int64
+	UploadedBytes               int64
+	DownloadedBytes             int64
+	PooledDownloadedBytes       int64
+	GradPooledUploadedBytes     int64
+	StatusDownloadedBytes       int64
+	PackedBytesAvoided          int64
+	HostGradUploadBytesAvoided  int64
+	KernelLaunches              int64
+	CublasGemmCalls             int64
+	KernelSynchronizations      int64
+	GraphCaptures               int64
+	GraphReplays                int64
+	FallbackOrUnhandled         int64
+	ForwardNanos                int64
+	BackwardNanos               int64
+	OptimizerResidentGradNanos  int64
+	LastShape                   CompactForwardShape
+	LastForwardLaunches         int64
+	LastBackwardLaunches        int64
+	LastForwardCublasGemmCalls  int64
+	LastBackwardCublasGemmCalls int64
+	LastForwardSyncs            int64
+	LastBackwardSyncs           int64
 }
 
 // ContrastiveGradResult contains pooled embedding gradients and unnormalized row metrics.

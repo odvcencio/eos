@@ -334,6 +334,7 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		out.PackedBytesAvoided -= start.PackedBytesAvoided
 		out.HostGradUploadBytesAvoided -= start.HostGradUploadBytesAvoided
 		out.KernelLaunches -= start.KernelLaunches
+		out.CublasGemmCalls -= start.CublasGemmCalls
 		out.KernelSynchronizations -= start.KernelSynchronizations
 		out.GraphCaptures -= start.GraphCaptures
 		out.GraphReplays -= start.GraphReplays
@@ -371,6 +372,7 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.PackedBytesAvoided += right.PackedBytesAvoided
 		out.HostGradUploadBytesAvoided += right.HostGradUploadBytesAvoided
 		out.KernelLaunches += right.KernelLaunches
+		out.CublasGemmCalls += right.CublasGemmCalls
 		out.KernelSynchronizations += right.KernelSynchronizations
 		out.GraphCaptures += right.GraphCaptures
 		out.GraphReplays += right.GraphReplays
