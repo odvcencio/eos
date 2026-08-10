@@ -2,6 +2,7 @@ package eosruntime
 
 import (
 	"bufio"
+	"container/heap"
 	"fmt"
 	"os"
 	"runtime"
@@ -17,8 +18,9 @@ type TokenizerTrainConfig struct {
 	CorpusPath string
 	VocabSize  int
 	MinFreq    int
-	// Workers sets how many goroutines shard pair counting and merge
-	// application during each BPE training round. <= 0 means "auto": see
+	// Workers sets how many goroutines shard word entries for the initial
+	// pair-frequency scan and for applying each selected merge to the word
+	// entries it affects. <= 0 means "auto": see
 	// ResolveTokenizerTrainWorkers. Merge-selection ties always break on a
 	// fixed total order (frequency descending, then pair lexicographic
 	// ascending; see selectBestPair), so the trained tokenizer is
@@ -32,11 +34,12 @@ const tokenizerTrainWorkersEnv = "EOS_TOKENIZER_TRAIN_WORKERS"
 
 // ResolveTokenizerTrainWorkers returns the effective worker count for
 // parallel tokenizer training. It only changes how many goroutines shard
-// the per-round pair-counting and merge-application work; it never changes
-// the trained tokenizer's content. requested wins when positive; otherwise
-// the EOS_TOKENIZER_TRAIN_WORKERS environment variable is used when it
-// parses as a positive integer; otherwise runtime.GOMAXPROCS(0). The
-// result is always >= 1.
+// the initial pair-counting scan and each round's merge application over
+// the word entries a merge affects; it never changes the trained
+// tokenizer's content. requested wins when positive; otherwise the
+// EOS_TOKENIZER_TRAIN_WORKERS environment variable is used when it parses
+// as a positive integer; otherwise runtime.GOMAXPROCS(0). The result is
+// always >= 1.
 func ResolveTokenizerTrainWorkers(requested int) int {
 	if requested > 0 {
 		return requested
@@ -63,7 +66,9 @@ var trainTokenizerFromCorpusCallCount atomic.Int64
 // occurred in the corpus. TrainTokenizerFromCorpus counts pairs and
 // applies merges over the unique-word table (wordMap), not the raw
 // per-occurrence corpus stream, so a word's cost is paid once regardless
-// of how many times it appears in the corpus.
+// of how many times it appears in the corpus. A wordEntry's pointer
+// identity is also used as a stable key by the incremental pair index
+// (pairIndex in TrainTokenizerFromCorpus; see applyIncrementalMergeShard).
 type wordEntry struct {
 	ids  []int32
 	freq int
@@ -172,13 +177,15 @@ func TrainTokenizerFromCorpus(cfg TokenizerTrainConfig) (TokenizerFile, error) {
 	// lexicographically, followed by merge tokens in creation order.
 	baseCharCount := len(interner.strings)
 
-	// entries is a stable partition unit for parallel pair counting and
-	// merge application. Materializing it once (instead of ranging over
-	// wordMap every round) also avoids re-walking the map up to VocabSize
-	// times. Which entries land in which shard does not affect the
-	// trained tokenizer: pair counting sums per-shard maps together (a
-	// commutative, associative reduction) and merge application mutates
-	// each entry independently of every other entry.
+	// entries is a stable, one-time partition unit for the initial parallel
+	// pair-frequency/index scan (scanWordEntryPairsParallel). Materializing
+	// it once (instead of ranging over wordMap) also avoids walking the map
+	// itself with its randomized iteration order. Which entries land in
+	// which shard does not affect the trained tokenizer: the scan sums
+	// per-shard maps together (a commutative, associative reduction), and
+	// every later merge round re-shards only the word entries the chosen
+	// pair actually affects (see applyIncrementalMergeParallel), never all
+	// of entries again.
 	entries := make([]*wordEntry, 0, len(wordMap))
 	for _, entry := range wordMap {
 		entries = append(entries, entry)
@@ -197,21 +204,36 @@ func TrainTokenizerFromCorpus(cfg TokenizerTrainConfig) (TokenizerFile, error) {
 		return TokenizerFile{}, fmt.Errorf("tokenizer vocab size %d is too small for %d special+base tokens", cfg.VocabSize, len(specials)+baseCharCount)
 	}
 
+	// pairFreqs and pairIndex (pair -> the word entries currently
+	// containing it) are seeded once, in parallel, over the whole corpus.
+	// Every merge round after that updates both incrementally (see
+	// applyIncrementalMergeParallel/applyMergeDelta) instead of rescanning:
+	// per-round cost tracks how many words the chosen merge actually
+	// touches, not the corpus size.
+	pairFreqs, pairIndex := scanWordEntryPairsParallel(shards)
+	pq := newPairHeap(pairFreqs, interner)
+
 	merges := make([]TokenizerMerge, 0)
 	for len(specials)+len(interner.strings)+len(merges) < cfg.VocabSize {
-		pairFreqs := countPairFreqsParallel(shards)
-		if len(pairFreqs) == 0 {
-			break
-		}
-
-		bestPair, _, found := selectBestPairID(pairFreqs, cfg.MinFreq, interner)
+		bestPair, _, found := popBestPair(pq, pairFreqs, cfg.MinFreq)
 		if !found {
 			break
+		}
+		affectedSet := pairIndex[bestPair]
+		if len(affectedSet) == 0 {
+			panic(fmt.Sprintf("tokenizer training: pair %+v has live frequency %d but no indexed word entries; pairFreqs and pairIndex are out of sync", bestPair, pairFreqs[bestPair]))
+		}
+		affected := make([]*wordEntry, 0, len(affectedSet))
+		for entry := range affectedSet {
+			affected = append(affected, entry)
 		}
 
 		leftStr, rightStr := interner.String(bestPair.left), interner.String(bestPair.right)
 		mergedID := interner.intern(leftStr + rightStr)
-		applyMergeParallel(shards, bestPair.left, bestPair.right, mergedID)
+
+		delta := applyIncrementalMergeParallel(affected, workers, bestPair.left, bestPair.right, mergedID)
+		applyMergeDelta(pairFreqs, pairIndex, pq, delta)
+
 		merges = append(merges, TokenizerMerge{Left: leftStr, Right: rightStr})
 	}
 
@@ -365,7 +387,10 @@ func pairLessID(a, b tokenizerBPEPairID, interner *tokenInterner) bool {
 
 // selectBestPairID is selectBestPair's ID-keyed production twin: identical
 // tie-break total order (see selectBestPair), verified equivalent to it by
-// TestSelectBestPairIDMatchesReference.
+// TestSelectBestPairIDMatchesReference. The actual training loop no longer
+// calls this directly (see popBestPair), but it stays as the readable,
+// directly tested specification popBestPair's heap-based selection must
+// match.
 func selectBestPairID(pairFreqs map[tokenizerBPEPairID]int, minFreq int, interner *tokenInterner) (tokenizerBPEPairID, int, bool) {
 	var (
 		bestPair tokenizerBPEPairID
@@ -387,10 +412,13 @@ func selectBestPairID(pairFreqs map[tokenizerBPEPairID]int, minFreq int, interne
 
 // shardWordEntries splits entries into up to workers contiguous,
 // roughly-equal shards (the last entries.len%workers shards get one extra
-// element). The partition only distributes work across goroutines: pair
-// counting sums per-shard results together and merge application mutates
-// each entry independently, so the trained tokenizer does not depend on
-// how entries are partitioned or on shard count.
+// element). The partition only distributes work across goroutines: callers
+// combine per-shard results with commutative, associative reductions and
+// mutate each entry independently of every other entry, so the trained
+// tokenizer does not depend on how entries are partitioned or on shard
+// count. Used both for the one-time initial pair scan (over every word
+// entry) and, every merge round, to re-partition just the word entries the
+// chosen pair currently affects (see applyIncrementalMergeParallel).
 func shardWordEntries(entries []*wordEntry, workers int) [][]*wordEntry {
 	if workers < 1 {
 		workers = 1
@@ -417,57 +445,10 @@ func shardWordEntries(entries []*wordEntry, workers int) [][]*wordEntry {
 	return shards
 }
 
-// countPairFreqsShard counts adjacent-token-ID pair frequencies, weighted
-// by each word's corpus frequency, across one shard of word entries.
-// Keying on interned int32 IDs instead of strings is deliberate: this loop
-// runs once per adjacent pair per unique word per round, and profiling a
-// real ~58MB/~159k-unique-word corpus showed Go's string-keyed map
-// hash/compare dominating (roughly half of total CPU time) at that volume.
-func countPairFreqsShard(entries []*wordEntry) map[tokenizerBPEPairID]int {
-	freqs := make(map[tokenizerBPEPairID]int, 2*len(entries))
-	for _, entry := range entries {
-		for i := 0; i < len(entry.ids)-1; i++ {
-			freqs[tokenizerBPEPairID{left: entry.ids[i], right: entry.ids[i+1]}] += entry.freq
-		}
-	}
-	return freqs
-}
-
-// countPairFreqsParallel counts pair frequencies across all shards
-// concurrently, then combines the per-shard maps into one map by summing
-// counts per pair. Integer addition is commutative and associative, so
-// the combined frequencies are identical regardless of shard count or
-// goroutine scheduling order.
-func countPairFreqsParallel(shards [][]*wordEntry) map[tokenizerBPEPairID]int {
-	if len(shards) == 0 {
-		return map[tokenizerBPEPairID]int{}
-	}
-	if len(shards) == 1 {
-		return countPairFreqsShard(shards[0])
-	}
-	partials := make([]map[tokenizerBPEPairID]int, len(shards))
-	var wg sync.WaitGroup
-	wg.Add(len(shards))
-	for i, shard := range shards {
-		go func(i int, shard []*wordEntry) {
-			defer wg.Done()
-			partials[i] = countPairFreqsShard(shard)
-		}(i, shard)
-	}
-	wg.Wait()
-	total := make(map[tokenizerBPEPairID]int, len(partials[0]))
-	for _, partial := range partials {
-		for p, f := range partial {
-			total[p] += f
-		}
-	}
-	return total
-}
-
 // applyMergeIDs combines every non-overlapping adjacent (left, right) ID
 // pair in ids into the single merged ID. It returns the input slice
 // unchanged (no allocation) when the pair does not occur at all, which
-// matters in aggregate for the same reason described on countPairFreqsShard.
+// matters in aggregate for the same reason described on wordPairCounts.
 func applyMergeIDs(ids []int32, left, right, merged int32) []int32 {
 	if len(ids) < 2 {
 		return ids
@@ -496,31 +477,380 @@ func applyMergeIDs(ids []int32, left, right, merged int32) []int32 {
 	return out
 }
 
-// applyMergeShard rewrites token IDs in place for one shard of word entries.
-func applyMergeShard(entries []*wordEntry, left, right, merged int32) {
+// --- incremental pair-frequency bookkeeping ---------------------------
+//
+// The original trainer recounted every adjacent pair over the whole corpus
+// every merge round (see git history for countPairFreqsParallel /
+// applyMergeParallel). That makes each round's cost proportional to the
+// corpus size, so total training cost is roughly (rounds * corpus size).
+// The functions below replace that with the standard production-BPE
+// technique: maintain pairFreqs and an inverted pairIndex (pair -> the
+// word entries currently containing it) across rounds, and when a merge is
+// applied, touch only the word entries pairIndex says the merged pair
+// occurs in -- updating just the pairs whose counts actually change
+// (decrementing the merged pair and its old neighbors, incrementing its
+// new neighbors; see applyIncrementalMergeShard) instead of every pair in
+// every word. Selection uses a lazily-validated max-heap (pairHeap) over
+// pairFreqs instead of scanning it, so a round's cost tracks the number of
+// affected words, not the corpus or vocabulary size.
+
+// wordPairEntry pairs a distinct adjacent-ID pair occurring within one
+// word's token sequence with how many times it occurs there, counting
+// overlapping occurrences (for example pair (X,X) occurs twice in the
+// 3-token sequence [X,X,X]).
+type wordPairEntry struct {
+	pair  tokenizerBPEPairID
+	count int
+}
+
+// wordPairCounts returns the raw adjacent-pair counts within one word's
+// token sequence: a plain sliding-window scan (i from 0 to len(ids)-2),
+// the same counting rule the original whole-corpus recount applied per
+// word. It returns a small slice rather than a map: BPE word lengths stay
+// short (typically well under a few dozen tokens, and only shrink as
+// merges combine tokens), so a linear scan-and-accumulate avoids
+// map-allocation overhead in a function called twice per affected word on
+// every merge round (see applyIncrementalMergeShard).
+func wordPairCounts(ids []int32) []wordPairEntry {
+	if len(ids) < 2 {
+		return nil
+	}
+	counts := make([]wordPairEntry, 0, len(ids)-1)
+	for i := 0; i < len(ids)-1; i++ {
+		pair := tokenizerBPEPairID{left: ids[i], right: ids[i+1]}
+		found := false
+		for j := range counts {
+			if counts[j].pair == pair {
+				counts[j].count++
+				found = true
+				break
+			}
+		}
+		if !found {
+			counts = append(counts, wordPairEntry{pair: pair, count: 1})
+		}
+	}
+	return counts
+}
+
+// wordPairCountsContain reports whether counts (as returned by
+// wordPairCounts) includes pair at all, regardless of its count.
+func wordPairCountsContain(counts []wordPairEntry, pair tokenizerBPEPairID) bool {
+	for _, c := range counts {
+		if c.pair == pair {
+			return true
+		}
+	}
+	return false
+}
+
+// scanWordEntryPairsShard computes one shard's contribution to the initial
+// pair-frequency table and inverted pair index: for every word entry, it
+// weights that word's wordPairCounts by the word's corpus frequency (see
+// wordEntry) and records the word as a member of every distinct pair it
+// contains.
+func scanWordEntryPairsShard(entries []*wordEntry) (freqs map[tokenizerBPEPairID]int, index map[tokenizerBPEPairID][]*wordEntry) {
+	freqs = make(map[tokenizerBPEPairID]int, 2*len(entries))
+	index = make(map[tokenizerBPEPairID][]*wordEntry)
 	for _, entry := range entries {
-		entry.ids = applyMergeIDs(entry.ids, left, right, merged)
+		for _, c := range wordPairCounts(entry.ids) {
+			freqs[c.pair] += c.count * entry.freq
+			index[c.pair] = append(index[c.pair], entry)
+		}
+	}
+	return freqs, index
+}
+
+// scanWordEntryPairsParallel builds the starting pairFreqs table and
+// pairIndex (pair -> the set of word entries containing it) across all
+// shards concurrently, then combines the per-shard results: frequencies
+// sum (commutative, associative integer addition), and index membership
+// lists merge into per-pair sets (shards partition entries, so no entry
+// can appear in two shards' lists for the same pair). It runs exactly
+// once, before the merge-selection loop begins; every later round updates
+// both structures incrementally instead of rescanning (see
+// applyIncrementalMergeParallel and applyMergeDelta).
+func scanWordEntryPairsParallel(shards [][]*wordEntry) (map[tokenizerBPEPairID]int, map[tokenizerBPEPairID]map[*wordEntry]struct{}) {
+	type partial struct {
+		freqs map[tokenizerBPEPairID]int
+		index map[tokenizerBPEPairID][]*wordEntry
+	}
+	partials := make([]partial, len(shards))
+	if len(shards) == 1 {
+		freqs, index := scanWordEntryPairsShard(shards[0])
+		partials[0] = partial{freqs: freqs, index: index}
+	} else {
+		var wg sync.WaitGroup
+		wg.Add(len(shards))
+		for i, shard := range shards {
+			go func(i int, shard []*wordEntry) {
+				defer wg.Done()
+				freqs, index := scanWordEntryPairsShard(shard)
+				partials[i] = partial{freqs: freqs, index: index}
+			}(i, shard)
+		}
+		wg.Wait()
+	}
+
+	freqs := make(map[tokenizerBPEPairID]int, len(partials[0].freqs))
+	index := make(map[tokenizerBPEPairID]map[*wordEntry]struct{}, len(partials[0].index))
+	for _, p := range partials {
+		for pair, f := range p.freqs {
+			freqs[pair] += f
+		}
+		for pair, members := range p.index {
+			set := index[pair]
+			if set == nil {
+				set = make(map[*wordEntry]struct{}, len(members))
+				index[pair] = set
+			}
+			for _, entry := range members {
+				set[entry] = struct{}{}
+			}
+		}
+	}
+	return freqs, index
+}
+
+// pairHeapItem is one snapshot of a pair's frequency at the moment it was
+// pushed onto a pairHeap. Because pairFreqs changes incrementally as
+// merges are applied (see applyMergeDelta), an item can go stale: a later
+// push for the same pair records its new frequency without removing the
+// earlier item. popBestPair treats a popped item as valid only when its
+// freq still matches pairFreqs' live value for that pair.
+type pairHeapItem struct {
+	pair tokenizerBPEPairID
+	freq int
+}
+
+// pairHeap is a max-heap over pairHeapItem, ordered by exactly the same
+// total order as selectBestPairID/pairLessID: highest frequency first,
+// ties broken by the lexicographically smaller pair. It supports lazy
+// deletion (see pairHeapItem, popBestPair): callers never remove or
+// decrease-key an existing item, they just push a fresh one whenever a
+// pair's live frequency changes, and popBestPair discards stale items it
+// encounters at pop time.
+type pairHeap struct {
+	items    []pairHeapItem
+	interner *tokenInterner
+}
+
+func (h *pairHeap) Len() int { return len(h.items) }
+
+// Less reports whether items[i] must be popped before items[j] under the
+// fixed BPE tie-break total order (see selectBestPairID): higher frequency
+// wins; frequency ties break on the lexicographically smaller pair via
+// pairLessID, mirrored here exactly so a pairHeap always agrees with
+// selectBestPairID about which pair wins.
+func (h *pairHeap) Less(i, j int) bool {
+	a, b := h.items[i], h.items[j]
+	if a.freq != b.freq {
+		return a.freq > b.freq
+	}
+	return pairLessID(a.pair, b.pair, h.interner)
+}
+
+func (h *pairHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
+
+// Push and Pop satisfy container/heap.Interface. Callers use the package
+// functions heap.Push/heap.Pop (see newPairHeap, popBestPair, and
+// applyMergeDelta), never these methods directly.
+func (h *pairHeap) Push(x any) { h.items = append(h.items, x.(pairHeapItem)) }
+
+func (h *pairHeap) Pop() any {
+	old := h.items
+	n := len(old)
+	item := old[n-1]
+	h.items = old[:n-1]
+	return item
+}
+
+// newPairHeap builds a pairHeap already holding one item per entry in
+// freqs, using heap.Init for an O(n) heapify instead of n individual
+// O(log n) pushes.
+func newPairHeap(freqs map[tokenizerBPEPairID]int, interner *tokenInterner) *pairHeap {
+	pq := &pairHeap{items: make([]pairHeapItem, 0, len(freqs)), interner: interner}
+	for pair, freq := range freqs {
+		pq.items = append(pq.items, pairHeapItem{pair: pair, freq: freq})
+	}
+	heap.Init(pq)
+	return pq
+}
+
+// popBestPair returns the same winner selectBestPairID would compute by
+// scanning the live pairFreqs table, without scanning it: it pops pq (see
+// pairHeap) until it finds an item whose recorded frequency still matches
+// pairFreqs' current value for that pair, discarding stale items along the
+// way (see pairHeapItem).
+//
+// That first live item is guaranteed to be the global best. applyMergeDelta
+// always pushes a fresh item whenever a pair's live frequency changes, so
+// every pair with a positive live count has at least one live item in pq
+// at all times, and pq pops in non-increasing frequency order (ties broken
+// exactly like selectBestPairID). So if the first live item's frequency is
+// below minFreq, every other pair's live frequency is too, and there is no
+// winner -- matching selectBestPairID(pairFreqs, minFreq, ...)'s
+// found=false case exactly.
+func popBestPair(pq *pairHeap, pairFreqs map[tokenizerBPEPairID]int, minFreq int) (tokenizerBPEPairID, int, bool) {
+	for pq.Len() > 0 {
+		top := heap.Pop(pq).(pairHeapItem)
+		live, ok := pairFreqs[top.pair]
+		if !ok || live != top.freq {
+			continue
+		}
+		if live < minFreq {
+			return tokenizerBPEPairID{}, 0, false
+		}
+		return top.pair, live, true
+	}
+	return tokenizerBPEPairID{}, 0, false
+}
+
+// shardMergeDelta accumulates one shard's contribution to a merge round:
+// how much each pair's live frequency should change (freq, which can be
+// negative), and which word entries newly started or stopped containing
+// each pair (add/remove), ready to fold into the global
+// pairFreqs/pairIndex (see applyMergeDelta).
+type shardMergeDelta struct {
+	freq   map[tokenizerBPEPairID]int
+	add    map[tokenizerBPEPairID][]*wordEntry
+	remove map[tokenizerBPEPairID][]*wordEntry
+}
+
+func newShardMergeDelta() *shardMergeDelta {
+	return &shardMergeDelta{
+		freq:   make(map[tokenizerBPEPairID]int),
+		add:    make(map[tokenizerBPEPairID][]*wordEntry),
+		remove: make(map[tokenizerBPEPairID][]*wordEntry),
 	}
 }
 
-// applyMergeParallel applies one merge to every word entry across all
-// shards concurrently. Each entry belongs to exactly one shard and is
-// rewritten only by that shard's own goroutine, so there is no shared
-// mutable state between goroutines and therefore no data race. The result
-// does not depend on shard count: every entry's new tokens depend only on
-// that entry's own prior tokens, never on any other entry.
-func applyMergeParallel(shards [][]*wordEntry, left, right, merged int32) {
-	if len(shards) == 1 {
-		applyMergeShard(shards[0], left, right, merged)
-		return
+// applyIncrementalMergeShard applies one merge to every word entry in one
+// shard of the affected-entries list (see applyIncrementalMergeParallel)
+// and records the exact resulting pair-frequency/index delta.
+//
+// For each entry it takes the word's raw pair counts before the merge
+// (oldCounts) and after (newCounts, computed from the same applyMergeIDs
+// rewrite the pre-incremental trainer applied to every word every round),
+// both via wordPairCounts, and folds their weighted difference into freq.
+//
+// Comparing full before/after pair counts -- rather than reasoning
+// pair-by-pair about which specific neighbors changed -- handles every
+// case correctly with one rule, including words where the merge pair
+// occurs more than once (possibly overlapping, so not every occurrence
+// becomes a merge site: see applyMergeIDs) or where the same pair type
+// also occurs elsewhere in the word, untouched by this merge. The diff is
+// exactly what a from-scratch recount of this one word would find, and
+// words outside the affected list are provably unchanged (applyMergeIDs is
+// a no-op when its pair does not occur in a word), so summing this diff
+// over every affected entry reproduces precisely the pairFreqs a full
+// recount would.
+func applyIncrementalMergeShard(entries []*wordEntry, left, right, merged int32) *shardMergeDelta {
+	d := newShardMergeDelta()
+	for _, entry := range entries {
+		oldCounts := wordPairCounts(entry.ids)
+		entry.ids = applyMergeIDs(entry.ids, left, right, merged)
+		newCounts := wordPairCounts(entry.ids)
+		freqWeight := entry.freq
+
+		for _, oc := range oldCounts {
+			d.freq[oc.pair] -= oc.count * freqWeight
+			if !wordPairCountsContain(newCounts, oc.pair) {
+				d.remove[oc.pair] = append(d.remove[oc.pair], entry)
+			}
+		}
+		for _, nc := range newCounts {
+			d.freq[nc.pair] += nc.count * freqWeight
+			if !wordPairCountsContain(oldCounts, nc.pair) {
+				d.add[nc.pair] = append(d.add[nc.pair], entry)
+			}
+		}
 	}
+	return d
+}
+
+// applyIncrementalMergeParallel applies one merge across every entry in
+// affected (the current live members of pairIndex[{left,right}]),
+// re-sharding just that subset across workers goroutines (see
+// shardWordEntries) and combining each shard's delta (see
+// applyIncrementalMergeShard): pair-frequency deltas sum, and add/remove
+// membership lists concatenate (shards partition affected, so no entry is
+// processed twice). Every entry belongs to exactly one shard and is
+// rewritten only by that shard's own goroutine, so there is no shared
+// mutable state between goroutines and therefore no data race; the result
+// does not depend on shard count for the same reason the original
+// whole-corpus parallel scan did not.
+func applyIncrementalMergeParallel(affected []*wordEntry, workers int, left, right, merged int32) *shardMergeDelta {
+	shards := shardWordEntries(affected, workers)
+	if len(shards) == 1 {
+		return applyIncrementalMergeShard(shards[0], left, right, merged)
+	}
+
+	partials := make([]*shardMergeDelta, len(shards))
 	var wg sync.WaitGroup
 	wg.Add(len(shards))
-	for _, shard := range shards {
-		go func(shard []*wordEntry) {
+	for i, shard := range shards {
+		go func(i int, shard []*wordEntry) {
 			defer wg.Done()
-			applyMergeShard(shard, left, right, merged)
-		}(shard)
+			partials[i] = applyIncrementalMergeShard(shard, left, right, merged)
+		}(i, shard)
 	}
 	wg.Wait()
+
+	combined := newShardMergeDelta()
+	for _, p := range partials {
+		for pair, f := range p.freq {
+			combined.freq[pair] += f
+		}
+		for pair, es := range p.add {
+			combined.add[pair] = append(combined.add[pair], es...)
+		}
+		for pair, es := range p.remove {
+			combined.remove[pair] = append(combined.remove[pair], es...)
+		}
+	}
+	return combined
+}
+
+// applyMergeDelta folds one merge round's shardMergeDelta into the global
+// pairFreqs table, pairIndex, and pq (see pairHeap), so the next
+// popBestPair call sees an up-to-date view without rescanning anything.
+//
+// Index removals are applied before additions, though the two operations
+// never actually interleave for the same (pair, entry): a single word
+// entry can only be added to or removed from one pair's index membership
+// per round (wordPairCountsContain(oldCounts, pair) and
+// wordPairCountsContain(newCounts, pair) cannot both be false for the pair
+// that put entry in d.add or d.remove in the first place), so add and
+// remove operations touching different entries commute freely regardless
+// of the order they are applied in.
+func applyMergeDelta(pairFreqs map[tokenizerBPEPairID]int, pairIndex map[tokenizerBPEPairID]map[*wordEntry]struct{}, pq *pairHeap, d *shardMergeDelta) {
+	for pair, entries := range d.remove {
+		set := pairIndex[pair]
+		for _, entry := range entries {
+			delete(set, entry)
+		}
+		if len(set) == 0 {
+			delete(pairIndex, pair)
+		}
+	}
+	for pair, entries := range d.add {
+		set := pairIndex[pair]
+		if set == nil {
+			set = make(map[*wordEntry]struct{}, len(entries))
+			pairIndex[pair] = set
+		}
+		for _, entry := range entries {
+			set[entry] = struct{}{}
+		}
+	}
+	for pair, delta := range d.freq {
+		newFreq := pairFreqs[pair] + delta
+		if newFreq <= 0 {
+			delete(pairFreqs, pair)
+			continue
+		}
+		pairFreqs[pair] = newFreq
+		heap.Push(pq, pairHeapItem{pair: pair, freq: newFreq})
+	}
 }
