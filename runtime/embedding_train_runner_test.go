@@ -1,6 +1,7 @@
 package eosruntime
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -1292,7 +1293,15 @@ func TestTurboQuantPreparedIPPrefixGradientsAreFiniteAndTangent(t *testing.T) {
 	}
 }
 
-func TestEmbeddingTrainerTurboQuantPrefixDisablesContrastiveAccelerator(t *testing.T) {
+// TestEmbeddingTrainerTurboQuantPrefixAcceleratesBaseTermButKeepsHostPrefix
+// covers S2: a configured TurboQuant prefix objective is a genuine host-only
+// term (it simulates quantization, not just truncation), so it must keep
+// running on the host. But it no longer forces the full-dim InfoNCE base
+// term onto the host too — S2 un-gates the accelerator for that term, so the
+// base term is accelerated while the TurboQuant prefix term still runs on
+// the host and gets summed back in (see the unchanged BatchSize/pairCount
+// versus the pre-S2 host-only path below).
+func TestEmbeddingTrainerTurboQuantPrefixAcceleratesBaseTermButKeepsHostPrefix(t *testing.T) {
 	batch := tinyEmbeddingContrastiveDataset()
 	accelerated := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
 	accelerated.config.ContrastiveLoss = "infonce"
@@ -1306,22 +1315,634 @@ func TestEmbeddingTrainerTurboQuantPrefixDisablesContrastiveAccelerator(t *testi
 		t.Fatalf("accelerator square calls = %d, want 1 when compact-prefix objective unset", accel.squareCalls)
 	}
 
-	host := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
-	host.config.ContrastiveLoss = "infonce"
-	host.config.Temperature = 0.05
-	host.config.MatryoshkaDims = []int{2}
-	host.config.MatryoshkaWeights = []float32{1}
-	host.config.TurboQuantPrefixBits = []int{2}
-	host.config.TurboQuantPrefixWeight = 1
-	host.config.TurboQuantPrefixSeed = DefaultTurboQuantMultiVectorQuantizerSeed
-	hostAccel := &countingContrastiveAccelerator{}
-	host.contrastiveAccel = hostAccel
-	if _, err := host.TrainContrastiveStep(batch); err != nil {
+	mixed := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	mixed.config.ContrastiveLoss = "infonce"
+	mixed.config.Temperature = 0.05
+	mixed.config.MatryoshkaDims = []int{2}
+	mixed.config.MatryoshkaWeights = []float32{1}
+	mixed.config.TurboQuantPrefixBits = []int{2}
+	mixed.config.TurboQuantPrefixWeight = 1
+	mixed.config.TurboQuantPrefixSeed = DefaultTurboQuantMultiVectorQuantizerSeed
+	mixedAccel := &countingContrastiveAccelerator{}
+	mixed.contrastiveAccel = mixedAccel
+	metrics, err := mixed.TrainContrastiveStep(batch)
+	if err != nil {
 		t.Fatalf("train turboquant prefix contrastive: %v", err)
 	}
-	if hostAccel.squareCalls != 0 || hostAccel.rectCalls != 0 {
-		t.Fatalf("accelerator calls square=%d rect=%d, want host path when turboquant prefix objective is enabled", hostAccel.squareCalls, hostAccel.rectCalls)
+	if mixedAccel.squareCalls != 1 || mixedAccel.rectCalls != 0 {
+		t.Fatalf("accelerator calls square=%d rect=%d, want the base term accelerated once (S2 general split) even with a turboquant prefix objective active", mixedAccel.squareCalls, mixedAccel.rectCalls)
 	}
+	// BatchSize (pairCount) must still reflect the base term plus the
+	// Matryoshka sub-dim (dim=2 of fullDim=3) plus the turboquant prefix
+	// objective: the true sub-dim/quantization terms stay on the host
+	// unchanged by S2, so this must match the pre-S2 host-only pairCount.
+	if metrics.BatchSize != 12 {
+		t.Fatalf("mixed batch size = %d, want 12 (base 4 + matryoshka sub-dim 4 + turboquant prefix 4)", metrics.BatchSize)
+	}
+
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+	rollback := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	rollback.config.ContrastiveLoss = "infonce"
+	rollback.config.Temperature = 0.05
+	rollback.config.MatryoshkaDims = []int{2}
+	rollback.config.MatryoshkaWeights = []float32{1}
+	rollback.config.TurboQuantPrefixBits = []int{2}
+	rollback.config.TurboQuantPrefixWeight = 1
+	rollback.config.TurboQuantPrefixSeed = DefaultTurboQuantMultiVectorQuantizerSeed
+	rollbackAccel := &countingContrastiveAccelerator{}
+	rollback.contrastiveAccel = rollbackAccel
+	rollbackMetrics, err := rollback.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train turboquant prefix contrastive with rollback flag: %v", err)
+	}
+	if rollbackAccel.squareCalls != 0 || rollbackAccel.rectCalls != 0 {
+		t.Fatalf("rollback accelerator calls square=%d rect=%d, want host path when %s forces the pre-S2 path", rollbackAccel.squareCalls, rollbackAccel.rectCalls, embedHostMatryoshkaLossEnv)
+	}
+	if rollbackMetrics.BatchSize != metrics.BatchSize {
+		t.Fatalf("rollback batch size = %d, want unchanged %d", rollbackMetrics.BatchSize, metrics.BatchSize)
+	}
+}
+
+// exactHostMathContrastiveAccelerator reproduces
+// accumulateInfoNCEContrastiveGrads/accumulateInfoNCEHardNegativeGrads
+// exactly: same cosine/InfoNCE helpers, same iteration order. Tests use it to
+// stand in for a real device accelerator without a GPU, so a "device plus
+// host prefix loop" split can be compared against a fully-host reference
+// computed with the same underlying math.
+type exactHostMathContrastiveAccelerator struct {
+	squareCalls int
+	rectCalls   int
+}
+
+func (a *exactHostMathContrastiveAccelerator) Backend() eosartifact.BackendKind {
+	return eosartifact.BackendCUDA
+}
+
+func (a *exactHostMathContrastiveAccelerator) RunInfoNCE(query, positive *backend.Tensor, cfg backend.ContrastiveLossConfig) (backend.ContrastiveGradResult, error) {
+	a.squareCalls++
+	if query == nil || positive == nil || query.Rank() != 2 || positive.Rank() != 2 ||
+		query.Shape[0] != positive.Shape[0] || query.Shape[1] != positive.Shape[1] {
+		return backend.ContrastiveGradResult{}, fmt.Errorf("exact host math accelerator: shape mismatch")
+	}
+	rows, width := query.Shape[0], query.Shape[1]
+	temperature := cfg.Temperature
+	if temperature <= 0 {
+		temperature = 0.05
+	}
+	queryRow := func(i int) []float32 { return query.F32[i*width : (i+1)*width] }
+	positiveRow := func(i int) []float32 { return positive.F32[i*width : (i+1)*width] }
+	queryNorms := make([]float32, rows)
+	positiveNorms := make([]float32, rows)
+	for i := 0; i < rows; i++ {
+		queryNorms[i] = vectorNorm(queryRow(i))
+		positiveNorms[i] = vectorNorm(positiveRow(i))
+	}
+	queryGrads := make([]float32, rows*width)
+	positiveGrads := make([]float32, rows*width)
+	rowScores := make([]float32, rows)
+	rowProbs := make([]float32, rows)
+	lossSum := float32(0)
+	scoreSum := float32(0)
+	for i := 0; i < rows; i++ {
+		for j := 0; j < rows; j++ {
+			score := cosineScoreWithNorms(queryRow(i), positiveRow(j), queryNorms[i], positiveNorms[j])
+			rowScores[j] = score
+			scoreSum += score
+		}
+		lossSum += infoNCERowProbsAndLossInto(rowScores, i, temperature, rowProbs)
+		for j, prob := range rowProbs {
+			target := float32(0)
+			if i == j {
+				target = 1
+			}
+			scale := (prob - target) / temperature
+			accumulateCosineGradFromScore(queryRow(i), positiveRow(j), queryNorms[i], positiveNorms[j], rowScores[j], scale, queryGrads[i*width:(i+1)*width], positiveGrads[j*width:(j+1)*width])
+		}
+	}
+	return backend.ContrastiveGradResult{
+		QueryGrads:    tensorF32View([]int{rows, width}, queryGrads),
+		PositiveGrads: tensorF32View([]int{rows, width}, positiveGrads),
+		LossSum:       lossSum,
+		ScoreSum:      scoreSum,
+	}, nil
+}
+
+func (a *exactHostMathContrastiveAccelerator) RunInfoNCEWithTargets(query, candidates *backend.Tensor, targetIndexes []int, cfg backend.ContrastiveLossConfig) (backend.ContrastiveGradResult, error) {
+	a.rectCalls++
+	if query == nil || candidates == nil || query.Rank() != 2 || candidates.Rank() != 2 || query.Shape[1] != candidates.Shape[1] {
+		return backend.ContrastiveGradResult{}, fmt.Errorf("exact host math accelerator: shape mismatch")
+	}
+	queryRows, width := query.Shape[0], query.Shape[1]
+	candidateRows := candidates.Shape[0]
+	temperature := cfg.Temperature
+	if temperature <= 0 {
+		temperature = 0.05
+	}
+	queryRow := func(i int) []float32 { return query.F32[i*width : (i+1)*width] }
+	candidateRow := func(i int) []float32 { return candidates.F32[i*width : (i+1)*width] }
+	queryNorms := make([]float32, queryRows)
+	candidateNorms := make([]float32, candidateRows)
+	for i := 0; i < queryRows; i++ {
+		queryNorms[i] = vectorNorm(queryRow(i))
+	}
+	for j := 0; j < candidateRows; j++ {
+		candidateNorms[j] = vectorNorm(candidateRow(j))
+	}
+	queryGrads := make([]float32, queryRows*width)
+	candidateGrads := make([]float32, candidateRows*width)
+	rowScores := make([]float32, candidateRows)
+	rowProbs := make([]float32, candidateRows)
+	lossSum := float32(0)
+	scoreSum := float32(0)
+	for i := 0; i < queryRows; i++ {
+		for j := 0; j < candidateRows; j++ {
+			score := cosineScoreWithNorms(queryRow(i), candidateRow(j), queryNorms[i], candidateNorms[j])
+			rowScores[j] = score
+			scoreSum += score
+		}
+		targetIndex := -1
+		if i < len(targetIndexes) {
+			targetIndex = targetIndexes[i]
+		}
+		lossSum += infoNCERowProbsAndLossInto(rowScores, targetIndex, temperature, rowProbs)
+		for j, prob := range rowProbs {
+			target := float32(0)
+			if j == targetIndex {
+				target = 1
+			}
+			scale := (prob - target) / temperature
+			accumulateCosineGradFromScore(queryRow(i), candidateRow(j), queryNorms[i], candidateNorms[j], rowScores[j], scale, queryGrads[i*width:(i+1)*width], candidateGrads[j*width:(j+1)*width])
+		}
+	}
+	return backend.ContrastiveGradResult{
+		QueryGrads:    tensorF32View([]int{queryRows, width}, queryGrads),
+		PositiveGrads: tensorF32View([]int{candidateRows, width}, candidateGrads),
+		LossSum:       lossSum,
+		ScoreSum:      scoreSum,
+	}, nil
+}
+
+func (a *exactHostMathContrastiveAccelerator) Stats() backend.ContrastiveAcceleratorStats {
+	return backend.ContrastiveAcceleratorStats{RunCalls: int64(a.squareCalls + a.rectCalls)}
+}
+
+func (a *exactHostMathContrastiveAccelerator) Close() {}
+
+// TestContrastiveFullDimMatryoshkaOnlyDetectsTrivialConfig covers S2 part 1:
+// the special case applies only when every configured Matryoshka dim equals
+// fullDim and no other host-only TurboQuant objective is active.
+func TestContrastiveFullDimMatryoshkaOnlyDetectsTrivialConfig(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg     EmbeddingTrainConfig
+		fullDim int
+		want    bool
+	}{
+		"single dim equals full dim": {
+			cfg:     EmbeddingTrainConfig{MatryoshkaDims: []int{3}},
+			fullDim: 3,
+			want:    true,
+		},
+		"duplicate dims all equal full dim": {
+			cfg:     EmbeddingTrainConfig{MatryoshkaDims: []int{3, 3}, MatryoshkaWeights: []float32{0.5, 0.25}},
+			fullDim: 3,
+			want:    true,
+		},
+		"true sub-dim": {
+			cfg:     EmbeddingTrainConfig{MatryoshkaDims: []int{2}},
+			fullDim: 3,
+			want:    false,
+		},
+		"mixed sub-dim and full dim": {
+			cfg:     EmbeddingTrainConfig{MatryoshkaDims: []int{2, 3}},
+			fullDim: 3,
+			want:    false,
+		},
+		"no dims configured": {
+			cfg:     EmbeddingTrainConfig{},
+			fullDim: 3,
+			want:    false,
+		},
+		"unknown full dim": {
+			cfg:     EmbeddingTrainConfig{MatryoshkaDims: []int{3}},
+			fullDim: 0,
+			want:    false,
+		},
+		"turboquant prefix objective active": {
+			cfg: EmbeddingTrainConfig{
+				MatryoshkaDims:             []int{3},
+				TurboQuantPrefixObjectives: []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 4, Weight: 0.25}},
+			},
+			fullDim: 3,
+			want:    false,
+		},
+		"turboquant compact objective active": {
+			cfg: EmbeddingTrainConfig{
+				MatryoshkaDims:              []int{3},
+				TurboQuantCompactObjectives: []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 4, Weight: 0.05}},
+			},
+			fullDim: 3,
+			want:    false,
+		},
+		"turboquant rank-margin objective active": {
+			cfg: EmbeddingTrainConfig{
+				MatryoshkaDims:                 []int{3},
+				TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 4, Weight: 0.1}},
+			},
+			fullDim: 3,
+			want:    false,
+		},
+		"zero-weight turboquant objectives do not block": {
+			cfg: EmbeddingTrainConfig{
+				MatryoshkaDims:                 []int{3},
+				TurboQuantPrefixObjectives:     []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 4, Weight: 0}},
+				TurboQuantCompactObjectives:    []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 4, Weight: 0}},
+				TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 4, Weight: 0}},
+			},
+			fullDim: 3,
+			want:    true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := contrastiveFullDimMatryoshkaOnly(tc.cfg, tc.fullDim); got != tc.want {
+				t.Fatalf("contrastiveFullDimMatryoshkaOnly(%+v, %d) = %v, want %v", tc.cfg, tc.fullDim, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestContrastiveBaseTermUsesAcceleratorRespectsRollbackFlag and
+// TestEmbedHostMatryoshkaLossForcedRecognizesTruthyAndFalsyValues cover S2
+// part 3: the EOS_EMBED_HOST_MATRYOSHKA_LOSS rollback flag.
+func TestContrastiveBaseTermUsesAcceleratorRespectsRollbackFlag(t *testing.T) {
+	plain := EmbeddingTrainConfig{}
+	matryoshka := EmbeddingTrainConfig{MatryoshkaDims: []int{3}}
+
+	if !contrastiveBaseTermUsesAccelerator(plain) {
+		t.Fatal("plain config should always try the accelerator")
+	}
+	if !contrastiveBaseTermUsesAccelerator(matryoshka) {
+		t.Fatal("matryoshka config should try the accelerator by default (S2)")
+	}
+
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+	if !contrastiveBaseTermUsesAccelerator(plain) {
+		t.Fatal("rollback flag must not affect the plain (non-matryoshka) path")
+	}
+	if contrastiveBaseTermUsesAccelerator(matryoshka) {
+		t.Fatal("rollback flag must force the host path for matryoshka configs")
+	}
+}
+
+func TestEmbedHostMatryoshkaLossForcedRecognizesTruthyAndFalsyValues(t *testing.T) {
+	falsy := []string{"", "0", "false", "off", "disabled", "no", "FALSE", "Off"}
+	for _, v := range falsy {
+		t.Setenv(embedHostMatryoshkaLossEnv, v)
+		if embedHostMatryoshkaLossForced() {
+			t.Fatalf("%s=%q should not force the host path", embedHostMatryoshkaLossEnv, v)
+		}
+	}
+	truthy := []string{"1", "true", "on", "yes", "TRUE", "enabled"}
+	for _, v := range truthy {
+		t.Setenv(embedHostMatryoshkaLossEnv, v)
+		if !embedHostMatryoshkaLossForced() {
+			t.Fatalf("%s=%q should force the host path", embedHostMatryoshkaLossEnv, v)
+		}
+	}
+}
+
+// TestEmbeddingTrainerContrastiveFullDimMatryoshkaMatchesPlainInfoNCEExactly
+// is the parity test in S2 spec item 4(a): a full-dim Matryoshka config must
+// produce identical loss and gradients to a plain InfoNCE config.
+func TestEmbeddingTrainerContrastiveFullDimMatryoshkaMatchesPlainInfoNCEExactly(t *testing.T) {
+	batch := tinyEmbeddingContrastiveDataset()
+
+	plain := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	plain.config.ContrastiveLoss = "infonce"
+	plain.config.Temperature = 0.05
+
+	checkpoint, err := plain.Checkpoint()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	trivial, err := NewEmbeddingTrainerFromCheckpoint(plain.module, checkpoint)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	// A non-trivial, non-power-of-two weight proves the special case does
+	// not merely get lucky with float rounding at weight=1: it must bypass
+	// the weighted rescale entirely rather than apply it.
+	trivial.config.MatryoshkaDims = []int{3}
+	trivial.config.MatryoshkaWeights = []float32{0.37}
+
+	plainMetrics, err := plain.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train plain: %v", err)
+	}
+	trivialMetrics, err := trivial.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train full-dim matryoshka: %v", err)
+	}
+
+	if trivialMetrics.BatchSize != plainMetrics.BatchSize {
+		t.Fatalf("batch size = %d, want %d", trivialMetrics.BatchSize, plainMetrics.BatchSize)
+	}
+	if trivialMetrics.Loss != plainMetrics.Loss {
+		t.Fatalf("loss = %v, want exact %v", trivialMetrics.Loss, plainMetrics.Loss)
+	}
+	if trivialMetrics.AverageScore != plainMetrics.AverageScore {
+		t.Fatalf("average score = %v, want exact %v", trivialMetrics.AverageScore, plainMetrics.AverageScore)
+	}
+	assertCloseF32Slice(t, "projection", trivial.projection.F32, plain.projection.F32, 0)
+	assertCloseF32Slice(t, "tokenEmbed", trivial.tokenEmbed.F32, plain.tokenEmbed.F32, 0)
+}
+
+// TestEmbeddingTrainerHardNegativeFullDimMatryoshkaMatchesPlainInfoNCEExactly
+// is the hard-negative counterpart of the 4(a) parity test, covering the
+// gradient-scaling/weightSum block in TrainHardNegativeContrastiveStep.
+func TestEmbeddingTrainerHardNegativeFullDimMatryoshkaMatchesPlainInfoNCEExactly(t *testing.T) {
+	batch := tinyEmbeddingHardNegativeDataset()
+
+	plain := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	plain.config.ContrastiveLoss = "infonce"
+	plain.config.Temperature = 0.05
+
+	checkpoint, err := plain.Checkpoint()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	trivial, err := NewEmbeddingTrainerFromCheckpoint(plain.module, checkpoint)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	trivial.config.MatryoshkaDims = []int{3}
+	trivial.config.MatryoshkaWeights = []float32{0.37}
+
+	plainMetrics, err := plain.TrainHardNegativeContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train plain: %v", err)
+	}
+	trivialMetrics, err := trivial.TrainHardNegativeContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train full-dim matryoshka: %v", err)
+	}
+
+	if trivialMetrics.BatchSize != plainMetrics.BatchSize {
+		t.Fatalf("batch size = %d, want %d", trivialMetrics.BatchSize, plainMetrics.BatchSize)
+	}
+	if trivialMetrics.Loss != plainMetrics.Loss {
+		t.Fatalf("loss = %v, want exact %v", trivialMetrics.Loss, plainMetrics.Loss)
+	}
+	if trivialMetrics.AverageScore != plainMetrics.AverageScore {
+		t.Fatalf("average score = %v, want exact %v", trivialMetrics.AverageScore, plainMetrics.AverageScore)
+	}
+	assertCloseF32Slice(t, "projection", trivial.projection.F32, plain.projection.F32, 0)
+	assertCloseF32Slice(t, "tokenEmbed", trivial.tokenEmbed.F32, plain.tokenEmbed.F32, 0)
+}
+
+// TestEmbeddingTrainerContrastiveFullDimMatryoshkaSkipsRedundantHostLoop and
+// TestEmbeddingTrainerHardNegativeFullDimMatryoshkaSkipsRedundantHostLoop
+// verify the routing mechanism behind 4(a): the accelerator is attempted for
+// the base term, and BatchSize (pairCount) proves the host prefix loop ran
+// or was skipped.
+func TestEmbeddingTrainerContrastiveFullDimMatryoshkaSkipsRedundantHostLoop(t *testing.T) {
+	batch := tinyEmbeddingContrastiveDataset()
+
+	accelerated := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	accelerated.config.ContrastiveLoss = "infonce"
+	accelerated.config.Temperature = 0.05
+	accelerated.config.MatryoshkaDims = []int{3}
+	accelerated.config.MatryoshkaWeights = []float32{0.37}
+	accel := &countingContrastiveAccelerator{}
+	accelerated.contrastiveAccel = accel
+
+	metrics, err := accelerated.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+	if metrics.BatchSize != len(batch)*len(batch) {
+		t.Fatalf("batch size = %d, want %d (host matryoshka prefix loop must be skipped)", metrics.BatchSize, len(batch)*len(batch))
+	}
+	if accel.squareCalls != 1 {
+		t.Fatalf("accelerator square calls = %d, want 1 (S2 un-gates the base term)", accel.squareCalls)
+	}
+
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+	rollback := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	rollback.config.ContrastiveLoss = "infonce"
+	rollback.config.Temperature = 0.05
+	rollback.config.MatryoshkaDims = []int{3}
+	rollback.config.MatryoshkaWeights = []float32{0.37}
+	rollbackAccel := &countingContrastiveAccelerator{}
+	rollback.contrastiveAccel = rollbackAccel
+
+	rollbackMetrics, err := rollback.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train rollback: %v", err)
+	}
+	if rollbackMetrics.BatchSize != 2*len(batch)*len(batch) {
+		t.Fatalf("rollback batch size = %d, want %d (rollback flag must run the host prefix loop)", rollbackMetrics.BatchSize, 2*len(batch)*len(batch))
+	}
+	if rollbackAccel.squareCalls != 0 {
+		t.Fatalf("rollback accelerator square calls = %d, want 0", rollbackAccel.squareCalls)
+	}
+}
+
+func TestEmbeddingTrainerHardNegativeFullDimMatryoshkaSkipsRedundantHostLoop(t *testing.T) {
+	batch := tinyEmbeddingHardNegativeDataset()
+
+	accelerated := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	accelerated.config.ContrastiveLoss = "infonce"
+	accelerated.config.Temperature = 0.05
+	accelerated.config.MatryoshkaDims = []int{3}
+	accelerated.config.MatryoshkaWeights = []float32{0.37}
+	accel := &countingContrastiveAccelerator{}
+	accelerated.contrastiveAccel = accel
+
+	metrics, err := accelerated.TrainHardNegativeContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train: %v", err)
+	}
+	if metrics.BatchSize != 8 {
+		t.Fatalf("batch size = %d, want 8 (host matryoshka prefix loop must be skipped)", metrics.BatchSize)
+	}
+	if accel.rectCalls != 1 {
+		t.Fatalf("accelerator rect calls = %d, want 1 (S2 un-gates the base term)", accel.rectCalls)
+	}
+
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+	rollback := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	rollback.config.ContrastiveLoss = "infonce"
+	rollback.config.Temperature = 0.05
+	rollback.config.MatryoshkaDims = []int{3}
+	rollback.config.MatryoshkaWeights = []float32{0.37}
+	rollbackAccel := &countingContrastiveAccelerator{}
+	rollback.contrastiveAccel = rollbackAccel
+
+	rollbackMetrics, err := rollback.TrainHardNegativeContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train rollback: %v", err)
+	}
+	if rollbackMetrics.BatchSize != 16 {
+		t.Fatalf("rollback batch size = %d, want 16 (rollback flag must run the host prefix loop)", rollbackMetrics.BatchSize)
+	}
+	if rollbackAccel.rectCalls != 0 {
+		t.Fatalf("rollback accelerator rect calls = %d, want 0", rollbackAccel.rectCalls)
+	}
+}
+
+// TestEmbeddingTrainerContrastiveGeneralSplitMatchesHostOverSeveralSteps and
+// TestEmbeddingTrainerHardNegativeGeneralSplitMatchesHostOverSeveralSteps
+// are the parity tests in S2 spec item 4(b): with a true Matryoshka sub-dim
+// present, the new device-base/host-prefix split must match the old
+// all-host path within the spec's 1e-4 tolerance over a few steps.
+func TestEmbeddingTrainerContrastiveGeneralSplitMatchesHostOverSeveralSteps(t *testing.T) {
+	newSplit := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	newSplit.config.ContrastiveLoss = "infonce"
+	newSplit.config.Temperature = 0.05
+	newSplit.config.MatryoshkaDims = []int{2}
+	newSplit.config.MatryoshkaWeights = []float32{0.6}
+	newSplitAccel := &exactHostMathContrastiveAccelerator{}
+	newSplit.contrastiveAccel = newSplitAccel
+
+	checkpoint, err := newSplit.Checkpoint()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	oldHost, err := NewEmbeddingTrainerFromCheckpoint(newSplit.module, checkpoint)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	batch := tinyEmbeddingContrastiveDataset()
+	const steps = 3
+	newLosses := make([]float32, steps)
+	newScores := make([]float32, steps)
+	newBatchSizes := make([]int, steps)
+	for step := 0; step < steps; step++ {
+		metrics, err := newSplit.TrainContrastiveStep(batch)
+		if err != nil {
+			t.Fatalf("step %d new split: %v", step, err)
+		}
+		newLosses[step], newScores[step], newBatchSizes[step] = metrics.Loss, metrics.AverageScore, metrics.BatchSize
+	}
+	if newSplitAccel.squareCalls != steps {
+		t.Fatalf("new-split accelerator square calls = %d, want %d (S2 general split accelerates the base term each step)", newSplitAccel.squareCalls, steps)
+	}
+
+	// Force the pre-S2 all-host path for the reference trainer, which
+	// started from the identical checkpointed weights.
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+	for step := 0; step < steps; step++ {
+		metrics, err := oldHost.TrainContrastiveStep(batch)
+		if err != nil {
+			t.Fatalf("step %d old host: %v", step, err)
+		}
+		if metrics.BatchSize != newBatchSizes[step] {
+			t.Fatalf("step %d batch size = %d, want %d", step, metrics.BatchSize, newBatchSizes[step])
+		}
+		assertClose(t, newLosses[step], metrics.Loss, 0.0001)
+		assertClose(t, newScores[step], metrics.AverageScore, 0.0001)
+	}
+
+	assertCloseF32Slice(t, "projection", newSplit.projection.F32, oldHost.projection.F32, 0.0001)
+	assertCloseF32Slice(t, "tokenEmbed", newSplit.tokenEmbed.F32, oldHost.tokenEmbed.F32, 0.0001)
+}
+
+func TestEmbeddingTrainerHardNegativeGeneralSplitMatchesHostOverSeveralSteps(t *testing.T) {
+	newSplit := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	newSplit.config.ContrastiveLoss = "infonce"
+	newSplit.config.Temperature = 0.05
+	newSplit.config.MatryoshkaDims = []int{2}
+	newSplit.config.MatryoshkaWeights = []float32{0.6}
+	newSplitAccel := &exactHostMathContrastiveAccelerator{}
+	newSplit.contrastiveAccel = newSplitAccel
+
+	checkpoint, err := newSplit.Checkpoint()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+	oldHost, err := NewEmbeddingTrainerFromCheckpoint(newSplit.module, checkpoint)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	batch := tinyEmbeddingHardNegativeDataset()
+	const steps = 3
+	newLosses := make([]float32, steps)
+	newScores := make([]float32, steps)
+	newBatchSizes := make([]int, steps)
+	for step := 0; step < steps; step++ {
+		metrics, err := newSplit.TrainHardNegativeContrastiveStep(batch)
+		if err != nil {
+			t.Fatalf("step %d new split: %v", step, err)
+		}
+		newLosses[step], newScores[step], newBatchSizes[step] = metrics.Loss, metrics.AverageScore, metrics.BatchSize
+	}
+	if newSplitAccel.rectCalls != steps {
+		t.Fatalf("new-split accelerator rect calls = %d, want %d (S2 general split accelerates the base term each step)", newSplitAccel.rectCalls, steps)
+	}
+
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+	for step := 0; step < steps; step++ {
+		metrics, err := oldHost.TrainHardNegativeContrastiveStep(batch)
+		if err != nil {
+			t.Fatalf("step %d old host: %v", step, err)
+		}
+		if metrics.BatchSize != newBatchSizes[step] {
+			t.Fatalf("step %d batch size = %d, want %d", step, metrics.BatchSize, newBatchSizes[step])
+		}
+		assertClose(t, newLosses[step], metrics.Loss, 0.0001)
+		assertClose(t, newScores[step], metrics.AverageScore, 0.0001)
+	}
+
+	assertCloseF32Slice(t, "projection", newSplit.projection.F32, oldHost.projection.F32, 0.0001)
+	assertCloseF32Slice(t, "tokenEmbed", newSplit.tokenEmbed.F32, oldHost.tokenEmbed.F32, 0.0001)
+}
+
+// TestEmbeddingTrainerContrastiveHostMatryoshkaLossFlagRestoresOldPathBitForBit
+// is the parity test in S2 spec item 4(c): the rollback flag must restore
+// the exact pre-S2 code path (the redundant host prefix loop runs), and that
+// path must still land on the same bit-exact answer as plain InfoNCE for a
+// weight=1 full-dim duplicate term.
+func TestEmbeddingTrainerContrastiveHostMatryoshkaLossFlagRestoresOldPathBitForBit(t *testing.T) {
+	batch := tinyEmbeddingContrastiveDataset()
+
+	plain := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	plain.config.ContrastiveLoss = "infonce"
+	plain.config.Temperature = 0.05
+	checkpoint, err := plain.Checkpoint()
+	if err != nil {
+		t.Fatalf("checkpoint: %v", err)
+	}
+
+	flagged, err := NewEmbeddingTrainerFromCheckpoint(plain.module, checkpoint)
+	if err != nil {
+		t.Fatalf("restore flagged: %v", err)
+	}
+	flagged.config.MatryoshkaDims = []int{3}
+	flagged.config.MatryoshkaWeights = []float32{1}
+	t.Setenv(embedHostMatryoshkaLossEnv, "1")
+
+	plainMetrics, err := plain.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train plain: %v", err)
+	}
+	flaggedMetrics, err := flagged.TrainContrastiveStep(batch)
+	if err != nil {
+		t.Fatalf("train flagged: %v", err)
+	}
+
+	if flaggedMetrics.BatchSize != 2*plainMetrics.BatchSize {
+		t.Fatalf("flagged batch size = %d, want %d (rollback flag must still run the redundant host prefix loop)", flaggedMetrics.BatchSize, 2*plainMetrics.BatchSize)
+	}
+	if flaggedMetrics.Loss != plainMetrics.Loss {
+		t.Fatalf("flagged loss = %v, want exact %v (weight=1 duplicate full-dim term is an exact identity even through the old rescale)", flaggedMetrics.Loss, plainMetrics.Loss)
+	}
+	if flaggedMetrics.AverageScore != plainMetrics.AverageScore {
+		t.Fatalf("flagged average score = %v, want exact %v", flaggedMetrics.AverageScore, plainMetrics.AverageScore)
+	}
+	assertCloseF32Slice(t, "projection", flagged.projection.F32, plain.projection.F32, 0)
+	assertCloseF32Slice(t, "tokenEmbed", flagged.tokenEmbed.F32, plain.tokenEmbed.F32, 0)
 }
 
 func normalizedCopy(values []float32) []float32 {

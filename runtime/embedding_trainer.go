@@ -1844,9 +1844,10 @@ func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExam
 	pairCount := len(batch) * len(batch)
 	batchScale := float32(1) / float32(pairCount)
 	lossScale := batchScale
+	skipHostMatryoshkaTerms := false
 	if embeddingUsesInfoNCELoss(t.config.ContrastiveLoss) {
 		var ok bool
-		if len(t.config.MatryoshkaDims) == 0 {
+		if contrastiveBaseTermUsesAccelerator(t.config) {
 			totalLoss, totalScore, ok = t.tryInfoNCEContrastiveAccelerator(queries, positives, queryGrads, positiveGrads)
 		}
 		if !ok {
@@ -1854,19 +1855,22 @@ func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExam
 		}
 		batchScale = float32(1) / float32(len(batch))
 		lossScale = batchScale
+		skipHostMatryoshkaTerms = contrastiveSkipsHostMatryoshkaTerms(t.config, trainerEmbeddingDim(t))
 	} else {
 		totalLoss, totalScore = accumulatePairMSEContrastiveGrads(queries, positives, queryGrads, positiveGrads)
 	}
-	prefixLoss, prefixScore, prefixPairs := accumulateMatryoshkaContrastiveGrads(queries, positives, t.config, queryGrads, positiveGrads)
-	turboPrefixLoss, turboPrefixScore, turboPrefixPairs := accumulateTurboQuantPrefixContrastiveGrads(queries, positives, t.config, queryGrads, positiveGrads)
-	if prefixPairs+turboPrefixPairs > 0 {
-		weightSum := matryoshkaWeightSum(t.config.MatryoshkaWeights) + turboQuantPrefixWeightSum(t.config)
-		objectiveScale := float32(1) / (1 + weightSum)
-		scaleEmbeddingGradBuffers(queryGrads, objectiveScale)
-		scaleEmbeddingGradBuffers(positiveGrads, objectiveScale)
-		totalLoss = totalLoss*objectiveScale + (prefixLoss+turboPrefixLoss)*objectiveScale
-		totalScore += prefixScore + turboPrefixScore
-		pairCount += prefixPairs + turboPrefixPairs
+	if !skipHostMatryoshkaTerms {
+		prefixLoss, prefixScore, prefixPairs := accumulateMatryoshkaContrastiveGrads(queries, positives, t.config, queryGrads, positiveGrads)
+		turboPrefixLoss, turboPrefixScore, turboPrefixPairs := accumulateTurboQuantPrefixContrastiveGrads(queries, positives, t.config, queryGrads, positiveGrads)
+		if prefixPairs+turboPrefixPairs > 0 {
+			weightSum := matryoshkaWeightSum(t.config.MatryoshkaWeights) + turboQuantPrefixWeightSum(t.config)
+			objectiveScale := float32(1) / (1 + weightSum)
+			scaleEmbeddingGradBuffers(queryGrads, objectiveScale)
+			scaleEmbeddingGradBuffers(positiveGrads, objectiveScale)
+			totalLoss = totalLoss*objectiveScale + (prefixLoss+turboPrefixLoss)*objectiveScale
+			totalScore += prefixScore + turboPrefixScore
+			pairCount += prefixPairs + turboPrefixPairs
+		}
 	}
 
 	if !t.tryBackpropContrastiveBatch(
@@ -2074,7 +2078,7 @@ func (t *EmbeddingTrainer) TrainHardNegativeContrastiveStep(batch []EmbeddingHar
 		var ok bool
 		globalLoss := float32(0)
 		globalScore := float32(0)
-		if len(t.config.MatryoshkaDims) == 0 {
+		if contrastiveBaseTermUsesAccelerator(t.config) {
 			globalLoss, globalScore, ok = t.tryInfoNCEHardNegativeAccelerator(queries, candidates, targetIndexes, queryGrads, candidateGrads)
 		}
 		if !ok {
@@ -2094,7 +2098,7 @@ func (t *EmbeddingTrainer) TrainHardNegativeContrastiveStep(batch []EmbeddingHar
 		totalScore = globalScore + groupedScore
 	} else {
 		var ok bool
-		if len(t.config.MatryoshkaDims) == 0 {
+		if contrastiveBaseTermUsesAccelerator(t.config) {
 			totalLoss, totalScore, ok = t.tryInfoNCEHardNegativeAccelerator(queries, candidates, targetIndexes, queryGrads, candidateGrads)
 		}
 		if !ok {
@@ -2126,18 +2130,20 @@ func (t *EmbeddingTrainer) TrainHardNegativeContrastiveStep(batch []EmbeddingHar
 		}
 	}
 	pairCount := hardNegativeCandidatePairCount(len(queries), len(candidates), candidateSpans, t.config.ContrastiveLoss) + teacherPairCount
-	prefixLoss, prefixScore, prefixPairs := accumulateMatryoshkaHardNegativeGrads(queries, candidates, targetIndexes, candidateSpans, t.config, queryGrads, candidateGrads)
-	turboPrefixLoss, turboPrefixScore, turboPrefixPairs := accumulateTurboQuantPrefixHardNegativeGrads(queries, candidates, targetIndexes, candidateSpans, t.config, queryGrads, candidateGrads)
-	compactLoss, compactScore, compactPairs := accumulateTurboQuantCompactHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, t.config, queryGrads, candidateGrads)
-	rankLoss, rankScore, rankPairs := accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, t.config, queryGrads, candidateGrads)
-	if prefixPairs+turboPrefixPairs+compactPairs+rankPairs > 0 {
-		weightSum := matryoshkaWeightSum(t.config.MatryoshkaWeights) + turboQuantPrefixWeightSum(t.config) + turboQuantCompactWeightSum(t.config) + turboQuantRankMarginWeightSum(t.config)
-		objectiveScale := float32(1) / (1 + weightSum)
-		scaleEmbeddingGradBuffers(queryGrads, objectiveScale)
-		scaleEmbeddingGradBuffers(candidateGrads, objectiveScale)
-		totalLoss = totalLoss*objectiveScale + (prefixLoss+turboPrefixLoss+compactLoss+rankLoss)*objectiveScale
-		totalScore += prefixScore + turboPrefixScore + compactScore + rankScore
-		pairCount += prefixPairs + turboPrefixPairs + compactPairs + rankPairs
+	if !contrastiveSkipsHostMatryoshkaTerms(t.config, trainerEmbeddingDim(t)) {
+		prefixLoss, prefixScore, prefixPairs := accumulateMatryoshkaHardNegativeGrads(queries, candidates, targetIndexes, candidateSpans, t.config, queryGrads, candidateGrads)
+		turboPrefixLoss, turboPrefixScore, turboPrefixPairs := accumulateTurboQuantPrefixHardNegativeGrads(queries, candidates, targetIndexes, candidateSpans, t.config, queryGrads, candidateGrads)
+		compactLoss, compactScore, compactPairs := accumulateTurboQuantCompactHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, t.config, queryGrads, candidateGrads)
+		rankLoss, rankScore, rankPairs := accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, t.config, queryGrads, candidateGrads)
+		if prefixPairs+turboPrefixPairs+compactPairs+rankPairs > 0 {
+			weightSum := matryoshkaWeightSum(t.config.MatryoshkaWeights) + turboQuantPrefixWeightSum(t.config) + turboQuantCompactWeightSum(t.config) + turboQuantRankMarginWeightSum(t.config)
+			objectiveScale := float32(1) / (1 + weightSum)
+			scaleEmbeddingGradBuffers(queryGrads, objectiveScale)
+			scaleEmbeddingGradBuffers(candidateGrads, objectiveScale)
+			totalLoss = totalLoss*objectiveScale + (prefixLoss+turboPrefixLoss+compactLoss+rankLoss)*objectiveScale
+			totalScore += prefixScore + turboPrefixScore + compactScore + rankScore
+			pairCount += prefixPairs + turboPrefixPairs + compactPairs + rankPairs
+		}
 	}
 	if !t.tryBackpropContrastiveBatch(
 		queries,
@@ -9277,6 +9283,86 @@ func turboQuantCompactWeightSum(cfg EmbeddingTrainConfig) float32 {
 		}
 	}
 	return sum
+}
+
+// embedHostMatryoshkaLossEnv is the S2 rollback flag. The accelerated
+// full-dim InfoNCE routing for Matryoshka/TurboQuant-prefix contrastive runs
+// is on by default; set this to a truthy value ("1", "true", "on", "yes", or
+// any other non-empty value outside the recognized off list) to force the
+// pre-S2 all-host loss path, for example to reproduce an exact pre-S2 run or
+// as an emergency rollback.
+const embedHostMatryoshkaLossEnv = "EOS_EMBED_HOST_MATRYOSHKA_LOSS"
+
+func embedHostMatryoshkaLossForced() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(embedHostMatryoshkaLossEnv))) {
+	case "", "0", "false", "off", "disabled", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+// contrastiveBaseTermUsesAccelerator reports whether TrainContrastiveStep and
+// TrainHardNegativeContrastiveStep should attempt the device contrastive
+// accelerator for the full-dim InfoNCE base term. Before S2, any configured
+// MatryoshkaDims unconditionally forced the host loss path for the base term,
+// even though the base term is identical work whether or not Matryoshka
+// prefix objectives are also configured — S2 un-gates the accelerator for
+// those runs. Plain InfoNCE (no Matryoshka dims) keeps its original
+// unconditional accelerator attempt: EOS_EMBED_HOST_MATRYOSHKA_LOSS only
+// affects Matryoshka/TurboQuant-prefix runs, not the plain path.
+func contrastiveBaseTermUsesAccelerator(cfg EmbeddingTrainConfig) bool {
+	if len(cfg.MatryoshkaDims) == 0 {
+		return true
+	}
+	return !embedHostMatryoshkaLossForced()
+}
+
+// contrastiveFullDimMatryoshkaOnly reports whether cfg's Matryoshka/TurboQuant
+// prefix configuration reduces exactly to the plain full-dim InfoNCE
+// objective: every configured Matryoshka dim equals fullDim, and no other
+// host-only prefix objective (TurboQuant prefix, compact, or rank-margin) is
+// active. When true, the host Matryoshka/TurboQuant prefix-objective loop in
+// TrainContrastiveStep/TrainHardNegativeContrastiveStep is pure duplicate
+// work: each configured "prefix" InfoNCE term operates over the identical
+// full pooled vectors as the base term (a prefix at the full width is not a
+// truncation at all), so adding it back in and renormalizing by weightSum
+// always reproduces the base term's loss, score, and gradients exactly.
+// Skipping the loop instead of running it and then cancelling it out avoids
+// both the wasted host O(B^2*fullDim) work and the extra floating-point
+// rounding the redundant rescale would introduce.
+func contrastiveFullDimMatryoshkaOnly(cfg EmbeddingTrainConfig, fullDim int) bool {
+	if fullDim <= 0 || len(cfg.MatryoshkaDims) == 0 {
+		return false
+	}
+	for _, dim := range cfg.MatryoshkaDims {
+		if dim != fullDim {
+			return false
+		}
+	}
+	if turboQuantPrefixWeightSum(cfg) > 0 {
+		return false
+	}
+	if turboQuantCompactWeightSum(cfg) > 0 {
+		return false
+	}
+	if turboQuantRankMarginWeightSum(cfg) > 0 {
+		return false
+	}
+	return true
+}
+
+// contrastiveSkipsHostMatryoshkaTerms reports whether TrainContrastiveStep/
+// TrainHardNegativeContrastiveStep can skip the host Matryoshka/TurboQuant
+// prefix-objective loop entirely for this step. The configuration must
+// reduce exactly to plain full-dim InfoNCE (contrastiveFullDimMatryoshkaOnly)
+// and EOS_EMBED_HOST_MATRYOSHKA_LOSS must not be forcing the pre-S2 host
+// path.
+func contrastiveSkipsHostMatryoshkaTerms(cfg EmbeddingTrainConfig, fullDim int) bool {
+	if embedHostMatryoshkaLossForced() {
+		return false
+	}
+	return contrastiveFullDimMatryoshkaOnly(cfg, fullDim)
 }
 
 func validateTrainConfig(cfg EmbeddingTrainConfig) error {
