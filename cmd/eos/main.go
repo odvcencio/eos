@@ -6562,6 +6562,9 @@ func runTrainCorpus(args []string) error {
 	var tokenizerPath string
 	var vocabSize int
 	var minFreq int
+	var tokenizerWorkers int
+	var tokenizerCacheDir string
+	var noTokenizerCache bool
 	var trainPairsPath string
 	var evalPairsPath string
 	var minChars int
@@ -6598,6 +6601,9 @@ func runTrainCorpus(args []string) error {
 	fs.StringVar(&tokenizerPath, "tokenizer", "", "output tokenizer path")
 	fs.IntVar(&vocabSize, "vocab-size", 0, "tokenizer vocab size override")
 	fs.IntVar(&minFreq, "min-freq", 2, "minimum pair frequency for tokenizer merges")
+	fs.IntVar(&tokenizerWorkers, "workers", 0, "parallel worker count for BPE tokenizer training (<=0: auto, GOMAXPROCS or EOS_TOKENIZER_TRAIN_WORKERS); does not affect the trained tokenizer's content")
+	fs.StringVar(&tokenizerCacheDir, "tokenizer-cache-dir", "", "content-addressed tokenizer training cache directory (empty disables the cache unless EOS_TOKENIZER_CACHE_DIR is set)")
+	fs.BoolVar(&noTokenizerCache, "no-tokenizer-cache", false, "bypass the tokenizer training cache (always retrain; do not read or write cache entries)")
 	fs.StringVar(&trainPairsPath, "train-pairs", "", "output mined train pair dataset path")
 	fs.StringVar(&evalPairsPath, "eval-pairs-path", "", "output mined eval pair dataset path")
 	fs.IntVar(&minChars, "min-chars", 8, "minimum normalized text length for mined segments")
@@ -6740,11 +6746,14 @@ func runTrainCorpus(args []string) error {
 		runConfig.Progress = printTrainProgress
 	}
 	summary, paths, err := eosruntime.TrainEmbeddingPackageFromCorpusFile(path, corpusPath, eosruntime.EmbeddingCorpusTrainConfig{
-		TokenizerPath:      tokenizerPath,
-		TokenizerVocabSize: vocabSize,
-		TokenizerMinFreq:   minFreq,
-		TrainPairsPath:     trainPairsPath,
-		EvalPairsPath:      evalPairsPath,
+		TokenizerPath:         tokenizerPath,
+		TokenizerVocabSize:    vocabSize,
+		TokenizerMinFreq:      minFreq,
+		TokenizerWorkers:      tokenizerWorkers,
+		TokenizerCacheDir:     tokenizerCacheDir,
+		TokenizerCacheDisable: noTokenizerCache,
+		TrainPairsPath:        trainPairsPath,
+		EvalPairsPath:         evalPairsPath,
 		Mining: eosruntime.EmbeddingTextMiningConfig{
 			MinChars:  minChars,
 			MaxPairs:  maxPairs,
@@ -8541,10 +8550,16 @@ func runTrainTokenizer(args []string) error {
 	var manifestPath string
 	var vocabSize int
 	var minFreq int
+	var workers int
+	var tokenizerCacheDir string
+	var noTokenizerCache bool
 	fs.StringVar(&outputPath, "output", "", "output tokenizer path")
 	fs.StringVar(&manifestPath, "manifest", "", "embedding manifest path")
 	fs.IntVar(&vocabSize, "vocab-size", 0, "tokenizer vocab size override")
 	fs.IntVar(&minFreq, "min-freq", 2, "minimum pair frequency for merges")
+	fs.IntVar(&workers, "workers", 0, "parallel worker count for BPE training (<=0: auto, GOMAXPROCS or EOS_TOKENIZER_TRAIN_WORKERS); does not affect the trained tokenizer's content")
+	fs.StringVar(&tokenizerCacheDir, "tokenizer-cache-dir", "", "content-addressed tokenizer training cache directory (empty disables the cache unless EOS_TOKENIZER_CACHE_DIR is set)")
+	fs.BoolVar(&noTokenizerCache, "no-tokenizer-cache", false, "bypass the tokenizer training cache (always retrain; do not read or write cache entries)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -8574,11 +8589,18 @@ func runTrainTokenizer(args []string) error {
 	if manifestVocabSize > 0 && vocabSize < manifestVocabSize {
 		return fmt.Errorf("tokenizer vocab size %d would shrink package vocab contract %d; checkpoint tensor resize is not supported by train-tokenizer", vocabSize, manifestVocabSize)
 	}
-	tokenizer, err := eosruntime.TrainTokenizerFromCorpus(eosruntime.TokenizerTrainConfig{
-		CorpusPath: corpusPath,
-		VocabSize:  vocabSize,
-		MinFreq:    minFreq,
-	})
+	tokenizer, cacheResult, err := eosruntime.TrainTokenizerFromCorpusCached(
+		eosruntime.TokenizerTrainConfig{
+			CorpusPath: corpusPath,
+			VocabSize:  vocabSize,
+			MinFreq:    minFreq,
+			Workers:    workers,
+		},
+		eosruntime.TokenizerCacheConfigOrDisabled(eosruntime.TokenizerTrainCacheConfig{
+			CacheDir: tokenizerCacheDir,
+			Disable:  noTokenizerCache,
+		}),
+	)
 	if err != nil {
 		return err
 	}
@@ -8594,6 +8616,7 @@ func runTrainTokenizer(args []string) error {
 	}
 	fmt.Printf("trained tokenizer %q\n", outputPath)
 	fmt.Printf("vocab: %d tokens, merges: %d\n", len(tokenizer.Tokens), len(tokenizer.Merges))
+	fmt.Printf("tokenizer cache: disabled=%t hit=%t key=%s path=%s\n", cacheResult.Disabled, cacheResult.Hit, cacheResult.Key, cacheResult.Path)
 	return nil
 }
 

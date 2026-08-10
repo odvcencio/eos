@@ -10,10 +10,20 @@ type EmbeddingCorpusTrainConfig struct {
 	TokenizerPath      string
 	TokenizerVocabSize int
 	TokenizerMinFreq   int
-	TrainPairsPath     string
-	EvalPairsPath      string
-	Mining             EmbeddingTextMiningConfig
-	Run                EmbeddingTrainRunConfig
+	// TokenizerWorkers sets the parallel worker count for BPE tokenizer
+	// training. <= 0 means "auto"; see ResolveTokenizerTrainWorkers. It
+	// never changes the trained tokenizer's content.
+	TokenizerWorkers int
+	// TokenizerCacheDir and TokenizerCacheDisable configure the
+	// content-addressed tokenizer training cache; see
+	// TrainTokenizerFromCorpusCached and TokenizerTrainCacheConfig. Empty
+	// TokenizerCacheDir falls back to EOS_TOKENIZER_CACHE_DIR.
+	TokenizerCacheDir     string
+	TokenizerCacheDisable bool
+	TrainPairsPath        string
+	EvalPairsPath         string
+	Mining                EmbeddingTextMiningConfig
+	Run                   EmbeddingTrainRunConfig
 }
 
 type EmbeddingCorpusTrainPaths struct {
@@ -508,11 +518,18 @@ func TrainEmbeddingPackageFromCorpusFile(artifactPath, corpusPath string, cfg Em
 	if minFreq <= 0 {
 		minFreq = 2
 	}
-	tokenizer, err := TrainTokenizerFromCorpus(TokenizerTrainConfig{
-		CorpusPath: corpusPath,
-		VocabSize:  vocabSize,
-		MinFreq:    minFreq,
-	})
+	tokenizer, _, err := TrainTokenizerFromCorpusCached(
+		TokenizerTrainConfig{
+			CorpusPath: corpusPath,
+			VocabSize:  vocabSize,
+			MinFreq:    minFreq,
+			Workers:    cfg.TokenizerWorkers,
+		},
+		TokenizerCacheConfigOrDisabled(TokenizerTrainCacheConfig{
+			CacheDir: cfg.TokenizerCacheDir,
+			Disable:  cfg.TokenizerCacheDisable,
+		}),
+	)
 	if err != nil {
 		return EmbeddingTrainRunSummary{}, EmbeddingCorpusTrainPaths{}, err
 	}
