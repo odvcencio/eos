@@ -2272,6 +2272,8 @@ type deviceRuntime struct {
 	softmaxForwardKernel        *auxKernel
 	softmaxForwardMaskedKernel  *auxKernel
 	attnSoftmaxBackwardScaled   *auxKernel
+	geluForwardKernel           *auxKernel
+	geluBackwardKernel          *auxKernel
 	matMulStats                 backend.MatMulAcceleratorStats
 	graphCache                  map[string]*cudaGraph
 	// attnTrain holds the S3(b) attention-resident-train handle registry
@@ -2279,6 +2281,12 @@ type deviceRuntime struct {
 	// file so this struct's flat kernel-field list stays the single place
 	// for per-kernel *auxKernel caches.
 	attnTrain attentionResidentTrainState
+	// ffnTrain holds the S3(c) FFN-resident-train handle registry (see
+	// ffn_resident_train_accel_linux.go). It shares attnTrain's
+	// generation/stepID/stepActive bookkeeping (one flag, one step, both
+	// block kinds -- see beginAttentionResidentTrainStep) rather than
+	// duplicating step lifecycle state.
+	ffnTrain ffnResidentTrainState
 }
 
 type residentMatrix struct {
@@ -2398,7 +2406,12 @@ func (rt *deviceRuntime) close() {
 	rt.softmaxForwardMaskedKernel = nil
 	rt.destroyAuxKernel(rt.attnSoftmaxBackwardScaled)
 	rt.attnSoftmaxBackwardScaled = nil
+	rt.destroyAuxKernel(rt.geluForwardKernel)
+	rt.geluForwardKernel = nil
+	rt.destroyAuxKernel(rt.geluBackwardKernel)
+	rt.geluBackwardKernel = nil
 	rt.releaseAllAttentionResidentTrainHandles()
+	rt.releaseAllFFNResidentTrainHandles()
 	for sig, g := range rt.graphCache {
 		g.destroy()
 		delete(rt.graphCache, sig)
@@ -3179,6 +3192,49 @@ func (rt *deviceRuntime) ensureAttnSoftmaxBackwardScaledKernel() (*auxKernel, er
 		return nil, err
 	}
 	rt.attnSoftmaxBackwardScaled = kernel
+	return kernel, nil
+}
+
+// ensureGeluForwardKernel lazily compiles and caches the on-device forward
+// GELU kernel (see forwardGeluKernelSource, defined in
+// activation_accel_linux.go and already validated by
+// forwardActivationKernelsSelfTest). The S3(c) FFN-resident-train
+// accelerator is its first production wiring.
+func (rt *deviceRuntime) ensureGeluForwardKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.geluForwardKernel != nil {
+		return rt.geluForwardKernel, nil
+	}
+	kernel, err := rt.compileAuxKernel(forwardGeluKernelSource, "manta_gelu_forward")
+	if err != nil {
+		return nil, err
+	}
+	rt.geluForwardKernel = kernel
+	return kernel, nil
+}
+
+// ensureGeluBackwardKernel lazily compiles and caches the on-device GELU
+// backward-multiply kernel (see geluBackwardMulKernelSource, defined in
+// activation_accel_linux.go and already used by activationAccelerator's own
+// RunGELUBackwardMul via the same generic launchAuxElementWise dispatcher
+// this method's caller uses). Compiling a second copy here (rather than
+// sharing activationAccelerator's) keeps the S3(c) FFN-resident-train
+// accelerator's kernel cache self-contained on deviceRuntime, matching every
+// other attention/FFN-resident *auxKernel field.
+func (rt *deviceRuntime) ensureGeluBackwardKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.geluBackwardKernel != nil {
+		return rt.geluBackwardKernel, nil
+	}
+	kernel, err := rt.compileAuxKernel(geluBackwardMulKernelSource, "manta_gelu_backward_mul")
+	if err != nil {
+		return nil, err
+	}
+	rt.geluBackwardKernel = kernel
 	return kernel, nil
 }
 

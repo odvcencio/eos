@@ -265,6 +265,50 @@ func (a *matMulAccelerator) ReleaseAttentionResidentTrainHandle(handle backend.A
 	return a.device.releaseAttentionResidentTrainHandle(handle)
 }
 
+// RunFFNBlockResidentTrainForward implements backend.FFNResidentTrainAccelerator.
+// See deviceRuntime.runFFNBlockResidentTrainForward for the device-resident
+// chain. FFN handles share attention's Begin/End/AbortAttentionResidentTrainStep
+// step lifecycle (see ffn_resident_train_accel_linux.go), so no separate
+// Begin/End/Abort wrapper is needed here.
+func (a *matMulAccelerator) RunFFNBlockResidentTrainForward(req backend.FFNResidentTrainForwardRequest) (backend.FFNResidentTrainForwardResult, error) {
+	if a == nil {
+		return backend.FFNResidentTrainForwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return backend.FFNResidentTrainForwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.runFFNBlockResidentTrainForward(req)
+}
+
+// RunFFNBlockResidentTrainBackward implements backend.FFNResidentTrainAccelerator.
+// See deviceRuntime.runFFNBlockResidentTrainBackward for the device-resident chain.
+func (a *matMulAccelerator) RunFFNBlockResidentTrainBackward(req backend.FFNResidentTrainBackwardRequest) (backend.FFNResidentTrainBackwardResult, error) {
+	if a == nil {
+		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.runFFNBlockResidentTrainBackward(req)
+}
+
+// ReleaseFFNResidentTrainHandle implements backend.FFNResidentTrainAccelerator.
+func (a *matMulAccelerator) ReleaseFFNResidentTrainHandle(handle backend.FFNResidentTrainHandle) error {
+	if a == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.releaseFFNResidentTrainHandle(handle)
+}
+
 func (a *matMulAccelerator) Stats() backend.MatMulAcceleratorStats {
 	if a == nil {
 		return backend.MatMulAcceleratorStats{}

@@ -598,6 +598,111 @@ type AttentionResidentTrainAccelerator interface {
 	ReleaseAttentionResidentTrainHandle(handle AttentionResidentTrainHandle) error
 }
 
+// FFNResidentTrainHandle references one resident FFN block's live
+// ffnHidden/activated (and flattened input) device buffers, kept alive from
+// RunFFNBlockResidentTrainForward until the matching
+// RunFFNBlockResidentTrainBackward call (or an explicit Release). It shares
+// its step lifecycle with AttentionResidentTrainHandle: the same
+// Begin/End/AbortAttentionResidentTrainStep calls that bound an attention
+// block's handle lifetime also bound an FFN block's, so S3(c) needs no
+// separate step-boundary API -- one flag, one step, both block kinds.
+type FFNResidentTrainHandle struct {
+	Backend    eosartifact.BackendKind
+	Token      FFNResidentTrainHandleToken
+	SeqLen     int
+	InputDim   int
+	HiddenDim  int
+	OutputDim  int
+	Generation uint64
+	StepID     uint64
+}
+
+// FFNResidentTrainHandleToken is implemented by backend-private FFN
+// resident handle tokens, mirroring AttentionResidentTrainHandleToken.
+type FFNResidentTrainHandleToken interface {
+	FFNResidentTrainHandleToken()
+	Backend() eosartifact.BackendKind
+	Generation() uint64
+	StepID() uint64
+	Alive() bool
+}
+
+// FFNResidentTrainForwardRequest asks a resident-train accelerator to run
+// one FFN block -- hidden projection, GELU, output projection -- entirely
+// device-to-device: input is [SeqLen, InputDim] (the caller's already
+// attention-residual/layernorm'd state.hidden), HiddenWeightName/
+// OutputWeightName must already be resident (see
+// MatMulAccelerator.BindMatrix), and FastGELU selects the same fast/exact
+// GELU variant the host path uses (fillGELUForward/fillGELUBackwardMul) so
+// forward and backward stay bit-consistent with the flag-OFF reference.
+type FFNResidentTrainForwardRequest struct {
+	SeqLen           int
+	InputDim         int
+	HiddenDim        int
+	OutputDim        int
+	Input            *Tensor // [SeqLen, InputDim]
+	HiddenWeightName string
+	OutputWeightName string
+	FastGELU         bool
+	StepID           uint64
+}
+
+// FFNResidentTrainForwardResult returns the FFN block's host-visible
+// activations -- the caller's existing host path still adds the FFN
+// residual and optional layer norm on top of FFNOutput -- plus the handle
+// RunFFNBlockResidentTrainBackward needs to find this call's still-resident
+// ffnHidden/activated/input buffers.
+type FFNResidentTrainForwardResult struct {
+	Handle    FFNResidentTrainHandle
+	FFNHidden *Tensor // [SeqLen, HiddenDim], pre-GELU
+	Activated *Tensor // [SeqLen, HiddenDim], post-GELU
+	FFNOutput *Tensor // [SeqLen, OutputDim]
+}
+
+// FFNResidentTrainBackwardRequest asks a resident-train accelerator to
+// backpropagate through one FFN block given the upstream gradient at
+// FFNOutput (computed by the caller's existing host backward through the
+// FFN residual and optional layer norm, exactly as
+// backpropProjectedFFNSequence does today before it reaches the output
+// projection). GradFFNOutput rows must be in the same order the matching
+// forward call used.
+type FFNResidentTrainBackwardRequest struct {
+	Handle        FFNResidentTrainHandle
+	GradFFNOutput *Tensor // [SeqLen, OutputDim]
+}
+
+// FFNResidentTrainBackwardResult returns the FFN block's hidden/output
+// weight-gradient contributions and the gradient flowing back into the
+// block's input (state.hidden) -- the hidden-projection/GELU/output-
+// projection contribution only; the caller still adds any FFN-residual
+// pass-through itself, matching how backpropProjectedFFNSequence composes
+// its own result. GradInput is named to match
+// AttentionResidentTrainBackwardResult.GradInput -- both mean "gradient
+// flowing into this block's input" -- and deliberately not "GradHidden",
+// which in the trainer package already names the Wup (hidden-projection)
+// weight-gradient accumulator, not an activation gradient.
+type FFNResidentTrainBackwardResult struct {
+	GradInput        *Tensor // [SeqLen, InputDim]
+	GradHiddenWeight *Tensor // [InputDim, HiddenDim]
+	GradOutputWeight *Tensor // [HiddenDim, OutputDim]
+}
+
+// FFNResidentTrainAccelerator optionally executes one FFN block's forward
+// AND backward without any intermediate host round trip beyond the forward
+// input upload, the forward ffnHidden/activated/ffnOutput download, the
+// backward gradFFNOutput upload, and the backward gradHidden/gradHiddenWeight/
+// gradOutputWeight download. It shares BeginAttentionResidentTrainStep/
+// EndAttentionResidentTrainStep/AbortAttentionResidentTrainStep with
+// AttentionResidentTrainAccelerator: a backend implementing both opens and
+// closes exactly one step per training step, and that single step's
+// End/Abort sweeps every live handle of either kind.
+type FFNResidentTrainAccelerator interface {
+	Backend() eosartifact.BackendKind
+	RunFFNBlockResidentTrainForward(req FFNResidentTrainForwardRequest) (FFNResidentTrainForwardResult, error)
+	RunFFNBlockResidentTrainBackward(req FFNResidentTrainBackwardRequest) (FFNResidentTrainBackwardResult, error)
+	ReleaseFFNResidentTrainHandle(handle FFNResidentTrainHandle) error
+}
+
 // CompactForwardAccelerator optionally executes compact forward for an
 // exact-length bucket and returns the versioned packed state ABI consumed by
 // host reconstruction/backward.
