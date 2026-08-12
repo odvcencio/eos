@@ -1846,6 +1846,7 @@ func runEvalRetrievalTurboQuant(args []string) error {
 	quantizerSeed := fs.Int64("quantizer-seed", eosruntime.DefaultTurboQuantMultiVectorQuantizerSeed, "TurboQuant IP quantizer seed for deterministic rows")
 	rerankOverfetchRaw := fs.String("rerank-overfetch", "", "optional comma-separated TurboQuant candidate depths to rerank, e.g. 200,500")
 	rerankStorage := fs.String("rerank-storage", eosruntime.TurboQuantRerankStorageDense, "rerank storage for --rerank-overfetch: dense, compact-reconstruct, or fp16")
+	rerankBits := fs.Int("rerank-bits", 0, "optional independent TurboQuant bit width (2..8) for a --rerank-storage=compact-reconstruct sidecar rerank; 0 disables and reranks from the primary codes as before")
 	metricsPath := fs.String("metrics-json", "", "write TurboQuant retrieval metrics JSON")
 	metricsTSVPath := fs.String("metrics-tsv", "", "write compact dense/quantized metrics TSV")
 	perQueryPath := fs.String("per-query-jsonl", "", "write one compact TurboQuant retrieval diagnostics JSONL row per evaluated query and method")
@@ -1892,6 +1893,7 @@ func runEvalRetrievalTurboQuant(args []string) error {
 		MaxQueries:        *maxQueries,
 		PerQueryJSONLPath: *perQueryPath,
 		QuantizerSeed:     *quantizerSeed,
+		RerankBits:        *rerankBits,
 	}, bits, rerankOverfetch, *rerankStorage)
 	if err != nil {
 		return err
@@ -1919,6 +1921,9 @@ func runEvalRetrievalTurboQuant(args []string) error {
 		label := fmt.Sprintf("q%d", row.Bits)
 		if row.RerankOverfetch > 0 {
 			label = fmt.Sprintf("q%d-rerank%d", row.Bits, row.RerankOverfetch)
+			if row.RerankBits > 0 {
+				label = fmt.Sprintf("q%d-rerank%d-q%d", row.Bits, row.RerankOverfetch, row.RerankBits)
+			}
 		}
 		fmt.Printf("%s: ndcg@10=%.6f delta=%+.6f recall@100=%.6f delta=%+.6f vector_bytes=%d total_vector_bytes=%d compression=%.2fx total_compression=%.2fx scores/s=%.2f query_p95_ms=%.3f\n",
 			label,

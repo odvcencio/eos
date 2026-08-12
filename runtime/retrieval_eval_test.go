@@ -16,6 +16,7 @@ import (
 	"m31labs.dev/eos/runtime/backend"
 	"m31labs.dev/eos/runtime/backends/cuda"
 	"m31labs.dev/eos/runtime/backends/metal"
+	"m31labs.dev/turboquant"
 )
 
 func TestComputeRetrievalQualityPerfectRanking(t *testing.T) {
@@ -756,6 +757,283 @@ func TestEvaluateTurboQuantVectorRetrievalReportsCompactReconstructRerankRows(t 
 	}
 	if rerank.RerankScores != int64(len(queries)*110) || rerank.RerankScoreSeconds <= 0 {
 		t.Fatalf("compact rerank accounting = scores:%d seconds:%f", rerank.RerankScores, rerank.RerankScoreSeconds)
+	}
+}
+
+// mixedWidthRerankFixtureDim is the dimension shared by every mixed-width
+// (--rerank-bits) test fixture below.
+const mixedWidthRerankFixtureDim = 8
+
+// mixedWidthRerankQuery, mixedWidthRerankDocA, and mixedWidthRerankDocB are a
+// seed=1, dim=8 query/document pair found by direct search against
+// turboquant.NewIPWithSeed(8, 4, 1) and turboquant.NewIPWithSeed(8, 8, 1):
+// docA's true (dense) dot product with the query exceeds docB's, but
+// dequantizing BOTH from bit=4 codes flips that order (docB scores higher),
+// while dequantizing both from an independent bit=8 sidecar restores the
+// correct order. Both quantizers are deterministic given the seed, so these
+// literals reproduce the same ordering on every run.
+var (
+	mixedWidthRerankQuery = []float32{1, 0, 0, 0, 0, 0, 0, 0}
+	mixedWidthRerankDocA  = []float32{1, -0.295449, -0.7959283, 2.3557012, -2.5782795, 2.6204405, -2.0905173, 1.4592514}
+	mixedWidthRerankDocB  = []float32{0.995, -1.7334143, 1.330273, 2.9839318, 2.8408797, 2.1353064, 0.76346475, 1.5357535}
+)
+
+// TestTopTurboQuantMixedWidthRerankScoresChangesOrderVsSameBitsRerank is the
+// most direct proof that an independent-width sidecar changes rerank
+// ordering: the same two candidates, from the same primary overfetch set,
+// rerank to opposite top-1 IDs depending on whether the rerank surface reuses
+// the primary bit=4 codes (topTurboQuantReconstructRerankScores) or reads an
+// independent bit=8 sidecar (topTurboQuantMixedWidthRerankScores).
+func TestTopTurboQuantMixedWidthRerankScoresChangesOrderVsSameBitsRerank(t *testing.T) {
+	seed := int64(1)
+	q4 := turboquant.NewIPWithSeed(mixedWidthRerankFixtureDim, 4, seed)
+	q8 := turboquant.NewIPWithSeed(mixedWidthRerankFixtureDim, 8, seed)
+	candidates := []retrievalScoredDoc{
+		{ID: "doc_a", Score: 1},
+		{ID: "doc_b", Score: 0.995},
+	}
+
+	sameBitsDocs := map[string]turboquant.IPQuantized{
+		"doc_a": q4.Quantize(mixedWidthRerankDocA),
+		"doc_b": q4.Quantize(mixedWidthRerankDocB),
+	}
+	sameBitsRanked := topTurboQuantReconstructRerankScores(q4, mixedWidthRerankQuery, candidates, sameBitsDocs, 2)
+	if len(sameBitsRanked) != 2 || sameBitsRanked[0].ID != "doc_b" {
+		t.Fatalf("same-bits (b4) rerank = %+v, want doc_b misordered ahead of doc_a", sameBitsRanked)
+	}
+
+	mixedWidthDocs := map[string]turboquant.IPQuantized{
+		"doc_a": q8.Quantize(mixedWidthRerankDocA),
+		"doc_b": q8.Quantize(mixedWidthRerankDocB),
+	}
+	mixedWidthRanked := topTurboQuantMixedWidthRerankScores(q8, mixedWidthRerankQuery, candidates, mixedWidthDocs, 2)
+	if len(mixedWidthRanked) != 2 || mixedWidthRanked[0].ID != "doc_a" {
+		t.Fatalf("mixed-width (b8 sidecar) rerank = %+v, want doc_a corrected to rank 1", mixedWidthRanked)
+	}
+}
+
+// mixedWidthRerankCorpus builds the full-pipeline fixture for the
+// evaluateTurboQuantVectorRetrievalWithRerankStorage-level mixed-width rerank
+// tests: mixedWidthRerankDocA and mixedWidthRerankDocB, plus enough filler
+// documents (a large negative dot product with the query, so they never
+// contend for the top ranks) to exercise a realistic overfetch depth.
+func mixedWidthRerankCorpus(total int) []retrievalVectorRecord {
+	docs := make([]retrievalVectorRecord, total)
+	for i := range docs {
+		vec := []float32{-1, 0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07}
+		vec[1+(i%7)] += float32(i) * 0.0001
+		docs[i] = retrievalVectorRecord{ID: fmt.Sprintf("filler%d", i), Vector: vec}
+	}
+	docs[0] = retrievalVectorRecord{ID: "doc_a", Vector: mixedWidthRerankDocA}
+	docs[1] = retrievalVectorRecord{ID: "doc_b", Vector: mixedWidthRerankDocB}
+	return docs
+}
+
+// TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankCorrectsSameBitsMisorder
+// proves requirement (a) through the full pipeline entry point: with
+// --rerank-storage=compact-reconstruct and --rerank-bits unset, the b4
+// same-bits rerank still misranks doc_b (not relevant) ahead of doc_a (the
+// only relevant document), so NDCG@10 falls below a perfect score. Setting
+// RerankBits=8 reranks from an independent sidecar instead and recovers a
+// perfect NDCG@10, changing the candidate ordering exactly as bullet (a)
+// requires.
+func TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankCorrectsSameBitsMisorder(t *testing.T) {
+	docs := mixedWidthRerankCorpus(250)
+	queries := []retrievalVectorRecord{{ID: "q1", Vector: mixedWidthRerankQuery}}
+	qrels := retrievalQrels{"q1": {"doc_a": 1}}
+
+	sameBits, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName: "mixed-width-rerank-corrects",
+		TopK:        100,
+	}, []int{4}, []int{200}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err != nil {
+		t.Fatalf("same-bits evaluate: %v", err)
+	}
+	if len(sameBits.Rows) != 2 {
+		t.Fatalf("same-bits rows = %d, want direct and rerank rows", len(sameBits.Rows))
+	}
+	sameBitsRerank := sameBits.Rows[1]
+	if sameBitsRerank.Method != "turboquant_ip_b4_overfetch200_reconstruct_rerank" || sameBitsRerank.RerankBits != 0 {
+		t.Fatalf("same-bits rerank row identity = method:%q rerank_bits:%d, want unchanged same-width method and rerank_bits 0", sameBitsRerank.Method, sameBitsRerank.RerankBits)
+	}
+	if sameBitsRerank.Quality.NDCGAt10 >= 0.9 {
+		t.Fatalf("same-bits (b4) rerank ndcg@10 = %v, want a clear misorder (< 0.9): doc_b should still outrank doc_a", sameBitsRerank.Quality.NDCGAt10)
+	}
+
+	mixedWidth, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName: "mixed-width-rerank-corrects",
+		TopK:        100,
+		RerankBits:  8,
+	}, []int{4}, []int{200}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err != nil {
+		t.Fatalf("mixed-width evaluate: %v", err)
+	}
+	if len(mixedWidth.Rows) != 2 {
+		t.Fatalf("mixed-width rows = %d, want direct and rerank rows", len(mixedWidth.Rows))
+	}
+	mixedWidthRerank := mixedWidth.Rows[1]
+	if mixedWidthRerank.Method != "turboquant_ip_b4_overfetch200_reconstruct_rerank_b8" || mixedWidthRerank.RerankBits != 8 {
+		t.Fatalf("mixed-width rerank row identity = method:%q rerank_bits:%d, want a b8-suffixed method and rerank_bits 8", mixedWidthRerank.Method, mixedWidthRerank.RerankBits)
+	}
+	if mixedWidthRerank.Quality.NDCGAt10 != 1 {
+		t.Fatalf("mixed-width (b4 retrieve + b8 sidecar rerank) ndcg@10 = %v, want a perfect score once doc_a is corrected to rank 1", mixedWidthRerank.Quality.NDCGAt10)
+	}
+	if mixedWidthRerank.Quality.NDCGAt10 <= sameBitsRerank.Quality.NDCGAt10 {
+		t.Fatalf("mixed-width rerank ndcg@10 = %v did not improve on same-bits rerank ndcg@10 = %v", mixedWidthRerank.Quality.NDCGAt10, sameBitsRerank.Quality.NDCGAt10)
+	}
+}
+
+// TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankAccountsSidecarBytes
+// proves requirement (b): the sidecar byte cost is the corpus size times
+// turboquantVectorBytes(dim, rerankBits) (the same helper every other
+// TurboQuant storage accounting site uses), and TotalVectorBytes is exactly
+// the direct (primary-width) bytes plus that sidecar cost.
+func TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankAccountsSidecarBytes(t *testing.T) {
+	docs := make([]retrievalVectorRecord, 120)
+	for i := range docs {
+		vec := []float32{0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08}
+		vec[i%len(vec)] += float32(i) * 0.0001
+		switch i {
+		case 0:
+			vec = []float32{1, 0, 0, 0, 0, 0, 0, 0}
+		case 1:
+			vec = []float32{0, 1, 0, 0, 0, 0, 0, 0}
+		}
+		docs[i] = retrievalVectorRecord{ID: fmt.Sprintf("d%d", i+1), Vector: normalizeRetrievalVector(vec)}
+	}
+	queries := []retrievalVectorRecord{
+		{ID: "q1", Vector: normalizeRetrievalVector([]float32{1, 0, 0, 0, 0, 0, 0, 0})},
+		{ID: "q2", Vector: normalizeRetrievalVector([]float32{0, 1, 0, 0, 0, 0, 0, 0})},
+	}
+	qrels := retrievalQrels{
+		"q1": {"d1": 1},
+		"q2": {"d2": 1},
+	}
+	const rerankBits = 4
+
+	metrics, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName: "tiny-tq-mixed-width-bytes",
+		TopK:        100,
+		RerankBits:  rerankBits,
+	}, []int{8}, []int{110}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err != nil {
+		t.Fatalf("evaluate turboquant retrieval with mixed-width rerank: %v", err)
+	}
+	if metrics.Config.RerankBits != rerankBits {
+		t.Fatalf("config rerank_bits = %d, want %d", metrics.Config.RerankBits, rerankBits)
+	}
+	if len(metrics.Rows) != 2 {
+		t.Fatalf("rows = %d, want direct and mixed-width rerank rows", len(metrics.Rows))
+	}
+	rerank := metrics.Rows[1]
+	if rerank.Method != "turboquant_ip_b8_overfetch110_reconstruct_rerank_b4" || rerank.RerankBits != rerankBits {
+		t.Fatalf("mixed-width rerank row identity = method:%q rerank_bits:%d", rerank.Method, rerank.RerankBits)
+	}
+	dim := len(docs[0].Vector)
+	wantSidecarBytes := int64(len(docs)) * turboquantVectorBytes(dim, rerankBits)
+	if rerank.RerankSidecarBytes != wantSidecarBytes {
+		t.Fatalf("mixed-width rerank sidecar bytes = %d, want %d (docs * turboquantVectorBytes(dim, rerankBits))", rerank.RerankSidecarBytes, wantSidecarBytes)
+	}
+	if rerank.TotalVectorBytes != rerank.VectorBytes+wantSidecarBytes {
+		t.Fatalf("mixed-width rerank total bytes = %d, want direct (%d) + sidecar (%d) = %d", rerank.TotalVectorBytes, rerank.VectorBytes, wantSidecarBytes, rerank.VectorBytes+wantSidecarBytes)
+	}
+	if rerank.TotalCompression != ratioFloat64(float64(rerank.DenseVectorBytes), float64(rerank.TotalVectorBytes)) {
+		t.Fatalf("mixed-width rerank total compression = %v, want dense/total", rerank.TotalCompression)
+	}
+}
+
+// TestEvaluateTurboQuantVectorRetrievalRerankBitsEmptyPreservesCurrentOutputs
+// proves requirement (c): leaving RerankBits at its zero value (the
+// --rerank-bits default) reproduces the pre-existing compact-reconstruct
+// rerank byte-for-byte, on the SAME fixture used above to prove the b4/b8
+// misorder-then-correct behavior in (a) — an empty --rerank-bits must still
+// exhibit the OLD same-bits misorder, not silently pick up any sidecar path.
+func TestEvaluateTurboQuantVectorRetrievalRerankBitsEmptyPreservesCurrentOutputs(t *testing.T) {
+	docs := mixedWidthRerankCorpus(250)
+	queries := []retrievalVectorRecord{{ID: "q1", Vector: mixedWidthRerankQuery}}
+	qrels := retrievalQrels{"q1": {"doc_a": 1}}
+
+	metrics, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName: "mixed-width-rerank-bits-empty",
+		TopK:        100,
+	}, []int{4}, []int{200}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if metrics.Config.RerankBits != 0 {
+		t.Fatalf("config rerank_bits = %d, want 0 with --rerank-bits unset", metrics.Config.RerankBits)
+	}
+	if len(metrics.Rows) != 2 {
+		t.Fatalf("rows = %d, want direct and rerank rows", len(metrics.Rows))
+	}
+	direct, rerank := metrics.Rows[0], metrics.Rows[1]
+	if rerank.Method != "turboquant_ip_b4_overfetch200_reconstruct_rerank" {
+		t.Fatalf("rerank method = %q, want the unsuffixed same-width method name unchanged by this feature", rerank.Method)
+	}
+	if rerank.RerankBits != 0 {
+		t.Fatalf("rerank_bits = %d, want 0 (no field leak) when --rerank-bits is empty", rerank.RerankBits)
+	}
+	if rerank.RerankSidecarBytes != 0 || rerank.TotalVectorBytes != rerank.VectorBytes || rerank.TotalCompression != rerank.CompressionRatio {
+		t.Fatalf("rerank byte accounting = %+v, want no sidecar bytes at all when --rerank-bits is empty", rerank)
+	}
+	// The same-width reconstruct rerank still dequantizes from the PRIMARY
+	// b4 codes (unchanged), so it reproduces the exact same misorder proven
+	// in TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankCorrectsSameBitsMisorder:
+	// the direct row and the compact-reconstruct rerank row score identically.
+	if rerank.Quality.NDCGAt10 != direct.Quality.NDCGAt10 {
+		t.Fatalf("rerank ndcg@10 = %v, want it to match the direct row's ndcg@10 = %v (bit-identical rerank at the same width)", rerank.Quality.NDCGAt10, direct.Quality.NDCGAt10)
+	}
+}
+
+// TestEvaluateTurboQuantVectorRetrievalRerankBitsRequiresCompactReconstructStorage
+// guards the validation that --rerank-bits only means something for
+// --rerank-storage=compact-reconstruct: dense and fp16 rerank already
+// dequantize at a fixed, non-TurboQuant width, so a mixed TurboQuant bit
+// width has no surface to apply to and must fail loudly instead of being
+// silently ignored.
+func TestEvaluateTurboQuantVectorRetrievalRerankBitsRequiresCompactReconstructStorage(t *testing.T) {
+	docs := []retrievalVectorRecord{
+		{ID: "d1", Vector: normalizeRetrievalVector([]float32{1, 0, 0, 0, 0, 0, 0, 0})},
+		{ID: "d2", Vector: normalizeRetrievalVector([]float32{0, 1, 0, 0, 0, 0, 0, 0})},
+	}
+	queries := []retrievalVectorRecord{{ID: "q1", Vector: normalizeRetrievalVector([]float32{1, 0, 0, 0, 0, 0, 0, 0})}}
+	qrels := retrievalQrels{"q1": {"d1": 1}}
+
+	_, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName: "rerank-bits-wrong-storage",
+		TopK:        100,
+		RerankBits:  8,
+	}, []int{4}, []int{1}, TurboQuantRerankStorageFP16, docs, queries, qrels)
+	if err == nil {
+		t.Fatal("evaluation succeeded with rerank-bits set under fp16 rerank storage")
+	}
+	if !strings.Contains(err.Error(), "rerank-bits") || !strings.Contains(err.Error(), TurboQuantRerankStorageCompactReconstruct) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestEvaluateTurboQuantVectorRetrievalRerankBitsRejectsOutOfRangeWidth
+// guards that --rerank-bits is validated with the same 2..8 bound as
+// --bits, instead of reaching turboquant.NewIPWithSeed with an invalid
+// width.
+func TestEvaluateTurboQuantVectorRetrievalRerankBitsRejectsOutOfRangeWidth(t *testing.T) {
+	docs := []retrievalVectorRecord{
+		{ID: "d1", Vector: normalizeRetrievalVector([]float32{1, 0, 0, 0, 0, 0, 0, 0})},
+		{ID: "d2", Vector: normalizeRetrievalVector([]float32{0, 1, 0, 0, 0, 0, 0, 0})},
+	}
+	queries := []retrievalVectorRecord{{ID: "q1", Vector: normalizeRetrievalVector([]float32{1, 0, 0, 0, 0, 0, 0, 0})}}
+	qrels := retrievalQrels{"q1": {"d1": 1}}
+
+	_, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName: "rerank-bits-out-of-range",
+		TopK:        100,
+		RerankBits:  9,
+	}, []int{4}, []int{1}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err == nil {
+		t.Fatal("evaluation succeeded with rerank-bits = 9 (out of the 2..8 range)")
+	}
+	if !strings.Contains(err.Error(), "rerank-bits") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

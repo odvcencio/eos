@@ -79,7 +79,7 @@ func TestEvaluateTurboQuantRetrievalBitsRanksByCarriedNorm(t *testing.T) {
 	}
 	qrels := retrievalQrels{"q1": {"doc_z_large_norm": 1}}
 
-	rows, err := evaluateTurboQuantRetrievalBits(context.Background(), dim, 8, 100, 0, 1, nil, "", docs, queries, qrels, RetrievalEvalQualityMetrics{}, 0, 0, "test", "")
+	rows, err := evaluateTurboQuantRetrievalBits(context.Background(), dim, 8, 100, 0, 1, nil, "", 0, docs, queries, qrels, RetrievalEvalQualityMetrics{}, 0, 0, "test", "")
 	if err != nil {
 		t.Fatalf("evaluateTurboQuantRetrievalBits: %v", err)
 	}

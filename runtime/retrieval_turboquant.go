@@ -71,6 +71,7 @@ type TurboQuantRetrievalEvalConfigMetrics struct {
 	Bits            []int  `json:"bits"`
 	RerankOverfetch []int  `json:"rerank_overfetch,omitempty"`
 	RerankStorage   string `json:"rerank_storage,omitempty"`
+	RerankBits      int    `json:"rerank_bits,omitempty"`
 	QuantizerSeed   int64  `json:"quantizer_seed"`
 }
 
@@ -95,6 +96,7 @@ type TurboQuantRetrievalBitMetrics struct {
 	DenseVectorBytes    int64                       `json:"dense_vector_bytes"`
 	CompressionRatio    float64                     `json:"compression_ratio"`
 	RerankStorage       string                      `json:"rerank_storage,omitempty"`
+	RerankBits          int                         `json:"rerank_bits,omitempty"`
 	RerankSidecarBytes  int64                       `json:"rerank_sidecar_bytes,omitempty"`
 	TotalVectorBytes    int64                       `json:"total_vector_bytes,omitempty"`
 	TotalCompression    float64                     `json:"total_compression_ratio,omitempty"`
@@ -327,6 +329,14 @@ func evaluateTurboQuantVectorRetrievalWithRerankStorage(ctx context.Context, cfg
 	if err != nil {
 		return TurboQuantRetrievalEvalMetrics{}, err
 	}
+	if cfg.RerankBits != 0 {
+		if err := validateTurboQuantRetrievalBits([]int{cfg.RerankBits}); err != nil {
+			return TurboQuantRetrievalEvalMetrics{}, fmt.Errorf("rerank-bits: %w", err)
+		}
+		if rerankStorage != TurboQuantRerankStorageCompactReconstruct {
+			return TurboQuantRetrievalEvalMetrics{}, fmt.Errorf("rerank-bits %d requires rerank storage %q (got %q)", cfg.RerankBits, TurboQuantRerankStorageCompactReconstruct, rerankStorage)
+		}
+	}
 	if cfg.QuantizerSeed == 0 {
 		cfg.QuantizerSeed = DefaultTurboQuantMultiVectorQuantizerSeed
 	}
@@ -377,6 +387,7 @@ func evaluateTurboQuantVectorRetrievalWithRerankStorage(ctx context.Context, cfg
 			Bits:            append([]int(nil), bits...),
 			RerankOverfetch: append([]int(nil), rerankOverfetch...),
 			RerankStorage:   rerankStorageMetricsValue(rerankOverfetch, rerankStorage),
+			RerankBits:      rerankBitsMetricsValue(rerankOverfetch, rerankStorage, cfg.RerankBits),
 			QuantizerSeed:   cfg.QuantizerSeed,
 		},
 		Dense: TurboQuantDenseRetrievalMetrics{
@@ -398,7 +409,7 @@ func evaluateTurboQuantVectorRetrievalWithRerankStorage(ctx context.Context, cfg
 		if err := ctx.Err(); err != nil {
 			return TurboQuantRetrievalEvalMetrics{}, err
 		}
-		rows, err := evaluateTurboQuantRetrievalBits(ctx, dim, bitWidth, cfg.TopK, cfg.PerQueryTopK, cfg.QuantizerSeed, rerankOverfetch, rerankStorage, docs, queries, qrels, denseQuality, denseVectorBytes, scoredPairs, cfg.DatasetName, cfg.PerQueryJSONLPath)
+		rows, err := evaluateTurboQuantRetrievalBits(ctx, dim, bitWidth, cfg.TopK, cfg.PerQueryTopK, cfg.QuantizerSeed, rerankOverfetch, rerankStorage, cfg.RerankBits, docs, queries, qrels, denseQuality, denseVectorBytes, scoredPairs, cfg.DatasetName, cfg.PerQueryJSONLPath)
 		if err != nil {
 			return TurboQuantRetrievalEvalMetrics{}, err
 		}
@@ -411,7 +422,7 @@ func evaluateTurboQuantVectorRetrievalWithRerankStorage(ctx context.Context, cfg
 	return out, nil
 }
 
-func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, perQueryTopK int, quantizerSeed int64, rerankOverfetch []int, rerankStorage string, docs, queries []retrievalVectorRecord, qrels retrievalQrels, denseQuality RetrievalEvalQualityMetrics, denseVectorBytes, scoredPairs int64, datasetName, perQueryJSONLPath string) ([]TurboQuantRetrievalBitMetrics, error) {
+func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, perQueryTopK int, quantizerSeed int64, rerankOverfetch []int, rerankStorage string, rerankBits int, docs, queries []retrievalVectorRecord, qrels retrievalQrels, denseQuality RetrievalEvalQualityMetrics, denseVectorBytes, scoredPairs int64, datasetName, perQueryJSONLPath string) ([]TurboQuantRetrievalBitMetrics, error) {
 	q := turboquant.NewIPWithSeed(dim, bitWidth, quantizerSeed)
 	quantizeStart := time.Now()
 	qdocs := make([]turboQuantRetrievalDoc, len(docs))
@@ -427,6 +438,29 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 	quantizeDuration := time.Since(quantizeStart)
 	if err := writeTurboQuantRetrievalPerQueryRows(ctx, datasetName, perQueryJSONLPath, q, bitWidth, topK, perQueryTopK, quantizerSeed, rerankOverfetch, rerankStorage, docs, queries, qdocs, qrels); err != nil {
 		return nil, err
+	}
+
+	// Build the independent-width rerank sidecar once, ahead of the overfetch
+	// loop, when compact-reconstruct reranking was asked to use a bit width
+	// other than the primary retrieval width. qRerank is a second, freshly
+	// constructed IPQuantizer sharing dim and quantizerSeed with q but built
+	// at rerankBits: same seed and dim keep the QJL sign projection anchored
+	// the same way, so only the MSE stage resolution differs. rerankBits == 0
+	// (the default, unset flag) leaves qRerank nil and every row below falls
+	// through to the pre-existing same-width reconstruct rerank untouched.
+	var qRerank *turboquant.IPQuantizer
+	var rerankSidecarByID map[string]turboquant.IPQuantized
+	var rerankSidecarVectorBytes int64
+	if rerankBits > 0 && rerankStorage == TurboQuantRerankStorageCompactReconstruct && len(rerankOverfetch) > 0 {
+		qRerank = turboquant.NewIPWithSeed(dim, rerankBits, quantizerSeed)
+		rerankSidecarByID = make(map[string]turboquant.IPQuantized, len(docs))
+		for _, doc := range docs {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			rerankSidecarByID[doc.ID] = qRerank.Quantize(doc.Vector)
+			rerankSidecarVectorBytes += turboquantVectorBytes(dim, rerankBits)
+		}
 	}
 
 	scoreStart := time.Now()
@@ -471,14 +505,26 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 		var rerankLatency RetrievalEvalLatencyMetrics
 		var method string
 		var rerankSidecarBytes int64
+		var rowRerankBits int
 		switch rerankStorage {
 		case TurboQuantRerankStorageDense:
 			rerankQuality, evaluatedQueries, _, skippedRelevantDocs, skippedNoRelevant, rerankScores, rerankLatency = computeTurboQuantDenseRerankRetrievalQuality(ctx, q, queries, docs, qdocs, qrels, topK, overfetch)
 			method = fmt.Sprintf("turboquant_ip_b%d_overfetch%d_dense_rerank", bitWidth, overfetch)
 			rerankSidecarBytes = denseVectorBytes
 		case TurboQuantRerankStorageCompactReconstruct:
-			rerankQuality, evaluatedQueries, _, skippedRelevantDocs, skippedNoRelevant, rerankScores, rerankLatency = computeTurboQuantReconstructRerankRetrievalQuality(ctx, q, queries, qdocs, qrels, topK, overfetch)
-			method = fmt.Sprintf("turboquant_ip_b%d_overfetch%d_reconstruct_rerank", bitWidth, overfetch)
+			if qRerank != nil {
+				// Mixed-width rerank: candidates still come from the primary
+				// q (bitWidth), but the rerank score dequantizes the
+				// INDEPENDENT sidecar built at rerankBits, so a coarser
+				// bitWidth's rerank error no longer bounds rerank quality.
+				rerankQuality, evaluatedQueries, _, skippedRelevantDocs, skippedNoRelevant, rerankScores, rerankLatency = computeTurboQuantMixedWidthRerankRetrievalQuality(ctx, q, qRerank, queries, qdocs, rerankSidecarByID, qrels, topK, overfetch)
+				method = fmt.Sprintf("turboquant_ip_b%d_overfetch%d_reconstruct_rerank_b%d", bitWidth, overfetch, rerankBits)
+				rerankSidecarBytes = rerankSidecarVectorBytes
+				rowRerankBits = rerankBits
+			} else {
+				rerankQuality, evaluatedQueries, _, skippedRelevantDocs, skippedNoRelevant, rerankScores, rerankLatency = computeTurboQuantReconstructRerankRetrievalQuality(ctx, q, queries, qdocs, qrels, topK, overfetch)
+				method = fmt.Sprintf("turboquant_ip_b%d_overfetch%d_reconstruct_rerank", bitWidth, overfetch)
+			}
 		case TurboQuantRerankStorageFP16:
 			rerankQuality, evaluatedQueries, _, skippedRelevantDocs, skippedNoRelevant, rerankScores, rerankLatency = computeTurboQuantFP16RerankRetrievalQuality(ctx, q, bitWidth, queries, docs, qdocs, qrels, topK, overfetch)
 			method = fmt.Sprintf("turboquant_ip_b%d_overfetch%d_fp16_rerank", bitWidth, overfetch)
@@ -504,6 +550,7 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 			DenseVectorBytes:    denseVectorBytes,
 			CompressionRatio:    ratioFloat64(float64(denseVectorBytes), float64(quantizedBytes)),
 			RerankStorage:       rerankStorage,
+			RerankBits:          rowRerankBits,
 			RerankSidecarBytes:  rerankSidecarBytes,
 			TotalVectorBytes:    totalVectorBytes,
 			TotalCompression:    ratioFloat64(float64(denseVectorBytes), float64(totalVectorBytes)),
@@ -921,6 +968,63 @@ func computeTurboQuantReconstructRerankRetrievalQuality(ctx context.Context, q *
 	return totals, evaluatedQueries, relevantPairs, skippedRelevantDocs, skippedNoRelevant, rerankScores, summarizeRetrievalEvalLatencies(latencies)
 }
 
+// computeTurboQuantMixedWidthRerankRetrievalQuality mirrors
+// computeTurboQuantReconstructRerankRetrievalQuality, except the rerank step
+// dequantizes from an INDEPENDENT sidecar code set (rerankDocs, quantized by
+// qRerank at its own bit width) instead of the primary retrieval codes qdocs
+// dequantized by q. Candidate selection is unchanged: q's prepared IP score
+// still picks the overfetched candidate set; only the rerank surface moves
+// to qRerank. This is the only rerank-storage path where the rerank quality
+// ceiling is decoupled from the primary retrieval bit width.
+func computeTurboQuantMixedWidthRerankRetrievalQuality(ctx context.Context, q, qRerank *turboquant.IPQuantizer, queries []retrievalVectorRecord, qdocs []turboQuantRetrievalDoc, rerankDocs map[string]turboquant.IPQuantized, qrels retrievalQrels, topK, overfetchK int) (RetrievalEvalQualityMetrics, int, int, int, int, int64, RetrievalEvalLatencyMetrics) {
+	docIDSet := make(map[string]bool, len(qdocs))
+	for _, doc := range qdocs {
+		docIDSet[doc.ID] = true
+	}
+	if topK < 100 {
+		topK = 100
+	}
+	if overfetchK < topK {
+		overfetchK = topK
+	}
+	var totals RetrievalEvalQualityMetrics
+	evaluatedQueries := 0
+	relevantPairs := 0
+	skippedRelevantDocs := 0
+	skippedNoRelevant := 0
+	var rerankScores int64
+	latencies := make([]time.Duration, 0, len(queries))
+	for _, query := range queries {
+		if err := ctx.Err(); err != nil {
+			break
+		}
+		rels := qrels[query.ID]
+		filteredRels := make(map[string]float64, len(rels))
+		for docID, rel := range rels {
+			if docIDSet[docID] {
+				filteredRels[docID] = rel
+			} else {
+				skippedRelevantDocs++
+			}
+		}
+		if len(filteredRels) == 0 {
+			skippedNoRelevant++
+			continue
+		}
+		queryStart := time.Now()
+		prepared := q.PrepareQuery(query.Vector)
+		candidates := topTurboQuantRetrievalScores(q, prepared, qdocs, overfetchK)
+		reranked := topTurboQuantMixedWidthRerankScores(qRerank, query.Vector, candidates, rerankDocs, topK)
+		latencies = append(latencies, time.Since(queryStart))
+		rerankScores += int64(len(candidates))
+		evaluatedQueries++
+		relevantPairs += len(filteredRels)
+		addRetrievalQuality(&totals, reranked, filteredRels)
+	}
+	averageRetrievalQuality(&totals, evaluatedQueries)
+	return totals, evaluatedQueries, relevantPairs, skippedRelevantDocs, skippedNoRelevant, rerankScores, summarizeRetrievalEvalLatencies(latencies)
+}
+
 func computeTurboQuantFP16RerankRetrievalQuality(ctx context.Context, q *turboquant.IPQuantizer, bitWidth int, queries []retrievalVectorRecord, denseDocs []retrievalVectorRecord, qdocs []turboQuantRetrievalDoc, qrels retrievalQrels, topK, overfetchK int) (RetrievalEvalQualityMetrics, int, int, int, int, int64, RetrievalEvalLatencyMetrics) {
 	docIDSet := make(map[string]bool, len(denseDocs))
 	halfByID := make(map[string][]uint16, len(denseDocs))
@@ -1235,6 +1339,37 @@ func topTurboQuantReconstructRerankScores(q *turboquant.IPQuantizer, query []flo
 	return scores
 }
 
+// topTurboQuantMixedWidthRerankScores mirrors topTurboQuantReconstructRerankScores,
+// but dequantizes each candidate from rerankDocs (a sidecar code set built by
+// qRerank, typically at a wider bit width than the primary retrieval codes)
+// instead of the primary retrieval quantizer's own codes. qRerank must be the
+// quantizer that produced rerankDocs; passing the primary quantizer's codes
+// here would silently reproduce the same-width rerank.
+func topTurboQuantMixedWidthRerankScores(qRerank *turboquant.IPQuantizer, query []float32, candidates []retrievalScoredDoc, rerankDocs map[string]turboquant.IPQuantized, topK int) []retrievalScoredDoc {
+	if topK <= 0 || topK > len(candidates) {
+		topK = len(candidates)
+	}
+	h := make(retrievalScoreHeap, 0, topK)
+	for _, candidate := range candidates {
+		qx, ok := rerankDocs[candidate.ID]
+		if !ok {
+			continue
+		}
+		score := retrievalScoredDoc{ID: candidate.ID, Score: dotRetrievalVectors(query, qRerank.Dequantize(qx))}
+		if len(h) < topK {
+			heap.Push(&h, score)
+			continue
+		}
+		if retrievalScoreBetter(score, h[0]) {
+			h[0] = score
+			heap.Fix(&h, 0)
+		}
+	}
+	scores := []retrievalScoredDoc(h)
+	slicesSortRetrievalScores(scores)
+	return scores
+}
+
 func topTurboQuantRetrievalScores(q *turboquant.IPQuantizer, prepared turboquant.PreparedQuery, docs []turboQuantRetrievalDoc, topK int) []retrievalScoredDoc {
 	if topK <= 0 || topK > len(docs) {
 		topK = len(docs)
@@ -1311,6 +1446,18 @@ func rerankStorageMetricsValue(overfetch []int, storage string) string {
 		return ""
 	}
 	return storage
+}
+
+// rerankBitsMetricsValue reports the config-level mixed-width rerank bit
+// width only when it can take effect: an overfetch depth is configured and
+// the rerank storage is TurboQuantRerankStorageCompactReconstruct (the only
+// storage that reads a sidecar quantizer). Every other combination reports 0
+// so the config summary never implies a mixed-width rerank that did not run.
+func rerankBitsMetricsValue(overfetch []int, storage string, rerankBits int) int {
+	if len(overfetch) == 0 || storage != TurboQuantRerankStorageCompactReconstruct {
+		return 0
+	}
+	return rerankBits
 }
 
 func validateTurboQuantRetrievalBits(bits []int) error {

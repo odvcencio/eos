@@ -30,22 +30,30 @@ const (
 
 // RetrievalEvalConfig describes a BEIR-style retrieval eval.
 type RetrievalEvalConfig struct {
-	DatasetName                  string
-	ArtifactPath                 string
-	CorpusPath                   string
-	QueriesPath                  string
-	QrelsPath                    string
-	DocVectorPath                string
-	QueryVectorPath              string
-	BackendName                  string
-	BatchSize                    int
-	TopK                         int
-	PerQueryTopK                 int
-	MaxDocs                      int
-	MaxQueries                   int
-	PerQueryJSONLPath            string
-	AllowMissingRelevant         bool
-	QuantizerSeed                int64
+	DatasetName          string
+	ArtifactPath         string
+	CorpusPath           string
+	QueriesPath          string
+	QrelsPath            string
+	DocVectorPath        string
+	QueryVectorPath      string
+	BackendName          string
+	BatchSize            int
+	TopK                 int
+	PerQueryTopK         int
+	MaxDocs              int
+	MaxQueries           int
+	PerQueryJSONLPath    string
+	AllowMissingRelevant bool
+	QuantizerSeed        int64
+	// RerankBits requests an independent TurboQuant bit width for
+	// TurboQuantRerankStorageCompactReconstruct reranking: a second
+	// IPQuantizer (same seed, same dim, RerankBits wide) quantizes the
+	// corpus into a sidecar code set, and overfetched candidates are
+	// reranked by dequantizing from that sidecar instead of the primary
+	// retrieval codes. Zero disables mixed-width reranking (the rerank
+	// dequantizes the primary codes, unchanged from prior behavior).
+	RerankBits                   int
 	BaselineDim                  int
 	MultiVectorAggregation       string
 	MultiVectorChildCountPenalty float64
