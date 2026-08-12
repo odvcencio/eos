@@ -106,6 +106,16 @@ type countingMatMulAccelerator struct {
 	attnResidentTrainStepID       uint64
 	attnResidentTrainNextID       int
 	attnResidentTrainHandles      map[int]*fakeAttentionResidentTrainHandleState
+	// S3(c) FFN-resident-train fake state (see
+	// embedding_trainer_ffn_resident_backward_test.go for the
+	// FFNResidentTrainAccelerator method implementations). Shares the
+	// attention step counters/state above rather than duplicating them --
+	// both block kinds share exactly one step per training step.
+	ffnResidentTrainForwardRuns  int
+	ffnResidentTrainBackwardRuns int
+	ffnResidentTrainReleaseCalls int
+	ffnResidentTrainNextID       int
+	ffnResidentTrainHandles      map[int]*fakeFFNResidentTrainHandleState
 }
 
 type fakeResidentOptimizerToken struct {

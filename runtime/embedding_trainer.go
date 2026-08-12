@@ -361,6 +361,14 @@ type embeddingSequenceState struct {
 	// flag keeps the intent obvious at call sites).
 	attnResidentTrainHandleSet bool
 	attnResidentTrainHandle    backend.AttentionResidentTrainHandle
+	// ffnResidentTrainHandle is set by tryFFNBlockResidentTrain (S3(c)) when
+	// this state's FFN block (hidden projection -> GELU -> output
+	// projection) ran on the device-resident forward+backward fast path.
+	// Mirrors attnResidentTrainHandle/attnResidentTrainHandleSet's per-state
+	// Batch=1 handle convention and its "explicit flag, not nil-Token
+	// sniffing" contract.
+	ffnResidentTrainHandleSet bool
+	ffnResidentTrainHandle    backend.FFNResidentTrainHandle
 }
 
 type embeddingEncodedSequence struct {
@@ -1463,6 +1471,10 @@ func (t *EmbeddingTrainer) releaseSequenceBindings(state *embeddingSequenceState
 	// device buffers until the next BeginAttentionResidentTrainStep sweep.
 	if state.attnResidentTrainHandleSet {
 		t.releaseStaleAttentionResidentTrainHandles([]*embeddingSequenceState{state})
+	}
+	// Same defense in depth for the S3(c) FFN-resident-train handle.
+	if state.ffnResidentTrainHandleSet {
+		t.releaseStaleFFNResidentTrainHandles([]*embeddingSequenceState{state})
 	}
 	for _, name := range []string{
 		state.inputBinding,
@@ -5328,29 +5340,46 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 	}
 
 	if hiddenProjection != nil {
-		t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
-			return state.hidden
-		}, t.hiddenParam.Name, hiddenProjection, h, func(state *embeddingSequenceState) []float32 {
-			return state.ffnHidden
-		}, func(state *embeddingSequenceState, data []float32) {
-			state.ffnHidden = data
-		})
+		// EOS_EMBED_ATTN_RESIDENT (S3(c)): try the device-resident hidden-
+		// projection/GELU/output-projection chain first. When it succeeds it
+		// already fills state.ffnHidden, .activated, and .ffnOutput for
+		// every state, so the per-call matmul + host GELU calls below are
+		// skipped; only the (already unconditional) sequence-tensor binds
+		// still run, matching the existing bind-for-backward contract (see
+		// tryFFNBlockResidentTrain's doc comment).
+		ffnResidentOK := false
+		if captureBindings {
+			ffnResidentOK = t.tryFFNBlockResidentTrain(states, seqLen, d, h, hiddenProjection, projection)
+		}
+		if !ffnResidentOK {
+			t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
+				return state.hidden
+			}, t.hiddenParam.Name, hiddenProjection, h, func(state *embeddingSequenceState) []float32 {
+				return state.ffnHidden
+			}, func(state *embeddingSequenceState, data []float32) {
+				state.ffnHidden = data
+			})
+		}
 		for _, state := range states {
 			if captureBindings {
 				state.ffnHiddenBinding = t.bindSequenceTensor(state, "ffn_hidden", tensorF32View([]int{seqLen, h}, state.ffnHidden), false, t.fullActivationBackwardAccelEnabled() && bindFullActivation)
 			}
-			fillGELUForward(state.activated, state.ffnHidden, fastGELUEnabled())
+			if !ffnResidentOK {
+				fillGELUForward(state.activated, state.ffnHidden, fastGELUEnabled())
+			}
 			if captureBindings {
 				state.activatedBinding = t.bindSequenceTensor(state, "activated", tensorF32View([]int{seqLen, h}, state.activated), true, false)
 			}
 		}
-		t.fillBatchedForwardWeightMatMul(states, seqLen, h, func(state *embeddingSequenceState) []float32 {
-			return state.activated
-		}, t.projParam.Name, projection, e, func(state *embeddingSequenceState) []float32 {
-			return state.ffnOutput
-		}, func(state *embeddingSequenceState, data []float32) {
-			state.ffnOutput = data
-		})
+		if !ffnResidentOK {
+			t.fillBatchedForwardWeightMatMul(states, seqLen, h, func(state *embeddingSequenceState) []float32 {
+				return state.activated
+			}, t.projParam.Name, projection, e, func(state *embeddingSequenceState) []float32 {
+				return state.ffnOutput
+			}, func(state *embeddingSequenceState, data []float32) {
+				state.ffnOutput = data
+			})
+		}
 		for _, state := range states {
 			if t.ffnResidualEnabled() || t.ffnLayerNormEnabled() {
 				for i := range state.ffnOutput {
@@ -5741,6 +5770,99 @@ func (t *EmbeddingTrainer) tryAttentionBlockResidentTrain(states []*embeddingSeq
 		state.attnMixed = result.Mixed.F32
 		state.attnResidentTrainHandleSet = true
 		state.attnResidentTrainHandle = result.Handle
+	}
+	return true
+}
+
+// tryFFNBlockResidentTrain attempts the S3(c) device-resident forward+
+// backward fast path for one batched FFN block during training
+// (captureBindings == true call sites only -- see encodeBatchedLayerStates).
+// It fills state.ffnHidden, state.activated, and state.ffnOutput for every
+// state -- exactly what the existing per-call matmul + host GELU path fills
+// -- plus each state's ffnResidentTrainHandle, which
+// tryFFNBlockResidentBackwardOne later uses to backpropagate this block
+// without re-uploading hidden/ffnHidden/activated.
+//
+// Each state gets its own independent accelerator call (and its own
+// handle), mirroring tryAttentionBlockResidentTrain's per-state convention
+// and for the same reason: the shipped default model's role conditioning
+// makes tryBackpropContrastiveBatch always decline the batched backward
+// path, so backward runs one sequence at a time through
+// backpropProjectedFFNSequence.
+//
+// Unlike stage (b)'s attention forward-download skip target (S3(c) item 1),
+// this always downloads ffnHidden, activated, and ffnOutput: the profile
+// that justified this stage did not justify skipping them, and duplicate
+// query/positive text within a batch (see cachedEmbeddingBatchSequence) can
+// legitimately backpropagate the same cached encoded sequence's states
+// twice in one step, so a host fallback copy must stay valid for every
+// state this creates a handle for -- exactly the property stage (b)'s
+// attention forward download already has and this mirrors rather than
+// changes.
+//
+// It returns false without mutating any state whenever the fast path is
+// unavailable or unsuitable (flag off, no accelerator, no open resident-
+// train step, fast GELU selected (the resident kernel only implements exact
+// GELU -- see runFFNBlockResidentTrainForward's FastGELU guard), or a
+// request/response shape mismatch on any one state), releasing any handles
+// it already created for earlier states in this same call before
+// returning, so callers can unconditionally fall back to the existing
+// per-call matmul + host GELU path.
+func (t *EmbeddingTrainer) tryFFNBlockResidentTrain(states []*embeddingSequenceState, seqLen, d, h int, hiddenProjection, projection *backend.Tensor) bool {
+	if t == nil || !attnResidentEnabled() || !t.attnResidentTrainStepOpen || fastGELUEnabled() {
+		return false
+	}
+	accel, ok := t.forwardMatMul.(backend.FFNResidentTrainAccelerator)
+	if !ok {
+		return false
+	}
+	if len(states) == 0 || seqLen == 0 || d == 0 || h == 0 || hiddenProjection == nil || projection == nil || len(projection.Shape) != 2 {
+		return false
+	}
+	e := projection.Shape[1]
+	if e == 0 {
+		return false
+	}
+	results := make([]backend.FFNResidentTrainForwardResult, 0, len(states))
+	perInput := seqLen * d
+	perHidden := seqLen * h
+	ok = true
+	for _, state := range states {
+		if state == nil || len(state.hidden) != perInput {
+			ok = false
+			break
+		}
+		result, err := accel.RunFFNBlockResidentTrainForward(backend.FFNResidentTrainForwardRequest{
+			SeqLen:           seqLen,
+			InputDim:         d,
+			HiddenDim:        h,
+			OutputDim:        e,
+			Input:            tensorF32View([]int{seqLen, d}, state.hidden),
+			HiddenWeightName: t.hiddenParam.Name,
+			OutputWeightName: t.projParam.Name,
+			FastGELU:         false,
+			StepID:           t.attnResidentTrainStepID,
+		})
+		if err != nil || result.FFNHidden == nil || result.Activated == nil || result.FFNOutput == nil || result.Handle.Token == nil ||
+			len(result.FFNHidden.F32) != perHidden || len(result.Activated.F32) != perHidden || len(result.FFNOutput.F32) != seqLen*e {
+			ok = false
+			break
+		}
+		results = append(results, result)
+	}
+	if !ok || len(results) != len(states) {
+		for _, result := range results {
+			_ = accel.ReleaseFFNResidentTrainHandle(result.Handle)
+		}
+		return false
+	}
+	for i, state := range states {
+		result := results[i]
+		state.ffnHidden = result.FFNHidden.F32
+		state.activated = result.Activated.F32
+		state.ffnOutput = result.FFNOutput.F32
+		state.ffnResidentTrainHandleSet = true
+		state.ffnResidentTrainHandle = result.Handle
 	}
 	return true
 }
@@ -10198,6 +10320,24 @@ func (t *EmbeddingTrainer) backpropProjectedFFNSequence(state *embeddingSequence
 			}
 		}
 	}
+
+	// S3(c): the shipped default (role-conditioned) model always
+	// backpropagates one sequence at a time through this function rather
+	// than the batched backpropProjectedFFNSequences, mirroring
+	// backpropAttentionSequence's identical resident-backward integration
+	// point (see that function's doc comment). gradOutputMatrix here is
+	// exactly the upstream gradient the state's resident handle (set by
+	// tryFFNBlockResidentTrain during forward) expects.
+	if residentGradInput, gradHiddenWeight, gradOutputWeight, ok := t.tryFFNBlockResidentBackwardOne(state, gradOutputMatrix, seqLen, d, h, e); ok {
+		addFloat32Slice(gradHidden, gradHiddenWeight)
+		addFloat32Slice(gradProj, gradOutputWeight)
+		result := append([]float32(nil), residentGradInput...)
+		if t.ffnResidualEnabled() {
+			addFloat32Slice(result, gradOutputMatrix)
+		}
+		return result
+	}
+
 	gradProjStep := make([]float32, h*e)
 	if out, ok := t.tryTrainerMatMulBoundLeft(
 		state.activatedBinding,
@@ -10856,6 +10996,63 @@ func (t *EmbeddingTrainer) releaseStaleAttentionResidentTrainHandles(states []*e
 			released[token] = true
 		}
 		state.attnResidentTrainHandleSet = false
+	}
+}
+
+// tryFFNBlockResidentBackwardOne backpropagates through one state's resident
+// FFN block (see tryFFNBlockResidentTrain), given the upstream gradient at
+// FFNOutput for that state alone -- mirrors
+// tryAttentionBlockResidentBackwardOne exactly, including its "does not
+// mutate the caller's weight-gradient accumulators itself" contract (the
+// caller merges GradHiddenWeight/GradOutputWeight in only after success).
+func (t *EmbeddingTrainer) tryFFNBlockResidentBackwardOne(state *embeddingSequenceState, gradFFNOutput []float32, seqLen, d, h, e int) (gradInput, gradHiddenWeight, gradOutputWeight []float32, ok bool) {
+	if t == nil || !attnResidentEnabled() || !t.attnResidentTrainStepOpen {
+		return nil, nil, nil, false
+	}
+	accel, accelOK := t.forwardMatMul.(backend.FFNResidentTrainAccelerator)
+	if !accelOK {
+		return nil, nil, nil, false
+	}
+	if state == nil || !state.ffnResidentTrainHandleSet || state.ffnResidentTrainHandle.Token == nil || seqLen == 0 || e == 0 || len(gradFFNOutput) != seqLen*e {
+		return nil, nil, nil, false
+	}
+	result, err := accel.RunFFNBlockResidentTrainBackward(backend.FFNResidentTrainBackwardRequest{
+		Handle:        state.ffnResidentTrainHandle,
+		GradFFNOutput: tensorF32View([]int{seqLen, e}, gradFFNOutput),
+	})
+	state.ffnResidentTrainHandleSet = false
+	if err != nil || result.GradInput == nil || result.GradHiddenWeight == nil || result.GradOutputWeight == nil {
+		return nil, nil, nil, false
+	}
+	if len(result.GradInput.F32) != seqLen*d || len(result.GradHiddenWeight.F32) != d*h || len(result.GradOutputWeight.F32) != h*e {
+		return nil, nil, nil, false
+	}
+	return result.GradInput.F32, result.GradHiddenWeight.F32, result.GradOutputWeight.F32, true
+}
+
+// releaseStaleFFNResidentTrainHandles releases every still-live FFN
+// resident-train handle referenced by states (each unique handle exactly
+// once) and clears their ffnResidentTrainHandleSet flags, mirroring
+// releaseStaleAttentionResidentTrainHandles.
+func (t *EmbeddingTrainer) releaseStaleFFNResidentTrainHandles(states []*embeddingSequenceState) {
+	if t == nil {
+		return
+	}
+	accel, ok := t.forwardMatMul.(backend.FFNResidentTrainAccelerator)
+	if !ok {
+		return
+	}
+	released := map[backend.FFNResidentTrainHandleToken]bool{}
+	for _, state := range states {
+		if state == nil || !state.ffnResidentTrainHandleSet || state.ffnResidentTrainHandle.Token == nil {
+			continue
+		}
+		token := state.ffnResidentTrainHandle.Token
+		if !released[token] {
+			_ = accel.ReleaseFFNResidentTrainHandle(state.ffnResidentTrainHandle)
+			released[token] = true
+		}
+		state.ffnResidentTrainHandleSet = false
 	}
 }
 

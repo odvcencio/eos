@@ -89,12 +89,16 @@ func (t *attentionResidentTrainToken) Alive() bool {
 // invalidating (and freeing the device buffers of) every handle still
 // registered from a previous step -- the stale-state guard a caller that
 // skipped End/Abort, or a second batch's Begin racing a first batch's
-// leftover handle, both rely on.
+// leftover handle, both rely on. This also sweeps ffnTrain's registry (see
+// ffn_resident_train_accel_linux.go): S3(c) FFN-resident-train handles
+// share attention's step generation/stepID/stepActive bookkeeping rather
+// than opening a second, parallel step.
 func (rt *deviceRuntime) beginAttentionResidentTrainStep(stepID uint64) error {
 	if rt == nil || rt.ptr == nil {
 		return fmt.Errorf("cuda runtime is not initialized")
 	}
 	rt.releaseAllAttentionResidentTrainHandles()
+	rt.releaseAllFFNResidentTrainHandles()
 	rt.attnTrain.generation++
 	rt.attnTrain.stepID = stepID
 	rt.attnTrain.stepActive = true
@@ -104,7 +108,8 @@ func (rt *deviceRuntime) beginAttentionResidentTrainStep(stepID uint64) error {
 // endOrAbortAttentionResidentTrainStep validates stepID against the active
 // step, then releases every handle still registered (a normal occurrence:
 // not every forward call is followed by a backward call, for example an
-// eval-only encode within a mixed step) and closes the step out.
+// eval-only encode within a mixed step) and closes the step out. Also
+// sweeps ffnTrain's registry (see beginAttentionResidentTrainStep).
 func (rt *deviceRuntime) endOrAbortAttentionResidentTrainStep(stepID uint64) error {
 	if rt == nil || rt.ptr == nil {
 		return fmt.Errorf("cuda runtime is not initialized")
@@ -113,6 +118,7 @@ func (rt *deviceRuntime) endOrAbortAttentionResidentTrainStep(stepID uint64) err
 		return fmt.Errorf("cuda attention resident train: step %d is not the active step", stepID)
 	}
 	rt.releaseAllAttentionResidentTrainHandles()
+	rt.releaseAllFFNResidentTrainHandles()
 	rt.attnTrain.stepActive = false
 	return nil
 }
