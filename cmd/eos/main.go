@@ -7068,6 +7068,7 @@ type compactTrainProfileDeltaJSON struct {
 	CompactTrainPackedBytesAvoided         int64 `json:"compact_train_packed_bytes_avoided"`
 	CompactTrainHostGradUploadBytesAvoided int64 `json:"compact_train_host_grad_upload_bytes_avoided"`
 	CompactTrainKernelLaunches             int64 `json:"compact_train_kernel_launches"`
+	CompactTrainCublasGemmCalls            int64 `json:"compact_train_cublas_gemm_calls"`
 	CompactTrainKernelSynchronizations     int64 `json:"compact_train_kernel_synchronizations"`
 	CompactTrainGraphCaptures              int64 `json:"compact_train_graph_captures"`
 	CompactTrainGraphReplays               int64 `json:"compact_train_graph_replays"`
@@ -7447,6 +7448,7 @@ func trainProfileDeltaPayload(profile eosruntime.EmbeddingTrainProfile) trainPro
 			CompactTrainPackedBytesAvoided:         profile.CompactTrain.PackedBytesAvoided,
 			CompactTrainHostGradUploadBytesAvoided: profile.CompactTrain.HostGradUploadBytesAvoided,
 			CompactTrainKernelLaunches:             profile.CompactTrain.KernelLaunches,
+			CompactTrainCublasGemmCalls:            profile.CompactTrain.CublasGemmCalls,
 			CompactTrainKernelSynchronizations:     profile.CompactTrain.KernelSynchronizations,
 			CompactTrainGraphCaptures:              profile.CompactTrain.GraphCaptures,
 			CompactTrainGraphReplays:               profile.CompactTrain.GraphReplays,
