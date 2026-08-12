@@ -434,6 +434,51 @@ type AccumulatedBoundRightMatMulAccelerator interface {
 	RunAccumulatedMatMulsWithBoundRights(lhs []*Tensor, rightNames []string, outputType eosartifact.ValueType, transposeLeft, transposeRight bool) (StepDispatchResult, error)
 }
 
+// AttentionResidentRequest asks an attention-resident accelerator to run one
+// attention block for a uniform-length batch: Q/K/V projection, per-sequence
+// scaled dot-product scores, forward softmax, and value-mix. Every step after
+// the initial upload runs device-to-device; Query, Key, Value, Scores, and
+// Mixed are each downloaded exactly once. QueryName/KeyName/ValueName must
+// already be resident (see MatMulAccelerator.BindMatrix). Score scaling is
+// expected to already be baked into the QueryName binding's weight data, so
+// the accelerator never needs a separate device-side scale step.
+type AttentionResidentRequest struct {
+	Batch    int
+	SeqLen   int
+	ModelDim int
+	// Input is [Batch*SeqLen, ModelDim], row-major, sequences concatenated in
+	// batch order.
+	Input     *Tensor
+	QueryName string
+	KeyName   string
+	ValueName string
+}
+
+// AttentionResidentResult returns every host-visible activation the stage
+// (a) forward-only residency boundary requires: the caller's existing
+// backward path still consumes Query/Key/Value/Scores/Mixed from the host.
+type AttentionResidentResult struct {
+	Query  *Tensor // [Batch*SeqLen, ModelDim]
+	Key    *Tensor // [Batch*SeqLen, ModelDim]
+	Value  *Tensor // [Batch*SeqLen, ModelDim]
+	Scores *Tensor // [Batch*SeqLen, SeqLen], post-softmax
+	Mixed  *Tensor // [Batch*SeqLen, ModelDim]
+}
+
+// AttentionResidentAccelerator optionally executes one attention block's
+// Q/K/V projection, scaled dot-product scores, softmax, and value-mix
+// without any intermediate host round trip: Q, K, V, scores, and the mixed
+// output stay device-resident between the block's internal kernel calls, and
+// only the initial input upload plus the final Q/K/V/scores/mixed downloads
+// cross the host/device boundary. Backends that do not implement it leave
+// callers on their existing per-call matmul path. Upload/download accounting
+// flows through the same backend's MatMulAccelerator.Stats() counters rather
+// than a separate stats surface.
+type AttentionResidentAccelerator interface {
+	Backend() eosartifact.BackendKind
+	RunAttentionBlockResident(req AttentionResidentRequest) (AttentionResidentResult, error)
+}
+
 // CompactForwardAccelerator optionally executes compact forward for an
 // exact-length bucket and returns the versioned packed state ABI consumed by
 // host reconstruction/backward.

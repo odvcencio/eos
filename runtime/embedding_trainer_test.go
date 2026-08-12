@@ -82,6 +82,8 @@ type countingMatMulAccelerator struct {
 	multiBoundRuns    int
 	sharedLeftRuns    int
 	accumulatedRuns   int
+	attnResidentRuns  int
+	attnResidentErr   error
 	maxBoundRightRows int
 	maxSharedLeftRHS  int
 	maxAccumTerms     int

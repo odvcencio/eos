@@ -2259,6 +2259,7 @@ type deviceRuntime struct {
 	bertCLSL2Kernel             *auxKernel
 	bertBiasAddKernel           *auxKernel
 	bertAttentionContextKernel  *auxKernel
+	softmaxForwardKernel        *auxKernel
 	matMulStats                 backend.MatMulAcceleratorStats
 	graphCache                  map[string]*cudaGraph
 }
@@ -2374,6 +2375,8 @@ func (rt *deviceRuntime) close() {
 	rt.bertBiasAddKernel = nil
 	rt.destroyAuxKernel(rt.bertAttentionContextKernel)
 	rt.bertAttentionContextKernel = nil
+	rt.destroyAuxKernel(rt.softmaxForwardKernel)
+	rt.softmaxForwardKernel = nil
 	for sig, g := range rt.graphCache {
 		g.destroy()
 		delete(rt.graphCache, sig)
@@ -3096,6 +3099,25 @@ func (rt *deviceRuntime) ensureGDNKernel() (*auxKernel, error) {
 		return nil, err
 	}
 	rt.gdnKernel = kernel
+	return kernel, nil
+}
+
+// ensureSoftmaxForwardKernel lazily compiles and caches the on-device forward
+// row softmax kernel (see forwardSoftmaxRowsKernelSource), the same kernel
+// validated by softmaxForwardSelfTest. runAttentionBlockResident is its first
+// production wiring.
+func (rt *deviceRuntime) ensureSoftmaxForwardKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.softmaxForwardKernel != nil {
+		return rt.softmaxForwardKernel, nil
+	}
+	kernel, err := rt.compileAuxKernel(forwardSoftmaxRowsKernelSource, "manta_softmax_forward_rows")
+	if err != nil {
+		return nil, err
+	}
+	rt.softmaxForwardKernel = kernel
 	return kernel, nil
 }
 

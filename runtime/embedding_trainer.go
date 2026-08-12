@@ -255,8 +255,15 @@ type EmbeddingTrainer struct {
 	forwardDirty            bool
 	forwardNeedsBind        bool
 	forwardBindSkips        int64
-	vectorDistillPhases     EmbeddingVectorDistillPhaseTimers
-	scratchF32              [][]float32
+	// attnResidentQueryBinding names the resident-bound, score-scale-baked
+	// query weight copy the EOS_EMBED_ATTN_RESIDENT fast path uses (see
+	// primeAttentionResidentQueryBinding). Empty means the fast path is
+	// unavailable this forward pass (flag off, backend without
+	// AttentionResidentAccelerator, or the last bind attempt failed) and
+	// encodeBatchedLayerStates must use the existing per-call matmul path.
+	attnResidentQueryBinding string
+	vectorDistillPhases      EmbeddingVectorDistillPhaseTimers
+	scratchF32               [][]float32
 	// vectorDistillDefaultRoleWarned tracks whether FitVectorDistill has already
 	// logged the one-time warning about rows falling back to the default role.
 	vectorDistillDefaultRoleWarned bool
@@ -1190,6 +1197,7 @@ func (t *EmbeddingTrainer) primeForwardWeightResidency(attnQForward, attnKForwar
 			return
 		}
 	}
+	t.primeAttentionResidentQueryBinding(attnQForward)
 	t.boundForward = embeddingForwardWeights{
 		attnQ:  attnQForward,
 		attnK:  attnKForward,
@@ -1199,6 +1207,53 @@ func (t *EmbeddingTrainer) primeForwardWeightResidency(attnQForward, attnKForwar
 		proj:   projForward,
 	}
 	t.forwardNeedsBind = false
+}
+
+// residentAttnQueryBindingName derives the resident-bound, score-scale-baked
+// query weight name the EOS_EMBED_ATTN_RESIDENT fast path binds separately
+// from the plain query weight base names (used by every other forward/
+// backward matmul path).
+func residentAttnQueryBindingName(base string) string {
+	return base + "#attn_resident_scaled_q"
+}
+
+// primeAttentionResidentQueryBinding refreshes the score-scale-baked query
+// weight copy the attention-resident fast path (tryAttentionBlockResident)
+// uses, sharing primeForwardWeightResidency's invalidation gate so it always
+// runs exactly when the real Wq/Wk/Wv/Wo bindings above it are refreshed
+// (trainer construction and every post-optimizer-step invalidation). It
+// always clears attnResidentQueryBinding first so a failed rebind disables
+// the fast path (fail closed) rather than leaving a stale binding name from
+// a prior weight generation live -- the class of bug CHANGELOG.md's
+// pre-eval device-weight sync fix addressed for the compact lane.
+//
+// Baking the score scale into a dedicated Q copy lets the device chain skip
+// a separate scale kernel: scale*(Q@K^T) == (scale*Q)@K^T ==
+// (input @ (scale*Wq)) @ K^T.
+func (t *EmbeddingTrainer) primeAttentionResidentQueryBinding(attnQForward *backend.Tensor) {
+	if t == nil {
+		return
+	}
+	t.attnResidentQueryBinding = ""
+	if t.forwardMatMul == nil || attnQForward == nil || !attnResidentEnabled() {
+		return
+	}
+	if _, ok := t.forwardMatMul.(backend.AttentionResidentAccelerator); !ok {
+		return
+	}
+	if len(attnQForward.Shape) != 2 || attnQForward.Shape[0] != attnQForward.Shape[1] || len(attnQForward.F32) != attnQForward.Shape[0]*attnQForward.Shape[1] {
+		return
+	}
+	scale := t.attentionScoreScale(attnQForward.Shape[0])
+	scaled := make([]float32, len(attnQForward.F32))
+	for i, v := range attnQForward.F32 {
+		scaled[i] = v * scale
+	}
+	name := residentAttnQueryBindingName(t.attnQParam.Name)
+	if err := t.forwardMatMul.BindMatrix(name, tensorF32View(attnQForward.Shape, scaled)); err != nil {
+		return
+	}
+	t.attnResidentQueryBinding = name
 }
 
 func (t *EmbeddingTrainer) primeCompactForwardWeightResidency(forward *compactEmbeddingForwardWeights) {
@@ -4818,6 +4873,15 @@ func qkvMultiBoundRightEnabled() bool {
 	}
 }
 
+// attnResidentEnabled gates the S3(a) device-resident attention-block fast
+// path (see tryAttentionBlockResident): Q/K/V projection, scores, softmax,
+// and value-mix run device-to-device instead of round-tripping each
+// intermediate through the host. Default OFF; set EOS_EMBED_ATTN_RESIDENT=1
+// to opt in.
+func attnResidentEnabled() bool {
+	return trainEnvFlagEnabled("EOS_EMBED_ATTN_RESIDENT")
+}
+
 func sharedLeftMatMulEnabled() bool {
 	if trainEnvFlagEnabled("EOS_TRAIN_DISABLE_SHARED_LEFT_MATMUL") {
 		return false
@@ -4993,28 +5057,37 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 	}
 
 	if attentionQuery != nil && attentionKey != nil && attentionValue != nil && attentionOutput != nil {
-		if !t.fillBatchedForwardQKVMatMul(states, seqLen, d, attentionQuery, attentionKey, attentionValue) {
-			t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
-				return state.input
-			}, t.attnQParam.Name, attentionQuery, d, func(state *embeddingSequenceState) []float32 {
-				return state.attnQ
-			}, func(state *embeddingSequenceState, data []float32) {
-				state.attnQ = data
-			})
-			t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
-				return state.input
-			}, t.attnKParam.Name, attentionKey, d, func(state *embeddingSequenceState) []float32 {
-				return state.attnK
-			}, func(state *embeddingSequenceState, data []float32) {
-				state.attnK = data
-			})
-			t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
-				return state.input
-			}, t.attnVParam.Name, attentionValue, d, func(state *embeddingSequenceState) []float32 {
-				return state.attnV
-			}, func(state *embeddingSequenceState, data []float32) {
-				state.attnV = data
-			})
+		// EOS_EMBED_ATTN_RESIDENT: try the device-resident QKV/scores/softmax/
+		// mixed chain first. When it succeeds it already fills state.attnQ,
+		// .attnK, .attnV, .attnScores (scaled+softmaxed), and .attnMixed for
+		// every state, so every per-call compute branch below is skipped;
+		// only the (already unconditional) sequence-tensor binds below still
+		// run, matching the existing bind-for-backward contract.
+		residentOK := t.tryAttentionBlockResident(states, seqLen, d)
+		if !residentOK {
+			if !t.fillBatchedForwardQKVMatMul(states, seqLen, d, attentionQuery, attentionKey, attentionValue) {
+				t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
+					return state.input
+				}, t.attnQParam.Name, attentionQuery, d, func(state *embeddingSequenceState) []float32 {
+					return state.attnQ
+				}, func(state *embeddingSequenceState, data []float32) {
+					state.attnQ = data
+				})
+				t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
+					return state.input
+				}, t.attnKParam.Name, attentionKey, d, func(state *embeddingSequenceState) []float32 {
+					return state.attnK
+				}, func(state *embeddingSequenceState, data []float32) {
+					state.attnK = data
+				})
+				t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
+					return state.input
+				}, t.attnVParam.Name, attentionValue, d, func(state *embeddingSequenceState) []float32 {
+					return state.attnV
+				}, func(state *embeddingSequenceState, data []float32) {
+					state.attnV = data
+				})
+			}
 		}
 		for _, state := range states {
 			if captureBindings {
@@ -5023,55 +5096,63 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 				state.attnVBinding = t.bindSequenceTensor(state, "v", tensorF32View([]int{seqLen, d}, state.attnV), true, false)
 			}
 		}
-		batchedScores, batchedScoresOK := t.tryBatchedAttentionScores(states, seqLen, d)
-		scoreScale := t.attentionScoreScale(d)
-		for i, state := range states {
-			if batchedScoresOK {
-				state.attnScores = batchedScores[i]
-			} else {
-				kt := transpose2DData(state.attnK, seqLen, d)
-				var (
-					scores   []float32
-					matmulOK bool
-				)
-				if captureBindings {
-					scores, matmulOK = t.tryTrainerMatMulBoundRight(state.attnQ, seqLen, d, state.attnKBinding, tensorF32View([]int{seqLen, d}, state.attnK), false, true)
+		if !residentOK {
+			batchedScores, batchedScoresOK := t.tryBatchedAttentionScores(states, seqLen, d)
+			scoreScale := t.attentionScoreScale(d)
+			for i, state := range states {
+				if batchedScoresOK {
+					state.attnScores = batchedScores[i]
 				} else {
-					scores, matmulOK = t.tryTrainerMatMul(state.attnQ, seqLen, d, state.attnK, seqLen, d, false, true)
+					kt := transpose2DData(state.attnK, seqLen, d)
+					var (
+						scores   []float32
+						matmulOK bool
+					)
+					if captureBindings {
+						scores, matmulOK = t.tryTrainerMatMulBoundRight(state.attnQ, seqLen, d, state.attnKBinding, tensorF32View([]int{seqLen, d}, state.attnK), false, true)
+					} else {
+						scores, matmulOK = t.tryTrainerMatMul(state.attnQ, seqLen, d, state.attnK, seqLen, d, false, true)
+					}
+					if matmulOK {
+						state.attnScores = scores
+					} else {
+						fillHostMatMul(state.attnQ, seqLen, d, kt, seqLen, state.attnScores)
+					}
 				}
-				if matmulOK {
-					state.attnScores = scores
-				} else {
-					fillHostMatMul(state.attnQ, seqLen, d, kt, seqLen, state.attnScores)
-				}
+				scaleFloat32Slice(state.attnScores, scoreScale)
+				softmaxAttentionScoresInPlace(state.attnScores, seqLen, state.mask, t.manifest.AttentionMaskMode)
 			}
-			scaleFloat32Slice(state.attnScores, scoreScale)
-			softmaxAttentionScoresInPlace(state.attnScores, seqLen, state.mask, t.manifest.AttentionMaskMode)
-			if captureBindings {
+		}
+		if captureBindings {
+			for _, state := range states {
 				state.attnScoresBinding = t.bindSequenceTensor(state, "scores", tensorF32View([]int{seqLen, seqLen}, state.attnScores), true, t.softmaxBackwardAccelEnabled() && bindSoftmaxActivation)
 			}
 		}
-		batchedMixed, batchedMixedOK := t.tryBatchedAttentionMixed(states, seqLen, d)
-		for i, state := range states {
-			if batchedMixedOK {
-				state.attnMixed = batchedMixed[i]
-			} else {
-				var (
-					mixed    []float32
-					matmulOK bool
-				)
-				if captureBindings {
-					mixed, matmulOK = t.tryTrainerMatMulBoundRight(state.attnScores, seqLen, seqLen, state.attnVBinding, tensorF32View([]int{seqLen, d}, state.attnV), false, false)
+		if !residentOK {
+			batchedMixed, batchedMixedOK := t.tryBatchedAttentionMixed(states, seqLen, d)
+			for i, state := range states {
+				if batchedMixedOK {
+					state.attnMixed = batchedMixed[i]
 				} else {
-					mixed, matmulOK = t.tryTrainerMatMul(state.attnScores, seqLen, seqLen, state.attnV, seqLen, d, false, false)
-				}
-				if matmulOK {
-					state.attnMixed = mixed
-				} else {
-					fillHostMatMul(state.attnScores, seqLen, seqLen, state.attnV, d, state.attnMixed)
+					var (
+						mixed    []float32
+						matmulOK bool
+					)
+					if captureBindings {
+						mixed, matmulOK = t.tryTrainerMatMulBoundRight(state.attnScores, seqLen, seqLen, state.attnVBinding, tensorF32View([]int{seqLen, d}, state.attnV), false, false)
+					} else {
+						mixed, matmulOK = t.tryTrainerMatMul(state.attnScores, seqLen, seqLen, state.attnV, seqLen, d, false, false)
+					}
+					if matmulOK {
+						state.attnMixed = mixed
+					} else {
+						fillHostMatMul(state.attnScores, seqLen, seqLen, state.attnV, d, state.attnMixed)
+					}
 				}
 			}
-			if captureBindings {
+		}
+		if captureBindings {
+			for _, state := range states {
 				state.attnMixedBinding = t.bindSequenceTensor(state, "mixed", tensorF32View([]int{seqLen, d}, state.attnMixed), true, false)
 			}
 		}
@@ -5325,6 +5406,98 @@ func (t *EmbeddingTrainer) tryBatchedAttentionMixed(states []*embeddingSequenceS
 		values[i] = state.attnV
 	}
 	return t.tryTrainerBatchedMatMul(scores, seqLen, seqLen, values, seqLen, d)
+}
+
+// tryAttentionBlockResident attempts the EOS_EMBED_ATTN_RESIDENT device-
+// resident fast path for one batched attention block. On success it fills
+// state.attnQ, state.attnK, state.attnV, state.attnScores (already scaled
+// and softmaxed), and state.attnMixed for every state from one
+// device-resident call, so the caller's surrounding QKV/scores/softmax/mixed
+// computation in encodeBatchedLayerStates should be skipped for this block --
+// Q, K, V, and post-softmax scores cross the host/device boundary exactly
+// once each (for backward and for the caller's existing Wo/FFN path), and no
+// intermediate is re-uploaded between the QKV, scores, softmax, and mixed
+// steps the way the per-call matmul path re-uploads Q/K into the scores GEMM
+// and scores/V into the mixed GEMM.
+//
+// It returns false without mutating any state whenever the fast path is
+// unavailable or unsuitable (flag off, no accelerator, no resident query
+// binding, masked softmax, or a request/response shape mismatch), so callers
+// can unconditionally fall back to the existing per-call matmul path.
+func (t *EmbeddingTrainer) tryAttentionBlockResident(states []*embeddingSequenceState, seqLen, d int) bool {
+	if t == nil || !attnResidentEnabled() || t.attnResidentQueryBinding == "" {
+		return false
+	}
+	accel, ok := t.forwardMatMul.(backend.AttentionResidentAccelerator)
+	if !ok {
+		return false
+	}
+	if len(states) == 0 || seqLen == 0 || d == 0 {
+		return false
+	}
+	switch t.manifest.AttentionMaskMode {
+	case "", EmbeddingAttentionMaskModeNone:
+	default:
+		// Masked softmax stays on the host path in stage (a); the device
+		// forward-softmax kernel this fast path uses takes no mask input.
+		return false
+	}
+	perInput := seqLen * d
+	batched := t.scratchFloat32(4, len(states)*perInput)
+	for _, state := range states {
+		if state == nil || len(state.input) != perInput {
+			return false
+		}
+	}
+	for i, state := range states {
+		copy(batched[i*perInput:(i+1)*perInput], state.input)
+	}
+	result, err := accel.RunAttentionBlockResident(backend.AttentionResidentRequest{
+		Batch:     len(states),
+		SeqLen:    seqLen,
+		ModelDim:  d,
+		Input:     tensorF32View([]int{len(states) * seqLen, d}, batched),
+		QueryName: t.attnResidentQueryBinding,
+		KeyName:   t.attnKParam.Name,
+		ValueName: t.attnVParam.Name,
+	})
+	if err != nil || result.Query == nil || result.Key == nil || result.Value == nil || result.Scores == nil || result.Mixed == nil {
+		return false
+	}
+	queries, ok := splitFloat32Views(result.Query.F32, len(states))
+	if !ok {
+		return false
+	}
+	keys, ok := splitFloat32Views(result.Key.F32, len(states))
+	if !ok {
+		return false
+	}
+	values, ok := splitFloat32Views(result.Value.F32, len(states))
+	if !ok {
+		return false
+	}
+	scores, ok := splitFloat32Views(result.Scores.F32, len(states))
+	if !ok {
+		return false
+	}
+	mixed, ok := splitFloat32Views(result.Mixed.F32, len(states))
+	if !ok {
+		return false
+	}
+	for i := range states {
+		if len(queries[i]) != perInput || len(keys[i]) != perInput || len(values[i]) != perInput ||
+			len(scores[i]) != seqLen*seqLen || len(mixed[i]) != perInput {
+			return false
+		}
+	}
+	for i, state := range states {
+		state.attnQ = queries[i]
+		state.attnK = keys[i]
+		state.attnV = values[i]
+		state.attnScores = scores[i]
+		state.attnMixed = mixed[i]
+	}
+	return true
 }
 
 func finalizeEncodedStatePooling(state *embeddingSequenceState, e int) error {

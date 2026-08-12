@@ -171,6 +171,20 @@ func (a *matMulAccelerator) RunAccumulatedMatMulsWithBoundRights(lhs []*backend.
 	return a.device.runAccumulatedMatMulsWithBoundRights(lhs, rightNames, outputType, transposeLeft, transposeRight)
 }
 
+// RunAttentionBlockResident implements backend.AttentionResidentAccelerator.
+// See deviceRuntime.runAttentionBlockResident for the device-resident chain.
+func (a *matMulAccelerator) RunAttentionBlockResident(req backend.AttentionResidentRequest) (backend.AttentionResidentResult, error) {
+	if a == nil {
+		return backend.AttentionResidentResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return backend.AttentionResidentResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.runAttentionBlockResident(req)
+}
+
 func (a *matMulAccelerator) Stats() backend.MatMulAcceleratorStats {
 	if a == nil {
 		return backend.MatMulAcceleratorStats{}
