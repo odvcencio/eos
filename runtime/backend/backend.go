@@ -452,6 +452,13 @@ type AttentionResidentRequest struct {
 	QueryName string
 	KeyName   string
 	ValueName string
+	// Mask optionally carries one length-SeqLen per-sequence key mask
+	// (nonzero means "attend to this key position"), one entry per batch
+	// sequence in the same order as Input. Nil or empty means unmasked
+	// (AttentionMaskMode "none"): every softmax row normalizes over every
+	// key, matching the accelerator's pre-S3(b) behavior exactly. A non-nil
+	// Mask must have exactly Batch entries, each of length SeqLen.
+	Mask [][]int32
 }
 
 // AttentionResidentResult returns every host-visible activation the stage
@@ -477,6 +484,118 @@ type AttentionResidentResult struct {
 type AttentionResidentAccelerator interface {
 	Backend() eosartifact.BackendKind
 	RunAttentionBlockResident(req AttentionResidentRequest) (AttentionResidentResult, error)
+}
+
+// AttentionResidentTrainHandle references one resident attention block's
+// live Q/K/V/scores (and flattened input) device buffers, kept alive from
+// RunAttentionBlockResidentTrainForward until the matching
+// RunAttentionBlockResidentTrainBackward call (or an End/Abort/Release).
+// It mirrors CompactTrainHandle's lifecycle pattern at attention-block
+// granularity instead of whole-compact-forward granularity.
+type AttentionResidentTrainHandle struct {
+	Backend    eosartifact.BackendKind
+	Token      AttentionResidentTrainHandleToken
+	Batch      int
+	SeqLen     int
+	ModelDim   int
+	Generation uint64
+	StepID     uint64
+}
+
+// AttentionResidentTrainHandleToken is implemented by backend-private
+// resident handle tokens. The runtime treats it as opaque liveness
+// metadata; backend packages may type-assert to their private token
+// implementation.
+type AttentionResidentTrainHandleToken interface {
+	AttentionResidentTrainHandleToken()
+	Backend() eosartifact.BackendKind
+	Generation() uint64
+	StepID() uint64
+	Alive() bool
+}
+
+// AttentionResidentTrainForwardRequest is AttentionResidentRequest plus the
+// step this call belongs to and an optional per-sequence key mask.
+type AttentionResidentTrainForwardRequest struct {
+	Batch    int
+	SeqLen   int
+	ModelDim int
+	// Input is [Batch*SeqLen, ModelDim], row-major, sequences concatenated in
+	// batch order.
+	Input     *Tensor
+	QueryName string
+	KeyName   string
+	ValueName string
+	// Mask optionally carries one length-SeqLen per-sequence key mask, one
+	// entry per batch sequence in the same order as Input. Nil/empty means
+	// unmasked, matching AttentionResidentRequest.Mask.
+	Mask [][]int32
+	// Scale is the attention score scale (for example 1/sqrt(model_dim));
+	// unlike AttentionResidentRequest, Q/K here are the caller's unscaled
+	// weight bindings, so the accelerator applies Scale itself inside the
+	// scores/softmax and backward kernels (0 behaves as 1: an unscaled
+	// caller need not set this field).
+	Scale  float32
+	StepID uint64
+}
+
+// AttentionResidentTrainForwardResult returns the same host-visible
+// activations AttentionResidentResult does, plus the handle
+// RunAttentionBlockResidentTrainBackward needs to find this call's
+// still-resident Q/K/V/scores/input buffers.
+type AttentionResidentTrainForwardResult struct {
+	Handle AttentionResidentTrainHandle
+	Query  *Tensor // [Batch*SeqLen, ModelDim]
+	Key    *Tensor // [Batch*SeqLen, ModelDim]
+	Value  *Tensor // [Batch*SeqLen, ModelDim]
+	Scores *Tensor // [Batch*SeqLen, SeqLen], post-softmax
+	Mixed  *Tensor // [Batch*SeqLen, ModelDim]
+}
+
+// AttentionResidentTrainBackwardRequest asks a resident-train accelerator to
+// backpropagate through one attention block's Q/K/V projection, scores,
+// softmax, and value-mix, given the upstream gradient at Mixed (computed by
+// the caller's existing host backward through Wo and any attention residual/
+// layer norm). GradMixed rows must be in the same batch order the matching
+// forward call used.
+type AttentionResidentTrainBackwardRequest struct {
+	Handle    AttentionResidentTrainHandle
+	GradMixed *Tensor // [Batch*SeqLen, ModelDim]
+}
+
+// AttentionResidentTrainBackwardResult returns the attention block's Q/K/V
+// weight-gradient contributions and the gradient flowing back into the
+// block's input -- the Q/K/V-path contribution only; the caller still adds
+// any attention-residual pass-through itself, matching how
+// backpropAttentionSequences composes its own per-call matmul results.
+type AttentionResidentTrainBackwardResult struct {
+	GradInput       *Tensor // [Batch*SeqLen, ModelDim]
+	GradQueryWeight *Tensor // [ModelDim, ModelDim]
+	GradKeyWeight   *Tensor // [ModelDim, ModelDim]
+	GradValueWeight *Tensor // [ModelDim, ModelDim]
+}
+
+// AttentionResidentTrainAccelerator optionally executes one attention
+// block's forward AND backward without any intermediate host round trip
+// beyond the forward input/mask upload, the forward Q/K/V/scores/mixed
+// download (unchanged from AttentionResidentAccelerator), the backward
+// gradMixed upload, and the backward gradInput/gradWq/gradWk/gradWv
+// download. Q, K, V, scores, and the flattened input stay device-resident
+// across the forward/backward boundary under the returned handle. Mirrors
+// CompactTrainAccelerator's Begin/Forward/Backward/End/Abort/Release
+// lifecycle at attention-block granularity: BeginAttentionResidentTrainStep
+// must run before any forward/backward call for that step, and
+// EndAttentionResidentTrainStep (success) or AbortAttentionResidentTrainStep
+// (failure) must run after, releasing every handle still live for the step
+// so a later step can never observe an earlier step's activations.
+type AttentionResidentTrainAccelerator interface {
+	Backend() eosartifact.BackendKind
+	BeginAttentionResidentTrainStep(stepID uint64) error
+	RunAttentionBlockResidentTrainForward(req AttentionResidentTrainForwardRequest) (AttentionResidentTrainForwardResult, error)
+	RunAttentionBlockResidentTrainBackward(req AttentionResidentTrainBackwardRequest) (AttentionResidentTrainBackwardResult, error)
+	EndAttentionResidentTrainStep(stepID uint64) error
+	AbortAttentionResidentTrainStep(stepID uint64) error
+	ReleaseAttentionResidentTrainHandle(handle AttentionResidentTrainHandle) error
 }
 
 // CompactForwardAccelerator optionally executes compact forward for an

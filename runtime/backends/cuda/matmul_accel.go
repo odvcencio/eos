@@ -185,6 +185,86 @@ func (a *matMulAccelerator) RunAttentionBlockResident(req backend.AttentionResid
 	return a.device.runAttentionBlockResident(req)
 }
 
+// BeginAttentionResidentTrainStep implements backend.AttentionResidentTrainAccelerator.
+func (a *matMulAccelerator) BeginAttentionResidentTrainStep(stepID uint64) error {
+	if a == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.beginAttentionResidentTrainStep(stepID)
+}
+
+// RunAttentionBlockResidentTrainForward implements backend.AttentionResidentTrainAccelerator.
+// See deviceRuntime.runAttentionBlockResidentTrainForward for the device-resident chain.
+func (a *matMulAccelerator) RunAttentionBlockResidentTrainForward(req backend.AttentionResidentTrainForwardRequest) (backend.AttentionResidentTrainForwardResult, error) {
+	if a == nil {
+		return backend.AttentionResidentTrainForwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return backend.AttentionResidentTrainForwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.runAttentionBlockResidentTrainForward(req)
+}
+
+// RunAttentionBlockResidentTrainBackward implements backend.AttentionResidentTrainAccelerator.
+// See deviceRuntime.runAttentionBlockResidentTrainBackward for the device-resident chain.
+func (a *matMulAccelerator) RunAttentionBlockResidentTrainBackward(req backend.AttentionResidentTrainBackwardRequest) (backend.AttentionResidentTrainBackwardResult, error) {
+	if a == nil {
+		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.runAttentionBlockResidentTrainBackward(req)
+}
+
+// EndAttentionResidentTrainStep implements backend.AttentionResidentTrainAccelerator.
+func (a *matMulAccelerator) EndAttentionResidentTrainStep(stepID uint64) error {
+	if a == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.endOrAbortAttentionResidentTrainStep(stepID)
+}
+
+// AbortAttentionResidentTrainStep implements backend.AttentionResidentTrainAccelerator.
+func (a *matMulAccelerator) AbortAttentionResidentTrainStep(stepID uint64) error {
+	if a == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.endOrAbortAttentionResidentTrainStep(stepID)
+}
+
+// ReleaseAttentionResidentTrainHandle implements backend.AttentionResidentTrainAccelerator.
+func (a *matMulAccelerator) ReleaseAttentionResidentTrainHandle(handle backend.AttentionResidentTrainHandle) error {
+	if a == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.releaseAttentionResidentTrainHandle(handle)
+}
+
 func (a *matMulAccelerator) Stats() backend.MatMulAcceleratorStats {
 	if a == nil {
 		return backend.MatMulAcceleratorStats{}

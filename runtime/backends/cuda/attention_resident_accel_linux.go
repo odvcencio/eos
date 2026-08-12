@@ -30,8 +30,14 @@ import (
 // package) so this method never launches a separate device-side scale
 // kernel: scale*(Q@K^T) == (scale*Q)@K^T == (input @ (scale*Wq)) @ K^T.
 //
-// Masked softmax is out of scope for stage (a); callers must only route
-// AttentionMaskMode "none" sequences here.
+// S3(b) extends this to AttentionMaskMode "key": when req.Mask is non-empty
+// this uploads it once (Batch*SeqLen int32 flags) and runs the masked
+// forward-softmax kernel (forwardSoftmaxRowsMaskedKernelSource) with
+// scale=1 in place of the unmasked one -- scale stays baked into the Q
+// binding exactly as in the unmasked path, so masking adds only the mask
+// upload and the kernel's per-column mask check, not a second scale step.
+// req.Mask == nil keeps the original unmasked kernel path byte-for-byte
+// unchanged.
 func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResidentRequest) (backend.AttentionResidentResult, error) {
 	if rt == nil || rt.ptr == nil {
 		return backend.AttentionResidentResult{}, fmt.Errorf("cuda runtime is not initialized")
@@ -43,6 +49,10 @@ func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResident
 	rows := batch * seqLen
 	if req.Input == nil || len(req.Input.F32) != rows*d {
 		return backend.AttentionResidentResult{}, fmt.Errorf("cuda attention resident block input must hold %d x %d floats", rows, d)
+	}
+	maskFlat, err := flattenAttentionResidentMask(req.Mask, batch, seqLen)
+	if err != nil {
+		return backend.AttentionResidentResult{}, err
 	}
 	wq, ok := rt.residentMatrices[req.QueryName]
 	if !ok {
@@ -64,7 +74,15 @@ func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResident
 			return backend.AttentionResidentResult{}, fmt.Errorf("cuda attention resident block: %s weight shape %dx%d does not match model_dim %d", w.label, w.m.rows, w.m.cols, d)
 		}
 	}
-	kernel, err := rt.ensureSoftmaxForwardKernel()
+	var (
+		kernel       *auxKernel
+		maskedKernel *auxKernel
+	)
+	if maskFlat == nil {
+		kernel, err = rt.ensureSoftmaxForwardKernel()
+	} else {
+		maskedKernel, err = rt.ensureSoftmaxForwardMaskedKernel()
+	}
 	if err != nil {
 		return backend.AttentionResidentResult{}, err
 	}
@@ -73,6 +91,14 @@ func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResident
 	inputBuf, err := rt.uploadMatMulScratchFloat32("attn_resident_input", req.Input.F32)
 	if err != nil {
 		return backend.AttentionResidentResult{}, err
+	}
+	var maskBuf C.CUdeviceptr
+	if maskFlat != nil {
+		maskBuf, err = rt.uploadInt32(maskFlat)
+		if err != nil {
+			return backend.AttentionResidentResult{}, err
+		}
+		defer rt.freeBuffer(maskBuf)
 	}
 	qBuf, err := rt.matMulScratchFloat32("attn_resident_q", rows*d)
 	if err != nil {
@@ -116,8 +142,14 @@ func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResident
 	if err != nil {
 		return backend.AttentionResidentResult{}, err
 	}
-	if err := rt.launchAuxSoftmaxForwardRows(kernel, uint(grid), uint(block), scoresBuf, rows, seqLen); err != nil {
-		return backend.AttentionResidentResult{}, fmt.Errorf("cuda attention resident block: softmax: %w", err)
+	if maskFlat == nil {
+		if err := rt.launchAuxSoftmaxForwardRows(kernel, uint(grid), uint(block), scoresBuf, rows, seqLen); err != nil {
+			return backend.AttentionResidentResult{}, fmt.Errorf("cuda attention resident block: softmax: %w", err)
+		}
+	} else {
+		if err := rt.launchAuxSoftmaxForwardRowsMasked(maskedKernel, uint(grid), uint(block), scoresBuf, maskBuf, rows, seqLen, seqLen, 1); err != nil {
+			return backend.AttentionResidentResult{}, fmt.Errorf("cuda attention resident block: masked softmax: %w", err)
+		}
 	}
 	// mixed[b] = scores[b] @ V[b]
 	if err := rt.matMulCublasStridedBatched(scoresBuf, vBuf, mixedBuf, C.int(batch), C.int(seqLen), C.int(seqLen), C.int(seqLen), C.int(d), false, false); err != nil {
@@ -147,8 +179,12 @@ func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResident
 		}
 	}
 
+	uploadedBytes := int64(len(req.Input.F32) * 4)
+	if maskFlat != nil {
+		uploadedBytes += int64(len(maskFlat) * 4)
+	}
 	downloadedBytes := int64((len(queryHost) + len(keyHost) + len(valueHost) + len(scoresHost) + len(mixedHost)) * 4)
-	rt.recordMatMulRun(start, int64(len(req.Input.F32)*4), downloadedBytes, false, true)
+	rt.recordMatMulRun(start, uploadedBytes, downloadedBytes, false, true)
 
 	return backend.AttentionResidentResult{
 		Query:  backend.NewTensorF32([]int{rows, d}, queryHost),
@@ -157,4 +193,28 @@ func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResident
 		Scores: backend.NewTensorF32([]int{rows, seqLen}, scoresHost),
 		Mixed:  backend.NewTensorF32([]int{rows, d}, mixedHost),
 	}, nil
+}
+
+// flattenAttentionResidentMask validates and flattens a per-sequence key
+// mask (one length-seqLen slice per batch sequence) into one Batch*SeqLen
+// int32 buffer in batch order, matching how flattenInt32 lays out compact
+// forward's token/mask arrays. A nil/empty mask returns a nil slice (the
+// unmasked path); every other shape mismatch is a hard error rather than a
+// silent fallback, so a caller bug surfaces immediately instead of quietly
+// running unmasked.
+func flattenAttentionResidentMask(mask [][]int32, batch, seqLen int) ([]int32, error) {
+	if len(mask) == 0 {
+		return nil, nil
+	}
+	if len(mask) != batch {
+		return nil, fmt.Errorf("cuda attention resident block: mask has %d sequences, want %d", len(mask), batch)
+	}
+	flat := make([]int32, batch*seqLen)
+	for i, row := range mask {
+		if len(row) != seqLen {
+			return nil, fmt.Errorf("cuda attention resident block: mask sequence %d has %d entries, want %d", i, len(row), seqLen)
+		}
+		copy(flat[i*seqLen:(i+1)*seqLen], row)
+	}
+	return flat, nil
 }
