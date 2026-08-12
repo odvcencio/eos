@@ -3,6 +3,7 @@
 package cuda
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -176,6 +177,76 @@ func BenchmarkCUDAContrastiveAccelerator128x512x64(b *testing.B) {
 	}
 }
 
+// contrastiveGEMMBenchBatch/Width/Negatives fix the S1a before/after
+// benchmark shape: batch 256, 5 negatives/query (own positive + 5 mined
+// negatives per query, so a 6x shared candidate pool), d=256.
+const (
+	contrastiveGEMMBenchBatch      = 256
+	contrastiveGEMMBenchWidth      = 256
+	contrastiveGEMMBenchNegatives  = 5
+	contrastiveGEMMBenchMultiplier = 1 + contrastiveGEMMBenchNegatives
+)
+
+func contrastiveGEMMBenchFixture() (*backend.Tensor, *backend.Tensor, []int) {
+	query, _ := syntheticContrastiveTensors(contrastiveGEMMBenchBatch, contrastiveGEMMBenchWidth)
+	candidates, _ := syntheticContrastiveTensors(contrastiveGEMMBenchBatch*contrastiveGEMMBenchMultiplier, contrastiveGEMMBenchWidth)
+	targets := make([]int, contrastiveGEMMBenchBatch)
+	for i := range targets {
+		targets[i] = i * contrastiveGEMMBenchMultiplier
+	}
+	return query, candidates, targets
+}
+
+// BenchmarkCUDAContrastiveAcceleratorAtomic256x5neg256 is the "before"
+// measurement for S1a: the retired one-thread-per-pair scoring kernel plus
+// the atomicAdd gradient kernel, forced on via EOS_CUDA_CONTRASTIVE_GEMM=0.
+func BenchmarkCUDAContrastiveAcceleratorAtomic256x5neg256(b *testing.B) {
+	b.Setenv("EOS_CUDA_CONTRASTIVE_GEMM", "0")
+	accelAny, err := NewContrastiveAccelerator()
+	if err != nil {
+		b.Fatalf("new contrastive accelerator: %v", err)
+	}
+	if accelAny == nil {
+		b.Skip("no cuda contrastive accelerator available")
+	}
+	defer accelAny.Close()
+
+	query, candidates, targets := contrastiveGEMMBenchFixture()
+	cfg := backend.ContrastiveLossConfig{Temperature: 0.05}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := accelAny.RunInfoNCEWithTargets(query, candidates, targets, cfg); err != nil {
+			b.Fatalf("run rectangular infonce: %v", err)
+		}
+	}
+}
+
+// BenchmarkCUDAContrastiveAcceleratorGEMM256x5neg256 is the "after"
+// measurement for S1a: the cuBLAS GEMM-based score/gradient path, forced on
+// via EOS_CUDA_CONTRASTIVE_GEMM=1.
+func BenchmarkCUDAContrastiveAcceleratorGEMM256x5neg256(b *testing.B) {
+	b.Setenv("EOS_CUDA_CONTRASTIVE_GEMM", "1")
+	accelAny, err := NewContrastiveAccelerator()
+	if err != nil {
+		b.Fatalf("new contrastive accelerator: %v", err)
+	}
+	if accelAny == nil {
+		b.Skip("no cuda contrastive accelerator available")
+	}
+	defer accelAny.Close()
+
+	query, candidates, targets := contrastiveGEMMBenchFixture()
+	cfg := backend.ContrastiveLossConfig{Temperature: 0.05}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := accelAny.RunInfoNCEWithTargets(query, candidates, targets, cfg); err != nil {
+			b.Fatalf("run rectangular infonce: %v", err)
+		}
+	}
+}
+
 func syntheticContrastiveTensors(rows, width int) (*backend.Tensor, *backend.Tensor) {
 	query := make([]float32, rows*width)
 	positive := make([]float32, rows*width)
@@ -292,5 +363,172 @@ func assertCloseF32(t *testing.T, got, want, tol float32) {
 	diff := got - want
 	if diff < -tol || diff > tol {
 		t.Fatalf("got %f, want %f", got, want)
+	}
+}
+
+// assertTensorCloseTol is assertTensorClose (cuda_integration_test.go) with a
+// caller-supplied tolerance instead of the fixed 0.0005 default. The GEMM
+// path sums in a different order than the host reference loop (S1a), so
+// larger shapes need a wider tolerance than the small fixtures elsewhere in
+// this file.
+func assertTensorCloseTol(t *testing.T, tensor *backend.Tensor, wantShape []int, want []float32, tol float32) {
+	t.Helper()
+	if tensor == nil {
+		t.Fatal("tensor is nil")
+	}
+	if len(tensor.Shape) != len(wantShape) {
+		t.Fatalf("rank = %d, want %d", len(tensor.Shape), len(wantShape))
+	}
+	for i := range wantShape {
+		if tensor.Shape[i] != wantShape[i] {
+			t.Fatalf("shape[%d] = %d, want %d", i, tensor.Shape[i], wantShape[i])
+		}
+	}
+	if len(tensor.F32) != len(want) {
+		t.Fatalf("len(F32) = %d, want %d", len(tensor.F32), len(want))
+	}
+	for i, got := range tensor.F32 {
+		diff := got - want[i]
+		if diff < -tol || diff > tol {
+			t.Fatalf("tensor[%d] = %f, want %f (tol %f)", i, got, want[i], tol)
+		}
+	}
+}
+
+// TestCUDAContrastiveGEMMMatchesHostAcrossShapes is the S1a parity gate for
+// the cuBLAS GEMM-based InfoNCE path (runInfoNCEGEMM): tolerance-based (not
+// bit-exact -- GEMM reduction order differs from the host's sequential sum)
+// agreement with the host reference across batch, candidate-pool, and width
+// shapes. It forces EOS_CUDA_CONTRASTIVE_GEMM=1 so the result reflects the
+// new path regardless of the process default.
+func TestCUDAContrastiveGEMMMatchesHostAcrossShapes(t *testing.T) {
+	t.Setenv("EOS_CUDA_CONTRASTIVE_GEMM", "1")
+	accelAny, err := NewContrastiveAccelerator()
+	if err != nil {
+		t.Fatalf("new contrastive accelerator: %v", err)
+	}
+	if accelAny == nil {
+		t.Skip("no cuda contrastive accelerator available")
+	}
+	defer accelAny.Close()
+
+	const negativeMultiplier = 1 + 4 // hard-negative shape: own positive + 4 mined negatives per query
+	batches := []int{8, 64, 256}
+	widths := []int{64, 256}
+
+	for _, batch := range batches {
+		for _, width := range widths {
+			for _, hardNegative := range []bool{false, true} {
+				candidateRows := batch
+				if hardNegative {
+					candidateRows = batch * negativeMultiplier
+				}
+				name := fmt.Sprintf("batch%d_width%d_candidates%d", batch, width, candidateRows)
+				t.Run(name, func(t *testing.T) {
+					query, _ := syntheticContrastiveTensors(batch, width)
+					candidates, _ := syntheticContrastiveTensors(candidateRows, width)
+					targets := make([]int, batch)
+					stride := 1
+					if hardNegative {
+						stride = negativeMultiplier
+					}
+					for i := range targets {
+						targets[i] = i * stride
+					}
+					cfg := backend.ContrastiveLossConfig{Temperature: 0.05}
+
+					got, err := accelAny.RunInfoNCEWithTargets(query, candidates, targets, cfg)
+					if err != nil {
+						t.Fatalf("run infonce: %v", err)
+					}
+					wantQ, wantC, wantLoss, wantScore := hostInfoNCEGradTargets(query.F32, candidates.F32, batch, candidateRows, width, targets, cfg.Temperature)
+
+					// Per-element gradient tolerance: matches the fixed-shape
+					// 0.0005 default (assertTensorClose). Measured max diff
+					// across these shapes tops out around 2.4e-5 (batch 256,
+					// width 64, 1280 candidates), so this keeps ~20x headroom
+					// while still catching a real algebra/summation regression.
+					gradTol := float32(0.0005)
+					assertTensorCloseTol(t, got.QueryGrads, []int{batch, width}, wantQ, gradTol)
+					assertTensorCloseTol(t, got.PositiveGrads, []int{candidateRows, width}, wantC, gradTol)
+					assertCloseF32(t, got.LossSum, wantLoss, 0.01)
+
+					// ScoreSum sums batch*candidateRows terms (up to 256*1280
+					// here); bound the tolerance relative to its own
+					// magnitude instead of a fixed absolute value.
+					scoreTol := float32(0.001)*float32(math.Abs(float64(wantScore))) + 0.01
+					assertCloseF32(t, got.ScoreSum, wantScore, scoreTol)
+				})
+			}
+		}
+	}
+}
+
+// TestCUDAContrastiveGEMMFlagDisabledUsesAtomicPath is the rollback check for
+// S1a: EOS_CUDA_CONTRASTIVE_GEMM=0 must still route through the retired
+// atomic kernels (runInfoNCEAtomic) and match the host reference, so the flag
+// is a genuine escape hatch and not dead code.
+func TestCUDAContrastiveGEMMFlagDisabledUsesAtomicPath(t *testing.T) {
+	t.Setenv("EOS_CUDA_CONTRASTIVE_GEMM", "0")
+	accelAny, err := NewContrastiveAccelerator()
+	if err != nil {
+		t.Fatalf("new contrastive accelerator: %v", err)
+	}
+	if accelAny == nil {
+		t.Skip("no cuda contrastive accelerator available")
+	}
+	defer accelAny.Close()
+
+	query, candidates := syntheticContrastiveTensors(32, 64)
+	cfg := backend.ContrastiveLossConfig{Temperature: 0.05}
+	got, err := accelAny.RunInfoNCE(query, candidates, cfg)
+	if err != nil {
+		t.Fatalf("run infonce: %v", err)
+	}
+	wantQ, wantP, wantLoss, wantScore := hostInfoNCEGrad(query.F32, candidates.F32, 32, 64, cfg.Temperature)
+	assertTensorClose(t, got.QueryGrads, []int{32, 64}, wantQ)
+	assertTensorClose(t, got.PositiveGrads, []int{32, 64}, wantP)
+	assertCloseF32(t, got.LossSum, wantLoss, 0.0001)
+	assertCloseF32(t, got.ScoreSum, wantScore, 0.0001)
+}
+
+// TestCUDAContrastiveScoreMatrixMemoryEnvelope is a pure size-arithmetic
+// guard, not a real allocation ("a unit test on the size calculation, not an
+// actual 4096 allocation" -- S1a). docs/benchmarks.md's Batch Sweep table
+// measured 4.47 GB (GiB) max RSS for the *whole* training process at batch
+// 4096 with in-batch negatives; this asserts the B x C score-matrix bytes
+// (the quadratic-in-batch term this change touches) stay a small, sane
+// fraction of that documented total envelope, so a future shape change (for
+// example growing the hard-negative multiplier) cannot silently blow past
+// it without failing a fast, GPU-free test.
+func TestCUDAContrastiveScoreMatrixMemoryEnvelope(t *testing.T) {
+	const documentedTotalEnvelopeGiB = 4.47
+	const gib = int64(1024) * 1024 * 1024
+	const negativeMultiplier = 1 + 4
+
+	cases := []struct {
+		name          string
+		queryRows     int
+		candidateRows int
+	}{
+		{"in-batch-4096", 4096, 4096},
+		{"hard-negative-4096x5", 4096, 4096 * negativeMultiplier},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			elements := tc.queryRows * tc.candidateRows
+			scoreBytes, err := checkedCUDABytes("cuda contrastive score matrix", elements, 4)
+			if err != nil {
+				t.Fatalf("score matrix byte calculation: %v", err)
+			}
+			// The scores and scales buffers are both allocated at this
+			// shape (see runInfoNCEGEMM / runInfoNCEAtomic); count both.
+			totalBytes := int64(scoreBytes) * 2
+			totalGiB := float64(totalBytes) / float64(gib)
+			if totalGiB >= documentedTotalEnvelopeGiB {
+				t.Fatalf("score+scale matrix envelope %.4f GiB at batch %d candidates %d meets or exceeds the documented %.2f GiB total training envelope from docs/benchmarks.md", totalGiB, tc.queryRows, tc.candidateRows, documentedTotalEnvelopeGiB)
+			}
+			t.Logf("batch=%d candidates=%d width-independent score+scale bytes = %.4f GiB (documented total training envelope %.2f GiB)", tc.queryRows, tc.candidateRows, totalGiB, documentedTotalEnvelopeGiB)
+		})
 	}
 }
