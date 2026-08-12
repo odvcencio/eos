@@ -1905,6 +1905,13 @@ func TestEmbeddingTrainerHardNegativeGeneralSplitMatchesHostOverSeveralSteps(t *
 // path must still land on the same bit-exact answer as plain InfoNCE for a
 // weight=1 full-dim duplicate term.
 func TestEmbeddingTrainerContrastiveHostMatryoshkaLossFlagRestoresOldPathBitForBit(t *testing.T) {
+	// Pin the contrastive accelerator to the atomic kernel: the bit-for-bit
+	// identity below compares a device-scored plain run against the host
+	// prefix loop, and it only holds when the device summation order matches
+	// the host order, which the atomic kernel does at this tiny shape. The
+	// S1a cuBLAS GEMM path (default since its merge) sums in a different
+	// order and legitimately lands one ulp away.
+	t.Setenv("EOS_CUDA_CONTRASTIVE_GEMM", "0")
 	batch := tinyEmbeddingContrastiveDataset()
 
 	plain := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
