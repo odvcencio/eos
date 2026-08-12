@@ -491,6 +491,16 @@ static int eosCudaLaunchSoftmaxForwardRows(EosCudaRuntime* rt, EosCudaKernel* ke
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
 }
 
+static int eosCudaLaunchSoftmaxForwardRowsMasked(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr data, CUdeviceptr mask, int rows, int cols, int seqLen, float scale, char** err) {
+	void* args[] = {&data, &mask, &rows, &cols, &seqLen, &scale};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+static int eosCudaLaunchAttnSoftmaxBackwardScaledRows(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr probs, CUdeviceptr out0, int rows, int cols, float scale, char** err) {
+	void* args[] = {&gradOut, &probs, &out0, &rows, &cols, &scale};
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
 static int eosCudaLaunchGeluForward(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr src, CUdeviceptr dst, int elements, char** err) {
 	void* args[] = {&src, &dst, &elements};
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
@@ -2260,8 +2270,15 @@ type deviceRuntime struct {
 	bertBiasAddKernel           *auxKernel
 	bertAttentionContextKernel  *auxKernel
 	softmaxForwardKernel        *auxKernel
+	softmaxForwardMaskedKernel  *auxKernel
+	attnSoftmaxBackwardScaled   *auxKernel
 	matMulStats                 backend.MatMulAcceleratorStats
 	graphCache                  map[string]*cudaGraph
+	// attnTrain holds the S3(b) attention-resident-train handle registry
+	// (see attention_resident_train_accel_linux.go); its type lives in that
+	// file so this struct's flat kernel-field list stays the single place
+	// for per-kernel *auxKernel caches.
+	attnTrain attentionResidentTrainState
 }
 
 type residentMatrix struct {
@@ -2377,6 +2394,11 @@ func (rt *deviceRuntime) close() {
 	rt.bertAttentionContextKernel = nil
 	rt.destroyAuxKernel(rt.softmaxForwardKernel)
 	rt.softmaxForwardKernel = nil
+	rt.destroyAuxKernel(rt.softmaxForwardMaskedKernel)
+	rt.softmaxForwardMaskedKernel = nil
+	rt.destroyAuxKernel(rt.attnSoftmaxBackwardScaled)
+	rt.attnSoftmaxBackwardScaled = nil
+	rt.releaseAllAttentionResidentTrainHandles()
 	for sig, g := range rt.graphCache {
 		g.destroy()
 		delete(rt.graphCache, sig)
@@ -3118,6 +3140,45 @@ func (rt *deviceRuntime) ensureSoftmaxForwardKernel() (*auxKernel, error) {
 		return nil, err
 	}
 	rt.softmaxForwardKernel = kernel
+	return kernel, nil
+}
+
+// ensureSoftmaxForwardMaskedKernel lazily compiles and caches the on-device
+// masked+scaled forward row softmax (see forwardSoftmaxRowsMaskedKernelSource).
+// Both the stage (a) forward-only fast path (scale=1, Q already
+// score-scale-baked) and the attention-resident TRAIN accelerator (real
+// scale, unscaled Q/K) share this one cached kernel.
+func (rt *deviceRuntime) ensureSoftmaxForwardMaskedKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.softmaxForwardMaskedKernel != nil {
+		return rt.softmaxForwardMaskedKernel, nil
+	}
+	kernel, err := rt.compileAuxKernel(forwardSoftmaxRowsMaskedKernelSource, "manta_softmax_forward_rows_masked")
+	if err != nil {
+		return nil, err
+	}
+	rt.softmaxForwardMaskedKernel = kernel
+	return kernel, nil
+}
+
+// ensureAttnSoftmaxBackwardScaledKernel lazily compiles and caches the
+// on-device fused softmax-backward-then-scale kernel (see
+// attnSoftmaxBackwardScaledRowsKernelSource), used by the attention-resident
+// TRAIN accelerator's backward chain.
+func (rt *deviceRuntime) ensureAttnSoftmaxBackwardScaledKernel() (*auxKernel, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if rt.attnSoftmaxBackwardScaled != nil {
+		return rt.attnSoftmaxBackwardScaled, nil
+	}
+	kernel, err := rt.compileAuxKernel(attnSoftmaxBackwardScaledRowsKernelSource, "manta_attn_softmax_backward_scaled_rows")
+	if err != nil {
+		return nil, err
+	}
+	rt.attnSoftmaxBackwardScaled = kernel
 	return kernel, nil
 }
 
@@ -4455,6 +4516,36 @@ func (rt *deviceRuntime) launchAuxSoftmaxForwardRows(kernel *auxKernel, grid, bl
 	}
 	var errStr *C.char
 	if C.eosCudaLaunchSoftmaxForwardRows(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), data, C.int(rows), C.int(cols), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+// launchAuxSoftmaxForwardRowsMasked runs the on-device masked+scaled forward
+// row softmax in place over a rows×cols buffer (rows=batch*seqLen) on rt's
+// stream, using mask (batch*seqLen int32 flags, flattened in the same batch
+// order as data) to exclude masked key columns from every query row of
+// their sequence.
+func (rt *deviceRuntime) launchAuxSoftmaxForwardRowsMasked(kernel *auxKernel, grid, block uint, data, mask C.CUdeviceptr, rows, cols, seqLen int, scale float32) error {
+	if kernel == nil || kernel.ptr == nil {
+		return fmt.Errorf("cuda auxiliary masked softmax forward kernel is not initialized")
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchSoftmaxForwardRowsMasked(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), data, mask, C.int(rows), C.int(cols), C.int(seqLen), C.float(scale), &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+// launchAuxAttnSoftmaxBackwardScaledRows runs the on-device fused softmax
+// backward + scale kernel (out0 = scale * softmaxBackward(gradOut, probs))
+// on rt's stream.
+func (rt *deviceRuntime) launchAuxAttnSoftmaxBackwardScaledRows(kernel *auxKernel, grid, block uint, gradOut, probs, out0 C.CUdeviceptr, rows, cols int, scale float32) error {
+	if kernel == nil || kernel.ptr == nil {
+		return fmt.Errorf("cuda auxiliary attention softmax backward-scaled kernel is not initialized")
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchAttnSoftmaxBackwardScaledRows(rt.ptr, kernel.ptr, C.uint(grid), C.uint(block), gradOut, probs, out0, C.int(rows), C.int(cols), C.float(scale), &errStr) != 0 {
 		return cStringError(errStr)
 	}
 	return nil

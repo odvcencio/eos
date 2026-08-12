@@ -267,6 +267,18 @@ type EmbeddingTrainer struct {
 	// vectorDistillDefaultRoleWarned tracks whether FitVectorDistill has already
 	// logged the one-time warning about rows falling back to the default role.
 	vectorDistillDefaultRoleWarned bool
+	// attnResidentTrainStepID is the monotonic step counter S3(b)'s
+	// Begin/EndAttentionResidentTrainStep calls use to scope one training
+	// step's resident attention-block handles. It never repeats a value
+	// across the trainer's lifetime, so a handle can never alias a
+	// different step by StepID coincidence even before the accelerator's
+	// own generation check runs.
+	attnResidentTrainStepID uint64
+	// attnResidentTrainStepOpen tracks whether a BeginAttentionResidentTrainStep
+	// call is currently unmatched by End/AbortAttentionResidentTrainStep, so
+	// abortAttentionResidentTrainStep (deferred on every training entry
+	// point that begins a step) knows whether there is anything to close.
+	attnResidentTrainStepOpen bool
 }
 
 type embeddingCompactForwardTrainerStats struct {
@@ -335,6 +347,20 @@ type embeddingSequenceState struct {
 	normalized          []float32
 	pooled              []float32
 	skipUnboundActAccel bool
+	// attnResidentTrainHandle is set by tryAttentionBlockResidentTrain
+	// (S3(b)) when this state's attention block ran on the device-resident
+	// forward+backward fast path. Each state gets its own independent
+	// Batch=1 handle (rather than one handle shared across a batched
+	// forward call) precisely so a later backward call can consume it
+	// per-state regardless of whether that backward call groups states the
+	// same way forward did, or one at a time the way the shipped default
+	// (role-conditioned) model's backpropAttentionSequence path does --
+	// see tryBackpropContrastiveBatch's role-embedding gate.
+	// attnResidentTrainHandleSet distinguishes "no handle" from the
+	// zero-value handle (whose Token is nil either way, but an explicit
+	// flag keeps the intent obvious at call sites).
+	attnResidentTrainHandleSet bool
+	attnResidentTrainHandle    backend.AttentionResidentTrainHandle
 }
 
 type embeddingEncodedSequence struct {
@@ -1428,6 +1454,16 @@ func (t *EmbeddingTrainer) releaseSequenceBindings(state *embeddingSequenceState
 	if t == nil || state == nil {
 		return
 	}
+	// Defense in depth: backward (tryAttentionBlockResidentBackward) and its
+	// own fallback (releaseStaleAttentionResidentTrainHandles) already
+	// release every resident-train handle on every path that runs backward
+	// at all. A state whose handle is still marked live here only happens
+	// on a path that skipped backward entirely (for example an error
+	// between encode and backprop); release it here rather than leaking its
+	// device buffers until the next BeginAttentionResidentTrainStep sweep.
+	if state.attnResidentTrainHandleSet {
+		t.releaseStaleAttentionResidentTrainHandles([]*embeddingSequenceState{state})
+	}
 	for _, name := range []string{
 		state.inputBinding,
 		state.hiddenBinding,
@@ -1872,6 +1908,20 @@ func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExam
 	}
 	forward := t.prepareForwardWeights()
 	t.primeForwardWeightResidency(forward.attnQ, forward.attnK, forward.attnV, forward.attnO, forward.hidden, forward.proj)
+	// S3(b): open one resident-train step for this whole forward+backward
+	// pass so tryAttentionBlockResidentTrain/tryAttentionBlockResidentBackward
+	// can create and consume handles; abort on any early return (began
+	// tracks whether the deferred abort has anything to close, mirroring
+	// FitVectorDistill's own Begin/Abort convention for CompactTrainAccelerator).
+	if err := t.beginAttentionResidentTrainStep(); err != nil {
+		return EmbeddingTrainMetrics{}, fmt.Errorf("attention resident train begin step: %w", err)
+	}
+	began := true
+	defer func() {
+		if began {
+			_ = t.abortAttentionResidentTrainStep()
+		}
+	}()
 	queries, positives, err := t.encodeContrastiveBatch(batch, forward, true)
 	if err != nil {
 		return EmbeddingTrainMetrics{}, err
@@ -1963,6 +2013,10 @@ func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExam
 	if err := t.applyEmbeddingOptimizerUpdates(gradToken, gradRole, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj, batchScale); err != nil {
 		return EmbeddingTrainMetrics{}, err
 	}
+	if err := t.endAttentionResidentTrainStep(); err != nil {
+		return EmbeddingTrainMetrics{}, fmt.Errorf("attention resident train end step: %w", err)
+	}
+	began = false
 	return EmbeddingTrainMetrics{
 		Loss:         totalLoss * lossScale,
 		AverageScore: totalScore / float32(pairCount),
@@ -4873,13 +4927,71 @@ func qkvMultiBoundRightEnabled() bool {
 	}
 }
 
-// attnResidentEnabled gates the S3(a) device-resident attention-block fast
-// path (see tryAttentionBlockResident): Q/K/V projection, scores, softmax,
-// and value-mix run device-to-device instead of round-tripping each
-// intermediate through the host. Default OFF; set EOS_EMBED_ATTN_RESIDENT=1
-// to opt in.
+// attnResidentEnabled gates both the S3(a) forward-only device-resident
+// attention-block fast path (see tryAttentionBlockResident) and the S3(b)
+// forward+backward resident fast path (see tryAttentionBlockResidentTrain):
+// Q/K/V projection, scores, softmax, and value-mix (and, for S3(b),
+// gradWq/gradWk/gradWv/gradInput) run device-to-device instead of
+// round-tripping each intermediate through the host. Default OFF; set
+// EOS_EMBED_ATTN_RESIDENT=1 to opt in. One flag gates both stages: S3(b)
+// builds directly on S3(a)'s forward chain.
 func attnResidentEnabled() bool {
 	return trainEnvFlagEnabled("EOS_EMBED_ATTN_RESIDENT")
+}
+
+// beginAttentionResidentTrainStep starts a new S3(b) resident-train step
+// when the flag is on and the bound accelerator supports it; it is a no-op
+// (nil error) otherwise, so every training entry point can call it
+// unconditionally and rely on tryAttentionBlockResidentTrain/
+// tryAttentionBlockResidentBackward falling back to the host path on their
+// own when no step is open. Mirrors CompactTrainAccelerator's
+// BeginCompactTrainStep call convention.
+func (t *EmbeddingTrainer) beginAttentionResidentTrainStep() error {
+	if t == nil || !attnResidentEnabled() {
+		return nil
+	}
+	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
+	if !ok {
+		return nil
+	}
+	t.attnResidentTrainStepID++
+	if err := accel.BeginAttentionResidentTrainStep(t.attnResidentTrainStepID); err != nil {
+		return err
+	}
+	t.attnResidentTrainStepOpen = true
+	return nil
+}
+
+// endAttentionResidentTrainStep closes the step beginAttentionResidentTrainStep
+// opened (successful completion path). No-op if no step is open.
+func (t *EmbeddingTrainer) endAttentionResidentTrainStep() error {
+	return t.closeAttentionResidentTrainStep(false)
+}
+
+// abortAttentionResidentTrainStep closes the step beginAttentionResidentTrainStep
+// opened (error path). No-op if no step is open. Callers should defer this
+// immediately after a successful beginAttentionResidentTrainStep and call
+// endAttentionResidentTrainStep explicitly on the success path; since
+// closeAttentionResidentTrainStep is idempotent (attnResidentTrainStepOpen
+// guards it), calling both in sequence on the success path is safe.
+func (t *EmbeddingTrainer) abortAttentionResidentTrainStep() error {
+	return t.closeAttentionResidentTrainStep(true)
+}
+
+func (t *EmbeddingTrainer) closeAttentionResidentTrainStep(aborted bool) error {
+	if t == nil || !t.attnResidentTrainStepOpen {
+		return nil
+	}
+	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
+	if !ok {
+		t.attnResidentTrainStepOpen = false
+		return nil
+	}
+	t.attnResidentTrainStepOpen = false
+	if aborted {
+		return accel.AbortAttentionResidentTrainStep(t.attnResidentTrainStepID)
+	}
+	return accel.EndAttentionResidentTrainStep(t.attnResidentTrainStepID)
 }
 
 func sharedLeftMatMulEnabled() bool {
@@ -5063,7 +5175,22 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 		// every state, so every per-call compute branch below is skipped;
 		// only the (already unconditional) sequence-tensor binds below still
 		// run, matching the existing bind-for-backward contract.
-		residentOK := t.tryAttentionBlockResident(states, seqLen, d)
+		//
+		// captureBindings == true means backward will run against these
+		// states (see the parameter's callers), so try the S3(b)
+		// forward+backward resident path first -- it also fills every field
+		// tryAttentionBlockResident does, plus the handle
+		// tryAttentionBlockResidentBackward needs. captureBindings == false
+		// (eval-only encodes) skips straight to the S3(a) forward-only path,
+		// since there is no backward call to consume a resident-train handle
+		// and release its device buffers.
+		residentOK := false
+		if captureBindings {
+			residentOK = t.tryAttentionBlockResidentTrain(states, seqLen, d)
+		}
+		if !residentOK {
+			residentOK = t.tryAttentionBlockResident(states, seqLen, d)
+		}
 		if !residentOK {
 			if !t.fillBatchedForwardQKVMatMul(states, seqLen, d, attentionQuery, attentionKey, attentionValue) {
 				t.fillBatchedForwardWeightMatMul(states, seqLen, d, func(state *embeddingSequenceState) []float32 {
@@ -5422,8 +5549,11 @@ func (t *EmbeddingTrainer) tryBatchedAttentionMixed(states []*embeddingSequenceS
 //
 // It returns false without mutating any state whenever the fast path is
 // unavailable or unsuitable (flag off, no accelerator, no resident query
-// binding, masked softmax, or a request/response shape mismatch), so callers
-// can unconditionally fall back to the existing per-call matmul path.
+// binding, an AttentionMaskMode other than "none"/"key", or a request/
+// response shape mismatch), so callers can unconditionally fall back to the
+// existing per-call matmul path. AttentionMaskMode "key" (the shipped
+// default model) is supported as of S3(b): see the Mask field this sends
+// on backend.AttentionResidentRequest.
 func (t *EmbeddingTrainer) tryAttentionBlockResident(states []*embeddingSequenceState, seqLen, d int) bool {
 	if t == nil || !attnResidentEnabled() || t.attnResidentQueryBinding == "" {
 		return false
@@ -5435,11 +5565,22 @@ func (t *EmbeddingTrainer) tryAttentionBlockResident(states []*embeddingSequence
 	if len(states) == 0 || seqLen == 0 || d == 0 {
 		return false
 	}
+	var mask [][]int32
 	switch t.manifest.AttentionMaskMode {
 	case "", EmbeddingAttentionMaskModeNone:
+	case EmbeddingAttentionMaskModeKey:
+		// S3(b): the device masked-softmax kernel takes each sequence's own
+		// key mask; scale still comes pre-baked into attnResidentQueryBinding
+		// (see primeAttentionResidentQueryBinding), so this path never needs
+		// a separate scale step even when masked.
+		mask = make([][]int32, len(states))
+		for i, state := range states {
+			if state == nil || len(state.mask) != seqLen {
+				return false
+			}
+			mask[i] = state.mask
+		}
 	default:
-		// Masked softmax stays on the host path in stage (a); the device
-		// forward-softmax kernel this fast path uses takes no mask input.
 		return false
 	}
 	perInput := seqLen * d
@@ -5460,6 +5601,7 @@ func (t *EmbeddingTrainer) tryAttentionBlockResident(states []*embeddingSequence
 		QueryName: t.attnResidentQueryBinding,
 		KeyName:   t.attnKParam.Name,
 		ValueName: t.attnVParam.Name,
+		Mask:      mask,
 	})
 	if err != nil || result.Query == nil || result.Key == nil || result.Value == nil || result.Scores == nil || result.Mixed == nil {
 		return false
@@ -5496,6 +5638,109 @@ func (t *EmbeddingTrainer) tryAttentionBlockResident(states []*embeddingSequence
 		state.attnV = values[i]
 		state.attnScores = scores[i]
 		state.attnMixed = mixed[i]
+	}
+	return true
+}
+
+// tryAttentionBlockResidentTrain attempts the S3(b) device-resident
+// forward+backward fast path for one batched attention block during
+// training (captureBindings == true call sites only -- see
+// encodeBatchedLayerStates). It fills the same state fields
+// tryAttentionBlockResident does (state.attnQ/K/V/Scores/Mixed) plus each
+// state's attnResidentTrainHandle, which tryAttentionBlockResidentBackward
+// or tryAttentionBlockResidentBackwardOne later use to backpropagate this
+// block without re-uploading Q/K/V/scores/input.
+//
+// Unlike tryAttentionBlockResident, Q/K here are the plain (unscaled)
+// attnQParam/attnKParam bindings, and the score scale is passed explicitly
+// (backend.AttentionResidentTrainForwardRequest.Scale) rather than
+// pre-baked into a scaled copy, so the backward chain can mirror
+// backpropAttentionSequences' algebra term for term.
+//
+// Each state gets its own independent Batch=1 accelerator call (and its own
+// handle) rather than one call/handle covering the whole states slice: the
+// shipped default model's role conditioning makes
+// tryBackpropContrastiveBatch always decline the batched backward path (see
+// its t.roleEmbed != nil gate), so backward for that model runs one
+// sequence at a time through backpropAttentionSequence -- a per-state
+// handle is what lets that singular path, and the batched
+// backpropAttentionSequences path, each consume exactly the handles their
+// own states own, in whichever order or grouping backward reaches them.
+//
+// It returns false without mutating any state whenever the fast path is
+// unavailable or unsuitable (flag off, no accelerator, no open resident-
+// train step, an AttentionMaskMode other than "none"/"key", or a request/
+// response shape mismatch on any one state), releasing any handles it
+// already created for earlier states in this same call before returning,
+// so callers can unconditionally fall back to tryAttentionBlockResident and
+// then the existing per-call matmul path.
+func (t *EmbeddingTrainer) tryAttentionBlockResidentTrain(states []*embeddingSequenceState, seqLen, d int) bool {
+	if t == nil || !attnResidentEnabled() || !t.attnResidentTrainStepOpen {
+		return false
+	}
+	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
+	if !ok {
+		return false
+	}
+	if len(states) == 0 || seqLen == 0 || d == 0 {
+		return false
+	}
+	maskEnabled := false
+	switch t.manifest.AttentionMaskMode {
+	case "", EmbeddingAttentionMaskModeNone:
+	case EmbeddingAttentionMaskModeKey:
+		maskEnabled = true
+	default:
+		return false
+	}
+	scale := t.attentionScoreScale(d)
+	results := make([]backend.AttentionResidentTrainForwardResult, 0, len(states))
+	perInput := seqLen * d
+	ok = true
+	for _, state := range states {
+		if state == nil || len(state.input) != perInput || (maskEnabled && len(state.mask) != seqLen) {
+			ok = false
+			break
+		}
+		var mask [][]int32
+		if maskEnabled {
+			mask = [][]int32{state.mask}
+		}
+		result, err := accel.RunAttentionBlockResidentTrainForward(backend.AttentionResidentTrainForwardRequest{
+			Batch:     1,
+			SeqLen:    seqLen,
+			ModelDim:  d,
+			Input:     tensorF32View([]int{seqLen, d}, state.input),
+			QueryName: t.attnQParam.Name,
+			KeyName:   t.attnKParam.Name,
+			ValueName: t.attnVParam.Name,
+			Mask:      mask,
+			Scale:     scale,
+			StepID:    t.attnResidentTrainStepID,
+		})
+		if err != nil || result.Query == nil || result.Key == nil || result.Value == nil || result.Scores == nil || result.Mixed == nil || result.Handle.Token == nil ||
+			len(result.Query.F32) != perInput || len(result.Key.F32) != perInput || len(result.Value.F32) != perInput ||
+			len(result.Scores.F32) != seqLen*seqLen || len(result.Mixed.F32) != perInput {
+			ok = false
+			break
+		}
+		results = append(results, result)
+	}
+	if !ok || len(results) != len(states) {
+		for _, result := range results {
+			_ = accel.ReleaseAttentionResidentTrainHandle(result.Handle)
+		}
+		return false
+	}
+	for i, state := range states {
+		result := results[i]
+		state.attnQ = result.Query.F32
+		state.attnK = result.Key.F32
+		state.attnV = result.Value.F32
+		state.attnScores = result.Scores.F32
+		state.attnMixed = result.Mixed.F32
+		state.attnResidentTrainHandleSet = true
+		state.attnResidentTrainHandle = result.Handle
 	}
 	return true
 }
@@ -10499,6 +10744,121 @@ func (t *EmbeddingTrainer) tryAccumulatedAttentionInputGradMatMul(gradQMatrices,
 	return splitFloat32Views(out, len(gradQMatrices))
 }
 
+// tryAttentionBlockResidentBackwardOne backpropagates through one state's
+// resident attention block (see tryAttentionBlockResidentTrain), given the
+// upstream gradient at Mixed for that state alone. It is the shared core
+// both tryAttentionBlockResidentBackward (the batched
+// backpropAttentionSequences path) and backpropAttentionSequence (the
+// singular, role-conditioned-model path) call: since S3(b) hands out one
+// independent handle per state rather than one per batched forward call,
+// backpropagating one state never depends on which other states, if any,
+// share its backward call.
+//
+// On success it releases state's handle (the accelerator does this as part
+// of backward -- see runAttentionBlockResidentTrainBackward) and clears
+// attnResidentTrainHandleSet, and returns gradInput (the Q/K/V-path
+// contribution only, matching backpropAttentionSequences' own composition
+// order) plus gradWq/gradWk/gradWv. It does not mutate any gradAttnQ/K/V
+// accumulator itself -- callers merge the returned weight gradients in only
+// once every state in their batch has succeeded, so a mid-batch failure
+// (rare: an accelerator-level error, not a validation failure -- validation
+// failures never call the accelerator at all) can never double-count a
+// gradient that a host-path recomputation would also produce.
+func (t *EmbeddingTrainer) tryAttentionBlockResidentBackwardOne(state *embeddingSequenceState, gradMixed []float32, seqLen, d int) (gradInput, gradWq, gradWk, gradWv []float32, ok bool) {
+	if t == nil || !attnResidentEnabled() || !t.attnResidentTrainStepOpen {
+		return nil, nil, nil, nil, false
+	}
+	accel, accelOK := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
+	if !accelOK {
+		return nil, nil, nil, nil, false
+	}
+	if state == nil || !state.attnResidentTrainHandleSet || state.attnResidentTrainHandle.Token == nil || seqLen == 0 || d == 0 || len(gradMixed) != seqLen*d {
+		return nil, nil, nil, nil, false
+	}
+	result, err := accel.RunAttentionBlockResidentTrainBackward(backend.AttentionResidentTrainBackwardRequest{
+		Handle:    state.attnResidentTrainHandle,
+		GradMixed: tensorF32View([]int{seqLen, d}, gradMixed),
+	})
+	state.attnResidentTrainHandleSet = false
+	if err != nil || result.GradInput == nil || result.GradQueryWeight == nil || result.GradKeyWeight == nil || result.GradValueWeight == nil {
+		return nil, nil, nil, nil, false
+	}
+	if len(result.GradInput.F32) != seqLen*d || len(result.GradQueryWeight.F32) != d*d || len(result.GradKeyWeight.F32) != d*d || len(result.GradValueWeight.F32) != d*d {
+		return nil, nil, nil, nil, false
+	}
+	return result.GradInput.F32, result.GradQueryWeight.F32, result.GradKeyWeight.F32, result.GradValueWeight.F32, true
+}
+
+// tryAttentionBlockResidentBackward is tryAttentionBlockResidentBackwardOne
+// looped across a batched backpropAttentionSequences call: every state must
+// already carry a live handle (checked up front, before any accelerator
+// call, so a missing handle never leaves earlier states in this same call
+// partially consumed), and gradAttnQ/gradAttnK/gradAttnV only accumulate
+// the batch's weight-gradient contributions once every state in the batch
+// has succeeded.
+func (t *EmbeddingTrainer) tryAttentionBlockResidentBackward(states []*embeddingSequenceState, gradMixedMatrices [][]float32, gradResidualInputs [][]float32, gradAttnQ, gradAttnK, gradAttnV []float32, seqLen, d int) ([][]float32, bool) {
+	if len(states) == 0 || len(states) != len(gradMixedMatrices) || seqLen == 0 || d == 0 {
+		return nil, false
+	}
+	for _, state := range states {
+		if state == nil || !state.attnResidentTrainHandleSet {
+			return nil, false
+		}
+	}
+	gradWqAccum := make([]float32, d*d)
+	gradWkAccum := make([]float32, d*d)
+	gradWvAccum := make([]float32, d*d)
+	gradInputs := make([][]float32, len(states))
+	for i, state := range states {
+		gradInput, gradWq, gradWk, gradWv, ok := t.tryAttentionBlockResidentBackwardOne(state, gradMixedMatrices[i], seqLen, d)
+		if !ok {
+			return nil, false
+		}
+		addFloat32Slice(gradWqAccum, gradWq)
+		addFloat32Slice(gradWkAccum, gradWk)
+		addFloat32Slice(gradWvAccum, gradWv)
+		gi := append([]float32(nil), gradInput...)
+		if gradResidualInputs != nil && i < len(gradResidualInputs) && gradResidualInputs[i] != nil {
+			addFloat32Slice(gi, gradResidualInputs[i])
+		}
+		gradInputs[i] = gi
+	}
+	addFloat32Slice(gradAttnQ, gradWqAccum)
+	addFloat32Slice(gradAttnK, gradWkAccum)
+	addFloat32Slice(gradAttnV, gradWvAccum)
+	return gradInputs, true
+}
+
+// releaseStaleAttentionResidentTrainHandles releases every still-live
+// resident-train handle referenced by states (each unique handle exactly
+// once) and clears their attnResidentTrainHandleSet flags. Callers use this
+// when they decide not to consume a handle tryAttentionBlockResidentTrain
+// attached during forward -- for example tryAttentionBlockResidentBackward
+// declining a mixed-handle group -- so the handle's device buffers are
+// freed immediately rather than surviving, unused, until the next
+// BeginAttentionResidentTrainStep's defensive sweep.
+func (t *EmbeddingTrainer) releaseStaleAttentionResidentTrainHandles(states []*embeddingSequenceState) {
+	if t == nil {
+		return
+	}
+	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
+	if !ok {
+		return
+	}
+	released := map[backend.AttentionResidentTrainHandleToken]bool{}
+	for _, state := range states {
+		if state == nil || !state.attnResidentTrainHandleSet || state.attnResidentTrainHandle.Token == nil {
+			continue
+		}
+		token := state.attnResidentTrainHandle.Token
+		if !released[token] {
+			_ = accel.ReleaseAttentionResidentTrainHandle(state.attnResidentTrainHandle)
+			released[token] = true
+		}
+		state.attnResidentTrainHandleSet = false
+	}
+}
+
 func (t *EmbeddingTrainer) backpropAttentionSequences(states []*embeddingSequenceState, gradHiddenMatrices [][]float32, attentionQuery, attentionKey, attentionValue, attentionOutput *backend.Tensor, gradAttnQ, gradAttnK, gradAttnV, gradAttnO []float32, d int) ([][]float32, bool) {
 	if len(states) == 0 || len(states) != len(gradHiddenMatrices) || attentionQuery == nil || attentionKey == nil || attentionValue == nil || attentionOutput == nil {
 		return nil, false
@@ -10593,6 +10953,20 @@ func (t *EmbeddingTrainer) backpropAttentionSequences(states []*embeddingSequenc
 			gradMixedMatrices[i] = gradMixed
 		}
 	}
+
+	// S3(b): gradMixedMatrices is exactly the upstream gradient the resident
+	// train handles (set by tryAttentionBlockResidentTrain during this
+	// block's forward pass) expect. On success this replaces every
+	// gradQ/gradK/gradV/gradAttnQ/gradAttnK/gradAttnV/gradInput step below
+	// with one device-resident backward call per handle.
+	if gradInputs, ok := t.tryAttentionBlockResidentBackward(states, gradMixedMatrices, gradResidualInputs, gradAttnQ, gradAttnK, gradAttnV, seqLen, d); ok {
+		return gradInputs, true
+	}
+	// tryAttentionBlockResidentBackward leaves any handle it did not
+	// consume untouched (for example a mixed-handle group, see its doc
+	// comment); release those now instead of leaking their device buffers
+	// until the next BeginAttentionResidentTrainStep's defensive sweep.
+	t.releaseStaleAttentionResidentTrainHandles(states)
 
 	gradQMatrices := make([][]float32, len(states))
 	gradKMatrices := make([][]float32, len(states))
@@ -10896,6 +11270,24 @@ func (t *EmbeddingTrainer) backpropAttentionSequence(state *embeddingSequenceSta
 	} else {
 		attnOData := forwardMatMulHostData(attentionOutput)
 		fillHostMatMulTranspose(gradAttnOutput, seqLen, d, attnOData, d, d, false, true, gradMixed)
+	}
+
+	// S3(b): the shipped default (role-conditioned) model always
+	// backpropagates one sequence at a time through this function rather
+	// than the batched backpropAttentionSequences (see
+	// tryBackpropContrastiveBatch's t.roleEmbed != nil gate), so this is
+	// the resident-backward integration point that matters for it.
+	// gradMixed here is exactly the upstream gradient the state's resident
+	// handle (set by tryAttentionBlockResidentTrain during forward) expects.
+	if residentGradInput, gradWq, gradWk, gradWv, ok := t.tryAttentionBlockResidentBackwardOne(state, gradMixed, seqLen, d); ok {
+		addFloat32Slice(gradAttnQ, gradWq)
+		addFloat32Slice(gradAttnK, gradWk)
+		addFloat32Slice(gradAttnV, gradWv)
+		result := append([]float32(nil), residentGradInput...)
+		if t.attentionResidualEnabled() {
+			addFloat32Slice(result, gradResidualInput)
+		}
+		return result
 	}
 
 	gradQ := make([]float32, seqLen*d)

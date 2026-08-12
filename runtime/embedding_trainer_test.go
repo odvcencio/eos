@@ -93,6 +93,19 @@ type countingMatMulAccelerator struct {
 	bindUploadedBytes int64
 	bound             map[string]*backend.Tensor
 	closed            bool
+	// S3(b) attention-resident-train fake state (see
+	// embedding_trainer_attn_resident_backward_test.go for the
+	// AttentionResidentTrainAccelerator method implementations).
+	attnResidentTrainForwardRuns  int
+	attnResidentTrainBackwardRuns int
+	attnResidentTrainBeginCalls   int
+	attnResidentTrainEndCalls     int
+	attnResidentTrainAbortCalls   int
+	attnResidentTrainReleaseCalls int
+	attnResidentTrainStepActive   bool
+	attnResidentTrainStepID       uint64
+	attnResidentTrainNextID       int
+	attnResidentTrainHandles      map[int]*fakeAttentionResidentTrainHandleState
 }
 
 type fakeResidentOptimizerToken struct {

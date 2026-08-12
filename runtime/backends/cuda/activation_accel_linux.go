@@ -101,6 +101,108 @@ extern "C" __global__ void manta_softmax_forward_rows(
 }
 `
 
+// forwardSoftmaxRowsMaskedKernelSource is forwardSoftmaxRowsKernelSource
+// plus an inline pre-softmax scale and a per-sequence key mask, numerically
+// identical to the host softmaxRowsMaskedColumnsInPlace fed
+// scale-premultiplied scores: masked columns are excluded from the row max,
+// from the exp/normalize accumulation, and are zeroed in the output --
+// matching state.mask's "key" semantics (a masked column excludes that key
+// position from every query row's softmax; it does not skip query rows).
+// rows is Batch*SeqLen; mask is Batch*SeqLen int32 flags flattened in the
+// same batch order as data, one flag per key position, reused across every
+// query row of its sequence (row's sequence = row/seqLen). scale=1
+// reproduces the stage (a) forward-only caller's already-scaled-Q
+// convention unchanged; the attention-resident TRAIN accelerator instead
+// passes the real attention score scale and leaves Q/K unscaled, so this
+// one kernel serves both callers.
+const forwardSoftmaxRowsMaskedKernelSource = `
+extern "C" __global__ void manta_softmax_forward_rows_masked(
+    float* data,
+    const int* mask,
+    int rows,
+    int cols,
+    int seqLen,
+    float scale
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int base = row * cols;
+    int maskBase = (row / seqLen) * seqLen;
+    float maxVal = -3.4028234663852886e38f;
+    int active = 0;
+    for (int col = 0; col < cols; ++col) {
+        if (mask[maskBase + col] == 0) {
+            data[base + col] = 0.0f;
+            continue;
+        }
+        float v = data[base + col] * scale;
+        data[base + col] = v;
+        if (active == 0 || v > maxVal) {
+            maxVal = v;
+        }
+        active = 1;
+    }
+    if (active == 0) {
+        for (int col = 0; col < cols; ++col) {
+            data[base + col] = 0.0f;
+        }
+        return;
+    }
+    float sum = 0.0f;
+    for (int col = 0; col < cols; ++col) {
+        if (mask[maskBase + col] == 0) {
+            continue;
+        }
+        float e = expf(data[base + col] - maxVal);
+        data[base + col] = e;
+        sum += e;
+    }
+    if (sum == 0.0f) {
+        return;
+    }
+    float inv = 1.0f / sum;
+    for (int col = 0; col < cols; ++col) {
+        if (mask[maskBase + col] != 0) {
+            data[base + col] *= inv;
+        }
+    }
+}
+`
+
+// attnSoftmaxBackwardScaledRowsKernelSource is softmaxBackwardRowsKernelSource
+// plus a trailing multiply by scale, fused into one kernel/one launch. It
+// reproduces the host backpropAttentionSequences pair of steps --
+// softmaxBackward(gradScores, probs) then scaleFloat32Slice(_, scoreScale)
+// -- exactly: probs already carries zeros at masked columns (from
+// forwardSoftmaxRowsMaskedKernelSource or its host equivalent), so the
+// standard softmax-Jacobian dot product already excludes masked columns and
+// this kernel needs no mask input of its own.
+const attnSoftmaxBackwardScaledRowsKernelSource = `
+extern "C" __global__ void manta_attn_softmax_backward_scaled_rows(
+    const float* gradOut,
+    const float* probs,
+    float* out0,
+    int rows,
+    int cols,
+    float scale
+) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    int base = row * cols;
+    float dot = 0.0f;
+    for (int col = 0; col < cols; ++col) {
+        dot += gradOut[base + col] * probs[base + col];
+    }
+    for (int col = 0; col < cols; ++col) {
+        out0[base + col] = scale * (probs[base + col] * (gradOut[base + col] - dot));
+    }
+}
+`
+
 // forwardGeluKernelSource is the on-device forward GELU (tanh approximation),
 // numerically matching the host geluForward.
 const forwardGeluKernelSource = `

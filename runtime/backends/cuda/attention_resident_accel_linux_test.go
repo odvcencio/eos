@@ -204,3 +204,99 @@ func abs32ForCUDATest(v float32) float32 {
 	}
 	return v
 }
+
+// TestAttentionResidentBlockMaskedMatchesHostReference is the S3(b) item 1
+// parity test: runAttentionBlockResident's masked path (req.Mask set, the
+// AttentionMaskMode "key" case the shipped default embedding model uses)
+// must match a host reference within 1e-4, including a ragged mask (a
+// shorter sequence padded to a shared seqLen within the batch). Scale
+// stays baked into the Q binding, matching the unmasked path and
+// primeAttentionResidentQueryBinding.
+func TestAttentionResidentBlockMaskedMatchesHostReference(t *testing.T) {
+	rt, err := newDeviceRuntime()
+	if err != nil {
+		t.Skipf("cuda runtime unavailable: %v", err)
+	}
+	defer rt.close()
+
+	cases := []struct {
+		name   string
+		batch  int
+		seqLen int
+		d      int
+		ragged int // keepInLast for the final sequence; 0 means fully unmasked
+	}{
+		{name: "batch1_seq2_d4_unmasked", batch: 1, seqLen: 2, d: 4, ragged: 0},
+		{name: "batch2_seq3_d4_ragged", batch: 2, seqLen: 3, d: 4, ragged: 1},
+		{name: "batch3_seq4_d6_ragged", batch: 3, seqLen: 4, d: 6, ragged: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := tc.batch * tc.seqLen
+			input := seqData(rows*tc.d, 0.023, -0.041)
+			wq := seqData(tc.d*tc.d, 0.017, -0.013)
+			wk := seqData(tc.d*tc.d, -0.019, 0.011)
+			wv := seqData(tc.d*tc.d, 0.014, 0.007)
+			var mask [][]int32
+			if tc.ragged > 0 {
+				mask = raggedMaskSet(tc.batch, tc.seqLen, tc.ragged)
+			} else {
+				mask = raggedMaskSet(tc.batch, tc.seqLen, tc.seqLen)
+			}
+
+			queryName, keyName, valueName := bindAttentionResidentTrainWeights(t, rt, "arb_masked_"+tc.name, tc.d, wq, wk, wv)
+
+			result, err := rt.runAttentionBlockResident(backend.AttentionResidentRequest{
+				Batch:     tc.batch,
+				SeqLen:    tc.seqLen,
+				ModelDim:  tc.d,
+				Input:     backend.NewTensorF32([]int{rows, tc.d}, input),
+				QueryName: queryName,
+				KeyName:   keyName,
+				ValueName: valueName,
+				Mask:      mask,
+			})
+			if err != nil {
+				t.Fatalf("run masked attention resident block: %v", err)
+			}
+
+			// Scale is pre-baked into Q by the caller in production (see
+			// primeAttentionResidentQueryBinding); this test's Q binding IS
+			// the raw weight, so the host reference uses scale=1 to match.
+			wantQ, wantK, wantV, wantProbs, wantMixed := hostAttentionResidentTrainForward(input, wq, wk, wv, mask, tc.batch, tc.seqLen, tc.d, 1)
+			assertFloatSlicesClose(t, result.Query.F32, wantQ, 1e-4)
+			assertFloatSlicesClose(t, result.Key.F32, wantK, 1e-4)
+			assertFloatSlicesClose(t, result.Value.F32, wantV, 1e-4)
+			assertFloatSlicesClose(t, result.Scores.F32, wantProbs, 1e-4)
+			assertFloatSlicesClose(t, result.Mixed.F32, wantMixed, 1e-4)
+		})
+	}
+}
+
+// TestAttentionResidentBlockMaskRejectsShapeMismatch confirms a malformed
+// mask (wrong sequence count) fails closed with an error rather than
+// silently falling back to unmasked or reading out of bounds.
+func TestAttentionResidentBlockMaskRejectsShapeMismatch(t *testing.T) {
+	rt, err := newDeviceRuntime()
+	if err != nil {
+		t.Skipf("cuda runtime unavailable: %v", err)
+	}
+	defer rt.close()
+
+	const d = 2
+	const seqLen = 2
+	queryName, keyName, valueName := bindAttentionResidentTrainWeights(t, rt, "arb_mask_shape", d, []float32{1, 0, 0, 1}, []float32{1, 0, 0, 1}, []float32{1, 0, 0, 1})
+	_, err = rt.runAttentionBlockResident(backend.AttentionResidentRequest{
+		Batch:     1,
+		SeqLen:    seqLen,
+		ModelDim:  d,
+		Input:     backend.NewTensorF32([]int{seqLen, d}, []float32{1, 2, 3, 4}),
+		QueryName: queryName,
+		KeyName:   keyName,
+		ValueName: valueName,
+		Mask:      [][]int32{{1, 1}, {1, 1}}, // 2 sequences supplied for Batch=1
+	})
+	if err == nil {
+		t.Fatal("expected an error for a mask sequence count mismatch")
+	}
+}

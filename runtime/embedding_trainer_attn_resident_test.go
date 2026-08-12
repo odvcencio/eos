@@ -45,8 +45,12 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResident(req backend.Attent
 	fillHostMatMul(req.Input.F32, rows, d, wk.F32, d, key)
 	fillHostMatMul(req.Input.F32, rows, d, wv.F32, d, value)
 
+	if req.Mask != nil && len(req.Mask) != req.Batch {
+		return backend.AttentionResidentResult{}, fmt.Errorf("fake attention resident accelerator: mask has %d sequences, want %d", len(req.Mask), req.Batch)
+	}
 	scores := make([]float32, req.Batch*seq*seq)
 	mixed := make([]float32, rows*d)
+	maskedBytes := 0
 	for b := 0; b < req.Batch; b++ {
 		base := b * seq * d
 		scoreBase := b * seq * seq
@@ -55,12 +59,20 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResident(req backend.Attent
 		vb := value[base : base+seq*d]
 		sb := scores[scoreBase : scoreBase+seq*seq]
 		fillHostMatMulTranspose(qb, seq, d, kb, seq, d, false, true, sb)
-		softmaxRowsInPlace(sb, seq, seq)
+		if req.Mask != nil {
+			if len(req.Mask[b]) != seq {
+				return backend.AttentionResidentResult{}, fmt.Errorf("fake attention resident accelerator: mask sequence %d has %d entries, want %d", b, len(req.Mask[b]), seq)
+			}
+			softmaxRowsMaskedColumnsInPlace(sb, seq, seq, req.Mask[b])
+			maskedBytes += len(req.Mask[b]) * 4
+		} else {
+			softmaxRowsInPlace(sb, seq, seq)
+		}
 		mb := mixed[base : base+seq*d]
 		fillHostMatMul(sb, seq, seq, vb, d, mb)
 	}
 
-	a.uploadedBytes += int64(len(req.Input.F32) * 4)
+	a.uploadedBytes += int64(len(req.Input.F32)*4 + maskedBytes)
 	a.downloadedBytes += int64((len(query) + len(key) + len(value) + len(scores) + len(mixed)) * 4)
 
 	return backend.AttentionResidentResult{
@@ -205,11 +217,13 @@ func (a *minimalMatMulAccelerator) Stats() backend.MatMulAcceleratorStats {
 
 func (a *minimalMatMulAccelerator) Close() {}
 
-// TestEmbeddingTrainerAttnResidentSkipsMaskedMode confirms the stage (a)
-// fast path stays off for masked attention: the device forward-softmax
-// kernel it uses has no mask input, so masked models must keep using the
-// host path.
-func TestEmbeddingTrainerAttnResidentSkipsMaskedMode(t *testing.T) {
+// TestEmbeddingTrainerAttnResidentEngagesMaskedMode is the S3(b) update of
+// what was previously a "masked mode always stays on the host path" guard:
+// attention_mask_mode=key (the shipped default model's mode) now DOES
+// engage the resident fast path -- tryAttentionBlockResident sends the
+// per-sequence key mask on backend.AttentionResidentRequest.Mask instead of
+// bailing out -- and produces the same loss as the host path.
+func TestEmbeddingTrainerAttnResidentEngagesMaskedMode(t *testing.T) {
 	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "1")
 	trainer := newTinyTrainableAttentionEmbeddingTrainer(t, 0.05)
 	if trainer.forwardMatMul != nil {
@@ -218,14 +232,26 @@ func TestEmbeddingTrainerAttnResidentSkipsMaskedMode(t *testing.T) {
 	fake := &countingMatMulAccelerator{}
 	trainer.forwardMatMul = fake
 	trainer.manifest.AttentionMaskMode = EmbeddingAttentionMaskModeKey
+	trainer.manifest.AttentionScoreScale = EmbeddingAttentionScoreScaleKeyDimRSQ
 	trainer.config.ContrastiveLoss = "infonce"
 	trainer.config.Temperature = 0.05
 
-	if _, err := trainer.TrainContrastiveStep(tinyAttnResidentContrastiveBatch(2)); err != nil {
-		t.Fatalf("train step: %v", err)
+	batch := tinyAttnResidentContrastiveBatch(2)
+	resident, err := trainer.EvaluateContrastive(batch)
+	if err != nil {
+		t.Fatalf("evaluate resident: %v", err)
 	}
-	if fake.attnResidentRuns != 0 {
-		t.Fatalf("attention resident runs = %d, want 0 for attention_mask_mode=key", fake.attnResidentRuns)
+	if fake.attnResidentRuns == 0 {
+		t.Fatal("expected the resident fast path to run for attention_mask_mode=key")
+	}
+
+	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "0")
+	host, err := trainer.EvaluateContrastive(batch)
+	if err != nil {
+		t.Fatalf("evaluate host: %v", err)
+	}
+	if diff := math.Abs(float64(resident.Loss - host.Loss)); diff > 1e-4 {
+		t.Fatalf("masked resident loss %v vs host loss %v, diff %v > 1e-4", resident.Loss, host.Loss, diff)
 	}
 }
 
