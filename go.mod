@@ -6,7 +6,7 @@ require (
 	github.com/odvcencio/gotreesitter v0.20.4
 	m31labs.dev/mll v0.1.0
 	m31labs.dev/prism v0.1.2
-	m31labs.dev/turboquant v0.2.0
+	m31labs.dev/turboquant v0.2.1
 )
 
 require (

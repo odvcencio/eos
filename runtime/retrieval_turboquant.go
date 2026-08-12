@@ -85,6 +85,8 @@ type TurboQuantDenseRetrievalMetrics struct {
 type TurboQuantRetrievalBitMetrics struct {
 	Bits                int                         `json:"bits"`
 	Method              string                      `json:"method"`
+	TurboQuantVersion   string                      `json:"turboquant_version"`
+	CodebookVersion     string                      `json:"codebook_version"`
 	RerankOverfetch     int                         `json:"rerank_overfetch,omitempty"`
 	Quality             RetrievalEvalQualityMetrics `json:"quality"`
 	NDCGAt10Delta       float64                     `json:"ndcg_at_10_delta"`
@@ -420,7 +422,7 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 		}
 		qx := q.Quantize(doc.Vector)
 		qdocs[i] = turboQuantRetrievalDoc{ID: doc.ID, Vector: qx}
-		quantizedBytes += int64(len(qx.MSE) + len(qx.Signs) + 4) // ResNorm is a float32 sidecar.
+		quantizedBytes += turboquantVectorBytes(dim, bitWidth)
 	}
 	quantizeDuration := time.Since(quantizeStart)
 	if err := writeTurboQuantRetrievalPerQueryRows(ctx, datasetName, perQueryJSONLPath, q, bitWidth, topK, perQueryTopK, quantizerSeed, rerankOverfetch, rerankStorage, docs, queries, qdocs, qrels); err != nil {
@@ -436,6 +438,8 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 	rows := []TurboQuantRetrievalBitMetrics{{
 		Bits:                bitWidth,
 		Method:              fmt.Sprintf("turboquant_ip_b%d", bitWidth),
+		TurboQuantVersion:   turboquantModuleVersion(),
+		CodebookVersion:     turboquantModuleVersion(), // no separate codebook-version symbol; codebook is bound to the module version.
 		Quality:             quality,
 		NDCGAt10Delta:       quality.NDCGAt10 - denseQuality.NDCGAt10,
 		RecallAt100Delta:    quality.RecallAt100 - denseQuality.RecallAt100,
@@ -490,6 +494,8 @@ func evaluateTurboQuantRetrievalBits(ctx context.Context, dim, bitWidth, topK, p
 		rows = append(rows, TurboQuantRetrievalBitMetrics{
 			Bits:                bitWidth,
 			Method:              method,
+			TurboQuantVersion:   turboquantModuleVersion(),
+			CodebookVersion:     turboquantModuleVersion(), // no separate codebook-version symbol; codebook is bound to the module version.
 			RerankOverfetch:     overfetch,
 			Quality:             rerankQuality,
 			NDCGAt10Delta:       rerankQuality.NDCGAt10 - denseQuality.NDCGAt10,

@@ -1,10 +1,6 @@
 package eosruntime
 
-import (
-	"fmt"
-
-	"m31labs.dev/turboquant"
-)
+import "fmt"
 
 const MultiVectorStoragePlanSchema = "manta.multivector_storage_plan.v1"
 
@@ -138,8 +134,7 @@ func PlanMultiVectorStorage(in MultiVectorStoragePlanInput) (MultiVectorStorageP
 	denseBaselineTotalBytes := denseVectorStorageBytes * int64(in.Objects)
 	sidecarBytesPerVector := multiVectorSidecarBytes(in.Dim, sidecarStorage)
 	for _, bitWidth := range bits {
-		mseBytes, signBytes := turboquant.IPQuantizedSizes(in.Dim, bitWidth)
-		quantizedPayloadBytes := int64(mseBytes + signBytes + 4)
+		quantizedPayloadBytes := turboquantVectorBytes(in.Dim, bitWidth)
 		quantizedVectorBytes := quantizedPayloadBytes + sidecarBytesPerVector
 		quantizedVectorStorageBytes := quantizedVectorBytes + in.VectorOverheadBytes
 		for _, scenario := range scenarios {

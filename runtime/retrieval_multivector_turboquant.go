@@ -549,8 +549,7 @@ func evaluateTurboQuantMultiVectorBits(ctx context.Context, dim, baselineDim, bi
 	q := turboquant.NewIPWithSeed(dim, bitWidth, quantizerSeed)
 	quantizeStart := time.Now()
 	qchildren := make([]turboQuantMultiVectorChild, len(children))
-	mseBytes, signBytes := turboquant.IPQuantizedSizes(dim, bitWidth)
-	quantizedVectorBytes := int64(mseBytes + signBytes + 4)
+	quantizedVectorBytes := turboquantVectorBytes(dim, bitWidth)
 	var quantizedBytes int64
 	for i, child := range children {
 		if err := ctx.Err(); err != nil {
