@@ -491,12 +491,30 @@ func applyRankedMerge(tokens []string, left, right, merged string) []string {
 	return tokens[:write]
 }
 
+// applyMerge combines every non-overlapping adjacent (left, right) pair in
+// tokens into one left+right token, returning the input slice unchanged
+// (no allocation) when the pair does not occur at all. BPE training's own
+// hot path uses the ID-keyed applyMergeIDs (see tokenizer_train.go) for
+// speed; this plain string version is kept as an easy-to-read reference
+// oracle that tokenizer_train_test.go checks applyMergeIDs and the full
+// training loop against.
 func applyMerge(tokens []string, left, right string) []string {
 	if len(tokens) < 2 {
 		return tokens
 	}
+	matchAt := -1
+	for i := 0; i < len(tokens)-1; i++ {
+		if tokens[i] == left && tokens[i+1] == right {
+			matchAt = i
+			break
+		}
+	}
+	if matchAt < 0 {
+		return tokens
+	}
 	out := make([]string, 0, len(tokens))
-	for i := 0; i < len(tokens); {
+	out = append(out, tokens[:matchAt]...)
+	for i := matchAt; i < len(tokens); {
 		if i < len(tokens)-1 && tokens[i] == left && tokens[i+1] == right {
 			out = append(out, left+right)
 			i += 2
