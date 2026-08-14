@@ -824,6 +824,9 @@ func TestRunTinyDecodeEntryPoint(t *testing.T) {
 }
 
 func TestRunTinyScoreEntryPoint(t *testing.T) {
+	if !cudaNativeRuntimeTestsAvailable {
+		t.Skip("CUDA native runtime dispatch requires linux cgo")
+	}
 	bundle, err := compiler.Build(nil, compiler.Options{ModuleName: "tiny_score", Preset: compiler.PresetTinyScore})
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -1697,6 +1700,9 @@ pipeline score_batch(queries: f16[Q, D], docs: q4[Q, N, D]) -> (scores: f32[Q, N
 }
 
 func TestRunDirectQuantizedBuiltinScoreOps(t *testing.T) {
+	if !cudaNativeRuntimeTestsAvailable {
+		t.Skip("CUDA native runtime dispatch requires linux cgo")
+	}
 	cases := []struct {
 		name     string
 		op       string

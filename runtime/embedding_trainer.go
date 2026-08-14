@@ -279,6 +279,10 @@ type EmbeddingTrainer struct {
 	// abortAttentionResidentTrainStep (deferred on every training entry
 	// point that begins a step) knows whether there is anything to close.
 	attnResidentTrainStepOpen bool
+	// attnResidentTrainStepErr records a hard resident-train backward failure.
+	// Unlike "fast path unavailable", an accelerator error after an elided
+	// forward download cannot safely fall back to host activations.
+	attnResidentTrainStepErr error
 }
 
 type embeddingCompactForwardTrainerStats struct {
@@ -369,6 +373,21 @@ type embeddingSequenceState struct {
 	// sniffing" contract.
 	ffnResidentTrainHandleSet bool
 	ffnResidentTrainHandle    backend.FFNResidentTrainHandle
+	// residentRefCount is S3(d)'s per-encoded-sequence reference count,
+	// copied from the owning embeddingBatchSequence.refCount at state
+	// creation time (see encodeBatchSequencesByLength): how many times this
+	// exact (tokens, mask, role) tuple appears across the whole batch this
+	// step encodes (cachedEmbeddingBatchSequence's dedup cache). A value of
+	// 1 means this state can never be a duplicate reference, so
+	// tryAttentionBlockResidentTrain/tryFFNBlockResidentTrain may ask the
+	// accelerator to skip downloading forward activations host code will
+	// only ever read via this state's own (guaranteed-live) resident
+	// backward call. A value >1 means a later reference to this same state
+	// may need the host fallback's downloaded copy after the first
+	// reference consumes the resident handle (see
+	// TestEmbeddingTrainerFFNResidentTrainDuplicateReferenceMatchesHost),
+	// so every download stays unconditional exactly as before S3(d).
+	residentRefCount int
 }
 
 type embeddingEncodedSequence struct {
@@ -2009,16 +2028,42 @@ func (t *EmbeddingTrainer) TrainContrastiveStep(batch []EmbeddingContrastiveExam
 		gradHidden,
 		gradProj,
 	) {
+		if err := t.attentionResidentTrainStepErr(); err != nil {
+			return EmbeddingTrainMetrics{}, err
+		}
 		for i, query := range queries {
 			inputGrad := t.backpropEncodedSequence(query, queryGrads[i], forward.attnQ, forward.attnK, forward.attnV, forward.attnO, forward.hidden, forward.proj, gradToken, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj)
+			if err := t.attentionResidentTrainStepErr(); err != nil {
+				return EmbeddingTrainMetrics{}, err
+			}
 			t.accumulateInputTokenGrad(query.tokens, inputGrad, gradToken)
 			t.accumulateInputRoleGrad(query.role, len(query.tokens), inputGrad, gradRole)
 		}
 		for i, positive := range positives {
 			inputGrad := t.backpropEncodedSequence(positive, positiveGrads[i], forward.attnQ, forward.attnK, forward.attnV, forward.attnO, forward.hidden, forward.proj, gradToken, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj)
+			if err := t.attentionResidentTrainStepErr(); err != nil {
+				return EmbeddingTrainMetrics{}, err
+			}
 			t.accumulateInputTokenGrad(positive.tokens, inputGrad, gradToken)
 			t.accumulateInputRoleGrad(positive.role, len(positive.tokens), inputGrad, gradRole)
 		}
+	}
+	if err := t.attentionResidentTrainStepErr(); err != nil {
+		return EmbeddingTrainMetrics{}, err
+	}
+
+	// S3(d): flush the step's device-accumulated resident weight gradients
+	// and merge them additively into gradAttnQ/gradAttnK/gradAttnV/
+	// gradHidden/gradProj before the optimizer reads those slices --
+	// applyEmbeddingOptimizerUpdates below must see the resident
+	// contribution alongside every non-resident path's, and
+	// endAttentionResidentTrainStep discards whatever is still accumulated
+	// device-side rather than returning it.
+	if err := t.flushAttentionResidentTrainWeightGradients(gradAttnQ, gradAttnK, gradAttnV); err != nil {
+		return EmbeddingTrainMetrics{}, fmt.Errorf("attention resident train flush gradients: %w", err)
+	}
+	if err := t.flushFFNResidentTrainWeightGradients(gradHidden, gradProj); err != nil {
+		return EmbeddingTrainMetrics{}, fmt.Errorf("ffn resident train flush gradients: %w", err)
 	}
 
 	t.step++
@@ -3414,6 +3459,7 @@ func (t *EmbeddingTrainer) runBatch(batch []EmbeddingPairExample, update bool) (
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	t.clearAttentionResidentTrainStepErr()
 	if err := t.failIfOptimizerPoisoned(); err != nil {
 		return EmbeddingTrainMetrics{}, err
 	}
@@ -4168,6 +4214,12 @@ type embeddingBatchSequence struct {
 	role    int32
 	current []float32
 	encoded *embeddingEncodedSequence
+	// refCount is S3(d)'s reference count: how many times
+	// cachedEmbeddingBatchSequence has returned this exact sequence so far
+	// this batch (1 on creation, incremented on every cache hit). See
+	// embeddingSequenceState.residentRefCount for how this flows into the
+	// forward-download elision decision.
+	refCount int
 }
 
 type embeddingBatchSequenceSlot struct {
@@ -4204,12 +4256,22 @@ func writeInt32KeyPart(b *strings.Builder, values []int32) {
 func (t *EmbeddingTrainer) cachedEmbeddingBatchSequence(cache map[string]*embeddingBatchSequence, sequences *[]*embeddingBatchSequence, groups map[int][]embeddingBatchSequenceSlot, lengths *[]int, tokens, mask []int32, role int32, forward *embeddingForwardWeights) (*embeddingBatchSequence, error) {
 	key := embeddingBatchSequenceKey(tokens, mask, role)
 	if sequence, ok := cache[key]; ok {
+		// S3(d): a second (or later) reference to an already-cached
+		// sequence -- the duplicate-content case
+		// TestEmbeddingTrainerFFNResidentTrainDuplicateReferenceMatchesHost
+		// exercises. refCount above 1 tells
+		// tryAttentionBlockResidentTrain/tryFFNBlockResidentTrain this
+		// sequence's forward activations must stay fully downloaded: only
+		// the first backward reference can consume the resident handle, so
+		// every later reference needs the host fallback's downloaded copy.
+		sequence.refCount++
 		return sequence, nil
 	}
 	sequence, err := t.newEmbeddingBatchSequence(tokens, mask, role, forward)
 	if err != nil {
 		return nil, err
 	}
+	sequence.refCount = 1
 	cache[key] = sequence
 	*sequences = append(*sequences, sequence)
 	seqLen := len(sequence.tokens)
@@ -4839,6 +4901,11 @@ func (t *EmbeddingTrainer) encodeBatchSequencesByLength(sequences []*embeddingBa
 					}
 					return err
 				}
+				// S3(d): every layer's state for this sequence shares the
+				// same reference count -- cachedEmbeddingBatchSequence
+				// counts references to the sequence as a whole, not to any
+				// one layer.
+				state.residentRefCount = slot.sequence.refCount
 				if captureBindings {
 					d := stateWidth(forward.hidden, forward.proj)
 					state.inputBinding = t.bindSequenceTensor(state, "input", tensorF32View([]int{len(state.tokens), d}, state.input), true, false)
@@ -4951,6 +5018,30 @@ func attnResidentEnabled() bool {
 	return trainEnvFlagEnabled("EOS_EMBED_ATTN_RESIDENT")
 }
 
+// residentDownloadElisionSafe reports whether backward for this trainer is
+// guaranteed to reach every resident-train handle through the singular
+// per-sequence path (backpropAttentionSequence/backpropProjectedFFNSequence,
+// each of which tries exactly one state's resident handle on its own) rather
+// than ever risking the batched multi-item group path
+// (backpropAttentionSequences/tryAttentionBlockResidentBackward). This
+// matters because S3(d)'s forward-download elision is only proven safe
+// state by state: a refcount==1 state's Q/K/V/scores (or FFN
+// hidden/activated) are never read by host code *if and only if* its
+// backward call is the guaranteed-live singular one. The batched group path
+// is a coarser, all-or-nothing gate (see tryAttentionBlockResidentBackward's
+// doc comment): a single duplicate-reference state sharing a length group
+// with an otherwise-eligible refcount==1 state forces the *entire* group
+// through the host fallback, which reads every member's Q/K/V/scores
+// unconditionally -- so an elided download in that group would silently
+// zero a gradient rather than error. tryBackpropContrastiveBatch only ever
+// engages that group path when batchedBackwardEnabled() is true AND
+// t.roleEmbed is nil; matching (the negation of) that same condition here
+// guarantees the group path can never fire, so elision stays safe without
+// having to predict which states will land in the same group.
+func (t *EmbeddingTrainer) residentDownloadElisionSafe() bool {
+	return t == nil || !batchedBackwardEnabled() || t.roleEmbed != nil
+}
+
 // beginAttentionResidentTrainStep starts a new S3(b) resident-train step
 // when the flag is on and the bound accelerator supports it; it is a no-op
 // (nil error) otherwise, so every training entry point can call it
@@ -4959,7 +5050,11 @@ func attnResidentEnabled() bool {
 // own when no step is open. Mirrors CompactTrainAccelerator's
 // BeginCompactTrainStep call convention.
 func (t *EmbeddingTrainer) beginAttentionResidentTrainStep() error {
-	if t == nil || !attnResidentEnabled() {
+	if t == nil {
+		return nil
+	}
+	t.clearAttentionResidentTrainStepErr()
+	if !attnResidentEnabled() {
 		return nil
 	}
 	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
@@ -4991,7 +5086,11 @@ func (t *EmbeddingTrainer) abortAttentionResidentTrainStep() error {
 }
 
 func (t *EmbeddingTrainer) closeAttentionResidentTrainStep(aborted bool) error {
-	if t == nil || !t.attnResidentTrainStepOpen {
+	if t == nil {
+		return nil
+	}
+	defer t.clearAttentionResidentTrainStepErr()
+	if !t.attnResidentTrainStepOpen {
 		return nil
 	}
 	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
@@ -5004,6 +5103,116 @@ func (t *EmbeddingTrainer) closeAttentionResidentTrainStep(aborted bool) error {
 		return accel.AbortAttentionResidentTrainStep(t.attnResidentTrainStepID)
 	}
 	return accel.EndAttentionResidentTrainStep(t.attnResidentTrainStepID)
+}
+
+func (t *EmbeddingTrainer) clearAttentionResidentTrainStepErr() {
+	if t == nil {
+		return
+	}
+	t.attnResidentTrainStepErr = nil
+}
+
+func (t *EmbeddingTrainer) recordAttentionResidentTrainStepErr(err error) {
+	if t == nil || err == nil || t.attnResidentTrainStepErr != nil {
+		return
+	}
+	t.attnResidentTrainStepErr = err
+}
+
+func (t *EmbeddingTrainer) attentionResidentTrainStepErr() error {
+	if t == nil {
+		return nil
+	}
+	return t.attnResidentTrainStepErr
+}
+
+// flushAttentionResidentTrainWeightGradients downloads this step's S3(d)
+// device-accumulated Wq/Wk/Wv weight-gradient sum exactly once and merges it
+// additively into gradAttnQ/gradAttnK/gradAttnV -- the same accumulators
+// every non-resident backward path (the embedding table's contribution
+// aside, since that never touches these three) already merges its own
+// contribution into: Wo/layernorm host computation upstream of the resident
+// boundary, and any duplicate-reference host-fallback backward call (see
+// tryAttentionBlockResidentBackwardOne/backpropAttentionSequence, which no
+// longer download or merge a weight gradient themselves -- see their doc
+// comments). Callers must call this before applyEmbeddingOptimizerUpdates
+// reads gradAttnQ/gradAttnK/gradAttnV, and before
+// endAttentionResidentTrainStep/abortAttentionResidentTrainStep, since
+// End/Abort discards whatever is still accumulated device-side rather than
+// returning it. No-op (nil error) when the accelerator does not implement
+// AttentionResidentTrainAccelerator or no resident-train step is open.
+func (t *EmbeddingTrainer) flushAttentionResidentTrainWeightGradients(gradAttnQ, gradAttnK, gradAttnV []float32) error {
+	if t == nil || !t.attnResidentTrainStepOpen {
+		return nil
+	}
+	accel, ok := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
+	if !ok {
+		return nil
+	}
+	gradWq, gradWk, gradWv, err := accel.FlushAttentionResidentTrainWeightGradients(t.attnQParam.Name, t.attnKParam.Name, t.attnVParam.Name)
+	if err != nil {
+		return err
+	}
+	if err := validateResidentFlushGradient("attention query", gradWq, len(gradAttnQ)); err != nil {
+		return err
+	}
+	if err := validateResidentFlushGradient("attention key", gradWk, len(gradAttnK)); err != nil {
+		return err
+	}
+	if err := validateResidentFlushGradient("attention value", gradWv, len(gradAttnV)); err != nil {
+		return err
+	}
+	if gradWq != nil {
+		addFloat32Slice(gradAttnQ, gradWq.F32)
+	}
+	if gradWk != nil {
+		addFloat32Slice(gradAttnK, gradWk.F32)
+	}
+	if gradWv != nil {
+		addFloat32Slice(gradAttnV, gradWv.F32)
+	}
+	return nil
+}
+
+// flushFFNResidentTrainWeightGradients mirrors
+// flushAttentionResidentTrainWeightGradients for the S3(c) FFN block's
+// hidden/output weight gradients, merging additively into
+// gradHidden/gradProj.
+func (t *EmbeddingTrainer) flushFFNResidentTrainWeightGradients(gradHidden, gradProj []float32) error {
+	if t == nil || !t.attnResidentTrainStepOpen {
+		return nil
+	}
+	accel, ok := t.forwardMatMul.(backend.FFNResidentTrainAccelerator)
+	if !ok {
+		return nil
+	}
+	gradHiddenWeight, gradOutputWeight, err := accel.FlushFFNResidentTrainWeightGradients(t.hiddenParam.Name, t.projParam.Name)
+	if err != nil {
+		return err
+	}
+	if err := validateResidentFlushGradient("ffn hidden", gradHiddenWeight, len(gradHidden)); err != nil {
+		return err
+	}
+	if err := validateResidentFlushGradient("ffn output", gradOutputWeight, len(gradProj)); err != nil {
+		return err
+	}
+	if gradHiddenWeight != nil {
+		addFloat32Slice(gradHidden, gradHiddenWeight.F32)
+	}
+	if gradOutputWeight != nil {
+		addFloat32Slice(gradProj, gradOutputWeight.F32)
+	}
+	return nil
+}
+
+func validateResidentFlushGradient(label string, grad *backend.Tensor, want int) error {
+	if grad == nil {
+		return nil
+	}
+	if len(grad.F32) != want {
+		return fmt.Errorf("%s flushed gradient length = %d, want %d", label, len(grad.F32), want)
+	}
+	return nil
 }
 
 func sharedLeftMatMulEnabled() bool {
@@ -5229,7 +5438,14 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 			}
 		}
 		for _, state := range states {
-			if captureBindings {
+			// S3(d): a resident-train forward that elided Q/K/V download
+			// (SkipUnreadDownload) leaves state.attnQ/K/V nil rather than the
+			// zero-valued slice newEmbeddingSequenceState pre-allocated (see
+			// tryAttentionBlockResidentTrain), so these binds -- already dead
+			// weight whenever residentOK, since nothing below or in backward
+			// reads the *Binding name in that case -- must not try to bind
+			// data that no longer exists.
+			if captureBindings && state.attnQ != nil && state.attnK != nil && state.attnV != nil {
 				state.attnQBinding = t.bindSequenceTensor(state, "q", tensorF32View([]int{seqLen, d}, state.attnQ), true, false)
 				state.attnKBinding = t.bindSequenceTensor(state, "k", tensorF32View([]int{seqLen, d}, state.attnK), true, false)
 				state.attnVBinding = t.bindSequenceTensor(state, "v", tensorF32View([]int{seqLen, d}, state.attnV), true, false)
@@ -5264,7 +5480,11 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 		}
 		if captureBindings {
 			for _, state := range states {
-				state.attnScoresBinding = t.bindSequenceTensor(state, "scores", tensorF32View([]int{seqLen, seqLen}, state.attnScores), true, t.softmaxBackwardAccelEnabled() && bindSoftmaxActivation)
+				// S3(d): mirrors the Q/K/V bind guard above -- an elided
+				// resident forward leaves state.attnScores nil.
+				if state.attnScores != nil {
+					state.attnScoresBinding = t.bindSequenceTensor(state, "scores", tensorF32View([]int{seqLen, seqLen}, state.attnScores), true, t.softmaxBackwardAccelEnabled() && bindSoftmaxActivation)
+				}
 			}
 		}
 		if !residentOK {
@@ -5361,13 +5581,18 @@ func (t *EmbeddingTrainer) encodeBatchedLayerStates(states []*embeddingSequenceS
 			})
 		}
 		for _, state := range states {
-			if captureBindings {
+			// S3(d): mirrors the attention bind guards above -- an elided
+			// resident forward (SkipUnreadDownload) leaves state.ffnHidden/
+			// activated nil rather than the zero-valued slice
+			// newEmbeddingSequenceState pre-allocated (see
+			// tryFFNBlockResidentTrain).
+			if captureBindings && state.ffnHidden != nil {
 				state.ffnHiddenBinding = t.bindSequenceTensor(state, "ffn_hidden", tensorF32View([]int{seqLen, h}, state.ffnHidden), false, t.fullActivationBackwardAccelEnabled() && bindFullActivation)
 			}
 			if !ffnResidentOK {
 				fillGELUForward(state.activated, state.ffnHidden, fastGELUEnabled())
 			}
-			if captureBindings {
+			if captureBindings && state.activated != nil {
 				state.activatedBinding = t.bindSequenceTensor(state, "activated", tensorF32View([]int{seqLen, h}, state.activated), true, false)
 			}
 		}
@@ -5696,6 +5921,18 @@ func (t *EmbeddingTrainer) tryAttentionBlockResident(states []*embeddingSequence
 // backpropAttentionSequences path, each consume exactly the handles their
 // own states own, in whichever order or grouping backward reaches them.
 //
+// S3(d): a state whose residentRefCount is exactly 1 AND whose backward is
+// guaranteed to reach it through the singular per-sequence path (see
+// residentDownloadElisionSafe) asks the accelerator to skip downloading
+// Query/Key/Value/Scores (SkipUnreadDownload) -- host code never reads them
+// in that case (see backpropAttentionSequence's resident-success branch,
+// which only ever touches gradMixed/state.attnMixed). state.attnQ/K/V/Scores
+// are left nil rather than the zero-valued slice newEmbeddingSequenceState
+// pre-allocated, so any future code path that reads them anyway (a would-be
+// silent-zero-gradient bug) hits a length mismatch or an index-out-of-range
+// panic instead of computing a wrong answer quietly. Mixed is always
+// downloaded regardless of refcount.
+//
 // It returns false without mutating any state whenever the fast path is
 // unavailable or unsuitable (flag off, no accelerator, no open resident-
 // train step, an AttentionMaskMode other than "none"/"key", or a request/
@@ -5723,7 +5960,9 @@ func (t *EmbeddingTrainer) tryAttentionBlockResidentTrain(states []*embeddingSeq
 		return false
 	}
 	scale := t.attentionScoreScale(d)
+	elisionSafe := t.residentDownloadElisionSafe()
 	results := make([]backend.AttentionResidentTrainForwardResult, 0, len(states))
+	skips := make([]bool, 0, len(states))
 	perInput := seqLen * d
 	ok = true
 	for _, state := range states {
@@ -5735,25 +5974,34 @@ func (t *EmbeddingTrainer) tryAttentionBlockResidentTrain(states []*embeddingSeq
 		if maskEnabled {
 			mask = [][]int32{state.mask}
 		}
+		skip := elisionSafe && state.residentRefCount == 1
 		result, err := accel.RunAttentionBlockResidentTrainForward(backend.AttentionResidentTrainForwardRequest{
-			Batch:     1,
-			SeqLen:    seqLen,
-			ModelDim:  d,
-			Input:     tensorF32View([]int{seqLen, d}, state.input),
-			QueryName: t.attnQParam.Name,
-			KeyName:   t.attnKParam.Name,
-			ValueName: t.attnVParam.Name,
-			Mask:      mask,
-			Scale:     scale,
-			StepID:    t.attnResidentTrainStepID,
+			Batch:              1,
+			SeqLen:             seqLen,
+			ModelDim:           d,
+			Input:              tensorF32View([]int{seqLen, d}, state.input),
+			QueryName:          t.attnQParam.Name,
+			KeyName:            t.attnKParam.Name,
+			ValueName:          t.attnVParam.Name,
+			Mask:               mask,
+			Scale:              scale,
+			StepID:             t.attnResidentTrainStepID,
+			SkipUnreadDownload: skip,
 		})
-		if err != nil || result.Query == nil || result.Key == nil || result.Value == nil || result.Scores == nil || result.Mixed == nil || result.Handle.Token == nil ||
-			len(result.Query.F32) != perInput || len(result.Key.F32) != perInput || len(result.Value.F32) != perInput ||
-			len(result.Scores.F32) != seqLen*seqLen || len(result.Mixed.F32) != perInput {
+		if err != nil || result.Mixed == nil || result.Handle.Token == nil || len(result.Mixed.F32) != perInput {
 			ok = false
 			break
 		}
+		if !skip {
+			if result.Query == nil || result.Key == nil || result.Value == nil || result.Scores == nil ||
+				len(result.Query.F32) != perInput || len(result.Key.F32) != perInput || len(result.Value.F32) != perInput ||
+				len(result.Scores.F32) != seqLen*seqLen {
+				ok = false
+				break
+			}
+		}
 		results = append(results, result)
+		skips = append(skips, skip)
 	}
 	if !ok || len(results) != len(states) {
 		for _, result := range results {
@@ -5763,10 +6011,17 @@ func (t *EmbeddingTrainer) tryAttentionBlockResidentTrain(states []*embeddingSeq
 	}
 	for i, state := range states {
 		result := results[i]
-		state.attnQ = result.Query.F32
-		state.attnK = result.Key.F32
-		state.attnV = result.Value.F32
-		state.attnScores = result.Scores.F32
+		if skips[i] {
+			state.attnQ = nil
+			state.attnK = nil
+			state.attnV = nil
+			state.attnScores = nil
+		} else {
+			state.attnQ = result.Query.F32
+			state.attnK = result.Key.F32
+			state.attnV = result.Value.F32
+			state.attnScores = result.Scores.F32
+		}
 		state.attnMixed = result.Mixed.F32
 		state.attnResidentTrainHandleSet = true
 		state.attnResidentTrainHandle = result.Handle
@@ -5790,15 +6045,19 @@ func (t *EmbeddingTrainer) tryAttentionBlockResidentTrain(states []*embeddingSeq
 // path, so backward runs one sequence at a time through
 // backpropProjectedFFNSequence.
 //
-// Unlike stage (b)'s attention forward-download skip target (S3(c) item 1),
-// this always downloads ffnHidden, activated, and ffnOutput: the profile
-// that justified this stage did not justify skipping them, and duplicate
-// query/positive text within a batch (see cachedEmbeddingBatchSequence) can
-// legitimately backpropagate the same cached encoded sequence's states
-// twice in one step, so a host fallback copy must stay valid for every
-// state this creates a handle for -- exactly the property stage (b)'s
-// attention forward download already has and this mirrors rather than
-// changes.
+// S3(d): a state whose residentRefCount is exactly 1 AND whose backward is
+// guaranteed to reach it through the singular per-sequence path (see
+// residentDownloadElisionSafe) asks the accelerator to skip downloading
+// ffnHidden/activated (SkipUnreadDownload) -- host code never reads them in
+// that case (see backpropProjectedFFNSequence's resident-success branch,
+// which only ever touches gradOutputMatrix/state.ffnOutput-derived values).
+// Every other state -- refcount above 1 (duplicate query/positive text
+// within a batch, see cachedEmbeddingBatchSequence) or a batch where
+// backward could reach the multi-item group path -- keeps downloading both,
+// exactly as stage (c) always did: only the first backward reference can
+// consume the resident handle, so a later reference needs the host
+// fallback's downloaded copy to stay correct. ffnOutput is always
+// downloaded regardless of refcount.
 //
 // It returns false without mutating any state whenever the fast path is
 // unavailable or unsuitable (flag off, no accelerator, no open resident-
@@ -5823,7 +6082,9 @@ func (t *EmbeddingTrainer) tryFFNBlockResidentTrain(states []*embeddingSequenceS
 	if e == 0 {
 		return false
 	}
+	elisionSafe := t.residentDownloadElisionSafe()
 	results := make([]backend.FFNResidentTrainForwardResult, 0, len(states))
+	skips := make([]bool, 0, len(states))
 	perInput := seqLen * d
 	perHidden := seqLen * h
 	ok = true
@@ -5832,23 +6093,32 @@ func (t *EmbeddingTrainer) tryFFNBlockResidentTrain(states []*embeddingSequenceS
 			ok = false
 			break
 		}
+		skip := elisionSafe && state.residentRefCount == 1
 		result, err := accel.RunFFNBlockResidentTrainForward(backend.FFNResidentTrainForwardRequest{
-			SeqLen:           seqLen,
-			InputDim:         d,
-			HiddenDim:        h,
-			OutputDim:        e,
-			Input:            tensorF32View([]int{seqLen, d}, state.hidden),
-			HiddenWeightName: t.hiddenParam.Name,
-			OutputWeightName: t.projParam.Name,
-			FastGELU:         false,
-			StepID:           t.attnResidentTrainStepID,
+			SeqLen:             seqLen,
+			InputDim:           d,
+			HiddenDim:          h,
+			OutputDim:          e,
+			Input:              tensorF32View([]int{seqLen, d}, state.hidden),
+			HiddenWeightName:   t.hiddenParam.Name,
+			OutputWeightName:   t.projParam.Name,
+			FastGELU:           false,
+			StepID:             t.attnResidentTrainStepID,
+			SkipUnreadDownload: skip,
 		})
-		if err != nil || result.FFNHidden == nil || result.Activated == nil || result.FFNOutput == nil || result.Handle.Token == nil ||
-			len(result.FFNHidden.F32) != perHidden || len(result.Activated.F32) != perHidden || len(result.FFNOutput.F32) != seqLen*e {
+		if err != nil || result.FFNOutput == nil || result.Handle.Token == nil || len(result.FFNOutput.F32) != seqLen*e {
 			ok = false
 			break
 		}
+		if !skip {
+			if result.FFNHidden == nil || result.Activated == nil ||
+				len(result.FFNHidden.F32) != perHidden || len(result.Activated.F32) != perHidden {
+				ok = false
+				break
+			}
+		}
 		results = append(results, result)
+		skips = append(skips, skip)
 	}
 	if !ok || len(results) != len(states) {
 		for _, result := range results {
@@ -5858,8 +6128,13 @@ func (t *EmbeddingTrainer) tryFFNBlockResidentTrain(states []*embeddingSequenceS
 	}
 	for i, state := range states {
 		result := results[i]
-		state.ffnHidden = result.FFNHidden.F32
-		state.activated = result.Activated.F32
+		if skips[i] {
+			state.ffnHidden = nil
+			state.activated = nil
+		} else {
+			state.ffnHidden = result.FFNHidden.F32
+			state.activated = result.Activated.F32
+		}
 		state.ffnOutput = result.FFNOutput.F32
 		state.ffnResidentTrainHandleSet = true
 		state.ffnResidentTrainHandle = result.Handle
@@ -10327,15 +10602,19 @@ func (t *EmbeddingTrainer) backpropProjectedFFNSequence(state *embeddingSequence
 	// backpropAttentionSequence's identical resident-backward integration
 	// point (see that function's doc comment). gradOutputMatrix here is
 	// exactly the upstream gradient the state's resident handle (set by
-	// tryFFNBlockResidentTrain during forward) expects.
-	if residentGradInput, gradHiddenWeight, gradOutputWeight, ok := t.tryFFNBlockResidentBackwardOne(state, gradOutputMatrix, seqLen, d, h, e); ok {
-		addFloat32Slice(gradHidden, gradHiddenWeight)
-		addFloat32Slice(gradProj, gradOutputWeight)
+	// tryFFNBlockResidentTrain during forward) expects. S3(d): the
+	// hidden/output weight-gradient contribution is no longer merged into
+	// gradHidden/gradProj here -- it accumulates device-side and is merged
+	// once per step (see flushFFNResidentTrainWeightGradients).
+	if residentGradInput, ok := t.tryFFNBlockResidentBackwardOne(state, gradOutputMatrix, seqLen, d, h, e); ok {
 		result := append([]float32(nil), residentGradInput...)
 		if t.ffnResidualEnabled() {
 			addFloat32Slice(result, gradOutputMatrix)
 		}
 		return result
+	}
+	if t.attentionResidentTrainStepErr() != nil {
+		return nil
 	}
 
 	gradProjStep := make([]float32, h*e)
@@ -10408,6 +10687,9 @@ func (t *EmbeddingTrainer) backpropEncodedSequence(seq *embeddingEncodedSequence
 	gradProjected := pooledGradToProjected(seq.layers[len(seq.layers)-1], gradPooled, t.projection.Shape[1])
 	for layer := len(seq.layers) - 1; layer >= 0; layer-- {
 		gradProjected = t.backpropEncodedLayer(seq.layers[layer], gradProjected, attentionQuery, attentionKey, attentionValue, attentionOutput, hiddenProjection, projection, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj)
+		if t.attentionResidentTrainStepErr() != nil {
+			return nil
+		}
 	}
 	return gradProjected
 }
@@ -10471,6 +10753,9 @@ func (t *EmbeddingTrainer) tryBackpropContrastiveBatch(queries, positives []*emb
 			if len(indexes) == 1 {
 				idx := indexes[0]
 				items[idx].gradProjected = t.backpropEncodedLayer(items[idx].seq.layers[layer], items[idx].gradProjected, attentionQuery, attentionKey, attentionValue, attentionOutput, hiddenProjection, projection, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj)
+				if t.attentionResidentTrainStepErr() != nil {
+					return false
+				}
 				continue
 			}
 
@@ -10483,8 +10768,14 @@ func (t *EmbeddingTrainer) tryBackpropContrastiveBatch(queries, positives []*emb
 
 			gradInput, ok := t.backpropProjectedFFNSequences(states, gradProjected, hiddenProjection, projection, gradHidden, gradProj, d, h, e)
 			if !ok {
+				if t.attentionResidentTrainStepErr() != nil {
+					return false
+				}
 				for _, idx := range indexes {
 					items[idx].gradProjected = t.backpropEncodedLayer(items[idx].seq.layers[layer], items[idx].gradProjected, attentionQuery, attentionKey, attentionValue, attentionOutput, hiddenProjection, projection, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj)
+					if t.attentionResidentTrainStepErr() != nil {
+						return false
+					}
 				}
 				continue
 			}
@@ -10492,8 +10783,14 @@ func (t *EmbeddingTrainer) tryBackpropContrastiveBatch(queries, positives []*emb
 				var ok bool
 				gradInput, ok = t.backpropAttentionSequences(states, gradInput, attentionQuery, attentionKey, attentionValue, attentionOutput, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, d)
 				if !ok {
+					if t.attentionResidentTrainStepErr() != nil {
+						return false
+					}
 					for _, idx := range indexes {
 						items[idx].gradProjected = t.backpropEncodedLayer(items[idx].seq.layers[layer], items[idx].gradProjected, attentionQuery, attentionKey, attentionValue, attentionOutput, hiddenProjection, projection, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj)
+						if t.attentionResidentTrainStepErr() != nil {
+							return false
+						}
 					}
 					continue
 				}
@@ -10898,45 +11195,44 @@ func (t *EmbeddingTrainer) tryAccumulatedAttentionInputGradMatMul(gradQMatrices,
 // of backward -- see runAttentionBlockResidentTrainBackward) and clears
 // attnResidentTrainHandleSet, and returns gradInput (the Q/K/V-path
 // contribution only, matching backpropAttentionSequences' own composition
-// order) plus gradWq/gradWk/gradWv. It does not mutate any gradAttnQ/K/V
-// accumulator itself -- callers merge the returned weight gradients in only
-// once every state in their batch has succeeded, so a mid-batch failure
-// (rare: an accelerator-level error, not a validation failure -- validation
-// failures never call the accelerator at all) can never double-count a
-// gradient that a host-path recomputation would also produce.
-func (t *EmbeddingTrainer) tryAttentionBlockResidentBackwardOne(state *embeddingSequenceState, gradMixed []float32, seqLen, d int) (gradInput, gradWq, gradWk, gradWv []float32, ok bool) {
+// order). S3(d): the Wq/Wk/Wv weight-gradient contribution is no longer
+// returned here -- the accelerator accumulates it device-side across every
+// backward call in the step instead, and the caller flushes the whole
+// step's sum exactly once (see flushAttentionResidentTrainWeightGradients),
+// so per-call callers never need to merge a per-call weight gradient in.
+func (t *EmbeddingTrainer) tryAttentionBlockResidentBackwardOne(state *embeddingSequenceState, gradMixed []float32, seqLen, d int) (gradInput []float32, ok bool) {
 	if t == nil || !attnResidentEnabled() || !t.attnResidentTrainStepOpen {
-		return nil, nil, nil, nil, false
+		return nil, false
 	}
 	accel, accelOK := t.forwardMatMul.(backend.AttentionResidentTrainAccelerator)
 	if !accelOK {
-		return nil, nil, nil, nil, false
+		return nil, false
 	}
 	if state == nil || !state.attnResidentTrainHandleSet || state.attnResidentTrainHandle.Token == nil || seqLen == 0 || d == 0 || len(gradMixed) != seqLen*d {
-		return nil, nil, nil, nil, false
+		return nil, false
 	}
 	result, err := accel.RunAttentionBlockResidentTrainBackward(backend.AttentionResidentTrainBackwardRequest{
 		Handle:    state.attnResidentTrainHandle,
 		GradMixed: tensorF32View([]int{seqLen, d}, gradMixed),
 	})
 	state.attnResidentTrainHandleSet = false
-	if err != nil || result.GradInput == nil || result.GradQueryWeight == nil || result.GradKeyWeight == nil || result.GradValueWeight == nil {
-		return nil, nil, nil, nil, false
+	if err != nil {
+		t.recordAttentionResidentTrainStepErr(fmt.Errorf("attention resident train backward: %w", err))
+		return nil, false
 	}
-	if len(result.GradInput.F32) != seqLen*d || len(result.GradQueryWeight.F32) != d*d || len(result.GradKeyWeight.F32) != d*d || len(result.GradValueWeight.F32) != d*d {
-		return nil, nil, nil, nil, false
+	if result.GradInput == nil || len(result.GradInput.F32) != seqLen*d {
+		t.recordAttentionResidentTrainStepErr(fmt.Errorf("attention resident train backward: invalid grad input result"))
+		return nil, false
 	}
-	return result.GradInput.F32, result.GradQueryWeight.F32, result.GradKeyWeight.F32, result.GradValueWeight.F32, true
+	return result.GradInput.F32, true
 }
 
 // tryAttentionBlockResidentBackward is tryAttentionBlockResidentBackwardOne
 // looped across a batched backpropAttentionSequences call: every state must
 // already carry a live handle (checked up front, before any accelerator
 // call, so a missing handle never leaves earlier states in this same call
-// partially consumed), and gradAttnQ/gradAttnK/gradAttnV only accumulate
-// the batch's weight-gradient contributions once every state in the batch
-// has succeeded.
-func (t *EmbeddingTrainer) tryAttentionBlockResidentBackward(states []*embeddingSequenceState, gradMixedMatrices [][]float32, gradResidualInputs [][]float32, gradAttnQ, gradAttnK, gradAttnV []float32, seqLen, d int) ([][]float32, bool) {
+// partially consumed).
+func (t *EmbeddingTrainer) tryAttentionBlockResidentBackward(states []*embeddingSequenceState, gradMixedMatrices [][]float32, gradResidualInputs [][]float32, seqLen, d int) ([][]float32, bool) {
 	if len(states) == 0 || len(states) != len(gradMixedMatrices) || seqLen == 0 || d == 0 {
 		return nil, false
 	}
@@ -10945,27 +11241,18 @@ func (t *EmbeddingTrainer) tryAttentionBlockResidentBackward(states []*embedding
 			return nil, false
 		}
 	}
-	gradWqAccum := make([]float32, d*d)
-	gradWkAccum := make([]float32, d*d)
-	gradWvAccum := make([]float32, d*d)
 	gradInputs := make([][]float32, len(states))
 	for i, state := range states {
-		gradInput, gradWq, gradWk, gradWv, ok := t.tryAttentionBlockResidentBackwardOne(state, gradMixedMatrices[i], seqLen, d)
+		gradInput, ok := t.tryAttentionBlockResidentBackwardOne(state, gradMixedMatrices[i], seqLen, d)
 		if !ok {
 			return nil, false
 		}
-		addFloat32Slice(gradWqAccum, gradWq)
-		addFloat32Slice(gradWkAccum, gradWk)
-		addFloat32Slice(gradWvAccum, gradWv)
 		gi := append([]float32(nil), gradInput...)
 		if gradResidualInputs != nil && i < len(gradResidualInputs) && gradResidualInputs[i] != nil {
 			addFloat32Slice(gi, gradResidualInputs[i])
 		}
 		gradInputs[i] = gi
 	}
-	addFloat32Slice(gradAttnQ, gradWqAccum)
-	addFloat32Slice(gradAttnK, gradWkAccum)
-	addFloat32Slice(gradAttnV, gradWvAccum)
 	return gradInputs, true
 }
 
@@ -11002,32 +11289,36 @@ func (t *EmbeddingTrainer) releaseStaleAttentionResidentTrainHandles(states []*e
 // tryFFNBlockResidentBackwardOne backpropagates through one state's resident
 // FFN block (see tryFFNBlockResidentTrain), given the upstream gradient at
 // FFNOutput for that state alone -- mirrors
-// tryAttentionBlockResidentBackwardOne exactly, including its "does not
-// mutate the caller's weight-gradient accumulators itself" contract (the
-// caller merges GradHiddenWeight/GradOutputWeight in only after success).
-func (t *EmbeddingTrainer) tryFFNBlockResidentBackwardOne(state *embeddingSequenceState, gradFFNOutput []float32, seqLen, d, h, e int) (gradInput, gradHiddenWeight, gradOutputWeight []float32, ok bool) {
+// tryAttentionBlockResidentBackwardOne exactly. S3(d): the hidden/output
+// weight-gradient contribution is no longer returned here -- the
+// accelerator accumulates it device-side across every backward call in the
+// step instead, and the caller flushes the whole step's sum exactly once
+// (see flushFFNResidentTrainWeightGradients).
+func (t *EmbeddingTrainer) tryFFNBlockResidentBackwardOne(state *embeddingSequenceState, gradFFNOutput []float32, seqLen, d, h, e int) (gradInput []float32, ok bool) {
 	if t == nil || !attnResidentEnabled() || !t.attnResidentTrainStepOpen {
-		return nil, nil, nil, false
+		return nil, false
 	}
 	accel, accelOK := t.forwardMatMul.(backend.FFNResidentTrainAccelerator)
 	if !accelOK {
-		return nil, nil, nil, false
+		return nil, false
 	}
 	if state == nil || !state.ffnResidentTrainHandleSet || state.ffnResidentTrainHandle.Token == nil || seqLen == 0 || e == 0 || len(gradFFNOutput) != seqLen*e {
-		return nil, nil, nil, false
+		return nil, false
 	}
 	result, err := accel.RunFFNBlockResidentTrainBackward(backend.FFNResidentTrainBackwardRequest{
 		Handle:        state.ffnResidentTrainHandle,
 		GradFFNOutput: tensorF32View([]int{seqLen, e}, gradFFNOutput),
 	})
 	state.ffnResidentTrainHandleSet = false
-	if err != nil || result.GradInput == nil || result.GradHiddenWeight == nil || result.GradOutputWeight == nil {
-		return nil, nil, nil, false
+	if err != nil {
+		t.recordAttentionResidentTrainStepErr(fmt.Errorf("ffn resident train backward: %w", err))
+		return nil, false
 	}
-	if len(result.GradInput.F32) != seqLen*d || len(result.GradHiddenWeight.F32) != d*h || len(result.GradOutputWeight.F32) != h*e {
-		return nil, nil, nil, false
+	if result.GradInput == nil || len(result.GradInput.F32) != seqLen*d {
+		t.recordAttentionResidentTrainStepErr(fmt.Errorf("ffn resident train backward: invalid grad input result"))
+		return nil, false
 	}
-	return result.GradInput.F32, result.GradHiddenWeight.F32, result.GradOutputWeight.F32, true
+	return result.GradInput.F32, true
 }
 
 // releaseStaleFFNResidentTrainHandles releases every still-live FFN
@@ -11154,9 +11445,12 @@ func (t *EmbeddingTrainer) backpropAttentionSequences(states []*embeddingSequenc
 	// S3(b): gradMixedMatrices is exactly the upstream gradient the resident
 	// train handles (set by tryAttentionBlockResidentTrain during this
 	// block's forward pass) expect. On success this replaces every
-	// gradQ/gradK/gradV/gradAttnQ/gradAttnK/gradAttnV/gradInput step below
-	// with one device-resident backward call per handle.
-	if gradInputs, ok := t.tryAttentionBlockResidentBackward(states, gradMixedMatrices, gradResidualInputs, gradAttnQ, gradAttnK, gradAttnV, seqLen, d); ok {
+	// gradQ/gradK/gradV/gradInput step below with one device-resident
+	// backward call per handle. S3(d): gradAttnQ/gradAttnK/gradAttnV no
+	// longer need to be threaded through here -- the weight-gradient
+	// contribution accumulates device-side and is flushed once per step
+	// (see flushAttentionResidentTrainWeightGradients).
+	if gradInputs, ok := t.tryAttentionBlockResidentBackward(states, gradMixedMatrices, gradResidualInputs, seqLen, d); ok {
 		return gradInputs, true
 	}
 	// tryAttentionBlockResidentBackward leaves any handle it did not
@@ -11395,6 +11689,9 @@ func (t *EmbeddingTrainer) backpropAttentionSequences(states []*embeddingSequenc
 func (t *EmbeddingTrainer) backpropEncodedLayer(state *embeddingSequenceState, gradProjected []float32, attentionQuery, attentionKey, attentionValue, attentionOutput, hiddenProjection, projection *backend.Tensor, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, gradHidden, gradProj []float32) []float32 {
 	if hiddenProjection != nil {
 		gradInput := t.backpropProjectedFFNSequence(state, gradProjected, hiddenProjection, projection, gradHidden, gradProj, t.tokenEmbed.Shape[1], hiddenProjection.Shape[1], t.projection.Shape[1])
+		if t.attentionResidentTrainStepErr() != nil {
+			return nil
+		}
 		if t.attentionEnabled() {
 			return t.backpropAttentionSequence(state, gradInput, attentionQuery, attentionKey, attentionValue, attentionOutput, gradAttnQ, gradAttnK, gradAttnV, gradAttnO, t.tokenEmbed.Shape[1])
 		}
@@ -11476,15 +11773,19 @@ func (t *EmbeddingTrainer) backpropAttentionSequence(state *embeddingSequenceSta
 	// the resident-backward integration point that matters for it.
 	// gradMixed here is exactly the upstream gradient the state's resident
 	// handle (set by tryAttentionBlockResidentTrain during forward) expects.
-	if residentGradInput, gradWq, gradWk, gradWv, ok := t.tryAttentionBlockResidentBackwardOne(state, gradMixed, seqLen, d); ok {
-		addFloat32Slice(gradAttnQ, gradWq)
-		addFloat32Slice(gradAttnK, gradWk)
-		addFloat32Slice(gradAttnV, gradWv)
+	// S3(d): the Wq/Wk/Wv weight-gradient contribution is no longer merged
+	// into gradAttnQ/gradAttnK/gradAttnV here -- it accumulates
+	// device-side and is merged once per step (see
+	// flushAttentionResidentTrainWeightGradients).
+	if residentGradInput, ok := t.tryAttentionBlockResidentBackwardOne(state, gradMixed, seqLen, d); ok {
 		result := append([]float32(nil), residentGradInput...)
 		if t.attentionResidualEnabled() {
 			addFloat32Slice(result, gradResidualInput)
 		}
 		return result
+	}
+	if t.attentionResidentTrainStepErr() != nil {
+		return nil
 	}
 
 	gradQ := make([]float32, seqLen*d)

@@ -28,6 +28,110 @@ type attentionResidentTrainState struct {
 	stepActive bool
 	nextHandle uint64
 	handles    map[uint64]*attentionResidentTrainHandleState
+	// gradAccum is S3(d)'s step-scoped device-side Wq/Wk/Wv weight-gradient
+	// accumulator, keyed by resident weight binding name (Q, K, and V each
+	// get their own entry under their own name). Every
+	// runAttentionBlockResidentTrainBackward call in a step GEMMs its
+	// contribution into the named entry with beta=1 instead of downloading
+	// its own copy; flushAttentionResidentTrainWeightGradients downloads
+	// the sum exactly once. Cleared by the same begin/end/abort sweep that
+	// clears handles (releaseAllAttentionResidentTrainHandles), so a later
+	// step never adds onto an earlier step's partial sum.
+	gradAccum map[string]*residentGradAccumBuffer
+}
+
+// residentGradAccumBuffer is one step-scoped device accumulator: a single
+// zero-initialized buffer (via memsetFloat32Zero) that every contributing
+// backward call GEMMs into with beta=1, downloaded and freed exactly once
+// by the matching flush call. Shared shape between the attention
+// (Wq/Wk/Wv) and FFN (gradHiddenWeight/gradOutputWeight) accumulators
+// (see ffn_resident_train_accel_linux.go). rows/cols are recorded (rather
+// than only a flat element count) so the flush call can hand back a
+// properly shaped *backend.Tensor without the caller needing to separately
+// remember or re-derive the weight's shape.
+type residentGradAccumBuffer struct {
+	ptr    C.CUdeviceptr
+	rows   int
+	cols   int
+	stepID uint64
+}
+
+func (b *residentGradAccumBuffer) elements() int {
+	if b == nil {
+		return 0
+	}
+	return b.rows * b.cols
+}
+
+// accumulateResidentGradWeight ensures accum[name] is a live, correctly
+// sized, zeroed device buffer for the current step (allocating and zeroing
+// it on first use, or discarding and reallocating it if a stale entry from
+// a different step or a different shape survived -- defense in depth; the
+// begin/end/abort sweep should already have cleared it), then GEMMs
+// contribution (lhs^T @ rhs or lhs @ rhs, per transposeLeft/transposeRight)
+// into it with beta=1 so repeated calls within the step accumulate rather
+// than overwrite.
+func (rt *deviceRuntime) accumulateResidentGradWeight(accum *map[string]*residentGradAccumBuffer, name string, rows, cols int, stepID uint64, lhs, rhs C.CUdeviceptr, lhsRows, lhsCols, rhsRows, rhsCols C.int, transposeLeft, transposeRight bool) error {
+	if rt == nil {
+		return fmt.Errorf("cuda runtime is not initialized")
+	}
+	if *accum == nil {
+		*accum = map[string]*residentGradAccumBuffer{}
+	}
+	buf, ok := (*accum)[name]
+	if ok && (buf.rows != rows || buf.cols != cols || buf.stepID != stepID) {
+		_ = rt.freeBuffer(buf.ptr)
+		delete(*accum, name)
+		buf, ok = nil, false
+	}
+	if !ok {
+		elements := rows * cols
+		ptr, err := rt.allocFloat32(elements)
+		if err != nil {
+			return err
+		}
+		if err := rt.memsetFloat32Zero(ptr, elements); err != nil {
+			_ = rt.freeBuffer(ptr)
+			return err
+		}
+		buf = &residentGradAccumBuffer{ptr: ptr, rows: rows, cols: cols, stepID: stepID}
+		(*accum)[name] = buf
+	}
+	return rt.matMulCublasWithBetaNoSync(lhs, rhs, buf.ptr, lhsRows, lhsCols, rhsRows, rhsCols, transposeLeft, transposeRight, 1)
+}
+
+// flushResidentGradAccum downloads and frees accum[name] exactly once,
+// returning a nil tensor (and nil error) when there is nothing accumulated
+// under that name for the given stepID (no contributing backward call ran,
+// or the name does not match) -- the "safe to always call, no-op when
+// empty" convention this package's other resident-train sweeps already use.
+func flushResidentGradAccum(rt *deviceRuntime, accum map[string]*residentGradAccumBuffer, name string, stepID uint64) (*backend.Tensor, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	buf, ok := accum[name]
+	if !ok || buf.stepID != stepID {
+		return nil, nil
+	}
+	host := make([]float32, buf.elements())
+	if err := rt.downloadFloat32(host, buf.ptr); err != nil {
+		return nil, err
+	}
+	_ = rt.freeBuffer(buf.ptr)
+	delete(accum, name)
+	return backend.NewTensorF32([]int{buf.rows, buf.cols}, host), nil
+}
+
+// releaseResidentGradAccum frees every live entry in *accum and clears the
+// map. Safe to call with a nil or empty map.
+func releaseResidentGradAccum(rt *deviceRuntime, accum *map[string]*residentGradAccumBuffer) {
+	if rt == nil || accum == nil {
+		return
+	}
+	for name, buf := range *accum {
+		_ = rt.freeBuffer(buf.ptr)
+		delete(*accum, name)
+	}
 }
 
 // attentionResidentTrainHandleState is the device-private data one
@@ -92,13 +196,19 @@ func (t *attentionResidentTrainToken) Alive() bool {
 // leftover handle, both rely on. This also sweeps ffnTrain's registry (see
 // ffn_resident_train_accel_linux.go): S3(c) FFN-resident-train handles
 // share attention's step generation/stepID/stepActive bookkeeping rather
-// than opening a second, parallel step.
+// than opening a second, parallel step. S3(d): also frees both blocks'
+// step-scoped weight-gradient accumulators (gradAccum), so a step that
+// never flushed its accumulator (an error path, or a step with zero
+// resident-train backward calls) never leaks its device buffer into the
+// next step.
 func (rt *deviceRuntime) beginAttentionResidentTrainStep(stepID uint64) error {
 	if rt == nil || rt.ptr == nil {
 		return fmt.Errorf("cuda runtime is not initialized")
 	}
 	rt.releaseAllAttentionResidentTrainHandles()
 	rt.releaseAllFFNResidentTrainHandles()
+	releaseResidentGradAccum(rt, &rt.attnTrain.gradAccum)
+	releaseResidentGradAccum(rt, &rt.ffnTrain.gradAccum)
 	rt.attnTrain.generation++
 	rt.attnTrain.stepID = stepID
 	rt.attnTrain.stepActive = true
@@ -109,7 +219,12 @@ func (rt *deviceRuntime) beginAttentionResidentTrainStep(stepID uint64) error {
 // step, then releases every handle still registered (a normal occurrence:
 // not every forward call is followed by a backward call, for example an
 // eval-only encode within a mixed step) and closes the step out. Also
-// sweeps ffnTrain's registry (see beginAttentionResidentTrainStep).
+// sweeps ffnTrain's registry and both blocks' weight-gradient accumulators
+// (see beginAttentionResidentTrainStep) -- callers that want the
+// accumulated gradient must flush it (see
+// flushAttentionResidentTrainWeightGradients/
+// flushFFNResidentTrainWeightGradients) before calling this, since End/Abort
+// discards whatever is still accumulated rather than returning it.
 func (rt *deviceRuntime) endOrAbortAttentionResidentTrainStep(stepID uint64) error {
 	if rt == nil || rt.ptr == nil {
 		return fmt.Errorf("cuda runtime is not initialized")
@@ -119,6 +234,8 @@ func (rt *deviceRuntime) endOrAbortAttentionResidentTrainStep(stepID uint64) err
 	}
 	rt.releaseAllAttentionResidentTrainHandles()
 	rt.releaseAllFFNResidentTrainHandles()
+	releaseResidentGradAccum(rt, &rt.attnTrain.gradAccum)
+	releaseResidentGradAccum(rt, &rt.ffnTrain.gradAccum)
 	rt.attnTrain.stepActive = false
 	return nil
 }
@@ -362,21 +479,49 @@ func (rt *deviceRuntime) runAttentionBlockResidentTrainForward(req backend.Atten
 		return backend.AttentionResidentTrainForwardResult{}, err
 	}
 
-	queryHost := make([]float32, rows*d)
-	keyHost := make([]float32, rows*d)
-	valueHost := make([]float32, rows*d)
-	scoresHost := make([]float32, batch*seqLen*seqLen)
+	// S3(d): SkipUnreadDownload elides the Query/Key/Value/Scores D2H copy
+	// when the caller has proven host code will never read them before the
+	// matching backward call -- see the field's doc comment in backend.go.
+	// Mixed is never skipped: the caller's forward continuation (the Wo
+	// projection) always reads it. The underlying device buffers are
+	// computed and kept resident either way; only their host copy is
+	// conditional.
+	skipQKVS := req.SkipUnreadDownload
+	var queryHost, keyHost, valueHost, scoresHost []float32
+	if !skipQKVS {
+		queryHost = make([]float32, rows*d)
+		keyHost = make([]float32, rows*d)
+		valueHost = make([]float32, rows*d)
+		scoresHost = make([]float32, batch*seqLen*seqLen)
+	}
 	mixedHost := make([]float32, rows*d)
-	for _, dl := range []struct {
+	downloads := []struct {
 		dst []float32
 		src C.CUdeviceptr
 	}{
-		{queryHost, qBuf},
-		{keyHost, kBuf},
-		{valueHost, vBuf},
-		{scoresHost, scoresBuf},
 		{mixedHost, mixedBuf},
-	} {
+	}
+	if !skipQKVS {
+		downloads = append(downloads,
+			struct {
+				dst []float32
+				src C.CUdeviceptr
+			}{queryHost, qBuf},
+			struct {
+				dst []float32
+				src C.CUdeviceptr
+			}{keyHost, kBuf},
+			struct {
+				dst []float32
+				src C.CUdeviceptr
+			}{valueHost, vBuf},
+			struct {
+				dst []float32
+				src C.CUdeviceptr
+			}{scoresHost, scoresBuf},
+		)
+	}
+	for _, dl := range downloads {
 		if err := rt.downloadFloat32(dl.dst, dl.src); err != nil {
 			freeKept()
 			return backend.AttentionResidentTrainForwardResult{}, err
@@ -411,7 +556,7 @@ func (rt *deviceRuntime) runAttentionBlockResidentTrainForward(req backend.Atten
 	downloadedBytes := int64((len(queryHost) + len(keyHost) + len(valueHost) + len(scoresHost) + len(mixedHost)) * 4)
 	rt.recordMatMulRun(start, uploadedBytes, downloadedBytes, false, true)
 
-	return backend.AttentionResidentTrainForwardResult{
+	result := backend.AttentionResidentTrainForwardResult{
 		Handle: backend.AttentionResidentTrainHandle{
 			Backend:    eosartifact.BackendCUDA,
 			Token:      &attentionResidentTrainToken{state: state},
@@ -421,12 +566,15 @@ func (rt *deviceRuntime) runAttentionBlockResidentTrainForward(req backend.Atten
 			Generation: state.generation,
 			StepID:     state.stepID,
 		},
-		Query:  backend.NewTensorF32([]int{rows, d}, queryHost),
-		Key:    backend.NewTensorF32([]int{rows, d}, keyHost),
-		Value:  backend.NewTensorF32([]int{rows, d}, valueHost),
-		Scores: backend.NewTensorF32([]int{rows, seqLen}, scoresHost),
-		Mixed:  backend.NewTensorF32([]int{rows, d}, mixedHost),
-	}, nil
+		Mixed: backend.NewTensorF32([]int{rows, d}, mixedHost),
+	}
+	if !skipQKVS {
+		result.Query = backend.NewTensorF32([]int{rows, d}, queryHost)
+		result.Key = backend.NewTensorF32([]int{rows, d}, keyHost)
+		result.Value = backend.NewTensorF32([]int{rows, d}, valueHost)
+		result.Scores = backend.NewTensorF32([]int{rows, seqLen}, scoresHost)
+	}
+	return result, nil
 }
 
 // runAttentionBlockResidentTrainBackward backpropagates through the
@@ -526,21 +674,6 @@ func (rt *deviceRuntime) runAttentionBlockResidentTrainBackward(req backend.Atte
 		return backend.AttentionResidentTrainBackwardResult{}, err
 	}
 	defer rt.freeBuffer(gradVBuf)
-	gradWqBuf, err := rt.allocFloat32(d * d)
-	if err != nil {
-		return backend.AttentionResidentTrainBackwardResult{}, err
-	}
-	defer rt.freeBuffer(gradWqBuf)
-	gradWkBuf, err := rt.allocFloat32(d * d)
-	if err != nil {
-		return backend.AttentionResidentTrainBackwardResult{}, err
-	}
-	defer rt.freeBuffer(gradWkBuf)
-	gradWvBuf, err := rt.allocFloat32(d * d)
-	if err != nil {
-		return backend.AttentionResidentTrainBackwardResult{}, err
-	}
-	defer rt.freeBuffer(gradWvBuf)
 	gradInputBuf, err := rt.allocFloat32(rows * d)
 	if err != nil {
 		return backend.AttentionResidentTrainBackwardResult{}, err
@@ -571,16 +704,19 @@ func (rt *deviceRuntime) runAttentionBlockResidentTrainBackward(req backend.Atte
 	if err := rt.matMulCublasStridedBatched(gradPreSoftmaxBuf, state.kBuf, gradQBuf, C.int(batch), C.int(seqLen), C.int(seqLen), C.int(seqLen), C.int(d), false, false); err != nil {
 		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradQ: %w", err)
 	}
-	// gradWq = input^T @ gradQ ; gradWk = input^T @ gradK ; gradWv = input^T @ gradV,
-	// each one GEMM contracting over every row (batch*seqLen) at once.
-	if err := rt.matMulCublasWithBetaNoSync(state.inputBuf, gradQBuf, gradWqBuf, C.int(rows), C.int(d), C.int(rows), C.int(d), true, false, 0); err != nil {
-		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradWq: %w", err)
+	// S3(d): gradWq += input^T @ gradQ ; gradWk += input^T @ gradK ;
+	// gradWv += input^T @ gradV, each one GEMM contracting over every row
+	// (batch*seqLen) at once, accumulated with beta=1 into this step's
+	// device-resident per-name accumulator instead of downloaded here --
+	// see flushAttentionResidentTrainWeightGradients.
+	if err := rt.accumulateResidentGradWeight(&rt.attnTrain.gradAccum, state.queryName, d, d, rt.attnTrain.stepID, state.inputBuf, gradQBuf, C.int(rows), C.int(d), C.int(rows), C.int(d), true, false); err != nil {
+		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradWq accumulate: %w", err)
 	}
-	if err := rt.matMulCublasWithBetaNoSync(state.inputBuf, gradKBuf, gradWkBuf, C.int(rows), C.int(d), C.int(rows), C.int(d), true, false, 0); err != nil {
-		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradWk: %w", err)
+	if err := rt.accumulateResidentGradWeight(&rt.attnTrain.gradAccum, state.keyName, d, d, rt.attnTrain.stepID, state.inputBuf, gradKBuf, C.int(rows), C.int(d), C.int(rows), C.int(d), true, false); err != nil {
+		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradWk accumulate: %w", err)
 	}
-	if err := rt.matMulCublasWithBetaNoSync(state.inputBuf, gradVBuf, gradWvBuf, C.int(rows), C.int(d), C.int(rows), C.int(d), true, false, 0); err != nil {
-		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradWv: %w", err)
+	if err := rt.accumulateResidentGradWeight(&rt.attnTrain.gradAccum, state.valueName, d, d, rt.attnTrain.stepID, state.inputBuf, gradVBuf, C.int(rows), C.int(d), C.int(rows), C.int(d), true, false); err != nil {
+		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train backward: gradWv accumulate: %w", err)
 	}
 	// gradInput = gradQ@Wq^T + gradK@Wk^T + gradV@Wv^T, accumulated in place
 	// via beta (term1 writes, term2/term3 accumulate).
@@ -598,31 +734,36 @@ func (rt *deviceRuntime) runAttentionBlockResidentTrainBackward(req backend.Atte
 	}
 
 	gradInputHost := make([]float32, rows*d)
-	gradWqHost := make([]float32, d*d)
-	gradWkHost := make([]float32, d*d)
-	gradWvHost := make([]float32, d*d)
-	for _, dl := range []struct {
-		dst []float32
-		src C.CUdeviceptr
-	}{
-		{gradInputHost, gradInputBuf},
-		{gradWqHost, gradWqBuf},
-		{gradWkHost, gradWkBuf},
-		{gradWvHost, gradWvBuf},
-	} {
-		if err := rt.downloadFloat32(dl.dst, dl.src); err != nil {
-			return backend.AttentionResidentTrainBackwardResult{}, err
-		}
+	if err := rt.downloadFloat32(gradInputHost, gradInputBuf); err != nil {
+		return backend.AttentionResidentTrainBackwardResult{}, err
 	}
 
 	uploadedBytes := int64(len(req.GradMixed.F32) * 4)
-	downloadedBytes := int64((len(gradInputHost) + len(gradWqHost) + len(gradWkHost) + len(gradWvHost)) * 4)
+	downloadedBytes := int64(len(gradInputHost) * 4)
 	rt.recordMatMulRun(start, uploadedBytes, downloadedBytes, true, false)
 
 	return backend.AttentionResidentTrainBackwardResult{
-		GradInput:       backend.NewTensorF32([]int{rows, d}, gradInputHost),
-		GradQueryWeight: backend.NewTensorF32([]int{d, d}, gradWqHost),
-		GradKeyWeight:   backend.NewTensorF32([]int{d, d}, gradWkHost),
-		GradValueWeight: backend.NewTensorF32([]int{d, d}, gradWvHost),
+		GradInput: backend.NewTensorF32([]int{rows, d}, gradInputHost),
 	}, nil
+}
+
+// flushAttentionResidentTrainWeightGradients implements
+// backend.AttentionResidentTrainAccelerator.FlushAttentionResidentTrainWeightGradients:
+// downloads and frees this step's device-accumulated Wq/Wk/Wv sums exactly
+// once. A name with no contributions this step (or that does not match any
+// accumulated name) yields a nil tensor for that slot, not an error.
+func (rt *deviceRuntime) flushAttentionResidentTrainWeightGradients(queryName, keyName, valueName string) (gradWq, gradWk, gradWv *backend.Tensor, err error) {
+	if rt == nil || rt.ptr == nil {
+		return nil, nil, nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if gradWq, err = flushResidentGradAccum(rt, rt.attnTrain.gradAccum, queryName, rt.attnTrain.stepID); err != nil {
+		return nil, nil, nil, err
+	}
+	if gradWk, err = flushResidentGradAccum(rt, rt.attnTrain.gradAccum, keyName, rt.attnTrain.stepID); err != nil {
+		return nil, nil, nil, err
+	}
+	if gradWv, err = flushResidentGradAccum(rt, rt.attnTrain.gradAccum, valueName, rt.attnTrain.stepID); err != nil {
+		return nil, nil, nil, err
+	}
+	return gradWq, gradWk, gradWv, nil
 }

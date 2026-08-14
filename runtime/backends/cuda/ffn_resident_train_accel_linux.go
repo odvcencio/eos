@@ -28,6 +28,14 @@ import (
 type ffnResidentTrainState struct {
 	nextHandle uint64
 	handles    map[uint64]*ffnResidentTrainHandleState
+	// gradAccum is S3(d)'s step-scoped device-side hidden/output
+	// weight-gradient accumulator, keyed by resident weight binding name.
+	// Mirrors attentionResidentTrainState.gradAccum exactly (see
+	// attention_resident_train_accel_linux.go for the shared
+	// residentGradAccumBuffer/accumulateResidentGradWeight/
+	// flushResidentGradAccum/releaseResidentGradAccum helpers); cleared by
+	// the same begin/end/abort sweep that clears handles.
+	gradAccum map[string]*residentGradAccumBuffer
 }
 
 // ffnResidentTrainHandleState is the device-private data one
@@ -264,17 +272,39 @@ func (rt *deviceRuntime) runFFNBlockResidentTrainForward(req backend.FFNResident
 		return backend.FFNResidentTrainForwardResult{}, err
 	}
 
-	ffnHiddenHost := make([]float32, seqLen*h)
-	activatedHost := make([]float32, seqLen*h)
+	// S3(d): SkipUnreadDownload elides the ffnHidden/activated D2H copy when
+	// the caller has proven host code will never read them before the
+	// matching backward call -- see the field's doc comment in backend.go.
+	// FFNOutput is never skipped: the caller's forward continuation
+	// (residual + layer norm) always reads it. The underlying device
+	// buffers are computed and kept resident either way; only their host
+	// copy is conditional.
+	skipHiddenActivated := req.SkipUnreadDownload
+	var ffnHiddenHost, activatedHost []float32
+	if !skipHiddenActivated {
+		ffnHiddenHost = make([]float32, seqLen*h)
+		activatedHost = make([]float32, seqLen*h)
+	}
 	ffnOutputHost := make([]float32, seqLen*e)
-	for _, dl := range []struct {
+	downloads := []struct {
 		dst []float32
 		src C.CUdeviceptr
 	}{
-		{ffnHiddenHost, ffnHiddenBuf},
-		{activatedHost, activatedBuf},
 		{ffnOutputHost, ffnOutputBuf},
-	} {
+	}
+	if !skipHiddenActivated {
+		downloads = append(downloads,
+			struct {
+				dst []float32
+				src C.CUdeviceptr
+			}{ffnHiddenHost, ffnHiddenBuf},
+			struct {
+				dst []float32
+				src C.CUdeviceptr
+			}{activatedHost, activatedBuf},
+		)
+	}
+	for _, dl := range downloads {
 		if err := rt.downloadFloat32(dl.dst, dl.src); err != nil {
 			freeKept()
 			return backend.FFNResidentTrainForwardResult{}, err
@@ -306,7 +336,7 @@ func (rt *deviceRuntime) runFFNBlockResidentTrainForward(req backend.FFNResident
 	downloadedBytes := int64((len(ffnHiddenHost) + len(activatedHost) + len(ffnOutputHost)) * 4)
 	rt.recordMatMulRun(start, uploadedBytes, downloadedBytes, false, true)
 
-	return backend.FFNResidentTrainForwardResult{
+	result := backend.FFNResidentTrainForwardResult{
 		Handle: backend.FFNResidentTrainHandle{
 			Backend:    eosartifact.BackendCUDA,
 			Token:      &ffnResidentTrainToken{state: state},
@@ -317,10 +347,13 @@ func (rt *deviceRuntime) runFFNBlockResidentTrainForward(req backend.FFNResident
 			Generation: state.generation,
 			StepID:     state.stepID,
 		},
-		FFNHidden: backend.NewTensorF32([]int{seqLen, h}, ffnHiddenHost),
-		Activated: backend.NewTensorF32([]int{seqLen, h}, activatedHost),
 		FFNOutput: backend.NewTensorF32([]int{seqLen, e}, ffnOutputHost),
-	}, nil
+	}
+	if !skipHiddenActivated {
+		result.FFNHidden = backend.NewTensorF32([]int{seqLen, h}, ffnHiddenHost)
+		result.Activated = backend.NewTensorF32([]int{seqLen, h}, activatedHost)
+	}
+	return result, nil
 }
 
 // runFFNBlockResidentTrainBackward backpropagates through the FFN block
@@ -397,20 +430,12 @@ func (rt *deviceRuntime) runFFNBlockResidentTrainBackward(req backend.FFNResiden
 		return backend.FFNResidentTrainBackwardResult{}, err
 	}
 	defer rt.freeBuffer(gradInputBuf)
-	gradHiddenWeightBuf, err := rt.allocFloat32(d * h)
-	if err != nil {
-		return backend.FFNResidentTrainBackwardResult{}, err
-	}
-	defer rt.freeBuffer(gradHiddenWeightBuf)
-	gradOutputWeightBuf, err := rt.allocFloat32(h * e)
-	if err != nil {
-		return backend.FFNResidentTrainBackwardResult{}, err
-	}
-	defer rt.freeBuffer(gradOutputWeightBuf)
 
-	// gradOutputWeight = activated^T @ gradFFNOutput
-	if err := rt.matMulCublasWithBetaNoSync(state.activatedBuf, gradFFNOutputBuf, gradOutputWeightBuf, C.int(seqLen), C.int(h), C.int(seqLen), C.int(e), true, false, 0); err != nil {
-		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda ffn resident train backward: gradOutputWeight: %w", err)
+	// S3(d): gradOutputWeight += activated^T @ gradFFNOutput, accumulated
+	// with beta=1 into this step's device-resident per-name accumulator
+	// instead of downloaded here -- see flushFFNResidentTrainWeightGradients.
+	if err := rt.accumulateResidentGradWeight(&rt.ffnTrain.gradAccum, state.outputWeightName, h, e, rt.attnTrain.stepID, state.activatedBuf, gradFFNOutputBuf, C.int(seqLen), C.int(h), C.int(seqLen), C.int(e), true, false); err != nil {
+		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda ffn resident train backward: gradOutputWeight accumulate: %w", err)
 	}
 	// gradActivatedPre = gradFFNOutput @ Wdown^T
 	if err := rt.matMulCublasWithBetaNoSync(gradFFNOutputBuf, wdown.ptr, gradActivatedPreBuf, C.int(seqLen), C.int(e), C.int(h), C.int(e), false, true, 0); err != nil {
@@ -424,9 +449,10 @@ func (rt *deviceRuntime) runFFNBlockResidentTrainBackward(req backend.FFNResiden
 	if err := rt.launchAuxElementWise(geluBackwardKernel, uint(grid), uint(block), gradActivatedPreBuf, state.ffnHiddenBuf, gradActivatedBuf, seqLen*h); err != nil {
 		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda ffn resident train backward: gelu backward: %w", err)
 	}
-	// gradHiddenWeight = input^T @ gradActivated
-	if err := rt.matMulCublasWithBetaNoSync(state.inputBuf, gradActivatedBuf, gradHiddenWeightBuf, C.int(seqLen), C.int(d), C.int(seqLen), C.int(h), true, false, 0); err != nil {
-		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda ffn resident train backward: gradHiddenWeight: %w", err)
+	// S3(d): gradHiddenWeight += input^T @ gradActivated, accumulated the
+	// same way as gradOutputWeight above.
+	if err := rt.accumulateResidentGradWeight(&rt.ffnTrain.gradAccum, state.hiddenWeightName, d, h, rt.attnTrain.stepID, state.inputBuf, gradActivatedBuf, C.int(seqLen), C.int(d), C.int(seqLen), C.int(h), true, false); err != nil {
+		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda ffn resident train backward: gradHiddenWeight accumulate: %w", err)
 	}
 	// gradInput = gradActivated @ Wup^T
 	if err := rt.matMulCublasWithBetaNoSync(gradActivatedBuf, wup.ptr, gradInputBuf, C.int(seqLen), C.int(h), C.int(d), C.int(h), false, true, 0); err != nil {
@@ -437,37 +463,44 @@ func (rt *deviceRuntime) runFFNBlockResidentTrainBackward(req backend.FFNResiden
 	}
 
 	gradInputHost := make([]float32, seqLen*d)
-	gradHiddenWeightHost := make([]float32, d*h)
-	gradOutputWeightHost := make([]float32, h*e)
-	for _, dl := range []struct {
-		dst []float32
-		src C.CUdeviceptr
-	}{
-		{gradInputHost, gradInputBuf},
-		{gradHiddenWeightHost, gradHiddenWeightBuf},
-		{gradOutputWeightHost, gradOutputWeightBuf},
-	} {
-		if err := rt.downloadFloat32(dl.dst, dl.src); err != nil {
-			return backend.FFNResidentTrainBackwardResult{}, err
-		}
+	if err := rt.downloadFloat32(gradInputHost, gradInputBuf); err != nil {
+		return backend.FFNResidentTrainBackwardResult{}, err
 	}
 
 	uploadedBytes := int64(len(req.GradFFNOutput.F32) * 4)
-	downloadedBytes := int64((len(gradInputHost) + len(gradHiddenWeightHost) + len(gradOutputWeightHost)) * 4)
+	downloadedBytes := int64(len(gradInputHost) * 4)
 	rt.recordMatMulRun(start, uploadedBytes, downloadedBytes, true, false)
 
 	return backend.FFNResidentTrainBackwardResult{
-		GradInput:        backend.NewTensorF32([]int{seqLen, d}, gradInputHost),
-		GradHiddenWeight: backend.NewTensorF32([]int{d, h}, gradHiddenWeightHost),
-		GradOutputWeight: backend.NewTensorF32([]int{h, e}, gradOutputWeightHost),
+		GradInput: backend.NewTensorF32([]int{seqLen, d}, gradInputHost),
 	}, nil
+}
+
+// flushFFNResidentTrainWeightGradients implements
+// backend.FFNResidentTrainAccelerator.FlushFFNResidentTrainWeightGradients:
+// downloads and frees this step's device-accumulated hidden/output weight
+// gradient sums exactly once, mirroring
+// flushAttentionResidentTrainWeightGradients. A name with no contributions
+// this step yields a nil tensor for that slot, not an error.
+func (rt *deviceRuntime) flushFFNResidentTrainWeightGradients(hiddenWeightName, outputWeightName string) (gradHiddenWeight, gradOutputWeight *backend.Tensor, err error) {
+	if rt == nil || rt.ptr == nil {
+		return nil, nil, fmt.Errorf("cuda runtime is not initialized")
+	}
+	if gradHiddenWeight, err = flushResidentGradAccum(rt, rt.ffnTrain.gradAccum, hiddenWeightName, rt.attnTrain.stepID); err != nil {
+		return nil, nil, err
+	}
+	if gradOutputWeight, err = flushResidentGradAccum(rt, rt.ffnTrain.gradAccum, outputWeightName, rt.attnTrain.stepID); err != nil {
+		return nil, nil, err
+	}
+	return gradHiddenWeight, gradOutputWeight, nil
 }
 
 // Note: the exported backend.FFNResidentTrainAccelerator methods
 // (RunFFNBlockResidentTrainForward, RunFFNBlockResidentTrainBackward,
-// ReleaseFFNResidentTrainHandle) live on *matMulAccelerator in
-// matmul_accel.go, not on *deviceRuntime directly -- t.forwardMatMul is
-// always a *matMulAccelerator wrapping a *deviceRuntime via a named field
-// (not an embedded one), so deviceRuntime's methods are not promoted.
-// Mirrors exactly how attention_resident_train_accel_linux.go's lowercase
+// FlushFFNResidentTrainWeightGradients, ReleaseFFNResidentTrainHandle) live
+// on *matMulAccelerator in matmul_accel.go, not on *deviceRuntime directly
+// -- t.forwardMatMul is always a *matMulAccelerator wrapping a
+// *deviceRuntime via a named field (not an embedded one), so deviceRuntime's
+// methods are not promoted. Mirrors exactly how
+// attention_resident_train_accel_linux.go's lowercase
 // runAttentionBlockResidentTrainForward/Backward are wrapped.

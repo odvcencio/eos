@@ -226,6 +226,20 @@ func (a *matMulAccelerator) RunAttentionBlockResidentTrainBackward(req backend.A
 	return a.device.runAttentionBlockResidentTrainBackward(req)
 }
 
+// FlushAttentionResidentTrainWeightGradients implements
+// backend.AttentionResidentTrainAccelerator.
+func (a *matMulAccelerator) FlushAttentionResidentTrainWeightGradients(queryName, keyName, valueName string) (*backend.Tensor, *backend.Tensor, *backend.Tensor, error) {
+	if a == nil {
+		return nil, nil, nil, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return nil, nil, nil, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.flushAttentionResidentTrainWeightGradients(queryName, keyName, valueName)
+}
+
 // EndAttentionResidentTrainStep implements backend.AttentionResidentTrainAccelerator.
 func (a *matMulAccelerator) EndAttentionResidentTrainStep(stepID uint64) error {
 	if a == nil {
@@ -294,6 +308,20 @@ func (a *matMulAccelerator) RunFFNBlockResidentTrainBackward(req backend.FFNResi
 		return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda matmul accelerator is not initialized")
 	}
 	return a.device.runFFNBlockResidentTrainBackward(req)
+}
+
+// FlushFFNResidentTrainWeightGradients implements
+// backend.FFNResidentTrainAccelerator.
+func (a *matMulAccelerator) FlushFFNResidentTrainWeightGradients(hiddenWeightName, outputWeightName string) (*backend.Tensor, *backend.Tensor, error) {
+	if a == nil {
+		return nil, nil, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a == nil || a.device == nil {
+		return nil, nil, fmt.Errorf("cuda matmul accelerator is not initialized")
+	}
+	return a.device.flushFFNResidentTrainWeightGradients(hiddenWeightName, outputWeightName)
 }
 
 // ReleaseFFNResidentTrainHandle implements backend.FFNResidentTrainAccelerator.
