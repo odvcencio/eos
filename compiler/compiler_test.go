@@ -257,28 +257,20 @@ func TestBuildEncoderTrainableQ8x2Preset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if got := len(bundle.Artifact.Params); got != 7 {
-		t.Fatalf("param count = %d, want 7", got)
-	}
+	assertEncoderTrainablePresetParams(t, bundle.Artifact.Params, "q8")
 	if got := len(bundle.Artifact.EntryPoints); got != 2 {
 		t.Fatalf("entrypoint count = %d, want 2", got)
 	}
 	if got := bundle.Artifact.EntryPoints[0].Name; got != "embed_pooled" {
 		t.Fatalf("entrypoint[0] = %q, want embed_pooled", got)
 	}
+	assertValueBinding(t, bundle.Artifact.EntryPoints[0].Inputs, "role_ids", "i32", "T")
 	if got := strings.Join(bundle.Artifact.EntryPoints[0].Outputs[0].Type.Tensor.Shape, ","); got != "D" {
 		t.Fatalf("embed_pooled output shape = %q, want D", got)
 	}
+	assertValueBinding(t, bundle.Artifact.EntryPoints[1].Inputs, "role_ids", "i32", "B,T")
 	if got := strings.Join(bundle.Artifact.EntryPoints[1].Outputs[0].Type.Tensor.Shape, ","); got != "B,D" {
 		t.Fatalf("embed_pooled_batch output shape = %q, want B,D", got)
-	}
-	for _, param := range bundle.Artifact.Params {
-		if !param.Trainable {
-			t.Fatalf("param %q is not trainable", param.Name)
-		}
-		if param.Type.Tensor == nil || param.Type.Tensor.DType != "q8" {
-			t.Fatalf("param %q dtype = %+v, want q8 tensor", param.Name, param.Type)
-		}
 	}
 	foundGELU := false
 	foundRoPE := false
@@ -311,6 +303,9 @@ func TestBuildEncoderTrainableQ8x2Preset(t *testing.T) {
 	}
 	if !foundRoPE {
 		t.Fatal("expected RoPE op in default encoder preset")
+	}
+	if !hasStep(bundle.Artifact.Steps, eosartifact.StepGather, "role_embedding,role_ids") {
+		t.Fatal("expected role_embedding gather in default encoder preset")
 	}
 	if !foundMaskedSoftmax {
 		t.Fatal("expected masked_softmax op in default encoder preset")
@@ -355,29 +350,92 @@ func TestBuildEncoderTrainableQ4x2Preset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
-	if got := len(bundle.Artifact.Params); got != 7 {
-		t.Fatalf("param count = %d, want 7", got)
-	}
+	assertEncoderTrainablePresetParams(t, bundle.Artifact.Params, "q4")
 	if got := len(bundle.Artifact.EntryPoints); got != 2 {
 		t.Fatalf("entrypoint count = %d, want 2", got)
 	}
 	if got := bundle.Artifact.EntryPoints[0].Name; got != "embed_pooled" {
 		t.Fatalf("entrypoint[0] = %q, want embed_pooled", got)
 	}
+	assertValueBinding(t, bundle.Artifact.EntryPoints[0].Inputs, "role_ids", "i32", "T")
 	if got := strings.Join(bundle.Artifact.EntryPoints[0].Outputs[0].Type.Tensor.Shape, ","); got != "D" {
 		t.Fatalf("embed_pooled output shape = %q, want D", got)
 	}
+	assertValueBinding(t, bundle.Artifact.EntryPoints[1].Inputs, "role_ids", "i32", "B,T")
 	if got := strings.Join(bundle.Artifact.EntryPoints[1].Outputs[0].Type.Tensor.Shape, ","); got != "B,D" {
 		t.Fatalf("embed_pooled_batch output shape = %q, want B,D", got)
 	}
-	for _, param := range bundle.Artifact.Params {
+}
+
+func assertEncoderTrainablePresetParams(t *testing.T, params []eosartifact.Param, dtype string) {
+	t.Helper()
+	want := []struct {
+		name    string
+		shape   string
+		binding string
+	}{
+		{"token_embedding", "V,D", "weights/token_embedding"},
+		{"role_embedding", "3,D", "weights/role_embedding"},
+		{"attn_q", "D,D", "weights/attn_q"},
+		{"attn_k", "D,D", "weights/attn_k"},
+		{"attn_v", "D,D", "weights/attn_v"},
+		{"attn_o", "D,D", "weights/attn_o"},
+		{"ffn_up", "D,H", "weights/ffn_up"},
+		{"projection", "H,D", "weights/projection"},
+	}
+	if got := len(params); got != len(want) {
+		t.Fatalf("param count = %d, want %d", got, len(want))
+	}
+	for i, wantParam := range want {
+		param := params[i]
+		if param.Name != wantParam.name {
+			t.Fatalf("param[%d] name = %q, want %q", i, param.Name, wantParam.name)
+		}
 		if !param.Trainable {
 			t.Fatalf("param %q is not trainable", param.Name)
 		}
-		if param.Type.Tensor == nil || param.Type.Tensor.DType != "q4" {
-			t.Fatalf("param %q dtype = %+v, want q4 tensor", param.Name, param.Type)
+		if param.Binding != wantParam.binding {
+			t.Fatalf("param %q binding = %q, want %q", param.Name, param.Binding, wantParam.binding)
+		}
+		if param.Type.Tensor == nil {
+			t.Fatalf("param %q type = %+v, want tensor", param.Name, param.Type)
+		}
+		if param.Type.Tensor.DType != dtype {
+			t.Fatalf("param %q dtype = %q, want %s", param.Name, param.Type.Tensor.DType, dtype)
+		}
+		if got := strings.Join(param.Type.Tensor.Shape, ","); got != wantParam.shape {
+			t.Fatalf("param %q shape = %q, want %q", param.Name, got, wantParam.shape)
 		}
 	}
+}
+
+func assertValueBinding(t *testing.T, bindings []eosartifact.ValueBinding, name, dtype, shape string) {
+	t.Helper()
+	for _, binding := range bindings {
+		if binding.Name != name {
+			continue
+		}
+		if binding.Type.Tensor == nil {
+			t.Fatalf("binding %q type = %+v, want tensor", name, binding.Type)
+		}
+		if binding.Type.Tensor.DType != dtype {
+			t.Fatalf("binding %q dtype = %q, want %q", name, binding.Type.Tensor.DType, dtype)
+		}
+		if got := strings.Join(binding.Type.Tensor.Shape, ","); got != shape {
+			t.Fatalf("binding %q shape = %q, want %q", name, got, shape)
+		}
+		return
+	}
+	t.Fatalf("missing binding %q in %+v", name, bindings)
+}
+
+func hasStep(steps []eosartifact.Step, kind eosartifact.StepKind, inputs string) bool {
+	for _, step := range steps {
+		if step.Kind == kind && strings.Join(step.Inputs, ",") == inputs {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildTinyAttentionEmbedSource(t *testing.T) {
