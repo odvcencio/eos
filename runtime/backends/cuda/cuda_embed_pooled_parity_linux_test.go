@@ -71,12 +71,20 @@ func parityRunEmbed(t *testing.T, b backend.Backend, src []byte, preset compiler
 		toks[i] = int32(i % 8)
 		mask[i] = 1
 	}
+	inputs := map[string]any{
+		"tokens":         backend.NewTensorI32([]int{tokens}, toks),
+		"attention_mask": backend.NewTensorI32([]int{tokens}, mask),
+	}
+	if preset == compiler.PresetEncoderTrainableQ8x2 || preset == compiler.PresetEncoderTrainableQ4x2 {
+		roles := make([]int32, tokens)
+		for i := range roles {
+			roles[i] = int32(i % 3)
+		}
+		inputs["role_ids"] = backend.NewTensorI32([]int{tokens}, roles)
+	}
 	result, err := prog.Run(context.Background(), backend.Request{
-		Entry: "embed_pooled",
-		Inputs: map[string]any{
-			"tokens":         backend.NewTensorI32([]int{tokens}, toks),
-			"attention_mask": backend.NewTensorI32([]int{tokens}, mask),
-		},
+		Entry:  "embed_pooled",
+		Inputs: inputs,
 	})
 	if err != nil {
 		t.Fatalf("run: %v", err)
@@ -218,6 +226,7 @@ func TestCUDAEncoderEmbedMatchesHost(t *testing.T) {
 		h := d * 2
 		weights := map[string]*backend.Tensor{
 			"token_embedding": parityGenTensor("q8", 8, d, 1),
+			"role_embedding":  parityGenTensor("q8", 3, d, 8),
 			"attn_q":          parityGenTensor("q8", d, d, 2),
 			"attn_k":          parityGenTensor("q8", d, d, 3),
 			"attn_v":          parityGenTensor("q8", d, d, 4),

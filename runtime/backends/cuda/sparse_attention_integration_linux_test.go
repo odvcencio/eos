@@ -3,6 +3,8 @@
 package cuda
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -84,7 +86,7 @@ func TestCUDATurboSparseAttentionStepMatchesReference(t *testing.T) {
 		10, 0, -10,
 		0, 20, 0,
 	})
-	attrs := map[string]string{"bits": "4", "seed": "77", "top_k": "1"}
+	attrs := map[string]string{"bits": "4", "seed": "77", "rounds": "1", "top_k": "1"}
 	keyCoords, keyNorms, err := backend.TurboQuantEncodeReference(keyNCHW, attrs)
 	if err != nil {
 		t.Fatal(err)
@@ -126,6 +128,130 @@ func TestCUDATurboSparseAttentionStepMatchesReference(t *testing.T) {
 	assertTensorClose(t, got.Outputs[0], want.Shape, want.F32)
 }
 
+func TestCUDATurboSparseAttentionRoundPlanningContract(t *testing.T) {
+	query, keyCoords, keyNorms, valueCoords, valueNorms := turboSparseRoundContractInputs(t)
+	base := map[string]string{"bits": "4", "seed": "77", "top_k": "1"}
+	step := eosartifact.Step{Kind: eosartifact.StepTurboSparseAttention, Attributes: cloneTurboRoundAttrs(base)}
+	inputs := []*backend.Tensor{query, keyCoords, keyNorms, valueCoords, valueNorms}
+	if _, ok := planBuiltinTurboSparseAttention(step, inputs); ok {
+		t.Fatal("cuda turbo_sparse_attention planned default multi-round Hadamard spec; want fail-closed until CUDA supports it")
+	}
+	step.Attributes["rounds"] = "3"
+	if _, ok := planBuiltinTurboSparseAttention(step, inputs); ok {
+		t.Fatal("cuda turbo_sparse_attention planned explicit multi-round Hadamard spec; want fail-closed until CUDA supports it")
+	}
+	step.Attributes["rounds"] = "bogus"
+	if _, ok := planBuiltinTurboSparseAttention(step, inputs); ok {
+		t.Fatal("cuda turbo_sparse_attention planned malformed rounds")
+	}
+	step.Attributes["rounds"] = "1"
+	if _, ok := planBuiltinTurboSparseAttention(step, inputs); !ok {
+		t.Fatal("cuda turbo_sparse_attention rejected explicit rounds=1")
+	}
+}
+
+func TestCUDATurboSparseAttentionExecutorFailsClosedForUnsupportedRounds(t *testing.T) {
+	rt, err := newDeviceRuntime()
+	if err != nil {
+		t.Skipf("no cuda runtime available: %v", err)
+	}
+	if rt == nil {
+		t.Skip("no cuda runtime available")
+	}
+	defer rt.close()
+
+	query, keyCoords, keyNorms, valueCoords, valueNorms := turboSparseRoundContractInputs(t)
+	for _, tc := range []struct {
+		name    string
+		attrs   map[string]string
+		wantErr string
+	}{
+		{name: "default-multi-round", attrs: map[string]string{"bits": "4", "seed": "77", "top_k": "1"}, wantErr: "requires rounds=1"},
+		{name: "explicit-multi-round", attrs: map[string]string{"bits": "4", "seed": "77", "rounds": "3", "top_k": "1"}, wantErr: "requires rounds=1"},
+		{name: "malformed-rounds", attrs: map[string]string{"bits": "4", "seed": "77", "rounds": "bogus", "top_k": "1"}, wantErr: "invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := runCUDATurboSparseModule(rt, tc.attrs, query, keyCoords, keyNorms, valueCoords, valueNorms)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("run error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	result, err := runCUDATurboSparseModule(rt, map[string]string{"bits": "4", "seed": "77", "rounds": "1", "top_k": "1"}, query, keyCoords, keyNorms, valueCoords, valueNorms)
+	if err != nil {
+		t.Fatalf("run rounds=1: %v", err)
+	}
+	if got := result.Outputs["out"].Metadata["execution_mode"]; got != "cuda_device" {
+		t.Fatalf("rounds=1 execution_mode = %v, want cuda_device", got)
+	}
+	if got := result.Outputs["out"].Metadata["rounds"]; got != 1 {
+		t.Fatalf("rounds metadata = %v, want 1", got)
+	}
+}
+
+func turboSparseRoundContractInputs(t *testing.T) (*backend.Tensor, *backend.Tensor, *backend.Tensor, *backend.Tensor, *backend.Tensor) {
+	t.Helper()
+	attrs := map[string]string{"bits": "4", "seed": "77", "rounds": "1", "top_k": "1"}
+	query := backend.NewTensorF16([]int{2, 2}, []float32{
+		1, 0,
+		0, 1,
+	})
+	keyNCHW := backend.NewTensorF16([]int{1, 2, 3, 1}, []float32{
+		1, 0, -1,
+		0, 1, 0,
+	})
+	valueNCHW := backend.NewTensorF16([]int{1, 2, 3, 1}, []float32{
+		10, 0, -10,
+		0, 20, 0,
+	})
+	keyCoords, keyNorms, err := backend.TurboQuantEncodeReference(keyNCHW, attrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valueCoords, valueNorms, err := backend.TurboQuantEncodeReference(valueNCHW, attrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return query, keyCoords, keyNorms, valueCoords, valueNorms
+}
+
+func runCUDATurboSparseModule(rt *deviceRuntime, attrs map[string]string, query, keyCoords, keyNorms, valueCoords, valueNorms *backend.Tensor) (backend.Result, error) {
+	mod := eosartifact.NewModule("cuda_turbo_sparse_rounds_contract")
+	mod.EntryPoints = []eosartifact.EntryPoint{{
+		Name: "attend",
+		Kind: eosartifact.EntryPointPipeline,
+		Inputs: []eosartifact.ValueBinding{
+			{Name: "q", Type: cudaTensorValueType("f16", []string{"2", "2"})},
+			{Name: "kc", Type: cudaTensorValueType("q4", []string{"1", "2", "3", "1"})},
+			{Name: "kn", Type: cudaTensorValueType("q_norm", []string{"1", "3", "1"})},
+			{Name: "vc", Type: cudaTensorValueType("q4", []string{"1", "2", "3", "1"})},
+			{Name: "vn", Type: cudaTensorValueType("q_norm", []string{"1", "3", "1"})},
+		},
+		Outputs: []eosartifact.ValueBinding{
+			{Name: "out", Type: cudaTensorValueType("f16", []string{"2", "2"})},
+		},
+	}}
+	mod.Buffers = []eosartifact.Buffer{
+		{Name: "out", DType: "f16", Shape: []string{"2", "2"}},
+	}
+	mod.Steps = []eosartifact.Step{
+		{Entry: "attend", Kind: eosartifact.StepTurboSparseAttention, Name: "attend", Inputs: []string{"q", "kc", "kn", "vc", "vn"}, Outputs: []string{"out"}, Attributes: cloneTurboRoundAttrs(attrs)},
+		{Entry: "attend", Kind: eosartifact.StepReturn, Name: "return", Outputs: []string{"out"}},
+	}
+	exec := &executor{module: mod, device: rt}
+	return backend.ExecuteSymbolic(context.Background(), mod, nil, nil, exec.dispatchKernel, exec.dispatchStep, eosartifact.BackendCUDA, backend.Request{
+		Entry: "attend",
+		Inputs: map[string]any{
+			"q":  query,
+			"kc": keyCoords,
+			"kn": keyNorms,
+			"vc": valueCoords,
+			"vn": valueNorms,
+		},
+	})
+}
+
 func TestCUDATurboSparseAttentionBatchedStepMatchesReference(t *testing.T) {
 	rt, err := newDeviceRuntime()
 	if err != nil {
@@ -152,7 +278,7 @@ func TestCUDATurboSparseAttentionBatchedStepMatchesReference(t *testing.T) {
 		1, 2, 3,
 		100, 200, 300,
 	})
-	attrs := map[string]string{"bits": "4", "seed": "91", "top_k": "1"}
+	attrs := map[string]string{"bits": "4", "seed": "91", "rounds": "1", "top_k": "1"}
 	keyCoords, keyNorms, err := backend.TurboQuantEncodeReference(keyNCHW, attrs)
 	if err != nil {
 		t.Fatal(err)
@@ -204,6 +330,7 @@ func TestCUDATurboSparseAttentionRoutedStepMatchesReference(t *testing.T) {
 	attrs := map[string]string{
 		"bits":             "4",
 		"seed":             "119",
+		"rounds":           "1",
 		"top_k":            "1",
 		"route_block_size": "2",
 		"route_top_blocks": "1",

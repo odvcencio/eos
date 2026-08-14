@@ -224,7 +224,11 @@ func turboQuantEncodeTensor(input *Tensor, attrs map[string]string) (*Tensor, *T
 	n, channels, height, width := input.Shape[0], input.Shape[1], input.Shape[2], input.Shape[3]
 	coords := tensorForDType(fmt.Sprintf("q%d", bits), append([]int(nil), input.Shape...), input.Elements())
 	norms := NewTensorQNorm([]int{n, height, width}, make([]float32, n*height*width))
-	q := turboquant.NewHadamardWithSeed(channels, bits, seed)
+	rounds, err := turboQuantRoundsAttr(attrs)
+	if err != nil {
+		return nil, nil, err
+	}
+	q := turboquant.NewHadamardRoundsWithSeed(channels, bits, rounds, seed)
 	indices := make([]int, channels)
 	vec := make([]float32, channels)
 	for b := 0; b < n; b++ {
@@ -266,7 +270,11 @@ func turboQuantDecodeTensor(coords, norms *Tensor, attrs map[string]string) (*Te
 	}
 	seed := int64(attrInt(attrs, "seed", 0x4d697261))
 	out := NewTensorF16(append([]int(nil), coords.Shape...), make([]float32, coords.Elements()))
-	q := turboquant.NewHadamardWithSeed(channels, bits, seed)
+	rounds, err := turboQuantRoundsAttr(attrs)
+	if err != nil {
+		return nil, err
+	}
+	q := turboquant.NewHadamardRoundsWithSeed(channels, bits, rounds, seed)
 	indices := make([]int, channels)
 	vec := make([]float32, channels)
 	for b := 0; b < n; b++ {
@@ -687,6 +695,20 @@ func attrInt(attrs map[string]string, key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func turboQuantRoundsAttr(attrs map[string]string) (int, error) {
+	if attrs == nil || attrs["rounds"] == "" {
+		return turboquant.DefaultHadamardRounds, nil
+	}
+	rounds, err := strconv.Atoi(attrs["rounds"])
+	if err != nil {
+		return 0, fmt.Errorf("turboquant rounds %q is invalid", attrs["rounds"])
+	}
+	if rounds < 1 || rounds > 8 {
+		return 0, fmt.Errorf("turboquant rounds must be between 1 and 8")
+	}
+	return rounds, nil
 }
 
 func attrFloat(attrs map[string]string, key string, fallback float64) float64 {
