@@ -216,9 +216,16 @@ func TestAttentionResidentTrainForwardBackwardMatchesHostReference(t *testing.T)
 			}
 			wantGradInput, wantGradWq, wantGradWk, wantGradWv := hostAttentionResidentTrainBackward(input, wq, wk, wv, wantQ, wantK, wantV, wantProbs, gradMixed, tc.batch, tc.seqLen, tc.d, tc.scale)
 			assertFloatSlicesClose(t, bwd.GradInput.F32, wantGradInput, 1e-4)
-			assertFloatSlicesClose(t, bwd.GradQueryWeight.F32, wantGradWq, 1e-4)
-			assertFloatSlicesClose(t, bwd.GradKeyWeight.F32, wantGradWk, 1e-4)
-			assertFloatSlicesClose(t, bwd.GradValueWeight.F32, wantGradWv, 1e-4)
+			gradWq, gradWk, gradWv, err := rt.flushAttentionResidentTrainWeightGradients(queryName, keyName, valueName)
+			if err != nil {
+				t.Fatalf("flush gradients: %v", err)
+			}
+			if gradWq == nil || gradWk == nil || gradWv == nil {
+				t.Fatalf("flush gradients returned nil tensors: wq=%v wk=%v wv=%v", gradWq, gradWk, gradWv)
+			}
+			assertFloatSlicesClose(t, gradWq.F32, wantGradWq, 1e-4)
+			assertFloatSlicesClose(t, gradWk.F32, wantGradWk, 1e-4)
+			assertFloatSlicesClose(t, gradWv.F32, wantGradWv, 1e-4)
 
 			if err := rt.endOrAbortAttentionResidentTrainStep(1); err != nil {
 				t.Fatalf("end step: %v", err)

@@ -133,8 +133,15 @@ func TestFFNResidentTrainForwardBackwardMatchesHostReference(t *testing.T) {
 			}
 			wantGradInput, wantGradWup, wantGradWdown := hostFFNResidentTrainBackward(input, wup, wdown, wantFFNHidden, wantActivated, gradFFNOutput, tc.seqLen, tc.d, tc.h, tc.e)
 			assertFloatSlicesClose(t, bwd.GradInput.F32, wantGradInput, 1e-4)
-			assertFloatSlicesClose(t, bwd.GradHiddenWeight.F32, wantGradWup, 1e-4)
-			assertFloatSlicesClose(t, bwd.GradOutputWeight.F32, wantGradWdown, 1e-4)
+			gradWup, gradWdown, err := rt.flushFFNResidentTrainWeightGradients(hiddenWeightName, outputWeightName)
+			if err != nil {
+				t.Fatalf("flush gradients: %v", err)
+			}
+			if gradWup == nil || gradWdown == nil {
+				t.Fatalf("flush gradients returned nil tensors: wup=%v wdown=%v", gradWup, gradWdown)
+			}
+			assertFloatSlicesClose(t, gradWup.F32, wantGradWup, 1e-4)
+			assertFloatSlicesClose(t, gradWdown.F32, wantGradWdown, 1e-4)
 
 			if err := rt.endOrAbortAttentionResidentTrainStep(1); err != nil {
 				t.Fatalf("end step: %v", err)

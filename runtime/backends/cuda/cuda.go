@@ -10,6 +10,7 @@ import (
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
 	"m31labs.dev/eos/runtime/backend"
+	turboquant "m31labs.dev/turboquant"
 )
 
 type cachedLoad struct {
@@ -519,6 +520,16 @@ func (e *executor) dispatchStep(_ context.Context, step eosartifact.Step, output
 		if e.device == nil {
 			return backend.StepDispatchResult{}, false, nil
 		}
+		rounds, err := cudaTurboQRoundsAttr(step.Attributes)
+		if err != nil {
+			return backend.StepDispatchResult{}, true, err
+		}
+		if rounds != 1 {
+			if _, ok := planBuiltinTurboQEncodeWithRounds(step, inputs, 1); ok {
+				return backend.StepDispatchResult{}, true, fmt.Errorf("cuda turboquant_encode requires rounds=1; got %d", rounds)
+			}
+			return backend.StepDispatchResult{}, false, nil
+		}
 		cfg, ok := planBuiltinTurboQEncode(step, inputs)
 		if !ok {
 			return backend.StepDispatchResult{}, false, nil
@@ -530,6 +541,16 @@ func (e *executor) dispatchStep(_ context.Context, step eosartifact.Step, output
 		return result, true, nil
 	case eosartifact.StepTurboQDecode:
 		if e.device == nil {
+			return backend.StepDispatchResult{}, false, nil
+		}
+		rounds, err := cudaTurboQRoundsAttr(step.Attributes)
+		if err != nil {
+			return backend.StepDispatchResult{}, true, err
+		}
+		if rounds != 1 {
+			if _, ok := planBuiltinTurboQDecodeWithRounds(step, inputs, 1); ok {
+				return backend.StepDispatchResult{}, true, fmt.Errorf("cuda turboquant_decode requires rounds=1; got %d", rounds)
+			}
 			return backend.StepDispatchResult{}, false, nil
 		}
 		cfg, ok := planBuiltinTurboQDecode(step, inputs)
@@ -556,6 +577,16 @@ func (e *executor) dispatchStep(_ context.Context, step eosartifact.Step, output
 		return result, true, nil
 	case eosartifact.StepTurboSparseAttention:
 		if e.device == nil {
+			return backend.StepDispatchResult{}, false, nil
+		}
+		rounds, err := cudaTurboQRoundsAttr(step.Attributes)
+		if err != nil {
+			return backend.StepDispatchResult{}, true, err
+		}
+		if rounds != 1 {
+			if _, ok := planBuiltinTurboSparseAttentionWithRounds(step, inputs, 1); ok {
+				return backend.StepDispatchResult{}, true, fmt.Errorf("cuda turbo_sparse_attention requires rounds=1; got %d", rounds)
+			}
 			return backend.StepDispatchResult{}, false, nil
 		}
 		cfg, ok := planBuiltinTurboSparseAttention(step, inputs)
@@ -854,6 +885,7 @@ func planBuiltinConv2DTranspose(step eosartifact.Step, inputs []*backend.Tensor)
 type cudaTurboQConfig struct {
 	bits     int
 	seed     int64
+	rounds   int
 	batches  int
 	channels int
 	height   int
@@ -886,6 +918,14 @@ type cudaTurboSparseAttentionConfig struct {
 }
 
 func planBuiltinTurboQEncode(step eosartifact.Step, inputs []*backend.Tensor) (cudaTurboQConfig, bool) {
+	rounds, err := cudaTurboQRoundsAttr(step.Attributes)
+	if err != nil || rounds != 1 {
+		return cudaTurboQConfig{}, false
+	}
+	return planBuiltinTurboQEncodeWithRounds(step, inputs, rounds)
+}
+
+func planBuiltinTurboQEncodeWithRounds(step eosartifact.Step, inputs []*backend.Tensor, rounds int) (cudaTurboQConfig, bool) {
 	if len(inputs) != 1 || inputs[0] == nil {
 		return cudaTurboQConfig{}, false
 	}
@@ -903,6 +943,7 @@ func planBuiltinTurboQEncode(step eosartifact.Step, inputs []*backend.Tensor) (c
 	return cudaTurboQConfig{
 		bits:     bits,
 		seed:     stepAttrInt64(step.Attributes, "seed", 0x4d697261),
+		rounds:   rounds,
 		batches:  input.Shape[0],
 		channels: input.Shape[1],
 		height:   input.Shape[2],
@@ -911,6 +952,14 @@ func planBuiltinTurboQEncode(step eosartifact.Step, inputs []*backend.Tensor) (c
 }
 
 func planBuiltinTurboQDecode(step eosartifact.Step, inputs []*backend.Tensor) (cudaTurboQConfig, bool) {
+	rounds, err := cudaTurboQRoundsAttr(step.Attributes)
+	if err != nil || rounds != 1 {
+		return cudaTurboQConfig{}, false
+	}
+	return planBuiltinTurboQDecodeWithRounds(step, inputs, rounds)
+}
+
+func planBuiltinTurboQDecodeWithRounds(step eosartifact.Step, inputs []*backend.Tensor, rounds int) (cudaTurboQConfig, bool) {
 	if len(inputs) != 2 || inputs[0] == nil || inputs[1] == nil {
 		return cudaTurboQConfig{}, false
 	}
@@ -931,6 +980,7 @@ func planBuiltinTurboQDecode(step eosartifact.Step, inputs []*backend.Tensor) (c
 	return cudaTurboQConfig{
 		bits:     bits,
 		seed:     stepAttrInt64(step.Attributes, "seed", 0x4d697261),
+		rounds:   rounds,
 		batches:  coords.Shape[0],
 		channels: coords.Shape[1],
 		height:   coords.Shape[2],
@@ -998,6 +1048,14 @@ func planBuiltinSparseAttention(step eosartifact.Step, inputs []*backend.Tensor)
 }
 
 func planBuiltinTurboSparseAttention(step eosartifact.Step, inputs []*backend.Tensor) (cudaTurboSparseAttentionConfig, bool) {
+	rounds, err := cudaTurboQRoundsAttr(step.Attributes)
+	if err != nil || rounds != 1 {
+		return cudaTurboSparseAttentionConfig{}, false
+	}
+	return planBuiltinTurboSparseAttentionWithRounds(step, inputs, rounds)
+}
+
+func planBuiltinTurboSparseAttentionWithRounds(step eosartifact.Step, inputs []*backend.Tensor, rounds int) (cudaTurboSparseAttentionConfig, bool) {
 	if len(inputs) != 5 || inputs[0] == nil || inputs[1] == nil || inputs[2] == nil || inputs[3] == nil || inputs[4] == nil {
 		return cudaTurboSparseAttentionConfig{}, false
 	}
@@ -1081,6 +1139,7 @@ func planBuiltinTurboSparseAttention(step eosartifact.Step, inputs []*backend.Te
 	keyCfg := cudaTurboQConfig{
 		bits:     bits,
 		seed:     seed,
+		rounds:   rounds,
 		batches:  batches,
 		channels: queryDim,
 		height:   keyLen,
@@ -1089,6 +1148,7 @@ func planBuiltinTurboSparseAttention(step eosartifact.Step, inputs []*backend.Te
 	valueCfg := cudaTurboQConfig{
 		bits:     bits,
 		seed:     seed,
+		rounds:   rounds,
 		batches:  batches,
 		channels: valueDim,
 		height:   keyLen,
@@ -1361,6 +1421,20 @@ func stepAttrInt(attrs map[string]string, key string, fallback int) int {
 		return fallback
 	}
 	return value
+}
+
+func cudaTurboQRoundsAttr(attrs map[string]string) (int, error) {
+	if attrs == nil || attrs["rounds"] == "" {
+		return turboquant.DefaultHadamardRounds, nil
+	}
+	rounds, err := strconv.Atoi(attrs["rounds"])
+	if err != nil {
+		return 0, fmt.Errorf("cuda turboquant rounds %q is invalid", attrs["rounds"])
+	}
+	if rounds < 1 || rounds > 8 {
+		return 0, fmt.Errorf("cuda turboquant rounds must be between 1 and 8")
+	}
+	return rounds, nil
 }
 
 func stepAttrFloat32(attrs map[string]string, key string, fallback float32) float32 {

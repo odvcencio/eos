@@ -40,6 +40,16 @@ func TestEmbeddingTrainProfileRoundTrip(t *testing.T) {
 				RunNanos:           7000,
 			},
 		},
+		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
+			EncodeNanos:         11,
+			ProjectionLossNanos: 22,
+			BackwardNanos:       33,
+			OptimizerNanos:      44,
+			EncodeCalls:         1,
+			ProjectionLossCalls: 2,
+			BackwardCalls:       2,
+			OptimizerCalls:      1,
+		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:         4,
 			TensorUpdateCalls:    13,
@@ -94,6 +104,7 @@ func TestEmbeddingTrainProfileRoundTrip(t *testing.T) {
 	if got.ForwardResidency.MatMul.RunUploadedBytes != want.ForwardResidency.MatMul.RunUploadedBytes {
 		t.Fatalf("run uploaded bytes = %d, want %d", got.ForwardResidency.MatMul.RunUploadedBytes, want.ForwardResidency.MatMul.RunUploadedBytes)
 	}
+	assertVectorDistillProfilePhases(t, got.VectorDistillPhases, want.VectorDistillPhases)
 	if got.Optimizer.UpdateCalls != want.Optimizer.UpdateCalls {
 		t.Fatalf("optimizer update calls = %d, want %d", got.Optimizer.UpdateCalls, want.Optimizer.UpdateCalls)
 	}
@@ -181,6 +192,16 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 	left := EmbeddingTrainProfile{
 		Version:          EmbeddingTrainProfileVersion,
 		OptimizerBackend: eosartifact.BackendCUDA,
+		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
+			EncodeNanos:         10,
+			ProjectionLossNanos: 20,
+			BackwardNanos:       30,
+			OptimizerNanos:      40,
+			EncodeCalls:         1,
+			ProjectionLossCalls: 2,
+			BackwardCalls:       2,
+			OptimizerCalls:      1,
+		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:         2,
 			TensorUpdateCalls:    9,
@@ -195,6 +216,16 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 	right := EmbeddingTrainProfile{
 		Version:          EmbeddingTrainProfileVersion,
 		OptimizerBackend: eosartifact.BackendCUDA,
+		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
+			EncodeNanos:         100,
+			ProjectionLossNanos: 200,
+			BackwardNanos:       300,
+			OptimizerNanos:      400,
+			EncodeCalls:         3,
+			ProjectionLossCalls: 6,
+			BackwardCalls:       6,
+			OptimizerCalls:      3,
+		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:         3,
 			TensorUpdateCalls:    11,
@@ -218,10 +249,30 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 		LastForcedSyncReason: "right-capacity",
 		ResidentParams:       4,
 	})
+	assertVectorDistillProfilePhases(t, merged.VectorDistillPhases, EmbeddingVectorDistillPhaseTimers{
+		EncodeNanos:         110,
+		ProjectionLossNanos: 220,
+		BackwardNanos:       330,
+		OptimizerNanos:      440,
+		EncodeCalls:         4,
+		ProjectionLossCalls: 8,
+		BackwardCalls:       8,
+		OptimizerCalls:      4,
+	})
 
 	base := EmbeddingTrainProfile{
 		Version:          EmbeddingTrainProfileVersion,
 		OptimizerBackend: eosartifact.BackendKind("host"),
+		VectorDistillPhases: EmbeddingVectorDistillPhaseTimers{
+			EncodeNanos:         1000,
+			ProjectionLossNanos: 2000,
+			BackwardNanos:       3000,
+			OptimizerNanos:      4000,
+			EncodeCalls:         10,
+			ProjectionLossCalls: 20,
+			BackwardCalls:       20,
+			OptimizerCalls:      10,
+		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:         10,
 			TensorUpdateCalls:    100,
@@ -243,6 +294,16 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 		ForcedSyncCalls:      6,
 		LastForcedSyncReason: "right-capacity",
 		ResidentParams:       4,
+	})
+	assertVectorDistillProfilePhases(t, applied.VectorDistillPhases, EmbeddingVectorDistillPhaseTimers{
+		EncodeNanos:         1100,
+		ProjectionLossNanos: 2200,
+		BackwardNanos:       3300,
+		OptimizerNanos:      4400,
+		EncodeCalls:         13,
+		ProjectionLossCalls: 26,
+		BackwardCalls:       26,
+		OptimizerCalls:      13,
 	})
 }
 
@@ -376,5 +437,33 @@ func assertOptimizerProfileCounters(t *testing.T, got, want backend.OptimizerAcc
 	}
 	if got.ResidentParams != want.ResidentParams {
 		t.Fatalf("resident params = %d, want %d", got.ResidentParams, want.ResidentParams)
+	}
+}
+
+func assertVectorDistillProfilePhases(t *testing.T, got, want EmbeddingVectorDistillPhaseTimers) {
+	t.Helper()
+	if got.EncodeNanos != want.EncodeNanos {
+		t.Fatalf("encode nanos = %d, want %d", got.EncodeNanos, want.EncodeNanos)
+	}
+	if got.ProjectionLossNanos != want.ProjectionLossNanos {
+		t.Fatalf("projection/loss nanos = %d, want %d", got.ProjectionLossNanos, want.ProjectionLossNanos)
+	}
+	if got.BackwardNanos != want.BackwardNanos {
+		t.Fatalf("backward nanos = %d, want %d", got.BackwardNanos, want.BackwardNanos)
+	}
+	if got.OptimizerNanos != want.OptimizerNanos {
+		t.Fatalf("optimizer nanos = %d, want %d", got.OptimizerNanos, want.OptimizerNanos)
+	}
+	if got.EncodeCalls != want.EncodeCalls {
+		t.Fatalf("encode calls = %d, want %d", got.EncodeCalls, want.EncodeCalls)
+	}
+	if got.ProjectionLossCalls != want.ProjectionLossCalls {
+		t.Fatalf("projection/loss calls = %d, want %d", got.ProjectionLossCalls, want.ProjectionLossCalls)
+	}
+	if got.BackwardCalls != want.BackwardCalls {
+		t.Fatalf("backward calls = %d, want %d", got.BackwardCalls, want.BackwardCalls)
+	}
+	if got.OptimizerCalls != want.OptimizerCalls {
+		t.Fatalf("optimizer calls = %d, want %d", got.OptimizerCalls, want.OptimizerCalls)
 	}
 }

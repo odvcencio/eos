@@ -165,6 +165,50 @@ func (rt *deviceRuntime) runMatMulWithBoundLeft(leftName string, rhs *backend.Te
 	return backend.StepDispatchResult{}, nil
 }
 
+func (rt *deviceRuntime) runAttentionBlockResident(req backend.AttentionResidentRequest) (backend.AttentionResidentResult, error) {
+	return backend.AttentionResidentResult{}, fmt.Errorf("cuda attention resident block is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) beginAttentionResidentTrainStep(stepID uint64) error {
+	return fmt.Errorf("cuda attention resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) runAttentionBlockResidentTrainForward(req backend.AttentionResidentTrainForwardRequest) (backend.AttentionResidentTrainForwardResult, error) {
+	return backend.AttentionResidentTrainForwardResult{}, fmt.Errorf("cuda attention resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) runAttentionBlockResidentTrainBackward(req backend.AttentionResidentTrainBackwardRequest) (backend.AttentionResidentTrainBackwardResult, error) {
+	return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("cuda attention resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) flushAttentionResidentTrainWeightGradients(queryName, keyName, valueName string) (*backend.Tensor, *backend.Tensor, *backend.Tensor, error) {
+	return nil, nil, nil, fmt.Errorf("cuda attention resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) endOrAbortAttentionResidentTrainStep(stepID uint64) error {
+	return fmt.Errorf("cuda attention resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) releaseAttentionResidentTrainHandle(handle backend.AttentionResidentTrainHandle) error {
+	return fmt.Errorf("cuda attention resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) runFFNBlockResidentTrainForward(req backend.FFNResidentTrainForwardRequest) (backend.FFNResidentTrainForwardResult, error) {
+	return backend.FFNResidentTrainForwardResult{}, fmt.Errorf("cuda ffn resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) runFFNBlockResidentTrainBackward(req backend.FFNResidentTrainBackwardRequest) (backend.FFNResidentTrainBackwardResult, error) {
+	return backend.FFNResidentTrainBackwardResult{}, fmt.Errorf("cuda ffn resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) flushFFNResidentTrainWeightGradients(hiddenWeightName, outputWeightName string) (*backend.Tensor, *backend.Tensor, error) {
+	return nil, nil, fmt.Errorf("cuda ffn resident train is unavailable without linux cgo")
+}
+
+func (rt *deviceRuntime) releaseFFNResidentTrainHandle(handle backend.FFNResidentTrainHandle) error {
+	return fmt.Errorf("cuda ffn resident train is unavailable without linux cgo")
+}
+
 func (rt *deviceRuntime) runBGEFullEncoderHidden(step eosartifact.Step, outputType eosartifact.ValueType, inputs []*backend.Tensor) (backend.StepDispatchResult, bertCUDAFullEncoderTransferStats, error) {
 	return backend.StepDispatchResult{}, bertCUDAFullEncoderTransferStats{}, nil
 }

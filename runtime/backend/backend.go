@@ -537,18 +537,33 @@ type AttentionResidentTrainForwardRequest struct {
 	// caller need not set this field).
 	Scale  float32
 	StepID uint64
+	// SkipUnreadDownload is S3(d)'s refcount-gated forward-download elision:
+	// when true, the caller has proven this encoded sequence is referenced
+	// exactly once for this training step AND backward is guaranteed to
+	// reach it through the singular per-sequence resident path (see
+	// EmbeddingTrainer.residentDownloadElisionSafe), so host code will never
+	// read Query/Key/Value/Scores between this forward call and the
+	// matching backward call. The accelerator must still compute and keep
+	// every buffer device-resident -- backward's algebra is unchanged --
+	// it only skips their D2H copy, leaving the corresponding
+	// AttentionResidentTrainForwardResult fields nil. Mixed is unaffected:
+	// the caller's forward continuation (the Wo projection) always reads
+	// it, so it is always downloaded regardless of this flag.
+	SkipUnreadDownload bool
 }
 
 // AttentionResidentTrainForwardResult returns the same host-visible
 // activations AttentionResidentResult does, plus the handle
 // RunAttentionBlockResidentTrainBackward needs to find this call's
-// still-resident Q/K/V/scores/input buffers.
+// still-resident Q/K/V/scores/input buffers. Query/Key/Value/Scores are nil
+// when the matching request set SkipUnreadDownload and the accelerator
+// honored it; Mixed is always populated.
 type AttentionResidentTrainForwardResult struct {
 	Handle AttentionResidentTrainHandle
-	Query  *Tensor // [Batch*SeqLen, ModelDim]
-	Key    *Tensor // [Batch*SeqLen, ModelDim]
-	Value  *Tensor // [Batch*SeqLen, ModelDim]
-	Scores *Tensor // [Batch*SeqLen, SeqLen], post-softmax
+	Query  *Tensor // [Batch*SeqLen, ModelDim], nil when SkipUnreadDownload
+	Key    *Tensor // [Batch*SeqLen, ModelDim], nil when SkipUnreadDownload
+	Value  *Tensor // [Batch*SeqLen, ModelDim], nil when SkipUnreadDownload
+	Scores *Tensor // [Batch*SeqLen, SeqLen], post-softmax, nil when SkipUnreadDownload
 	Mixed  *Tensor // [Batch*SeqLen, ModelDim]
 }
 
@@ -563,36 +578,57 @@ type AttentionResidentTrainBackwardRequest struct {
 	GradMixed *Tensor // [Batch*SeqLen, ModelDim]
 }
 
-// AttentionResidentTrainBackwardResult returns the attention block's Q/K/V
-// weight-gradient contributions and the gradient flowing back into the
-// block's input -- the Q/K/V-path contribution only; the caller still adds
-// any attention-residual pass-through itself, matching how
+// AttentionResidentTrainBackwardResult returns the gradient flowing back
+// into the block's input -- the Q/K/V-path contribution only; the caller
+// still adds any attention-residual pass-through itself, matching how
 // backpropAttentionSequences composes its own per-call matmul results.
+// S3(d): the Wq/Wk/Wv weight-gradient contribution is no longer downloaded
+// per call -- the accelerator accumulates it device-side across every
+// backward call in the step instead (see
+// FlushAttentionResidentTrainWeightGradients).
 type AttentionResidentTrainBackwardResult struct {
-	GradInput       *Tensor // [Batch*SeqLen, ModelDim]
-	GradQueryWeight *Tensor // [ModelDim, ModelDim]
-	GradKeyWeight   *Tensor // [ModelDim, ModelDim]
-	GradValueWeight *Tensor // [ModelDim, ModelDim]
+	GradInput *Tensor // [Batch*SeqLen, ModelDim]
 }
 
 // AttentionResidentTrainAccelerator optionally executes one attention
 // block's forward AND backward without any intermediate host round trip
 // beyond the forward input/mask upload, the forward Q/K/V/scores/mixed
-// download (unchanged from AttentionResidentAccelerator), the backward
-// gradMixed upload, and the backward gradInput/gradWq/gradWk/gradWv
-// download. Q, K, V, scores, and the flattened input stay device-resident
-// across the forward/backward boundary under the returned handle. Mirrors
-// CompactTrainAccelerator's Begin/Forward/Backward/End/Abort/Release
-// lifecycle at attention-block granularity: BeginAttentionResidentTrainStep
-// must run before any forward/backward call for that step, and
-// EndAttentionResidentTrainStep (success) or AbortAttentionResidentTrainStep
-// (failure) must run after, releasing every handle still live for the step
-// so a later step can never observe an earlier step's activations.
+// download (unchanged from AttentionResidentAccelerator, minus whatever
+// SkipUnreadDownload elides per S3(d)), the backward gradMixed upload, and
+// the backward gradInput download. Q, K, V, scores, and the flattened input
+// stay device-resident across the forward/backward boundary under the
+// returned handle. Mirrors CompactTrainAccelerator's
+// Begin/Forward/Backward/End/Abort/Release lifecycle at attention-block
+// granularity: BeginAttentionResidentTrainStep must run before any
+// forward/backward call for that step, and EndAttentionResidentTrainStep
+// (success) or AbortAttentionResidentTrainStep (failure) must run after,
+// releasing every handle still live for the step so a later step can never
+// observe an earlier step's activations.
+//
+// S3(d) adds device-side Wq/Wk/Wv weight-gradient accumulation: every
+// RunAttentionBlockResidentTrainBackward call in a step adds its
+// contribution into a step-scoped device accumulator (instead of
+// downloading its own copy), and FlushAttentionResidentTrainWeightGradients
+// downloads the accumulated sum exactly once. Implementations that do not
+// support accumulation may leave the accumulator empty and always return
+// nil from Flush; callers must treat a nil Flush result as "nothing to add"
+// rather than an error.
 type AttentionResidentTrainAccelerator interface {
 	Backend() eosartifact.BackendKind
 	BeginAttentionResidentTrainStep(stepID uint64) error
 	RunAttentionBlockResidentTrainForward(req AttentionResidentTrainForwardRequest) (AttentionResidentTrainForwardResult, error)
 	RunAttentionBlockResidentTrainBackward(req AttentionResidentTrainBackwardRequest) (AttentionResidentTrainBackwardResult, error)
+	// FlushAttentionResidentTrainWeightGradients downloads (once) and resets
+	// to zero the step-scoped, device-accumulated sum of every
+	// RunAttentionBlockResidentTrainBackward call's Wq/Wk/Wv weight-gradient
+	// contribution so far this step. queryName/keyName/valueName identify
+	// which resident weight bindings' accumulators to flush; a name with no
+	// contributions this step returns a nil tensor for that slot and no
+	// error. The caller merges the result additively into its own
+	// accumulator (for example via addFloat32Slice) alongside every
+	// non-resident path's contribution -- this call does not zero or
+	// otherwise touch the caller's own accumulator.
+	FlushAttentionResidentTrainWeightGradients(queryName, keyName, valueName string) (gradWq, gradWk, gradWv *Tensor, err error)
 	EndAttentionResidentTrainStep(stepID uint64) error
 	AbortAttentionResidentTrainStep(stepID uint64) error
 	ReleaseAttentionResidentTrainHandle(handle AttentionResidentTrainHandle) error
@@ -645,17 +681,31 @@ type FFNResidentTrainForwardRequest struct {
 	OutputWeightName string
 	FastGELU         bool
 	StepID           uint64
+	// SkipUnreadDownload mirrors
+	// AttentionResidentTrainForwardRequest.SkipUnreadDownload: true when the
+	// caller has proven this encoded sequence is referenced exactly once
+	// this step AND backward is guaranteed to reach it through the singular
+	// per-sequence resident path, so host code will never read
+	// FFNHidden/Activated between this forward call and the matching
+	// backward call. The accelerator still computes and keeps every buffer
+	// device-resident; it only skips their D2H copy, leaving the
+	// corresponding FFNResidentTrainForwardResult fields nil. FFNOutput is
+	// unaffected: the caller's forward continuation (residual + layer norm)
+	// always reads it, so it is always downloaded regardless of this flag.
+	SkipUnreadDownload bool
 }
 
 // FFNResidentTrainForwardResult returns the FFN block's host-visible
 // activations -- the caller's existing host path still adds the FFN
 // residual and optional layer norm on top of FFNOutput -- plus the handle
 // RunFFNBlockResidentTrainBackward needs to find this call's still-resident
-// ffnHidden/activated/input buffers.
+// ffnHidden/activated/input buffers. FFNHidden/Activated are nil when the
+// matching request set SkipUnreadDownload and the accelerator honored it;
+// FFNOutput is always populated.
 type FFNResidentTrainForwardResult struct {
 	Handle    FFNResidentTrainHandle
-	FFNHidden *Tensor // [SeqLen, HiddenDim], pre-GELU
-	Activated *Tensor // [SeqLen, HiddenDim], post-GELU
+	FFNHidden *Tensor // [SeqLen, HiddenDim], pre-GELU, nil when SkipUnreadDownload
+	Activated *Tensor // [SeqLen, HiddenDim], post-GELU, nil when SkipUnreadDownload
 	FFNOutput *Tensor // [SeqLen, OutputDim]
 }
 
@@ -671,8 +721,7 @@ type FFNResidentTrainBackwardRequest struct {
 	GradFFNOutput *Tensor // [SeqLen, OutputDim]
 }
 
-// FFNResidentTrainBackwardResult returns the FFN block's hidden/output
-// weight-gradient contributions and the gradient flowing back into the
+// FFNResidentTrainBackwardResult returns the gradient flowing back into the
 // block's input (state.hidden) -- the hidden-projection/GELU/output-
 // projection contribution only; the caller still adds any FFN-residual
 // pass-through itself, matching how backpropProjectedFFNSequence composes
@@ -680,26 +729,44 @@ type FFNResidentTrainBackwardRequest struct {
 // AttentionResidentTrainBackwardResult.GradInput -- both mean "gradient
 // flowing into this block's input" -- and deliberately not "GradHidden",
 // which in the trainer package already names the Wup (hidden-projection)
-// weight-gradient accumulator, not an activation gradient.
+// weight-gradient accumulator, not an activation gradient. S3(d): the
+// hidden/output weight-gradient contribution is no longer downloaded per
+// call -- see FlushFFNResidentTrainWeightGradients.
 type FFNResidentTrainBackwardResult struct {
-	GradInput        *Tensor // [SeqLen, InputDim]
-	GradHiddenWeight *Tensor // [InputDim, HiddenDim]
-	GradOutputWeight *Tensor // [HiddenDim, OutputDim]
+	GradInput *Tensor // [SeqLen, InputDim]
 }
 
 // FFNResidentTrainAccelerator optionally executes one FFN block's forward
 // AND backward without any intermediate host round trip beyond the forward
-// input upload, the forward ffnHidden/activated/ffnOutput download, the
-// backward gradFFNOutput upload, and the backward gradHidden/gradHiddenWeight/
-// gradOutputWeight download. It shares BeginAttentionResidentTrainStep/
-// EndAttentionResidentTrainStep/AbortAttentionResidentTrainStep with
-// AttentionResidentTrainAccelerator: a backend implementing both opens and
-// closes exactly one step per training step, and that single step's
-// End/Abort sweeps every live handle of either kind.
+// input upload, the forward ffnHidden/activated/ffnOutput download (minus
+// whatever SkipUnreadDownload elides per S3(d)), the backward gradFFNOutput
+// upload, and the backward gradInput download. It shares
+// BeginAttentionResidentTrainStep/EndAttentionResidentTrainStep/
+// AbortAttentionResidentTrainStep with AttentionResidentTrainAccelerator: a
+// backend implementing both opens and closes exactly one step per training
+// step, and that single step's End/Abort sweeps every live handle of either
+// kind.
+//
+// S3(d) adds device-side hidden/output weight-gradient accumulation,
+// mirroring AttentionResidentTrainAccelerator's Wq/Wk/Wv accumulation: every
+// RunFFNBlockResidentTrainBackward call in a step adds its contribution
+// into a step-scoped device accumulator, and
+// FlushFFNResidentTrainWeightGradients downloads the accumulated sum
+// exactly once.
 type FFNResidentTrainAccelerator interface {
 	Backend() eosartifact.BackendKind
 	RunFFNBlockResidentTrainForward(req FFNResidentTrainForwardRequest) (FFNResidentTrainForwardResult, error)
 	RunFFNBlockResidentTrainBackward(req FFNResidentTrainBackwardRequest) (FFNResidentTrainBackwardResult, error)
+	// FlushFFNResidentTrainWeightGradients downloads (once) and resets to
+	// zero the step-scoped, device-accumulated sum of every
+	// RunFFNBlockResidentTrainBackward call's hidden/output weight-gradient
+	// contribution so far this step. hiddenWeightName/outputWeightName
+	// identify which resident weight bindings' accumulators to flush; a
+	// name with no contributions this step returns a nil tensor for that
+	// slot and no error. The caller merges the result additively into its
+	// own accumulator, mirroring
+	// AttentionResidentTrainAccelerator.FlushAttentionResidentTrainWeightGradients.
+	FlushFFNResidentTrainWeightGradients(hiddenWeightName, outputWeightName string) (gradHiddenWeight, gradOutputWeight *Tensor, err error)
 	ReleaseFFNResidentTrainHandle(handle FFNResidentTrainHandle) error
 }
 

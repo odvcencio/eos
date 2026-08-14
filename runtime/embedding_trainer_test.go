@@ -106,6 +106,17 @@ type countingMatMulAccelerator struct {
 	attnResidentTrainStepID       uint64
 	attnResidentTrainNextID       int
 	attnResidentTrainHandles      map[int]*fakeAttentionResidentTrainHandleState
+	// S3(d) attention weight-gradient device-accumulation fake state: mirrors
+	// the CUDA accelerator's step-scoped gradAccum map (keyed by resident
+	// weight binding name), cleared by Begin/End/AbortAttentionResidentTrainStep
+	// exactly like the CUDA implementation frees its device buffers there.
+	attnResidentTrainGradAccum   map[string]*fakeResidentGradAccumEntry
+	attnResidentTrainFlushCalls  int
+	attnResidentTrainSkippedRuns int
+	attnResidentTrainBackwardErr error
+	attnResidentTrainFlushWq     *backend.Tensor
+	attnResidentTrainFlushWk     *backend.Tensor
+	attnResidentTrainFlushWv     *backend.Tensor
 	// S3(c) FFN-resident-train fake state (see
 	// embedding_trainer_ffn_resident_backward_test.go for the
 	// FFNResidentTrainAccelerator method implementations). Shares the
@@ -116,6 +127,51 @@ type countingMatMulAccelerator struct {
 	ffnResidentTrainReleaseCalls int
 	ffnResidentTrainNextID       int
 	ffnResidentTrainHandles      map[int]*fakeFFNResidentTrainHandleState
+	// S3(d) FFN weight-gradient device-accumulation fake state, mirroring
+	// attnResidentTrainGradAccum above.
+	ffnResidentTrainGradAccum   map[string]*fakeResidentGradAccumEntry
+	ffnResidentTrainFlushCalls  int
+	ffnResidentTrainSkippedRuns int
+	ffnResidentTrainBackwardErr error
+	ffnResidentTrainFlushHidden *backend.Tensor
+	ffnResidentTrainFlushOutput *backend.Tensor
+}
+
+// fakeResidentGradAccumEntry is the host-slice analog of the CUDA
+// accelerator's residentGradAccumBuffer (see
+// attention_resident_train_accel_linux.go): a running sum plus the shape
+// needed to hand back a properly shaped *backend.Tensor on flush.
+type fakeResidentGradAccumEntry struct {
+	data       []float32
+	rows, cols int
+}
+
+// accumulateFakeResidentGrad adds contribution into (*accum)[name],
+// allocating a zero-valued entry (with contribution's shape) on first use --
+// the host-slice analog of accumulateResidentGradWeight's device beta=1
+// GEMM into a persistent buffer.
+func accumulateFakeResidentGrad(accum *map[string]*fakeResidentGradAccumEntry, name string, rows, cols int, contribution []float32) {
+	if *accum == nil {
+		*accum = map[string]*fakeResidentGradAccumEntry{}
+	}
+	entry, ok := (*accum)[name]
+	if !ok || entry.rows != rows || entry.cols != cols {
+		entry = &fakeResidentGradAccumEntry{data: make([]float32, rows*cols), rows: rows, cols: cols}
+		(*accum)[name] = entry
+	}
+	addFloat32Slice(entry.data, contribution)
+}
+
+// flushFakeResidentGrad downloads (returns) and clears accum[name], mirroring
+// flushResidentGradAccum's "nil when nothing accumulated under that name"
+// contract.
+func flushFakeResidentGrad(accum *map[string]*fakeResidentGradAccumEntry, name string) *backend.Tensor {
+	entry, ok := (*accum)[name]
+	if !ok {
+		return nil
+	}
+	delete(*accum, name)
+	return backend.NewTensorF32([]int{entry.rows, entry.cols}, entry.data)
 }
 
 type fakeResidentOptimizerToken struct {

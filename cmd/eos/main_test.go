@@ -7715,7 +7715,7 @@ func TestRunTrainCorpusRepeatedEncoderExampleFlow(t *testing.T) {
 	if err := os.WriteFile(corpusPath, []byte(corpus), 0o644); err != nil {
 		t.Fatalf("write corpus: %v", err)
 	}
-	if err := run([]string{"train-corpus", "--vocab-size", "48", "--min-freq", "1", "--epochs", "2", "--batch-size", "2", "--min-chars", "12", "--eval-pairs", "3", artifactPath, corpusPath}); err != nil {
+	if err := run([]string{"train-corpus", "--min-freq", "1", "--epochs", "2", "--batch-size", "2", "--min-chars", "12", "--eval-pairs", "3", artifactPath, corpusPath}); err != nil {
 		t.Fatalf("run train-corpus: %v", err)
 	}
 	if err := run([]string{"inspect", artifactPath}); err != nil {
@@ -7727,6 +7727,9 @@ func TestRunTrainCorpusRepeatedEncoderExampleFlow(t *testing.T) {
 	}
 	if manifest.EncoderRepeats != 2 {
 		t.Fatalf("encoder repeats = %d, want 2", manifest.EncoderRepeats)
+	}
+	if manifest.Tokenizer.VocabSize != 32768 {
+		t.Fatalf("tokenizer vocab size = %d, want example manifest contract 32768", manifest.Tokenizer.VocabSize)
 	}
 	profile, err := eosruntime.ReadEmbeddingTrainProfileFile(eosruntime.DefaultEmbeddingTrainProfilePath(artifactPath))
 	if err != nil {
@@ -7746,6 +7749,13 @@ func TestRunTrainCorpusRepeatedEncoderExampleFlow(t *testing.T) {
 		if _, err := os.Stat(candidate); err != nil {
 			t.Fatalf("expected generated training artifact %q: %v", candidate, err)
 		}
+	}
+	tokenizer, err := eosruntime.ReadTokenizerFile(eosruntime.DefaultTokenizerPath(artifactPath))
+	if err != nil {
+		t.Fatalf("read generated tokenizer: %v", err)
+	}
+	if len(tokenizer.Tokens) != manifest.Tokenizer.VocabSize {
+		t.Fatalf("tokenizer tokens = %d, want manifest vocab size %d", len(tokenizer.Tokens), manifest.Tokenizer.VocabSize)
 	}
 	if _, err := eosruntime.LoadEmbeddingTrainerPackage(artifactPath); err != nil {
 		t.Fatalf("reload trained repeated-encoder package: %v", err)

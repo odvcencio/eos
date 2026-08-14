@@ -3,6 +3,7 @@ package eosruntime
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -29,12 +30,13 @@ func (tk *fakeAttentionResidentTrainHandleToken) Alive() bool        { return tk
 // RunAttentionBlockResidentTrainForward call would keep on the device; the
 // fake keeps it as plain host slices instead.
 type fakeAttentionResidentTrainHandleState struct {
-	token          *fakeAttentionResidentTrainHandleToken
-	seqLen, d      int
-	scale          float32
-	input          []float32
-	q, k, v, probs []float32
-	wq, wk, wv     []float32
+	token                         *fakeAttentionResidentTrainHandleToken
+	seqLen, d                     int
+	scale                         float32
+	input                         []float32
+	q, k, v, probs                []float32
+	wq, wk, wv                    []float32
+	queryName, keyName, valueName string
 }
 
 // RunAttentionBlockResidentTrainForward implements
@@ -108,24 +110,30 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResidentTrainForward(req ba
 	id := a.attnResidentTrainNextID
 	token := &fakeAttentionResidentTrainHandleToken{id: id, alive: true}
 	a.attnResidentTrainHandles[id] = &fakeAttentionResidentTrainHandleState{
-		token:  token,
-		seqLen: seq,
-		d:      d,
-		scale:  scale,
-		input:  append([]float32(nil), req.Input.F32...),
-		q:      query,
-		k:      key,
-		v:      value,
-		probs:  scores,
-		wq:     append([]float32(nil), wq.F32...),
-		wk:     append([]float32(nil), wk.F32...),
-		wv:     append([]float32(nil), wv.F32...),
+		token:     token,
+		seqLen:    seq,
+		d:         d,
+		scale:     scale,
+		input:     append([]float32(nil), req.Input.F32...),
+		q:         query,
+		k:         key,
+		v:         value,
+		probs:     scores,
+		wq:        append([]float32(nil), wq.F32...),
+		wk:        append([]float32(nil), wk.F32...),
+		wv:        append([]float32(nil), wv.F32...),
+		queryName: req.QueryName,
+		keyName:   req.KeyName,
+		valueName: req.ValueName,
 	}
 
+	// S3(d): SkipUnreadDownload mirrors the CUDA accelerator -- Q/K/V/scores
+	// are still computed and stashed under the handle for backward, but are
+	// left out of both the result and the download-byte counter when the
+	// caller proved host code will never read them before backward. Mixed
+	// is never skipped.
 	a.uploadedBytes += int64(len(req.Input.F32) * 4)
-	a.downloadedBytes += int64((len(query) + len(key) + len(value) + len(scores) + len(mixed)) * 4)
-
-	return backend.AttentionResidentTrainForwardResult{
+	result := backend.AttentionResidentTrainForwardResult{
 		Handle: backend.AttentionResidentTrainHandle{
 			Backend:  eosartifact.BackendCUDA,
 			Token:    token,
@@ -134,12 +142,19 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResidentTrainForward(req ba
 			ModelDim: d,
 			StepID:   req.StepID,
 		},
-		Query:  backend.NewTensorF32([]int{rows, d}, query),
-		Key:    backend.NewTensorF32([]int{rows, d}, key),
-		Value:  backend.NewTensorF32([]int{rows, d}, value),
-		Scores: backend.NewTensorF32([]int{rows, seq}, scores),
-		Mixed:  backend.NewTensorF32([]int{rows, d}, mixed),
-	}, nil
+		Mixed: backend.NewTensorF32([]int{rows, d}, mixed),
+	}
+	if req.SkipUnreadDownload {
+		a.attnResidentTrainSkippedRuns++
+		a.downloadedBytes += int64(len(mixed) * 4)
+	} else {
+		result.Query = backend.NewTensorF32([]int{rows, d}, query)
+		result.Key = backend.NewTensorF32([]int{rows, d}, key)
+		result.Value = backend.NewTensorF32([]int{rows, d}, value)
+		result.Scores = backend.NewTensorF32([]int{rows, seq}, scores)
+		a.downloadedBytes += int64((len(query) + len(key) + len(value) + len(scores) + len(mixed)) * 4)
+	}
+	return result, nil
 }
 
 // RunAttentionBlockResidentTrainBackward implements
@@ -157,6 +172,9 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResidentTrainBackward(req b
 	state := a.attnResidentTrainHandles[token.id]
 	if state == nil {
 		return backend.AttentionResidentTrainBackwardResult{}, fmt.Errorf("fake attention resident train backward: handle %d is not registered", token.id)
+	}
+	if a.attnResidentTrainBackwardErr != nil {
+		return backend.AttentionResidentTrainBackwardResult{}, a.attnResidentTrainBackwardErr
 	}
 	defer func() {
 		token.alive = false
@@ -189,6 +207,13 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResidentTrainBackward(req b
 	gradWv := make([]float32, d*d)
 	fillHostMatMulTranspose(state.input, seq, d, gradV, seq, d, true, false, gradWv)
 
+	// S3(d): accumulate into the step-scoped per-name map instead of
+	// returning per call, mirroring accumulateResidentGradWeight's
+	// beta=1-into-a-persistent-buffer semantics on plain host slices.
+	accumulateFakeResidentGrad(&a.attnResidentTrainGradAccum, state.queryName, d, d, gradWq)
+	accumulateFakeResidentGrad(&a.attnResidentTrainGradAccum, state.keyName, d, d, gradWk)
+	accumulateFakeResidentGrad(&a.attnResidentTrainGradAccum, state.valueName, d, d, gradWv)
+
 	gradInput := make([]float32, seq*d)
 	fillHostMatMulTranspose(gradQ, seq, d, state.wq, d, d, false, true, gradInput)
 	term2 := make([]float32, seq*d)
@@ -199,21 +224,53 @@ func (a *countingMatMulAccelerator) RunAttentionBlockResidentTrainBackward(req b
 	addFloat32Slice(gradInput, term3)
 
 	a.uploadedBytes += int64(len(req.GradMixed.F32) * 4)
-	a.downloadedBytes += int64((len(gradInput) + len(gradWq) + len(gradWk) + len(gradWv)) * 4)
+	a.downloadedBytes += int64(len(gradInput) * 4)
 
 	return backend.AttentionResidentTrainBackwardResult{
-		GradInput:       backend.NewTensorF32([]int{seq, d}, gradInput),
-		GradQueryWeight: backend.NewTensorF32([]int{d, d}, gradWq),
-		GradKeyWeight:   backend.NewTensorF32([]int{d, d}, gradWk),
-		GradValueWeight: backend.NewTensorF32([]int{d, d}, gradWv),
+		GradInput: backend.NewTensorF32([]int{seq, d}, gradInput),
 	}, nil
+}
+
+// FlushAttentionResidentTrainWeightGradients implements
+// backend.AttentionResidentTrainAccelerator: downloads (returns) and clears
+// this step's accumulated per-name sums, mirroring
+// flushResidentGradAccum's "nil, nil when nothing accumulated under that
+// name" contract.
+func (a *countingMatMulAccelerator) FlushAttentionResidentTrainWeightGradients(queryName, keyName, valueName string) (*backend.Tensor, *backend.Tensor, *backend.Tensor, error) {
+	a.attnResidentTrainFlushCalls++
+	wq := flushFakeResidentGrad(&a.attnResidentTrainGradAccum, queryName)
+	wk := flushFakeResidentGrad(&a.attnResidentTrainGradAccum, keyName)
+	wv := flushFakeResidentGrad(&a.attnResidentTrainGradAccum, valueName)
+	if a.attnResidentTrainFlushWq != nil {
+		wq = a.attnResidentTrainFlushWq
+	}
+	if a.attnResidentTrainFlushWk != nil {
+		wk = a.attnResidentTrainFlushWk
+	}
+	if a.attnResidentTrainFlushWv != nil {
+		wv = a.attnResidentTrainFlushWv
+	}
+	if wq != nil {
+		a.downloadedBytes += int64(len(wq.F32) * 4)
+	}
+	if wk != nil {
+		a.downloadedBytes += int64(len(wk.F32) * 4)
+	}
+	if wv != nil {
+		a.downloadedBytes += int64(len(wv.F32) * 4)
+	}
+	return wq, wk, wv, nil
 }
 
 // BeginAttentionResidentTrainStep implements backend.AttentionResidentTrainAccelerator.
 // It defensively releases any handle left over from a prior step, mirroring
-// the CUDA accelerator's generation bump.
+// the CUDA accelerator's generation bump, and clears both S3(d) weight-
+// gradient accumulator maps (mirroring releaseResidentGradAccum).
 func (a *countingMatMulAccelerator) BeginAttentionResidentTrainStep(stepID uint64) error {
 	a.releaseAllFakeAttentionResidentTrainHandles()
+	a.releaseAllFakeFFNResidentTrainHandles()
+	a.attnResidentTrainGradAccum = nil
+	a.ffnResidentTrainGradAccum = nil
 	a.attnResidentTrainStepID = stepID
 	a.attnResidentTrainStepActive = true
 	a.attnResidentTrainBeginCalls++
@@ -226,6 +283,9 @@ func (a *countingMatMulAccelerator) EndAttentionResidentTrainStep(stepID uint64)
 		return fmt.Errorf("fake attention resident train: step %d is not the active step", stepID)
 	}
 	a.releaseAllFakeAttentionResidentTrainHandles()
+	a.releaseAllFakeFFNResidentTrainHandles()
+	a.attnResidentTrainGradAccum = nil
+	a.ffnResidentTrainGradAccum = nil
 	a.attnResidentTrainStepActive = false
 	a.attnResidentTrainEndCalls++
 	return nil
@@ -237,6 +297,9 @@ func (a *countingMatMulAccelerator) AbortAttentionResidentTrainStep(stepID uint6
 		return fmt.Errorf("fake attention resident train: step %d is not the active step", stepID)
 	}
 	a.releaseAllFakeAttentionResidentTrainHandles()
+	a.releaseAllFakeFFNResidentTrainHandles()
+	a.attnResidentTrainGradAccum = nil
+	a.ffnResidentTrainGradAccum = nil
 	a.attnResidentTrainStepActive = false
 	a.attnResidentTrainAbortCalls++
 	return nil
@@ -320,6 +383,15 @@ func TestEmbeddingTrainerAttnResidentTrainBackwardMatchesHostStep(t *testing.T) 
 	if len(residentFake.attnResidentTrainHandles) != 0 {
 		t.Fatalf("%d resident-train handles still live after the step; expected all released", len(residentFake.attnResidentTrainHandles))
 	}
+	if residentFake.attnResidentTrainFlushCalls != 1 {
+		t.Fatalf("attention resident gradient flush calls = %d, want exactly 1", residentFake.attnResidentTrainFlushCalls)
+	}
+	if residentFake.attnResidentTrainSkippedRuns != 0 {
+		t.Fatalf("attention resident skipped downloads = %d, want 0 while batched backward can still run", residentFake.attnResidentTrainSkippedRuns)
+	}
+	if len(residentFake.attnResidentTrainGradAccum) != 0 {
+		t.Fatalf("attention resident gradient accumulator still has %d entries after end", len(residentFake.attnResidentTrainGradAccum))
+	}
 
 	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "0")
 	host, hostFake := newAttnResidentTrainTestTrainer(t)
@@ -353,6 +425,131 @@ func TestEmbeddingTrainerAttnResidentTrainDisabledByDefault(t *testing.T) {
 	if fake.attnResidentTrainBeginCalls != 0 {
 		t.Fatalf("resident-train begin calls = %d, want 0 when the flag is off", fake.attnResidentTrainBeginCalls)
 	}
+}
+
+func TestEmbeddingTrainerAttnResidentTrainBackwardErrorAbortsWithoutOptimizerUpdate(t *testing.T) {
+	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "1")
+	t.Setenv("EOS_TRAIN_DISABLE_BATCHED_BACKWARD", "1")
+	trainer, fake := newAttnResidentTrainTestTrainer(t)
+	fake.attnResidentTrainBackwardErr = fmt.Errorf("injected attention backward failure")
+	beforeStep := trainer.step
+	beforeToken := append([]float32(nil), trainer.tokenEmbed.F32...)
+	beforeAttnQ := append([]float32(nil), trainer.attentionQuery.F32...)
+
+	_, err := trainer.TrainContrastiveStep(tinyRaggedAttnResidentContrastiveBatch())
+	if err == nil {
+		t.Fatal("expected resident attention backward error")
+	}
+	if !strings.Contains(err.Error(), "attention resident train backward") || !strings.Contains(err.Error(), "injected attention backward failure") {
+		t.Fatalf("error = %v, want resident attention backward context and injected cause", err)
+	}
+	if fake.attnResidentTrainForwardRuns == 0 || fake.attnResidentTrainBackwardRuns == 0 {
+		t.Fatalf("resident train runs forward/backward = %d/%d, want both paths attempted", fake.attnResidentTrainForwardRuns, fake.attnResidentTrainBackwardRuns)
+	}
+	if fake.attnResidentTrainSkippedRuns == 0 {
+		t.Fatal("expected elided forward downloads before the injected backward failure")
+	}
+	if fake.attnResidentTrainFlushCalls != 0 {
+		t.Fatalf("attention resident gradient flush calls = %d, want 0 after backward error", fake.attnResidentTrainFlushCalls)
+	}
+	if fake.attnResidentTrainEndCalls != 0 || fake.attnResidentTrainAbortCalls != 1 {
+		t.Fatalf("end/abort calls = %d/%d, want 0/1", fake.attnResidentTrainEndCalls, fake.attnResidentTrainAbortCalls)
+	}
+	if len(fake.attnResidentTrainHandles) != 0 {
+		t.Fatalf("%d attention resident handles still live after abort", len(fake.attnResidentTrainHandles))
+	}
+	if len(fake.attnResidentTrainGradAccum) != 0 {
+		t.Fatalf("attention resident gradient accumulator still has %d entries after abort", len(fake.attnResidentTrainGradAccum))
+	}
+	if trainer.step != beforeStep {
+		t.Fatalf("trainer step = %d, want unchanged %d after failed resident backward", trainer.step, beforeStep)
+	}
+	assertCloseF32Slice(t, "token_embedding unchanged", trainer.tokenEmbed.F32, beforeToken, 0)
+	assertCloseF32Slice(t, "attn_q unchanged", trainer.attentionQuery.F32, beforeAttnQ, 0)
+}
+
+func TestEmbeddingTrainerAttnResidentBackwardErrorDoesNotLeakIntoPairTrainStep(t *testing.T) {
+	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "1")
+	t.Setenv("EOS_TRAIN_DISABLE_BATCHED_BACKWARD", "1")
+	trainer, fake := newAttnResidentTrainTestTrainer(t)
+	fake.attnResidentTrainBackwardErr = fmt.Errorf("injected attention backward failure")
+
+	if _, err := trainer.TrainContrastiveStep(tinyRaggedAttnResidentContrastiveBatch()); err == nil {
+		t.Fatal("expected resident attention backward error")
+	}
+	if err := trainer.attentionResidentTrainStepErr(); err != nil {
+		t.Fatalf("resident step error leaked after abort: %v", err)
+	}
+
+	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "0")
+	fake.attnResidentTrainBackwardErr = nil
+	beforeStep := trainer.step
+	_, err := trainer.TrainStep([]EmbeddingPairExample{
+		{LeftTokens: []int32{0, 2}, RightTokens: []int32{1, 2}, LeftMask: []int32{1, 1}, RightMask: []int32{1, 1}, Target: 0.25},
+		{LeftTokens: []int32{2, 1}, RightTokens: []int32{0, 1}, LeftMask: []int32{1, 0}, RightMask: []int32{1, 1}, Target: -0.25},
+	})
+	if err != nil {
+		t.Fatalf("non-resident pair TrainStep after resident failure: %v", err)
+	}
+	if trainer.step != beforeStep+1 {
+		t.Fatalf("trainer step = %d, want %d after successful pair TrainStep", trainer.step, beforeStep+1)
+	}
+}
+
+func TestEmbeddingTrainerAttentionResidentFlushRejectsMalformedGradientAtomically(t *testing.T) {
+	trainer, fake := newAttnResidentTrainTestTrainer(t)
+	trainer.attnResidentTrainStepOpen = true
+	gradAttnQ := make([]float32, tensorDataLen(trainer.attentionQuery))
+	gradAttnK := make([]float32, tensorDataLen(trainer.attentionKey))
+	gradAttnV := make([]float32, tensorDataLen(trainer.attentionValue))
+	fake.attnResidentTrainFlushWq = filledResidentGradientForTest(len(gradAttnQ), 0.5)
+	fake.attnResidentTrainFlushWk = backend.NewTensorF32([]int{1}, []float32{1})
+	fake.attnResidentTrainFlushWv = filledResidentGradientForTest(len(gradAttnV), 0.25)
+
+	err := trainer.flushAttentionResidentTrainWeightGradients(gradAttnQ, gradAttnK, gradAttnV)
+	if err == nil {
+		t.Fatal("expected malformed attention resident flush error")
+	}
+	if !strings.Contains(err.Error(), "attention key") || !strings.Contains(err.Error(), "length") {
+		t.Fatalf("error = %v, want attention key length context", err)
+	}
+	if fake.attnResidentTrainFlushCalls != 1 {
+		t.Fatalf("attention resident gradient flush calls = %d, want 1", fake.attnResidentTrainFlushCalls)
+	}
+	if !sliceAllZeroForTest(gradAttnQ) || !sliceAllZeroForTest(gradAttnK) || !sliceAllZeroForTest(gradAttnV) {
+		t.Fatalf("attention flush partially merged despite malformed tensor: q=%v k=%v v=%v", gradAttnQ, gradAttnK, gradAttnV)
+	}
+}
+
+func TestEmbeddingTrainerAttentionResidentTrainMalformedFlushAbortsWithoutOptimizerUpdate(t *testing.T) {
+	t.Setenv("EOS_EMBED_ATTN_RESIDENT", "1")
+	trainer, fake := newAttnResidentTrainTestTrainer(t)
+	fake.attnResidentTrainFlushWq = backend.NewTensorF32([]int{1}, []float32{1})
+	beforeStep := trainer.step
+	beforeToken := append([]float32(nil), trainer.tokenEmbed.F32...)
+	beforeAttnQ := append([]float32(nil), trainer.attentionQuery.F32...)
+
+	_, err := trainer.TrainContrastiveStep(tinyRaggedAttnResidentContrastiveBatch())
+	if err == nil {
+		t.Fatal("expected malformed attention resident flush error")
+	}
+	if !strings.Contains(err.Error(), "attention resident train flush gradients") || !strings.Contains(err.Error(), "attention query") || !strings.Contains(err.Error(), "length") {
+		t.Fatalf("error = %v, want attention resident flush length context", err)
+	}
+	if fake.attnResidentTrainFlushCalls != 1 {
+		t.Fatalf("attention resident gradient flush calls = %d, want 1", fake.attnResidentTrainFlushCalls)
+	}
+	if fake.attnResidentTrainEndCalls != 0 || fake.attnResidentTrainAbortCalls != 1 {
+		t.Fatalf("end/abort calls = %d/%d, want 0/1", fake.attnResidentTrainEndCalls, fake.attnResidentTrainAbortCalls)
+	}
+	if len(fake.attnResidentTrainGradAccum) != 0 {
+		t.Fatalf("attention resident gradient accumulator still has %d entries after malformed flush abort", len(fake.attnResidentTrainGradAccum))
+	}
+	if trainer.step != beforeStep {
+		t.Fatalf("trainer step = %d, want unchanged %d after malformed flush", trainer.step, beforeStep)
+	}
+	assertCloseF32Slice(t, "token_embedding unchanged", trainer.tokenEmbed.F32, beforeToken, 0)
+	assertCloseF32Slice(t, "attn_q unchanged", trainer.attentionQuery.F32, beforeAttnQ, 0)
 }
 
 // TestEmbeddingTrainerAttnResidentTrainStepBoundaryInvalidatesPriorBatch is
@@ -431,6 +628,23 @@ func sliceAllCloseForTest(a, b []float32, tol float32) bool {
 	}
 	for i := range a {
 		if abs32(a[i]-b[i]) > tol {
+			return false
+		}
+	}
+	return true
+}
+
+func filledResidentGradientForTest(n int, value float32) *backend.Tensor {
+	data := make([]float32, n)
+	for i := range data {
+		data[i] = value
+	}
+	return backend.NewTensorF32([]int{n}, data)
+}
+
+func sliceAllZeroForTest(values []float32) bool {
+	for _, value := range values {
+		if value != 0 {
 			return false
 		}
 	}

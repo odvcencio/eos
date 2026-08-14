@@ -388,7 +388,7 @@ The compiler, IR pipeline, artifact format, semantic analysis, runtime, and CLI 
 ## Development
 
 ```bash
-CGO_ENABLED=0 go test ./artifact/eos ./cmd/eos ./compiler ./models ./runtime/backend ./runtime/backends/metal ./runtime/backends/vulkan ./runtime/backends/directml ./runtime/backends/webgpu ./syntax
+CGO_ENABLED=0 go test ./artifact/eos ./cmd/eos ./compiler ./models ./runtime ./runtime/backend ./runtime/backends/cuda ./runtime/backends/metal ./runtime/backends/vulkan ./runtime/backends/directml ./runtime/backends/webgpu ./syntax
 go build ./cmd/eos/
 ```
 
@@ -404,7 +404,7 @@ EOS_BENCH_ROOT=$PWD EOS_BENCH_CUDA=1 ferrous-wheel run scripts/bench.fw
 EOS_BENCH_ROOT=$PWD EOS_BENCH_MODEL_ASSETS=/path/to/assets/eos-embed-v1 ferrous-wheel run scripts/bench.fw
 ```
 
-Current `eos-embed-v1` CUDA smoke: `845.15` train examples/s and `865437.87` train pairs/s on batch `1024`, with the promoted grouped CUDA training path enabled by default. See `docs/benchmarks.md` for the full profile and the next perf targets.
+Historical pre-S3 `eos-embed-v1` CUDA smoke baseline: `845.15` train examples/s and `865437.87` train pairs/s on batch `1024`, with the grouped CUDA training path enabled. These numbers are stale for current S3 throughput. See `docs/benchmarks.md` and `docs/eos-training-inference-performance-plan.md` for the full profile, evidence boundaries, and next perf targets.
 
 ## License
 

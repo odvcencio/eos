@@ -501,6 +501,7 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 	encodeStart := time.Now()
 	encoded, err := t.encodeSequenceInputs(inputs, forward, true)
 	t.vectorDistillPhases.EncodeNanos += time.Since(encodeStart).Nanoseconds()
+	t.vectorDistillPhases.EncodeCalls++
 	if err != nil {
 		return EmbeddingTrainMetrics{}, proj, err
 	}
@@ -564,6 +565,7 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchWithScratch(
 		return EmbeddingTrainMetrics{}, proj, err
 	}
 	t.vectorDistillPhases.OptimizerNanos += time.Since(optimizerStart).Nanoseconds()
+	t.vectorDistillPhases.OptimizerCalls++
 
 	return EmbeddingTrainMetrics{
 		// relationalLoss is already a batch-level mean (not per-example), so
@@ -649,6 +651,7 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchResidentWithScratch(
 		residentGradRefs = result.ResidentGradRefs
 	}
 	t.vectorDistillPhases.BackwardNanos += time.Since(backwardStart).Nanoseconds()
+	t.vectorDistillPhases.BackwardCalls++
 	if err := t.compactTrainAccel.EndCompactTrainStep(residentForward.stepID); err != nil {
 		_ = t.compactTrainAccel.AbortCompactTrainStep(residentForward.stepID)
 		aborted = true
@@ -678,6 +681,7 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchResidentWithScratch(
 	t.compactForwardSelected = true
 	proj.Step = prospectiveProjStep
 	t.vectorDistillPhases.OptimizerNanos += time.Since(optimizerStart).Nanoseconds()
+	t.vectorDistillPhases.OptimizerCalls++
 	stepCompleted = true
 	return EmbeddingTrainMetrics{
 		Loss:      totalLoss*batchScale + relationalLoss,
@@ -793,6 +797,7 @@ func (t *EmbeddingTrainer) runVectorDistillResidentForward(inputs []embeddingSeq
 		}
 	}
 	t.vectorDistillPhases.EncodeNanos += time.Since(encodeStart).Nanoseconds()
+	t.vectorDistillPhases.EncodeCalls++
 	began = false
 	return out, nil
 }
@@ -871,6 +876,7 @@ func (t *EmbeddingTrainer) computeVectorDistillResidentPooledGradientsWithScratc
 		}
 		totalLoss += lossResult.Loss
 		t.vectorDistillPhases.ProjectionLossNanos += time.Since(projectionLossStart).Nanoseconds()
+		t.vectorDistillPhases.ProjectionLossCalls++
 		backwardStart := time.Now()
 		gradStudent := make([]float32, proj.InputDim)
 		if err := t.accumulateVectorDistillProjectionGrads(student, lossResult.GradProj, proj, gradStudent, gradW); err != nil {
@@ -889,6 +895,7 @@ func (t *EmbeddingTrainer) computeVectorDistillResidentPooledGradientsWithScratc
 			uniqueGrads[unique][k] += g
 		}
 		t.vectorDistillPhases.BackwardNanos += time.Since(backwardStart).Nanoseconds()
+		t.vectorDistillPhases.BackwardCalls++
 	}
 	return uniqueGrads, gradW, totalLoss, nil
 }
@@ -1069,6 +1076,7 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 		}
 		totalLoss += lossResult.Loss
 		t.vectorDistillPhases.ProjectionLossNanos += time.Since(projectionLossStart).Nanoseconds()
+		t.vectorDistillPhases.ProjectionLossCalls++
 
 		// Backprop through projection → gradStudent and gradW
 		backwardStart := time.Now()
@@ -1103,6 +1111,7 @@ func (t *EmbeddingTrainer) computeVectorDistillBatchGradientsWithScratch(
 			}
 		}
 		t.vectorDistillPhases.BackwardNanos += time.Since(backwardStart).Nanoseconds()
+		t.vectorDistillPhases.BackwardCalls++
 
 		// Backprop gradStudent through the encoder
 		if berr := t.backpropCompactEncodedSequence(enc, gradStudent, forward.compact, grads); berr != nil {

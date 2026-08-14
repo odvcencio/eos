@@ -7783,7 +7783,7 @@ type turboQDeviceSpec struct {
 }
 
 func (rt *deviceRuntime) uploadTurboQSpec(cfg cudaTurboQConfig) (*turboQDeviceSpec, error) {
-	q := turboquant.NewHadamardWithSeed(cfg.channels, cfg.bits, cfg.seed)
+	q := turboquant.NewHadamardRoundsWithSeed(cfg.channels, cfg.bits, cfg.rounds, cfg.seed)
 	spec := q.Spec()
 	if spec.RotationKind != "hadamard" {
 		return nil, fmt.Errorf("cuda turboquant requires hadamard rotation spec")
@@ -7886,6 +7886,7 @@ func turboQStepMetadata(op string, cfg cudaTurboQConfig) map[string]any {
 		"op":               op,
 		"bits":             cfg.bits,
 		"seed":             cfg.seed,
+		"rounds":           cfg.rounds,
 		"rotation_kind":    "hadamard",
 	}
 }
@@ -7942,6 +7943,7 @@ func turboSparseAttentionStepResult(outputType eosartifact.ValueType, cfg cudaTu
 		"op":                    "turbo_sparse_attention",
 		"bits":                  cfg.key.bits,
 		"seed":                  cfg.key.seed,
+		"rounds":                cfg.key.rounds,
 		"rotation_kind":         "hadamard",
 		"kv_decode":             "cuda_turboquant_inline",
 		"dense_kv_materialized": false,
