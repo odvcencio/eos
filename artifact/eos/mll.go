@@ -17,6 +17,7 @@ import (
 const MLLMetadataVersion = "manta/mll/v0alpha1"
 
 var MLLTagXMTA = [4]byte{'X', 'M', 'T', 'A'}
+var MLLTagXKBI = [4]byte{'X', 'K', 'B', 'I'}
 
 // MLLMetadata preserves the Eos module inside an MLL container while
 // the native MLL section model catches up with Eos-specific semantics.
@@ -111,7 +112,8 @@ func EncodeMLL(mod *Module) ([]byte, error) {
 		return nil, err
 	}
 
-	artifactJSON, err := EncodeJSON(mod)
+	artifactModule, binaries := moduleForMLL(mod)
+	artifactJSON, err := EncodeJSON(artifactModule)
 	if err != nil {
 		return nil, err
 	}
@@ -296,6 +298,21 @@ func EncodeMLL(mod *Module) ([]byte, error) {
 		Flags:         mll.SectionFlagSkippable | mll.SectionFlagSchemaless,
 		SchemaVersion: 1,
 	})
+	if len(binaries) > 0 {
+		body, err := json.Marshal(binaries)
+		if err != nil {
+			return nil, fmt.Errorf("encode offline kernel images: %w", err)
+		}
+		// XKBI is a custom, skippable section. Keeping images out of XMTA
+		// avoids base64 expansion in the artifact metadata while preserving
+		// source-backed compatibility for readers that do not understand it.
+		sections = append(sections, mll.SectionInput{
+			Tag:           MLLTagXKBI,
+			Body:          body,
+			Flags:         mll.SectionFlagSkippable | mll.SectionFlagSchemaless,
+			SchemaVersion: 1,
+		})
+	}
 
 	return mll.WriteToBytes(mll.ProfileSealed, mll.V1_0, sections)
 }
@@ -313,7 +330,81 @@ func DecodeMLL(data []byte) (*Module, error) {
 	if err != nil {
 		return nil, err
 	}
-	return DecodeJSON(meta.Artifact)
+	var mod Module
+	if err := json.Unmarshal(meta.Artifact, &mod); err != nil {
+		return nil, err
+	}
+	if body, ok := reader.Section(MLLTagXKBI); ok {
+		var binaries []kernelBinaryEntry
+		if err := json.Unmarshal(body, &binaries); err != nil {
+			return nil, fmt.Errorf("decode offline kernel images: %w", err)
+		}
+		if err := attachKernelBinaries(&mod, binaries); err != nil {
+			return nil, err
+		}
+	}
+	if err := mod.Validate(); err != nil {
+		return nil, err
+	}
+	return &mod, nil
+}
+
+type kernelBinaryEntry struct {
+	Kernel  string       `json:"kernel"`
+	Backend BackendKind  `json:"backend"`
+	Binary  KernelBinary `json:"binary"`
+}
+
+func moduleForMLL(mod *Module) (*Module, []kernelBinaryEntry) {
+	clone := *mod
+	clone.Kernels = make([]Kernel, len(mod.Kernels))
+	var binaries []kernelBinaryEntry
+	for i, kernel := range mod.Kernels {
+		clone.Kernels[i] = kernel
+		clone.Kernels[i].Variants = append([]KernelVariant(nil), kernel.Variants...)
+		for j, variant := range kernel.Variants {
+			if variant.Binary == nil {
+				continue
+			}
+			binary := *variant.Binary
+			binary.Data = append([]byte(nil), variant.Binary.Data...)
+			binaries = append(binaries, kernelBinaryEntry{Kernel: kernel.Name, Backend: variant.Backend, Binary: binary})
+			// The image bytes live in XKBI, not the XMTA artifact JSON.
+			clone.Kernels[i].Variants[j].Binary = nil
+		}
+	}
+	return &clone, binaries
+}
+
+func attachKernelBinaries(mod *Module, binaries []kernelBinaryEntry) error {
+	seen := map[string]bool{}
+	for _, entry := range binaries {
+		key := entry.Kernel + "\x00" + string(entry.Backend)
+		if seen[key] {
+			return fmt.Errorf("duplicate offline kernel image for %q backend %q", entry.Kernel, entry.Backend)
+		}
+		seen[key] = true
+		found := false
+		for i := range mod.Kernels {
+			if mod.Kernels[i].Name != entry.Kernel {
+				continue
+			}
+			for j := range mod.Kernels[i].Variants {
+				variant := &mod.Kernels[i].Variants[j]
+				if variant.Backend != entry.Backend {
+					continue
+				}
+				binary := entry.Binary
+				variant.Binary = &binary
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("offline kernel image references unknown kernel %q backend %q", entry.Kernel, entry.Backend)
+		}
+	}
+	return nil
 }
 
 func ReadFile(path string) (*Module, error) {

@@ -52,6 +52,8 @@ type CompiledKernel struct {
 	Source     string
 	SourceHash string
 	Meta       map[string]string
+	ABI        *eosartifact.KernelABI
+	Binary     *eosartifact.KernelBinary
 }
 
 // NativeKernelProgram is a backend-owned compiled kernel program.
@@ -1007,9 +1009,33 @@ func CompileVariants(mod *eosartifact.Module, kind eosartifact.BackendKind) (map
 			Source:     variant.Source,
 			SourceHash: hex.EncodeToString(sum[:]),
 			Meta:       cloneStringMap(variant.Meta),
+			ABI:        cloneKernelABI(variant.ABI),
+			Binary:     cloneKernelBinary(variant.Binary),
 		}
 	}
 	return compiled, nil
+}
+
+func cloneKernelABI(in *eosartifact.KernelABI) *eosartifact.KernelABI {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if len(in.Args) > 0 {
+		out.Args = append([]eosartifact.KernelABIArg(nil), in.Args...)
+	}
+	return &out
+}
+
+func cloneKernelBinary(in *eosartifact.KernelBinary) *eosartifact.KernelBinary {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if len(in.Data) > 0 {
+		out.Data = append([]byte(nil), in.Data...)
+	}
+	return &out
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

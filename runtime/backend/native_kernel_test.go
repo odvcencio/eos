@@ -1,11 +1,44 @@
 package backend
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
 	"m31labs.dev/eos/compiler"
 )
+
+func TestCompileNativeKernelProgramCarriesOfflineImage(t *testing.T) {
+	bundle, err := compiler.Build(nil, compiler.Options{ModuleName: "tiny_embed", Preset: compiler.PresetTinyEmbed})
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("fake-ptx")
+	sum := sha256.Sum256(data)
+	for i := range bundle.Artifact.Kernels[0].Variants {
+		variant := &bundle.Artifact.Kernels[0].Variants[i]
+		if variant.Backend != eosartifact.BackendCUDA {
+			continue
+		}
+		variant.Binary = &eosartifact.KernelBinary{Format: "ptx", Arch: "90", SourceSHA256: variant.ABI.SourceSHA256, SHA256: hex.EncodeToString(sum[:]), Data: data}
+	}
+	compiled, err := CompileVariants(bundle.Artifact, eosartifact.BackendCUDA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernel := bundle.Artifact.Kernels[0]
+	prog, err := CompileNativeKernelProgram(eosartifact.BackendCUDA, kernel, compiled[kernel.Name])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := prog.LaunchConfig["launch_compiler"], "offline_ptx"; got != want {
+		t.Fatalf("launch_compiler = %v, want %v", got, want)
+	}
+	if prog.Compiled.Binary == nil || string(prog.Compiled.Binary.Data) != string(data) {
+		t.Fatalf("compiled offline binary = %+v", prog.Compiled.Binary)
+	}
+}
 
 func TestCompileNativeKernelProgramCUDAConfig(t *testing.T) {
 	bundle, err := compiler.Build(nil, compiler.Options{ModuleName: "tiny_embed", Preset: compiler.PresetTinyEmbed})

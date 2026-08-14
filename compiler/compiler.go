@@ -225,6 +225,10 @@ func lowerArtifact(file *syntax.File, h *hir.Module, plan *lir.Plan) (*eosartifa
 		})
 	}
 	for _, kernel := range plan.Kernels {
+		variants, err := emitKernelVariants(kernel)
+		if err != nil {
+			return nil, fmt.Errorf("kernel %q: %w", kernel.Name, err)
+		}
 		out := eosartifact.Kernel{
 			Name: kernel.Name,
 			Hints: eosartifact.ScheduleHints{
@@ -236,7 +240,7 @@ func lowerArtifact(file *syntax.File, h *hir.Module, plan *lir.Plan) (*eosartifa
 				Halo:        append([]int(nil), kernel.Hints.Halo...),
 				Memory:      kernel.Hints.Memory,
 			},
-			Variants: emitKernelVariants(kernel),
+			Variants: variants,
 		}
 		for _, input := range kernel.Inputs {
 			out.Inputs = append(out.Inputs, lowerArtifactKernelValue(input))
@@ -997,7 +1001,7 @@ var metalNativeEmitter = nativeKernelEmitter{
 // reality the way a metadata tag could.
 const ropeKernelABIVersion = "v2"
 
-func emitKernelVariants(kernel lir.Kernel) []eosartifact.KernelVariant {
+func emitKernelVariants(kernel lir.Kernel) ([]eosartifact.KernelVariant, error) {
 	meta := map[string]string{
 		"tile":         scheduleTileString(kernel.Hints.Tile),
 		"tile_2d":      scheduleTileString(kernel.Hints.Tile2D),
@@ -1012,14 +1016,21 @@ func emitKernelVariants(kernel lir.Kernel) []eosartifact.KernelVariant {
 	}
 	variants := make([]eosartifact.KernelVariant, 0, len(kernelBackendEmitters))
 	for _, emitter := range kernelBackendEmitters {
+		entry := emitter.entry(kernel)
+		source := emitter.source(kernel)
+		abi, err := extractKernelABI(emitter.backend, entry, source)
+		if err != nil {
+			return nil, fmt.Errorf("%s variant: %w", emitter.backend, err)
+		}
 		variants = append(variants, eosartifact.KernelVariant{
 			Backend: emitter.backend,
-			Entry:   emitter.entry(kernel),
-			Source:  emitter.source(kernel),
+			Entry:   entry,
+			Source:  source,
 			Meta:    cloneStringMap(meta),
+			ABI:     abi,
 		})
 	}
-	return variants
+	return variants, nil
 }
 
 // signature returns the kernel signature prefix. For WebGPU the

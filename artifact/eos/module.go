@@ -1,8 +1,11 @@
 package eos
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // Version is the current artifact schema version.
@@ -168,6 +171,50 @@ type KernelVariant struct {
 	Entry   string            `json:"entry"`
 	Source  string            `json:"source,omitempty"`
 	Meta    map[string]string `json:"meta,omitempty"`
+	ABI     *KernelABI        `json:"abi,omitempty"`
+	Binary  *KernelBinary     `json:"binary,omitempty"`
+}
+
+// KernelABIVersion identifies the typed source-level launch contract embedded
+// in a kernel variant. The contract is intentionally backend-neutral at the
+// schema boundary; backend adapters use AddressSpace and Location to map it
+// to driver arguments without reparsing source at runtime.
+const KernelABIVersion = "eos/kernel-abi/v1"
+
+// KernelABI is the compiler-produced signature contract for one kernel
+// variant. SourceSHA256 binds the contract to the exact source that was
+// validated and (until offline binaries are available) compiled by a backend.
+type KernelABI struct {
+	Version      string         `json:"version"`
+	Entry        string         `json:"entry"`
+	Parser       string         `json:"parser"`
+	SourceSHA256 string         `json:"source_sha256"`
+	Args         []KernelABIArg `json:"args,omitempty"`
+}
+
+// KernelABIArg describes one source-level kernel parameter in launch order.
+// Type is the normalized C/C++ spelling, while AddressSpace, Access, and
+// Location carry the pieces that backend runtimes must not infer ad hoc.
+type KernelABIArg struct {
+	Index        int    `json:"index"`
+	Name         string `json:"name"`
+	Type         string `json:"type"`
+	AddressSpace string `json:"address_space,omitempty"`
+	Access       string `json:"access,omitempty"`
+	Location     string `json:"location,omitempty"`
+}
+
+// KernelBinary is an optional offline-compiled image. CUDA accepts PTX,
+// cubin, and fatbin; Metal accepts AIR or metallib. The runtime treats the
+// image as opaque bytes and uses SHA256 to reject truncated or mismatched
+// payloads before handing it to the native driver loader.
+type KernelBinary struct {
+	Format       string `json:"format"`
+	Arch         string `json:"arch,omitempty"`
+	Toolchain    string `json:"toolchain,omitempty"`
+	SourceSHA256 string `json:"source_sha256"`
+	SHA256       string `json:"sha256"`
+	Data         []byte `json:"data"`
 }
 
 // ScheduleHints describe backend-neutral scheduling intent for a kernel body.
@@ -445,7 +492,7 @@ func validateKernelVariants(required []BackendKind, kernel Kernel) error {
 		if variant.Source == "" {
 			return fmt.Errorf("kernel %q variant source is required for backend %q", kernel.Name, variant.Backend)
 		}
-		if err := ValidateKernelVariantSource(kernel.Name, variant); err != nil {
+		if err := ValidateKernelVariant(kernel.Name, variant); err != nil {
 			return err
 		}
 	}
@@ -453,6 +500,100 @@ func validateKernelVariants(required []BackendKind, kernel Kernel) error {
 		if !seen[backend] {
 			return fmt.Errorf("kernel %q is missing variant for backend %q", kernel.Name, backend)
 		}
+	}
+	return nil
+}
+
+func validateKernelABI(kernelName string, variant KernelVariant) error {
+	abi := variant.ABI
+	if abi == nil {
+		return nil
+	}
+	if abi.Version != KernelABIVersion {
+		return fmt.Errorf("kernel %q variant ABI version %q is unsupported", kernelName, abi.Version)
+	}
+	if abi.Entry == "" {
+		return fmt.Errorf("kernel %q variant ABI entry is required for backend %q", kernelName, variant.Backend)
+	}
+	if abi.Entry != variant.Entry {
+		return fmt.Errorf("kernel %q variant ABI entry %q does not match variant entry %q", kernelName, abi.Entry, variant.Entry)
+	}
+	if abi.Parser == "" {
+		return fmt.Errorf("kernel %q variant ABI parser is required for backend %q", kernelName, variant.Backend)
+	}
+	if len(abi.SourceSHA256) != 64 {
+		return fmt.Errorf("kernel %q variant ABI source hash must be a SHA-256 hex digest", kernelName)
+	}
+	for _, r := range abi.SourceSHA256 {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return fmt.Errorf("kernel %q variant ABI source hash is not hexadecimal", kernelName)
+		}
+	}
+	seen := map[string]bool{}
+	for i, arg := range abi.Args {
+		if arg.Index != i {
+			return fmt.Errorf("kernel %q variant ABI argument %q has index %d, want %d", kernelName, arg.Name, arg.Index, i)
+		}
+		if arg.Name == "" {
+			return fmt.Errorf("kernel %q variant ABI argument %d has empty name", kernelName, i)
+		}
+		if seen[arg.Name] {
+			return fmt.Errorf("kernel %q variant ABI has duplicate argument %q", kernelName, arg.Name)
+		}
+		seen[arg.Name] = true
+		if arg.Type == "" {
+			return fmt.Errorf("kernel %q variant ABI argument %q has empty type", kernelName, arg.Name)
+		}
+		if arg.Access != "" && arg.Access != "read" && arg.Access != "write" && arg.Access != "read_write" && arg.Access != "value" {
+			return fmt.Errorf("kernel %q variant ABI argument %q has unsupported access %q", kernelName, arg.Name, arg.Access)
+		}
+	}
+	return nil
+}
+
+func validateKernelBinary(kernelName string, variant KernelVariant) error {
+	binary := variant.Binary
+	if binary == nil {
+		return nil
+	}
+	if len(binary.Data) == 0 {
+		return fmt.Errorf("kernel %q variant binary has no data", kernelName)
+	}
+	if len(binary.SourceSHA256) != 64 {
+		return fmt.Errorf("kernel %q variant binary source SHA-256 must be a hex digest", kernelName)
+	}
+	for _, r := range binary.SourceSHA256 {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return fmt.Errorf("kernel %q variant binary source SHA-256 is not hexadecimal", kernelName)
+		}
+	}
+	sourceSum := sha256.Sum256([]byte(variant.Source))
+	if !strings.EqualFold(binary.SourceSHA256, hex.EncodeToString(sourceSum[:])) {
+		return fmt.Errorf("kernel %q variant binary source SHA-256 does not match source", kernelName)
+	}
+	validFormat := false
+	switch variant.Backend {
+	case BackendCUDA:
+		validFormat = binary.Format == "ptx" || binary.Format == "cubin" || binary.Format == "fatbin"
+	case BackendMetal:
+		validFormat = binary.Format == "air" || binary.Format == "metallib"
+	default:
+		validFormat = binary.Format != ""
+	}
+	if !validFormat {
+		return fmt.Errorf("kernel %q variant binary format %q is invalid for backend %q", kernelName, binary.Format, variant.Backend)
+	}
+	if len(binary.SHA256) != 64 {
+		return fmt.Errorf("kernel %q variant binary SHA-256 must be a hex digest", kernelName)
+	}
+	for _, r := range binary.SHA256 {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return fmt.Errorf("kernel %q variant binary SHA-256 is not hexadecimal", kernelName)
+		}
+	}
+	sum := sha256.Sum256(binary.Data)
+	if !strings.EqualFold(binary.SHA256, hex.EncodeToString(sum[:])) {
+		return fmt.Errorf("kernel %q variant binary SHA-256 does not match data", kernelName)
 	}
 	return nil
 }

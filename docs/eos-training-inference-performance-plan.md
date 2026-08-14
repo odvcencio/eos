@@ -21,6 +21,38 @@ This is an implementation specification, not a result announcement. It reconcile
 7. Teacher and data signal come before bigger models. Complete provenance-safe Qwen3/mxbai teacher-cache scoring, agreement, margin, and leak filtering before one bounded dense pilot. Scale only after macro nDCG moves by at least `+0.001` with floors intact; promotion target is `+0.010`.
 8. Compact serving promotion is parallel, not dense-quality evidence. q5+q8 at `432 B/vector` passed 6/6 quality gates as a candidate replacement for q4+fp16 at `648 B/vector`, but needs repeated p95 timing. That does not prove dense model quality.
 
+## Current Execution Checkpoint: Kernel-First K0 (2026-08-13)
+
+The first implementation slice of the native toolchain is now in the branch,
+behind the existing source-backed behavior:
+
+- The compiler emits a versioned `KernelABI` for generated CUDA and Metal
+  variants. Pure-Go GoTreeSitter parses the generated C++-compatible signature;
+  vendor qualifiers and Metal attributes are masked in a byte-preserving view,
+  while address spaces, access mode, and binding locations are recovered from
+  the original source. The ABI carries the parser mode and a SHA-256 fingerprint
+  of the exact source.
+- `KernelVariant.Binary` is an optional, hash-checked offline image descriptor
+  (`ptx`, `cubin`, `air`, or `metallib`). `compiler.CompileKernelVariants` and
+  `eos compile --offline-backend ...` are the explicit build actions that attach
+  images; each image carries both its own hash and the source fingerprint it was
+  compiled from. Ordinary compilation still produces portable source-backed
+  artifacts.
+- CUDA's native loader accepts a sealed offline image and calls the driver
+  module loader directly; Darwin's Metal path does the same for `metallib`.
+  NVRTC/Metal source compilation remains the compatibility fallback when a
+  variant has no compatible image. This removes runtime source compilation
+  without pretending that driver module/pipeline load and launch FFI can
+  disappear.
+- MLL sealing now places image bytes in the skippable `XKBI` custom section and
+  leaves the backend-neutral artifact metadata source-backed. This avoids
+  base64 expansion in `XMTA`; readers that do not understand `XKBI` still retain
+  the source/host-fallback contract.
+
+Measured in this checkpoint: compiler, artifact, backend, CUDA, Metal, and CLI
+tests pass; no CUDA compiler is installed in the current Linux environment, so
+no PTX throughput or device-parity claim is made here.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -133,6 +165,9 @@ Phase 0, weeks 1-2, close safety and observability:
 
 - Critical path: close S3d safely, add execution accounting, add backend feature contract design and first manifest fields.
 - Exit gate: S3d default-off gates pass, no host fallback after resident errors, and run manifests expose required counters.
+- Kernel-first K0 slice: emit typed GoTreeSitter-derived ABI metadata and make
+  offline CUDA/Metal images an explicit, hash-checked artifact option. Keep
+  NVRTC/source fallback until device parity is demonstrated.
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 
@@ -203,6 +238,33 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - dependencies/blockers: CUDA device availability; explicit skip/flush counter surfacing; resident-gradient attribution.
 - checkpoint criteria: focused safety slice verified and default-off.
 - report contract: Outcome; files; commands/results; residual failures; checkpoint candidate; Arbiter next action.
+
+### KERNEL-ABI-OFFLINE / Build-Time Kernel Contract And Image Loader
+
+- role/profile: `tiller-worker` with compiler/runtime review.
+- objective: derive typed CUDA/Metal launch ABIs with pure-Go GoTreeSitter,
+  compile selected variants offline, and load PTX/cubin/AIR/metallib directly
+  through the minimal driver adapter.
+- context paths: `compiler/kernel_abi.go`; `compiler/kernel_toolchain.go`;
+  `artifact/eos/module.go`; `runtime/backend/backend.go`;
+  `runtime/backends/cuda/native_linux.go`; `cmd/eos/main.go`.
+- constraints: preserve source-backed artifacts and NVRTC fallback; never make
+  cgo/MLX the compiler or artifact authority; fail closed on ABI/hash mismatch;
+  keep image format/backend semantics explicit.
+- expected outputs: versioned ABI schema, offline compiler command, binary
+  validation, direct CUDA module loading, and a future native MLL binary section.
+- verification target: GoTreeSitter signature tests; JSON/MLL round trips;
+  fake-toolchain sealing test; CUDA/Metal package tests; real PTX parity and
+  p95 comparison when `nvcc` and a GPU are available.
+- budget tier/model ceiling: medium-high, `gpt-5.5 medium` plus review.
+- sandbox/permission needs: local compiler invocation only when explicitly
+  requested; no default network or toolchain download.
+- dependencies/blockers: CUDA/Metal compiler availability; driver parity;
+  MLL section support for large images.
+- checkpoint criteria: source-backed behavior unchanged, offline image path is
+  opt-in, binary hashes and ABI fingerprints validate, and fallback is truthful.
+- report contract: Outcome; exact files and commands; source/image mode;
+  parity/performance evidence; caveats; checkpoint candidate; next action.
 
 ### OBS-EXEC / Truthful Execution Accounting
 

@@ -238,11 +238,15 @@ func runCompile(args []string) error {
 	fs := flag.NewFlagSet("compile", flag.ContinueOnError)
 	bundleDir := fs.String("bundle", "", "write inspection bundle sidecar directory")
 	validateKernels := fs.Bool("validate-kernels", false, "record Prism kernel source validation status in the bundle manifest")
+	offlineBackend := fs.String("offline-backend", "", "offline-compile kernel variants for cuda or metal")
+	offlineTool := fs.String("offline-tool", "", "offline kernel compiler (default: nvcc or xcrun)")
+	offlineArch := fs.String("offline-arch", "", "CUDA SM architecture such as sm_90")
+	offlineFormat := fs.String("offline-format", "", "offline image format (CUDA: ptx/cubin; Metal: air/metallib)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("usage: eos compile [--bundle dir] [--validate-kernels] <source.eos> [output.mll]")
+		return fmt.Errorf("usage: eos compile [--bundle dir] [--validate-kernels] [--offline-backend cuda --offline-arch sm_90] <source.eos> [output.mll]")
 	}
 	srcPath := fs.Arg(0)
 	outPath := defaultArtifactPath(srcPath)
@@ -259,6 +263,20 @@ func runCompile(args []string) error {
 	if err != nil {
 		return attachSource(srcPath, src, err)
 	}
+	if *offlineBackend != "" {
+		backendKind := eosartifact.BackendKind(strings.ToLower(strings.TrimSpace(*offlineBackend)))
+		if backendKind != eosartifact.BackendCUDA && backendKind != eosartifact.BackendMetal {
+			return fmt.Errorf("--offline-backend must be cuda or metal, got %q", *offlineBackend)
+		}
+		if err := compiler.CompileKernelVariants(context.Background(), bundle.Artifact, compiler.KernelToolchainOptions{
+			Backend: backendKind,
+			Tool:    *offlineTool,
+			Arch:    *offlineArch,
+			Format:  *offlineFormat,
+		}); err != nil {
+			return err
+		}
+	}
 	if err := eosartifact.WriteFile(outPath, bundle.Artifact); err != nil {
 		return err
 	}
@@ -274,6 +292,13 @@ func runCompile(args []string) error {
 	fmt.Printf("entrypoints: %d, steps: %d, kernels: %d\n",
 		len(bundle.Artifact.EntryPoints), len(bundle.Artifact.Steps), len(bundle.Artifact.Kernels))
 	fmt.Printf("kernel ops: %d\n", totalKernelOps(bundle.Artifact.Kernels))
+	if *offlineBackend != "" {
+		format := *offlineFormat
+		if format == "" {
+			format = "default"
+		}
+		fmt.Printf("offline kernels: backend=%s format=%s\n", *offlineBackend, format)
+	}
 	return nil
 }
 

@@ -322,6 +322,55 @@ static int eosCudaCompileKernel(EosCudaRuntime* rt, const char* src, const char*
 	return 0;
 }
 
+// eosCudaLoadKernelBinary loads an offline-compiled PTX/cubin/fatbin image.
+// Keeping this path separate from NVRTC means production artifacts can skip
+// runtime source compilation while retaining the same driver-owned module and
+// function handles. The image is copied and NUL-terminated because PTX is a
+// text image while cubin/fatbin are opaque binary payloads.
+static int eosCudaLoadKernelBinary(EosCudaRuntime* rt, const void* data, size_t size, const char* entry, EosCudaKernel** out, char** err) {
+	if (rt == NULL || data == NULL || size == 0 || entry == NULL || out == NULL) {
+		*err = manta_dup_format("cuModuleLoadDataEx", "invalid offline kernel image");
+		return 1;
+	}
+	unsigned char* image = (unsigned char*)malloc(size + 1);
+	if (image == NULL) {
+		*err = manta_dup_format("malloc", "failed to allocate offline kernel image");
+		return 1;
+	}
+	memcpy(image, data, size);
+	image[size] = 0;
+	CUmodule module = NULL;
+	CUfunction function = NULL;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		free(image);
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	cuRes = cuModuleLoadDataEx(&module, image, 0, NULL, NULL);
+	free(image);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuModuleLoadDataEx(offline)", cuRes);
+		return 1;
+	}
+	cuRes = cuModuleGetFunction(&function, module, entry);
+	if (cuRes != CUDA_SUCCESS) {
+		cuModuleUnload(module);
+		*err = manta_dup_cu_error("cuModuleGetFunction(offline)", cuRes);
+		return 1;
+	}
+	EosCudaKernel* kernel = (EosCudaKernel*)malloc(sizeof(EosCudaKernel));
+	if (kernel == NULL) {
+		cuModuleUnload(module);
+		*err = manta_dup_format("malloc", "failed to allocate offline kernel");
+		return 1;
+	}
+	kernel->module = module;
+	kernel->function = function;
+	*out = kernel;
+	return 0;
+}
+
 static void eosCudaKernelDestroy(EosCudaKernel* kernel) {
 	if (kernel == NULL) {
 		return;
@@ -2454,10 +2503,10 @@ func (rt *deviceRuntime) attachDeviceExecution(prog *backend.NativeKernelProgram
 	}
 	if shapeKind == cudaShapeRoPE {
 		// classifyCUDAKernel routed here purely on the backend-neutral
-		// kernel.Body[0].Op == "rope". The GPU code that will actually run,
-		// though, is whatever source was JIT-compiled from
-		// prog.Compiled.Source -- persisted verbatim inside the sealed .mll
-		// artifact at compile time. Artifacts sealed before the seq_len fix
+		// kernel.Body[0].Op == "rope". The GPU code that will actually run is
+		// either the offline image or the source compiled by NVRTC; both are
+		// bound to the source fingerprint persisted in the sealed .mll
+		// artifact. Artifacts sealed before the seq_len fix
 		// carry the OLD 4-param `rope_cuda(in0, out0, rows, cols)` source.
 		// runRoPEKernel/launchRoPE unconditionally pass 5 args; per the CUDA
 		// driver ABI (cuLaunchKernel with a raw void* args[] array) a
@@ -2474,7 +2523,7 @@ func (rt *deviceRuntime) attachDeviceExecution(prog *backend.NativeKernelProgram
 	}
 	prog.LaunchConfig["device_execution"] = true
 	prog.LaunchConfig["execution_mode"] = "cuda_device"
-	prog.LaunchConfig["launch_compiler"] = "nvrtc"
+	prog.LaunchConfig["launch_compiler"] = compiledKernelCompiler(prog.Compiled)
 	prog.Run = func(inputs []*backend.Tensor) ([]*backend.Tensor, error) {
 		return rt.runKernel(deviceKernel, kernel, prog, inputs)
 	}
@@ -2482,15 +2531,22 @@ func (rt *deviceRuntime) attachDeviceExecution(prog *backend.NativeKernelProgram
 }
 
 func (rt *deviceRuntime) compileKernel(compiled backend.CompiledKernel, shapeKind cudaShapeKind) (*deviceKernel, error) {
-	src := C.CString(compiled.Source)
 	entry := C.CString(compiled.Entry)
-	defer C.free(unsafe.Pointer(src))
 	defer C.free(unsafe.Pointer(entry))
 
 	var kernel *C.EosCudaKernel
 	var logStr *C.char
 	var errStr *C.char
-	rc := C.eosCudaCompileKernel(rt.ptr, src, entry, &kernel, &logStr, &errStr)
+	var rc C.int
+	if compiled.Binary != nil && len(compiled.Binary.Data) > 0 {
+		image := C.CBytes(compiled.Binary.Data)
+		defer C.free(image)
+		rc = C.eosCudaLoadKernelBinary(rt.ptr, image, C.size_t(len(compiled.Binary.Data)), entry, &kernel, &errStr)
+	} else {
+		src := C.CString(compiled.Source)
+		defer C.free(unsafe.Pointer(src))
+		rc = C.eosCudaCompileKernel(rt.ptr, src, entry, &kernel, &logStr, &errStr)
+	}
 	logText := cStringValue(logStr)
 	if rc != 0 {
 		err := cStringError(errStr)
@@ -2500,6 +2556,13 @@ func (rt *deviceRuntime) compileKernel(compiled backend.CompiledKernel, shapeKin
 		return nil, err
 	}
 	return &deviceKernel{ptr: kernel, shapeKind: shapeKind}, nil
+}
+
+func compiledKernelCompiler(compiled backend.CompiledKernel) string {
+	if compiled.Binary != nil && compiled.Binary.Format != "" {
+		return "offline_" + compiled.Binary.Format
+	}
+	return "nvrtc"
 }
 
 func (rt *deviceRuntime) compileAuxKernel(source, entry string) (*auxKernel, error) {
@@ -2803,11 +2866,11 @@ func ropeEntryParams(source, entry string) (string, bool) {
 // checking, so the extra seq_len pointer is simply never read and the old
 // bug keeps executing silently.
 //
-// This inspects prog.Compiled.Source/Entry -- the actual bytes nvrtc is
-// about to JIT-compile and the GPU is about to execute -- rather than only
-// trusting the KernelVariant.Meta["rope_abi"] provenance tag set by
-// emitKernelVariants, since a source/metadata desync (stale tag, hand-built
-// artifact, future refactor) must not be able to mask a stale kernel body.
+// This inspects prog.Compiled.Source/Entry -- the source contract bound to
+// either the offline image or the NVRTC fallback -- rather than only trusting
+// the KernelVariant.Meta["rope_abi"] provenance tag set by emitKernelVariants,
+// since a source/metadata desync (stale tag, hand-built artifact, future
+// refactor) must not be able to mask a stale kernel body.
 func validateRoPEKernelABI(kernelName string, compiled backend.CompiledKernel) error {
 	params, ok := ropeEntryParams(compiled.Source, compiled.Entry)
 	if !ok || !strings.Contains(params, "seq_len") {

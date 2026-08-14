@@ -1,11 +1,82 @@
 package eos
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestKernelBinaryRoundTripAndValidation(t *testing.T) {
+	data := []byte("offline ptx placeholder")
+	sum := sha256.Sum256(data)
+	source := `extern "C" __global__ void embed_cuda() {}`
+	sourceSum := sha256.Sum256([]byte(source))
+	module := NewModule("offline-kernel")
+	module.Requirements.SupportedBackends = []BackendKind{BackendCUDA}
+	module.Kernels = []Kernel{{
+		Name: "embed",
+		Variants: []KernelVariant{{
+			Backend: BackendCUDA,
+			Entry:   "embed_cuda",
+			Source:  source,
+			Binary: &KernelBinary{
+				Format:       "ptx",
+				Arch:         "sm_90",
+				SourceSHA256: hex.EncodeToString(sourceSum[:]),
+				SHA256:       hex.EncodeToString(sum[:]),
+				Data:         data,
+			},
+		}},
+	}}
+	if err := module.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	encoded, err := EncodeJSON(module)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	decoded, err := DecodeJSON(encoded)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	binary := decoded.Kernels[0].Variants[0].Binary
+	if binary == nil || binary.Format != "ptx" || string(binary.Data) != string(data) {
+		t.Fatalf("offline binary did not round-trip: %+v", binary)
+	}
+	mllData, err := EncodeMLL(module)
+	if err != nil {
+		t.Fatalf("encode MLL: %v", err)
+	}
+	fromMLL, err := DecodeMLL(mllData)
+	if err != nil {
+		t.Fatalf("decode MLL: %v", err)
+	}
+	if got := fromMLL.Kernels[0].Variants[0].Binary; got == nil || string(got.Data) != string(data) {
+		t.Fatalf("offline binary did not round-trip through MLL: %+v", got)
+	}
+}
+
+func TestValidateRejectsKernelBinaryHashMismatch(t *testing.T) {
+	source := `extern "C" __global__ void embed_cuda() {}`
+	sourceSum := sha256.Sum256([]byte(source))
+	module := NewModule("bad-offline-kernel")
+	module.Requirements.SupportedBackends = []BackendKind{BackendCUDA}
+	module.Kernels = []Kernel{{
+		Name: "embed",
+		Variants: []KernelVariant{{
+			Backend: BackendCUDA,
+			Entry:   "embed_cuda",
+			Source:  source,
+			Binary:  &KernelBinary{Format: "ptx", SourceSHA256: hex.EncodeToString(sourceSum[:]), SHA256: strings.Repeat("0", 64), Data: []byte("not-matching")},
+		}},
+	}}
+	if err := module.Validate(); err == nil || !strings.Contains(err.Error(), "does not match data") {
+		t.Fatalf("validate error = %v, want binary hash mismatch", err)
+	}
+}
 
 func TestEncodeDecodeJSONRoundTrip(t *testing.T) {
 	module := NewModule("demo")

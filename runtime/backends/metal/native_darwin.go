@@ -126,6 +126,42 @@ static int eosMetalCompileKernel(EosMetalRuntime* rt, const char* src, const cha
 	}
 }
 
+static int eosMetalLoadKernelBinary(EosMetalRuntime* rt, const void* data, size_t size, const char* entry, EosMetalKernel** out, char** err) {
+	@autoreleasepool {
+		if (rt == NULL || data == NULL || size == 0 || entry == NULL || out == NULL) {
+			*err = manta_dup_format("newLibraryWithData", "invalid offline metallib image");
+			return 1;
+		}
+		id<MTLDevice> device = (__bridge id<MTLDevice>)rt->device;
+		NSString* entryName = [NSString stringWithUTF8String:entry];
+		NSData* image = [NSData dataWithBytes:data length:size];
+		NSError* nsErr = nil;
+		id<MTLLibrary> library = [device newLibraryWithData:image error:&nsErr];
+		if (library == nil) {
+			*err = manta_dup_ns_error("newLibraryWithData", nsErr);
+			return 1;
+		}
+		id<MTLFunction> function = [library newFunctionWithName:entryName];
+		if (function == nil) {
+			*err = manta_dup_format("newFunctionWithName(offline)", "entry not found");
+			return 1;
+		}
+		id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function error:&nsErr];
+		if (pipeline == nil) {
+			*err = manta_dup_ns_error("newComputePipelineStateWithFunction(offline)", nsErr);
+			return 1;
+		}
+		EosMetalKernel* kernel = (EosMetalKernel*)malloc(sizeof(EosMetalKernel));
+		if (kernel == NULL) {
+			*err = manta_dup_format("malloc", "failed to allocate offline kernel");
+			return 1;
+		}
+		kernel->pipeline = (__bridge_retained void*)pipeline;
+		*out = kernel;
+		return 0;
+	}
+}
+
 static void eosMetalKernelDestroy(EosMetalKernel* kernel) {
 	if (kernel == NULL) {
 		return;
@@ -455,7 +491,7 @@ func (rt *deviceRuntime) attachDeviceExecution(prog *backend.NativeKernelProgram
 	}
 	prog.LaunchConfig["device_execution"] = true
 	prog.LaunchConfig["execution_mode"] = "metal_device"
-	prog.LaunchConfig["launch_compiler"] = "metal_runtime"
+	prog.LaunchConfig["launch_compiler"] = compiledMetalKernelCompiler(prog.Compiled)
 	prog.Run = func(inputs []*backend.Tensor) ([]*backend.Tensor, error) {
 		return rt.runKernel(deviceKernel, kernel, prog, inputs)
 	}
@@ -463,17 +499,32 @@ func (rt *deviceRuntime) attachDeviceExecution(prog *backend.NativeKernelProgram
 }
 
 func (rt *deviceRuntime) compileKernel(compiled backend.CompiledKernel, shapeKind metalShapeKind) (*deviceKernel, error) {
-	src := C.CString(compiled.Source)
 	entry := C.CString(compiled.Entry)
-	defer C.free(unsafe.Pointer(src))
 	defer C.free(unsafe.Pointer(entry))
 
 	var kernel *C.EosMetalKernel
 	var errStr *C.char
-	if C.eosMetalCompileKernel(rt.ptr, src, entry, &kernel, &errStr) != 0 {
+	var rc C.int
+	if compiled.Binary != nil && compiled.Binary.Format == "metallib" && len(compiled.Binary.Data) > 0 {
+		image := C.CBytes(compiled.Binary.Data)
+		defer C.free(image)
+		rc = C.eosMetalLoadKernelBinary(rt.ptr, image, C.size_t(len(compiled.Binary.Data)), entry, &kernel, &errStr)
+	} else {
+		src := C.CString(compiled.Source)
+		defer C.free(unsafe.Pointer(src))
+		rc = C.eosMetalCompileKernel(rt.ptr, src, entry, &kernel, &errStr)
+	}
+	if rc != 0 {
 		return nil, cStringError(errStr)
 	}
 	return &deviceKernel{ptr: kernel, shapeKind: shapeKind}, nil
+}
+
+func compiledMetalKernelCompiler(compiled backend.CompiledKernel) string {
+	if compiled.Binary != nil && compiled.Binary.Format == "metallib" {
+		return "offline_metallib"
+	}
+	return "metal_runtime"
 }
 
 func (rt *deviceRuntime) runKernel(deviceKernel *deviceKernel, kernel eosartifact.Kernel, prog *backend.NativeKernelProgram, inputs []*backend.Tensor) ([]*backend.Tensor, error) {

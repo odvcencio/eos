@@ -35,10 +35,12 @@ func CompileNativeKernelProgram(kind eosartifact.BackendKind, kernel eosartifact
 }
 
 func validateCompiledKernelSource(kind eosartifact.BackendKind, compiled CompiledKernel) error {
-	return eosartifact.ValidateKernelVariantSource(compiled.Name, eosartifact.KernelVariant{
+	return eosartifact.ValidateKernelVariant(compiled.Name, eosartifact.KernelVariant{
 		Backend: kind,
 		Entry:   compiled.Entry,
 		Source:  compiled.Source,
+		ABI:     compiled.ABI,
+		Binary:  compiled.Binary,
 	})
 }
 
@@ -55,6 +57,11 @@ func nativeLaunchConfig(kind eosartifact.BackendKind, kernel eosartifact.Kernel,
 		"launch_subgroup":     compiled.Meta["subgroup"],
 		"launch_subgroup_2d":  compiled.Meta["subgroup_2d"],
 		"launch_halo":         compiled.Meta["halo"],
+	}
+	if compiled.Binary != nil && compiled.Binary.Format != "" {
+		config["launch_compiler"] = "offline_" + compiled.Binary.Format
+	} else {
+		config["launch_compiler"] = "nvrtc"
 	}
 	tile := firstTileSize(kernel, compiled)
 	grid := "1d"

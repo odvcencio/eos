@@ -159,6 +159,10 @@ pipeline rope_probe(tokens: i32[T]) -> f16[T, D] {
 			// Downgrade to the exact pre-fix artifact contents.
 			variant.Source = staleRoPECUDASource
 			variant.Entry = "rope_cuda"
+			// Simulate a pre-kernel-ABI artifact: old sealed modules do not
+			// carry the new source fingerprint, so the dedicated rope guard
+			// remains the actionable diagnostic for this regression.
+			variant.ABI = nil
 			delete(variant.Meta, "rope_abi")
 			found = true
 		}
