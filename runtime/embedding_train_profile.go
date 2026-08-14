@@ -35,12 +35,16 @@ type EmbeddingTrainProfile struct {
 	Contrastive           backend.ContrastiveAcceleratorStats     `json:"contrastive"`
 }
 
-// EmbeddingVectorDistillPhaseTimers captures host-observed compact vector-distill phase time.
+// EmbeddingVectorDistillPhaseTimers captures host-observed compact vector-distill phase activity.
 type EmbeddingVectorDistillPhaseTimers struct {
 	EncodeNanos         int64 `json:"encode_nanos,omitempty"`
 	ProjectionLossNanos int64 `json:"projection_loss_nanos,omitempty"`
 	BackwardNanos       int64 `json:"backward_nanos,omitempty"`
 	OptimizerNanos      int64 `json:"optimizer_nanos,omitempty"`
+	EncodeCalls         int64 `json:"encode_calls,omitempty"`
+	ProjectionLossCalls int64 `json:"projection_loss_calls,omitempty"`
+	BackwardCalls       int64 `json:"backward_calls,omitempty"`
+	OptimizerCalls      int64 `json:"optimizer_calls,omitempty"`
 }
 
 // DefaultEmbeddingTrainProfilePath returns the conventional sibling training-profile path for a .mll artifact.
@@ -395,6 +399,10 @@ func diffVectorDistillPhaseTimers(start, end EmbeddingVectorDistillPhaseTimers) 
 		ProjectionLossNanos: end.ProjectionLossNanos - start.ProjectionLossNanos,
 		BackwardNanos:       end.BackwardNanos - start.BackwardNanos,
 		OptimizerNanos:      end.OptimizerNanos - start.OptimizerNanos,
+		EncodeCalls:         end.EncodeCalls - start.EncodeCalls,
+		ProjectionLossCalls: end.ProjectionLossCalls - start.ProjectionLossCalls,
+		BackwardCalls:       end.BackwardCalls - start.BackwardCalls,
+		OptimizerCalls:      end.OptimizerCalls - start.OptimizerCalls,
 	}
 }
 
@@ -424,6 +432,10 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 		profile.VectorDistillPhases.ProjectionLossNanos != 0 ||
 		profile.VectorDistillPhases.BackwardNanos != 0 ||
 		profile.VectorDistillPhases.OptimizerNanos != 0 ||
+		profile.VectorDistillPhases.EncodeCalls != 0 ||
+		profile.VectorDistillPhases.ProjectionLossCalls != 0 ||
+		profile.VectorDistillPhases.BackwardCalls != 0 ||
+		profile.VectorDistillPhases.OptimizerCalls != 0 ||
 		profile.Optimizer.LogicalSteps != 0 ||
 		profile.Optimizer.TensorUpdateCalls != 0 ||
 		profile.Optimizer.UpdateCalls != 0 ||
@@ -491,6 +503,10 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 			ProjectionLossNanos: left.VectorDistillPhases.ProjectionLossNanos + right.VectorDistillPhases.ProjectionLossNanos,
 			BackwardNanos:       left.VectorDistillPhases.BackwardNanos + right.VectorDistillPhases.BackwardNanos,
 			OptimizerNanos:      left.VectorDistillPhases.OptimizerNanos + right.VectorDistillPhases.OptimizerNanos,
+			EncodeCalls:         left.VectorDistillPhases.EncodeCalls + right.VectorDistillPhases.EncodeCalls,
+			ProjectionLossCalls: left.VectorDistillPhases.ProjectionLossCalls + right.VectorDistillPhases.ProjectionLossCalls,
+			BackwardCalls:       left.VectorDistillPhases.BackwardCalls + right.VectorDistillPhases.BackwardCalls,
+			OptimizerCalls:      left.VectorDistillPhases.OptimizerCalls + right.VectorDistillPhases.OptimizerCalls,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:                   left.Optimizer.LogicalSteps + right.Optimizer.LogicalSteps,
@@ -601,6 +617,10 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 			ProjectionLossNanos: base.VectorDistillPhases.ProjectionLossNanos + delta.VectorDistillPhases.ProjectionLossNanos,
 			BackwardNanos:       base.VectorDistillPhases.BackwardNanos + delta.VectorDistillPhases.BackwardNanos,
 			OptimizerNanos:      base.VectorDistillPhases.OptimizerNanos + delta.VectorDistillPhases.OptimizerNanos,
+			EncodeCalls:         base.VectorDistillPhases.EncodeCalls + delta.VectorDistillPhases.EncodeCalls,
+			ProjectionLossCalls: base.VectorDistillPhases.ProjectionLossCalls + delta.VectorDistillPhases.ProjectionLossCalls,
+			BackwardCalls:       base.VectorDistillPhases.BackwardCalls + delta.VectorDistillPhases.BackwardCalls,
+			OptimizerCalls:      base.VectorDistillPhases.OptimizerCalls + delta.VectorDistillPhases.OptimizerCalls,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
 			LogicalSteps:                   base.Optimizer.LogicalSteps + delta.Optimizer.LogicalSteps,

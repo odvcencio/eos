@@ -315,17 +315,19 @@ func TestVectorDistillHostFallbackRecordsPhaseTimers(t *testing.T) {
 		t.Fatalf("loss is not finite: %v", metrics.Loss)
 	}
 	delta := diffTrainProfile(start, trainer.TrainProfile())
-	if delta.VectorDistillPhases.EncodeNanos <= 0 {
-		t.Fatalf("encode timer = %d, want > 0", delta.VectorDistillPhases.EncodeNanos)
+	assertVectorDistillPhaseActivity(t, "encode", delta.VectorDistillPhases.EncodeCalls, delta.VectorDistillPhases.EncodeNanos, 1)
+	assertVectorDistillPhaseActivity(t, "projection/loss", delta.VectorDistillPhases.ProjectionLossCalls, delta.VectorDistillPhases.ProjectionLossNanos, int64(len(batch)))
+	assertVectorDistillPhaseActivity(t, "backward", delta.VectorDistillPhases.BackwardCalls, delta.VectorDistillPhases.BackwardNanos, int64(len(batch)))
+	assertVectorDistillPhaseActivity(t, "optimizer", delta.VectorDistillPhases.OptimizerCalls, delta.VectorDistillPhases.OptimizerNanos, 1)
+}
+
+func assertVectorDistillPhaseActivity(t *testing.T, name string, calls, nanos, wantCalls int64) {
+	t.Helper()
+	if calls != wantCalls {
+		t.Fatalf("%s calls = %d, want %d", name, calls, wantCalls)
 	}
-	if delta.VectorDistillPhases.ProjectionLossNanos <= 0 {
-		t.Fatalf("projection/loss timer = %d, want > 0", delta.VectorDistillPhases.ProjectionLossNanos)
-	}
-	if delta.VectorDistillPhases.BackwardNanos <= 0 {
-		t.Fatalf("backward timer = %d, want > 0", delta.VectorDistillPhases.BackwardNanos)
-	}
-	if delta.VectorDistillPhases.OptimizerNanos <= 0 {
-		t.Fatalf("optimizer timer = %d, want > 0", delta.VectorDistillPhases.OptimizerNanos)
+	if nanos < 0 {
+		t.Fatalf("%s timer = %d, want non-negative", name, nanos)
 	}
 }
 
