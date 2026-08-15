@@ -877,6 +877,7 @@ var cudaNativeEmitter = nativeKernelEmitter{
 
 var metalNativeEmitter = nativeKernelEmitter{
 	rowKernel:     emitMetalRowKernel,
+	ropeKernel:    emitMetalRoPEKernel,
 	scoreKernel:   emitMetalScoreKernel,
 	geluKernel:    emitMetalGELUKernel,
 	binaryKernel:  emitMetalElementwiseBinaryKernel,
@@ -936,9 +937,10 @@ var metalNativeEmitter = nativeKernelEmitter{
 `,
 	ropeBody: `
     if ((int)gid >= rows) return;
+    int pos = (seq_len > 0) ? ((int)gid % seq_len) : (int)gid;
     int base = ((int)gid) * cols;
     for (int c = 0; c + 1 < cols; c += 2) {
-        float theta = ((float)gid) / pow(10000.0f, ((float)c) / (float)cols);
+        float theta = ((float)pos) / pow(10000.0f, ((float)c) / (float)cols);
         float cos_theta = cos(theta);
         float sin_theta = sin(theta);
         float x0 = in0[base + c];
@@ -1291,6 +1293,23 @@ func emitMetalRowKernel(kernel lir.Kernel, body string) string {
 	b.WriteString("device float* out0 [[buffer(1)]], ")
 	b.WriteString("constant int& rows [[buffer(2)]], ")
 	b.WriteString("constant int& cols [[buffer(3)]], ")
+	b.WriteString("uint gid [[thread_position_in_grid]]) {\n")
+	b.WriteString(body)
+	b.WriteString("}\n")
+	return b.String()
+}
+
+func emitMetalRoPEKernel(kernel lir.Kernel, body string) string {
+	var b strings.Builder
+	b.WriteString("#include <metal_stdlib>\nusing namespace metal;\n\n")
+	b.WriteString("kernel void ")
+	b.WriteString(kernel.Name)
+	b.WriteString("_metal(")
+	b.WriteString("const device float* in0 [[buffer(0)]], ")
+	b.WriteString("device float* out0 [[buffer(1)]], ")
+	b.WriteString("constant int& rows [[buffer(2)]], ")
+	b.WriteString("constant int& cols [[buffer(3)]], ")
+	b.WriteString("constant int& seq_len [[buffer(4)]], ")
 	b.WriteString("uint gid [[thread_position_in_grid]]) {\n")
 	b.WriteString(body)
 	b.WriteString("}\n")

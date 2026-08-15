@@ -251,6 +251,7 @@ type EmbeddingTrainer struct {
 	forwardCache            *embeddingForwardWeights
 	compactState            *CompactEmbeddingTrainState
 	compactForwardCache     *compactEmbeddingForwardWeights
+	compactTrainConfigured  *compactEmbeddingForwardWeights
 	boundForward            embeddingForwardWeights
 	forwardDirty            bool
 	forwardNeedsBind        bool
@@ -439,6 +440,40 @@ type compactEmbeddingForwardWeights struct {
 	layers               []compactEmbeddingForwardLayer
 	outputProjectionName string
 	outputProjection     *backend.Tensor
+}
+
+func compactTrainForwardConfigurationEqual(current, next *compactEmbeddingForwardWeights) bool {
+	if current == nil || next == nil || current.outputProjectionName != next.outputProjectionName || len(current.layers) != len(next.layers) {
+		return false
+	}
+	if !compactTrainTensorShapeEqual(current.token, next.token) || !compactTrainTensorShapeEqual(current.role, next.role) || !compactTrainTensorShapeEqual(current.outputProjection, next.outputProjection) {
+		return false
+	}
+	for i := range current.layers {
+		left, right := current.layers[i], next.layers[i]
+		if left.attnQName != right.attnQName || left.attnKName != right.attnKName || left.attnVName != right.attnVName || left.attnOName != right.attnOName || left.ffnUpName != right.ffnUpName || left.ffnDownName != right.ffnDownName || left.attentionHeads != right.attentionHeads || left.headDim != right.headDim {
+			return false
+		}
+		if !compactTrainTensorShapeEqual(left.attnQ, right.attnQ) || !compactTrainTensorShapeEqual(left.attnK, right.attnK) || !compactTrainTensorShapeEqual(left.attnV, right.attnV) || !compactTrainTensorShapeEqual(left.attnO, right.attnO) || !compactTrainTensorShapeEqual(left.ffnUp, right.ffnUp) || !compactTrainTensorShapeEqual(left.ffnDown, right.ffnDown) {
+			return false
+		}
+	}
+	return true
+}
+
+func compactTrainTensorShapeEqual(left, right *backend.Tensor) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	if len(left.Shape) != len(right.Shape) {
+		return false
+	}
+	for i := range left.Shape {
+		if left.Shape[i] != right.Shape[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type compactEmbeddingGradLayer struct {
@@ -4553,7 +4588,7 @@ func (t *EmbeddingTrainer) prepareCompactTrainAccelerator(forward *compactEmbedd
 	if t == nil || t.compactTrainAccel == nil || forward == nil {
 		return fmt.Errorf("compact train accelerator is not initialized")
 	}
-	if configurator, ok := t.compactTrainAccel.(backend.CompactForwardConfigurator); ok {
+	if configurator, ok := t.compactTrainAccel.(backend.CompactForwardConfigurator); ok && !compactTrainForwardConfigurationEqual(t.compactTrainConfigured, forward) {
 		layers := make([]backend.CompactForwardLayerConfig, len(forward.layers))
 		for i, layer := range forward.layers {
 			layers[i] = backend.CompactForwardLayerConfig{
@@ -4570,6 +4605,7 @@ func (t *EmbeddingTrainer) prepareCompactTrainAccelerator(forward *compactEmbedd
 			roleName = t.compactState.RoleEmbedding.Name
 		}
 		configurator.ConfigureCompactForward(layers, t.compactState.TokenEmbedding.Name, roleName, forward.outputProjectionName, t.manifest.PositionEncoding == EmbeddingPositionEncodingRoPE)
+		t.compactTrainConfigured = forward
 	}
 	items := t.compactForwardResidentItems(forward)
 	for i := range items {

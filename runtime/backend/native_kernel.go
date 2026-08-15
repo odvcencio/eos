@@ -201,6 +201,9 @@ func CompileNativeKernelProgram(kind eosartifact.BackendKind, kernel eosartifact
 		config["launch_contract_shape"] = contract.Shape
 		config["launch_contract_fingerprint"] = contract.Fingerprint
 		config["launch_arg_count"] = len(contract.Args)
+		if kind == eosartifact.BackendCUDA {
+			config["launch_bridge"] = "typed_args_v1"
+		}
 		if compiled.ABI == nil {
 			config["launch_abi_status"] = "legacy_unverified"
 		} else {

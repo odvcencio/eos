@@ -74,6 +74,51 @@ Measured in this checkpoint: compiler, artifact, backend, CUDA, Metal, and CLI
 tests pass; no CUDA compiler is installed in the current Linux environment, so
 no PTX throughput or device-parity claim is made here.
 
+## Current Preparation Checkpoint: K2 (2026-08-14)
+
+The next pre-training hardening slice removes avoidable allocation and launch
+plumbing overhead without changing the backend-neutral artifact contract:
+
+- Compact resident training now reuses activation and backward arenas by exact
+  `CompactForwardShape`. Consumed handles remain precisely recognizable as
+  already released, while their device buffers move to a per-shape pool
+  bounded by consumed arena concurrency and flushed on reconfiguration or
+  close.
+- The trainer memoizes the layer/name/shape/position configuration around its
+  per-batch preparation hook, so unchanged preparation does not call the
+  explicit reconfiguration API (which still flushes safely when invoked by a
+  caller) or flush the warm pool/resident gradients.
+- Compact train int32 token/mask/role/status staging buffers are copied into
+  the reusable arena instead of being freed and reallocated for every
+  microbatch. `ArenaReuseHits` and `ArenaAllocations` are explicit counters for
+  the warm-up/performance gate.
+- Generated CUDA row-wise, RoPE, elementwise, and row-score families use a
+  typed argument bridge (`typed_args_v1`) backed by the validated K1 launch
+  contract. The bridge keeps pointer/value storage stable for the driver and
+  provides one common path for the later batched/asynchronous launch bridge;
+  existing auxiliary wrappers remain until their contracts are promoted.
+- Metal RoPE emission now carries `seq_len` and resets batched positions by
+  sequence, keeping the cross-backend K1 contract truthful instead of falling
+  through to a four-argument stale variant.
+
+The K2 verification gate is green for `go test ./...`, `CGO_ENABLED=0 go test
+./...`, `go vet ./...`, and the exact-shape arena-pool unit tests. These are
+allocation/ABI correctness gates only; no CUDA device throughput or embedder
+quality claim is made until a quiet-host warm benchmark records launch,
+synchronization, byte, residency, and loss-parity deltas.
+
+The host-only pool microbenchmark (`-benchtime=100x -benchmem`) measured
+`72.71 ns/op`, `0 B/op`, and `0 allocs/op` on the current Intel Core Ultra 9
+285 environment. This validates the reuse bookkeeping, not device allocation
+latency; the CUDA warm-run gate remains outstanding.
+
+A live two-step CUDA parity profile at the small `B=1,T=2,D=4,H=6,L=2`
+fixture then recorded `ArenaReuseHits=1`, `ArenaAllocations=1`, `136` kernel
+launches, `4` synchronizations, and `FallbackOrUnhandled=0`; gradients and
+weights remained within the existing hard parity tolerance. This is a
+correctness and reuse signal, not a throughput claim or a release-shape
+benchmark.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -195,6 +240,9 @@ Phase 0, weeks 1-2, close safety and observability:
   compilation and expose run-level device/host/fallback accounting. Keep the
   generic argument bridge and device byte/sync telemetry as the next measured
   sub-gates rather than claiming they already exist.
+- K2 preparation slice: warm exact-shape compact-train arenas and staging
+  buffers, use the typed CUDA launch bridge for promoted generated families,
+  and repair Metal RoPE ABI parity before the next embedder training run.
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 

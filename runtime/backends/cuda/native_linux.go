@@ -28,6 +28,16 @@ typedef struct {
 	CUfunction function;
 } EosCudaKernel;
 
+// EosCudaTypedLaunchArg is the small, backend-owned launch ABI used by the
+// generated pointwise/row-wise kernel families. Keeping the scalar storage in
+// the C-owned array means cuLaunchKernel receives stable addresses without a
+// per-family wrapper or a Go pointer graph crossing the cgo boundary.
+typedef struct {
+	int kind; // 0 = device pointer, 1 = int32 value
+	CUdeviceptr pointer;
+	int value;
+} EosCudaTypedLaunchArg;
+
 static char* manta_dup_cstr(const char* s) {
 	if (s == NULL) {
 		return NULL;
@@ -498,6 +508,28 @@ static int eosCudaLaunch1D(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned i
 		return 1;
 	}
 	return 0;
+}
+
+static int eosCudaLaunchTyped1D(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, EosCudaTypedLaunchArg* typedArgs, int argCount, char** err) {
+	if (typedArgs == NULL || argCount <= 0 || argCount > 64) {
+		*err = manta_dup_format("eosCudaLaunchTyped1D", "invalid typed argument vector");
+		return 1;
+	}
+	void* args[64];
+	for (int i = 0; i < argCount; i++) {
+		switch (typedArgs[i].kind) {
+		case 0:
+			args[i] = &typedArgs[i].pointer;
+			break;
+		case 1:
+			args[i] = &typedArgs[i].value;
+			break;
+		default:
+			*err = manta_dup_format("eosCudaLaunchTyped1D", "unknown typed argument kind");
+			return 1;
+		}
+	}
+	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
 }
 
 static int eosCudaLaunchRowWise(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr in0, CUdeviceptr out0, int rows, int cols, char** err) {
@@ -2361,6 +2393,20 @@ type deviceKernel struct {
 	shapeKind cudaShapeKind
 }
 
+type cudaTypedLaunchArg struct {
+	kind    C.int
+	pointer C.CUdeviceptr
+	value   C.int
+}
+
+func cudaPointerLaunchArg(ptr C.CUdeviceptr) cudaTypedLaunchArg {
+	return cudaTypedLaunchArg{kind: 0, pointer: ptr}
+}
+
+func cudaIntLaunchArg(value C.int) cudaTypedLaunchArg {
+	return cudaTypedLaunchArg{kind: 1, value: value}
+}
+
 type auxKernel struct {
 	ptr *C.EosCudaKernel
 }
@@ -2524,6 +2570,7 @@ func (rt *deviceRuntime) attachDeviceExecution(prog *backend.NativeKernelProgram
 	prog.LaunchConfig["device_execution"] = true
 	prog.LaunchConfig["execution_mode"] = "cuda_device"
 	prog.LaunchConfig["launch_compiler"] = compiledKernelCompiler(prog.Compiled)
+	prog.LaunchConfig["launch_bridge"] = "typed_args_v1"
 	prog.Run = func(inputs []*backend.Tensor) ([]*backend.Tensor, error) {
 		return rt.runKernel(deviceKernel, kernel, prog, inputs)
 	}
@@ -2642,7 +2689,10 @@ func (rt *deviceRuntime) runRowWiseKernel(deviceKernel *deviceKernel, kernel eos
 	colsArg := C.int(cols)
 	block := C.uint(firstIntValue(prog.LaunchConfig["launch_block_size"], 128))
 	grid := C.uint((rows + int(block) - 1) / int(block))
-	if err := rt.launchRowWise(deviceKernel.ptr, grid, block, inBuf, outBuf, rowsArg, colsArg); err != nil {
+	if err := rt.launchTyped1D(deviceKernel.ptr, grid, block, []cudaTypedLaunchArg{
+		cudaPointerLaunchArg(inBuf), cudaPointerLaunchArg(outBuf),
+		cudaIntLaunchArg(rowsArg), cudaIntLaunchArg(colsArg),
+	}); err != nil {
 		return nil, err
 	}
 	if err := rt.downloadFloat32(outHost, outBuf); err != nil {
@@ -2695,7 +2745,10 @@ func (rt *deviceRuntime) runRoPEKernel(deviceKernel *deviceKernel, kernel eosart
 	seqLenArg := C.int(seqLen)
 	block := C.uint(firstIntValue(prog.LaunchConfig["launch_block_size"], 128))
 	grid := C.uint((rows + int(block) - 1) / int(block))
-	if err := rt.launchRoPE(deviceKernel.ptr, grid, block, inBuf, outBuf, rowsArg, colsArg, seqLenArg); err != nil {
+	if err := rt.launchTyped1D(deviceKernel.ptr, grid, block, []cudaTypedLaunchArg{
+		cudaPointerLaunchArg(inBuf), cudaPointerLaunchArg(outBuf),
+		cudaIntLaunchArg(rowsArg), cudaIntLaunchArg(colsArg), cudaIntLaunchArg(seqLenArg),
+	}); err != nil {
 		return nil, err
 	}
 	if err := rt.downloadFloat32(outHost, outBuf); err != nil {
@@ -2733,7 +2786,10 @@ func (rt *deviceRuntime) runElementWiseKernel(deviceKernel *deviceKernel, kernel
 	elementsArg := C.int(elements)
 	block := C.uint(firstIntValue(prog.LaunchConfig["launch_block_size"], 128))
 	grid := C.uint((elements + int(block) - 1) / int(block))
-	if err := rt.launchElementWise(deviceKernel.ptr, grid, block, lhsBuf, rhsBuf, outBuf, elementsArg); err != nil {
+	if err := rt.launchTyped1D(deviceKernel.ptr, grid, block, []cudaTypedLaunchArg{
+		cudaPointerLaunchArg(lhsBuf), cudaPointerLaunchArg(rhsBuf),
+		cudaPointerLaunchArg(outBuf), cudaIntLaunchArg(elementsArg),
+	}); err != nil {
 		return nil, err
 	}
 	if err := rt.downloadFloat32(outHost, outBuf); err != nil {
@@ -2765,7 +2821,9 @@ func (rt *deviceRuntime) runUnaryKernel(deviceKernel *deviceKernel, kernel eosar
 	elementsArg := C.int(elements)
 	block := C.uint(firstIntValue(prog.LaunchConfig["launch_block_size"], 128))
 	grid := C.uint((elements + int(block) - 1) / int(block))
-	if err := rt.launchUnary(deviceKernel.ptr, grid, block, inBuf, outBuf, elementsArg); err != nil {
+	if err := rt.launchTyped1D(deviceKernel.ptr, grid, block, []cudaTypedLaunchArg{
+		cudaPointerLaunchArg(inBuf), cudaPointerLaunchArg(outBuf), cudaIntLaunchArg(elementsArg),
+	}); err != nil {
 		return nil, err
 	}
 	if err := rt.downloadFloat32(outHost, outBuf); err != nil {
@@ -2805,7 +2863,10 @@ func (rt *deviceRuntime) runScoreKernel(deviceKernel *deviceKernel, kernel eosar
 	colsArg := C.int(cols)
 	block := C.uint(firstIntValue(prog.LaunchConfig["launch_block_size"], 128))
 	grid := C.uint((rows + int(block) - 1) / int(block))
-	if err := rt.launchScore(deviceKernel.ptr, grid, block, queryBuf, docsBuf, outBuf, rowsArg, colsArg); err != nil {
+	if err := rt.launchTyped1D(deviceKernel.ptr, grid, block, []cudaTypedLaunchArg{
+		cudaPointerLaunchArg(queryBuf), cudaPointerLaunchArg(docsBuf),
+		cudaPointerLaunchArg(outBuf), cudaIntLaunchArg(rowsArg), cudaIntLaunchArg(colsArg),
+	}); err != nil {
 		return nil, err
 	}
 	if err := rt.downloadFloat32(outHost, outBuf); err != nil {
@@ -4209,6 +4270,34 @@ func (rt *deviceRuntime) freeBuffer(ptr C.CUdeviceptr) error {
 	}
 	var errStr *C.char
 	if C.eosCudaMemFree(rt.ptr, ptr, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) launchTyped1D(kernel *C.EosCudaKernel, grid, block C.uint, args []cudaTypedLaunchArg) error {
+	if kernel == nil {
+		return fmt.Errorf("cuda typed launch kernel is not initialized")
+	}
+	if len(args) == 0 || len(args) > 64 {
+		return fmt.Errorf("cuda typed launch argument count %d is outside [1,64]", len(args))
+	}
+	cargs := make([]C.EosCudaTypedLaunchArg, len(args))
+	for i, arg := range args {
+		cargs[i].kind = arg.kind
+		cargs[i].pointer = arg.pointer
+		cargs[i].value = arg.value
+	}
+	var errStr *C.char
+	if C.eosCudaLaunchTyped1D(
+		rt.ptr,
+		kernel,
+		grid,
+		block,
+		(*C.EosCudaTypedLaunchArg)(unsafe.Pointer(&cargs[0])),
+		C.int(len(cargs)),
+		&errStr,
+	) != 0 {
 		return cStringError(errStr)
 	}
 	return nil

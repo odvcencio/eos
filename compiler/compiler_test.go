@@ -685,14 +685,17 @@ func TestRoPEKernelCUDAVariantCarriesABIMarkerAndSeqLenParam(t *testing.T) {
 	foundSoftmax := false
 	for _, kernel := range bundle.Artifact.Kernels {
 		var cudaVariant *eosartifact.KernelVariant
+		var metalVariant *eosartifact.KernelVariant
 		for i := range kernel.Variants {
 			if kernel.Variants[i].Backend == eosartifact.BackendCUDA {
 				cudaVariant = &kernel.Variants[i]
-				break
+			}
+			if kernel.Variants[i].Backend == eosartifact.BackendMetal {
+				metalVariant = &kernel.Variants[i]
 			}
 		}
-		if cudaVariant == nil {
-			t.Fatalf("kernel %q missing CUDA variant", kernel.Name)
+		if cudaVariant == nil || metalVariant == nil {
+			t.Fatalf("kernel %q missing CUDA or Metal variant", kernel.Name)
 		}
 		switch kernel.Name {
 		case "rope":
@@ -705,6 +708,9 @@ func TestRoPEKernelCUDAVariantCarriesABIMarkerAndSeqLenParam(t *testing.T) {
 			}
 			if !strings.Contains(cudaVariant.Source, "int seq_len") {
 				t.Fatalf("rope CUDA source missing seq_len parameter:\n%s", cudaVariant.Source)
+			}
+			if !strings.Contains(metalVariant.Source, "seq_len") {
+				t.Fatalf("rope Metal source missing seq_len parameter:\n%s", metalVariant.Source)
 			}
 		case "softmax":
 			foundSoftmax = true

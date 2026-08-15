@@ -405,6 +405,7 @@ func (t *fakeResidentGradientToken) Alive() bool        { return t != nil && t.a
 
 type fakeCompactTrainAccelerator struct {
 	configured      bool
+	configureCalls  int64
 	bound           map[string]backend.OptimizerResidentParameter
 	preflightCalls  int64
 	beginCalls      int64
@@ -451,6 +452,7 @@ func (a *fakeCompactTrainAccelerator) Close() {
 
 func (a *fakeCompactTrainAccelerator) ConfigureCompactForward([]backend.CompactForwardLayerConfig, string, string, string, bool) {
 	a.configured = true
+	a.configureCalls++
 }
 
 func (a *fakeCompactTrainAccelerator) BindCompactTrainResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
@@ -3283,6 +3285,31 @@ func TestCompactEmbeddingTrainerResidentTrainForwardValidationReleasesHandles(t 
 	}
 	if trainer.compactForwardSelected {
 		t.Fatal("forward-only validation marked normal compact forward selected")
+	}
+}
+
+func TestCompactTrainPrepareMemoizesConfigurationAcrossWeightRefresh(t *testing.T) {
+	trainer := newCompactEmbeddingTrainerForTest(t, 3)
+	t.Cleanup(trainer.Close)
+	optimizer := &fakeResidentOptimizerAccelerator{}
+	train := &fakeCompactTrainAccelerator{supportBackward: true}
+	trainer.optimizerAccel = optimizer
+	trainer.compactTrainAccel = train
+
+	forward := trainer.prepareCompactForwardWeights()
+	if err := trainer.prepareCompactTrainAccelerator(forward); err != nil {
+		t.Fatalf("initial compact train preparation: %v", err)
+	}
+	trainer.invalidateForwardWeights()
+	refreshed := trainer.prepareCompactForwardWeights()
+	if refreshed == forward {
+		t.Fatal("forward refresh reused the old weight descriptor")
+	}
+	if err := trainer.prepareCompactTrainAccelerator(refreshed); err != nil {
+		t.Fatalf("refreshed compact train preparation: %v", err)
+	}
+	if train.configureCalls != 1 {
+		t.Fatalf("compact train configure calls = %d, want 1 across unchanged weight refresh", train.configureCalls)
 	}
 }
 

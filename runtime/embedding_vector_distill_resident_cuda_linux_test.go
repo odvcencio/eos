@@ -58,6 +58,9 @@ func TestVectorDistillCompactResidentTrainCUDAOneAndTwoStepParity(t *testing.T) 
 	if residentImmediateSummary.DeltaProfile.CompactTrain == nil || residentImmediateSummary.DeltaProfile.CompactTrain.BackwardCalls != 2 || residentImmediateSummary.DeltaProfile.CompactTrain.LiveHandles != 0 || residentImmediateSummary.DeltaProfile.CompactTrain.FallbackOrUnhandled != 0 {
 		t.Fatalf("resident immediate compact train profile = %+v", residentImmediateSummary.DeltaProfile.CompactTrain)
 	}
+	if residentImmediateSummary.DeltaProfile.CompactTrain.ArenaReuseHits != 1 || residentImmediateSummary.DeltaProfile.CompactTrain.ArenaAllocations != 1 {
+		t.Fatalf("resident immediate arena reuse/allocation = %d/%d, want 1/1: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.ArenaReuseHits, residentImmediateSummary.DeltaProfile.CompactTrain.ArenaAllocations, *residentImmediateSummary.DeltaProfile.CompactTrain)
+	}
 	if wantLaunches, wantSyncs := int64(136), expectedRuntimeCompactTrainSyncs(136, 4); residentImmediateSummary.DeltaProfile.CompactTrain.KernelLaunches != wantLaunches || residentImmediateSummary.DeltaProfile.CompactTrain.KernelSynchronizations != wantSyncs {
 		t.Fatalf("resident immediate compact train launch/sync = %d/%d, want %d/%d: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.KernelLaunches, residentImmediateSummary.DeltaProfile.CompactTrain.KernelSynchronizations, wantLaunches, wantSyncs, *residentImmediateSummary.DeltaProfile.CompactTrain)
 	}

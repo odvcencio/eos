@@ -145,6 +145,7 @@ type CompactTrainAccelerator struct {
 	*CompactForwardAccelerator
 	stats              backend.CompactTrainAcceleratorStats
 	arenas             map[*compactTrainHandleToken]*compactTrainArena
+	arenaPool          map[backend.CompactForwardShape][]*compactTrainArena
 	trainKernels       compactTrainKernels
 	grads              map[string]*compactTrainGradient
 	gradGen            uint64
@@ -763,6 +764,7 @@ func NewCompactTrainAccelerator() (*CompactTrainAccelerator, error) {
 		compactTrainCublas: cudaEnvFlagEnabled("EOS_CUDA_COMPACT_TRAIN_CUBLAS"),
 		grads:              map[string]*compactTrainGradient{},
 		arenas:             map[*compactTrainHandleToken]*compactTrainArena{},
+		arenaPool:          map[backend.CompactForwardShape][]*compactTrainArena{},
 	}, nil
 }
 
@@ -783,6 +785,7 @@ func (a *CompactTrainAccelerator) configureCompactTrain(names []CompactForwardLa
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.releaseArenasLocked()
+	a.releaseArenaPoolLocked()
 	a.releaseGradientsLocked()
 	a.stepActive = false
 	a.stepSealed = false
@@ -802,6 +805,7 @@ func (a *CompactTrainAccelerator) Close() {
 	a.closed = true
 	a.releaseGradientsLocked()
 	a.releaseArenasLocked()
+	a.releaseArenaPoolLocked()
 	if a.device != nil {
 		a.device.destroyAuxKernel(a.trainKernels.finalProjectionGrad)
 		a.device.destroyAuxKernel(a.trainKernels.finalHiddenGrad)
@@ -1711,6 +1715,9 @@ func (a *CompactTrainAccelerator) validateHandleLocked(handle backend.CompactTra
 	if handle.StepID != a.stepID || token.StepID() != a.stepID || token.StepID() != handle.StepID {
 		return nil, fmt.Errorf("cuda compact train handle step %d is stale, current %d", handle.StepID, a.stepID)
 	}
+	if !token.Alive() {
+		return nil, fmt.Errorf("cuda compact train handle already released")
+	}
 	arena := a.arenas[token]
 	if arena == nil || arena.token != token || arena.id != token.id || arena.generation != handle.Generation || token.Generation() != handle.Generation {
 		return nil, fmt.Errorf("cuda compact train handle is stale")
@@ -1718,7 +1725,7 @@ func (a *CompactTrainAccelerator) validateHandleLocked(handle backend.CompactTra
 	if handle.Shape != arena.shape {
 		return nil, fmt.Errorf("cuda compact train handle shape mismatch")
 	}
-	if !arena.live || !token.Alive() {
+	if !arena.live {
 		return nil, fmt.Errorf("cuda compact train handle already released")
 	}
 	return arena, nil
@@ -1736,6 +1743,8 @@ func (a *CompactTrainAccelerator) consumeHandleLocked(handle backend.CompactTrai
 	arena.live = false
 	a.stats.HandlesReleased++
 	a.stats.LiveHandles--
+	a.recycleArenaLocked(arena)
+	a.refreshArenaStatsLocked()
 	return nil
 }
 
@@ -2269,6 +2278,31 @@ func (a *CompactTrainAccelerator) ReleaseCompactTrainHandle(handle backend.Compa
 }
 
 func (a *CompactTrainAccelerator) prepareArenaLocked(shape backend.CompactForwardShape) (*compactTrainArena, error) {
+	if a.arenaPool == nil {
+		a.arenaPool = map[backend.CompactForwardShape][]*compactTrainArena{}
+	}
+	if bucket := a.arenaPool[shape]; len(bucket) > 0 {
+		arena := bucket[len(bucket)-1]
+		a.arenaPool[shape] = bucket[:len(bucket)-1]
+		for token, mapped := range a.arenas {
+			if mapped == arena {
+				delete(a.arenas, token)
+			}
+		}
+		arena.shape = shape
+		arena.id = 0
+		arena.generation = 0
+		arena.token = nil
+		arena.live = false
+		arena.geluFast = false
+		for i := range arena.layers {
+			// input is an alias to another activation buffer and is rewritten by
+			// every forward pass; it is not owned by the layer arena.
+			arena.layers[i].input = 0
+		}
+		a.stats.ArenaReuseHits++
+		return arena, nil
+	}
 	arena := &compactTrainArena{shape: shape}
 	B, T, D, H := shape.Batch, shape.Tokens, shape.ModelDim, shape.FFNDim
 	rows := B * T
@@ -2349,13 +2383,13 @@ func (a *CompactTrainAccelerator) prepareArenaLocked(shape backend.CompactForwar
 			return nil, err
 		}
 	}
+	a.stats.ArenaAllocations++
 	return arena, nil
 }
 
 func (a *CompactTrainAccelerator) replaceUploadedInt32(dst *C.CUdeviceptr, data []int32) error {
 	if *dst != 0 {
-		_ = a.device.freeBuffer(*dst)
-		*dst = 0
+		return a.device.copyInt32ToBuffer(*dst, data)
 	}
 	ptr, err := a.device.uploadInt32(data)
 	if err != nil {
@@ -2365,8 +2399,42 @@ func (a *CompactTrainAccelerator) replaceUploadedInt32(dst *C.CUdeviceptr, data 
 	return nil
 }
 
+func (a *CompactTrainAccelerator) recycleArenaLocked(arena *compactTrainArena) {
+	if a == nil || arena == nil {
+		return
+	}
+	if a.arenaPool == nil {
+		a.arenaPool = map[backend.CompactForwardShape][]*compactTrainArena{}
+	}
+	arena.id = 0
+	arena.generation = 0
+	arena.token = nil
+	arena.live = false
+	arena.geluFast = false
+	a.arenaPool[arena.shape] = append(a.arenaPool[arena.shape], arena)
+}
+
+func (a *CompactTrainAccelerator) releaseArenaPoolLocked() {
+	if a == nil || a.device == nil {
+		return
+	}
+	for shape, bucket := range a.arenaPool {
+		for _, arena := range bucket {
+			a.freeArena(arena)
+		}
+		delete(a.arenaPool, shape)
+	}
+}
+
 func (a *CompactTrainAccelerator) releaseArenasLocked() {
 	for token, arena := range a.arenas {
+		if arena != nil && !arena.live {
+			// A consumed arena is retained in arenaPool for reuse. The stale
+			// handle entry remains until the arena is taken again so callers get
+			// the precise "already released" error on a double release.
+			delete(a.arenas, token)
+			continue
+		}
 		if arena != nil && arena.live {
 			if token != nil && token.alive.CompareAndSwap(true, false) {
 				a.stats.HandlesReleased++

@@ -211,6 +211,8 @@ type CompactTrainAcceleratorStats struct {
 	HandlesCreated              int64
 	HandlesReleased             int64
 	LiveHandles                 int64
+	ArenaReuseHits              int64
+	ArenaAllocations            int64
 	GradientZeroCalls           int64
 	ResidentGradBytes           int64
 	ActivationArenaBytes        int64

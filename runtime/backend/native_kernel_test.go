@@ -159,6 +159,9 @@ func TestCompileNativeKernelProgramValidatesLaunchContract(t *testing.T) {
 	if got := prog.LaunchConfig["launch_arg_count"]; got != 4 {
 		t.Fatalf("launch_arg_count = %v, want 4", got)
 	}
+	if got := prog.LaunchConfig["launch_bridge"]; got != "typed_args_v1" {
+		t.Fatalf("launch_bridge = %v, want typed_args_v1", got)
+	}
 	if prog.LaunchContract.Fingerprint == "" {
 		t.Fatal("launch contract fingerprint is empty")
 	}
