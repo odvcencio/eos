@@ -49,6 +49,27 @@ behind the existing source-backed behavior:
   base64 expansion in `XMTA`; readers that do not understand `XKBI` still retain
   the source/host-fallback contract.
 
+The next correctness/performance gate is the K1 dispatch contract slice:
+
+- Generated CUDA/Metal ABI arguments now carry an explicit `kind` (`pointer` or
+  `value`) in addition to type, access, address space, and location. This is
+  the minimum information a future generic Go-to-driver argument bridge needs;
+  runtime code does not guess from C spellings.
+- The backend derives a launch contract for the currently promoted row-wise,
+  RoPE, elementwise, and score families, validates it against the typed ABI
+  before native compilation, and records a stable contract fingerprint. Metal
+  built-in thread identifiers are excluded from the runtime buffer vector.
+- Every symbolic run now exposes structured `ExecutionAccounting` plus stable
+  metadata for total/kernel/device/host/fallback steps, kernel launches,
+  upload/download bytes, synchronizations, graph captures/replays, residency
+  hits/misses, fallback reasons, and the strict `full_device_execution` claim.
+  Missing runtime telemetry remains zero rather than being inferred from a
+  backend name.
+- Legacy source-backed variants without an ABI remain loadable and are marked
+  `launch_abi_status=legacy_unverified`; newly emitted variants are validated.
+  A mismatch in a present ABI fails before driver compilation, preserving the
+  fail-closed behavior instead of silently launching a wrong argument vector.
+
 Measured in this checkpoint: compiler, artifact, backend, CUDA, Metal, and CLI
 tests pass; no CUDA compiler is installed in the current Linux environment, so
 no PTX throughput or device-parity claim is made here.
@@ -163,11 +184,17 @@ Non-goals:
 
 Phase 0, weeks 1-2, close safety and observability:
 
-- Critical path: close S3d safely, add execution accounting, add backend feature contract design and first manifest fields.
+- Critical path: close S3d safely, land the K1 launch-contract gate, add
+  execution accounting, and add backend feature contract design and first
+  manifest fields.
 - Exit gate: S3d default-off gates pass, no host fallback after resident errors, and run manifests expose required counters.
 - Kernel-first K0 slice: emit typed GoTreeSitter-derived ABI metadata and make
   offline CUDA/Metal images an explicit, hash-checked artifact option. Keep
   NVRTC/source fallback until device parity is demonstrated.
+- Kernel-first K1 slice: validate the typed launch contract before native
+  compilation and expose run-level device/host/fallback accounting. Keep the
+  generic argument bridge and device byte/sync telemetry as the next measured
+  sub-gates rather than claiming they already exist.
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 
@@ -265,6 +292,33 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
   opt-in, binary hashes and ABI fingerprints validate, and fallback is truthful.
 - report contract: Outcome; exact files and commands; source/image mode;
   parity/performance evidence; caveats; checkpoint candidate; next action.
+
+### KERNEL-DISPATCH-K1 / Typed Launch Contract And Run Accounting
+
+- role/profile: `tiller-worker` with compiler/runtime review.
+- objective: make K0's typed ABI operational at the native dispatch boundary
+  and expose truthful per-run counters before reducing FFI or adding graph
+  capture.
+- context paths: `artifact/eos/module.go`; `compiler/kernel_abi.go`;
+  `runtime/backend/native_kernel.go`; `runtime/backend/symbolic.go`;
+  `runtime/backend/backend.go`.
+- constraints: validate only generated launch families with a known contract;
+  preserve legacy source-backed artifacts as explicitly unverified; do not
+  infer device execution from backend identity; keep fallback behavior intact.
+- expected outputs: ABI pointer/value kind, launch contract fingerprint,
+  pre-driver validation, structured execution accounting, and focused tests.
+- verification target: compiler/artifact/backend tests; mismatch rejection;
+  deterministic accounting tests for device, host, and fallback paths; full
+  default test/vet gates; no CUDA throughput claim without a device.
+- budget tier/model ceiling: medium, `gpt-5.5 medium`.
+- sandbox/permission needs: local Go tests; no network or external toolchain.
+- dependencies/blockers: K0 artifact schema; CUDA/Metal hardware only for
+  later launch parity and telemetry sub-gates.
+- checkpoint criteria: current slice is merged locally with green default
+  verification and `tmp/` excluded; generic launch bridge remains a separate
+  measured gate.
+- report contract: Outcome; changed paths; contract/accounting fields;
+  verification; caveats; checkpoint candidate; Arbiter next action.
 
 ### OBS-EXEC / Truthful Execution Accounting
 
@@ -518,4 +572,8 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 ## Immediate Next Action
 
-Run `S3D-CLOSE` and `OBS-EXEC` in parallel. `RES-COORD` is blocked on S3d being safe and default-off. Broad optimization claims are blocked on `OBS-EXEC`, so every subsequent performance claim reports exactly what executed on device, what fell back, and why.
+K1 is now the first post-K0 implementation gate. The next sub-gates are the
+generic typed launch bridge (one CUDA family first), device-side byte/sync
+telemetry, then `S3D-CLOSE`/`RES-COORD` and fixed-bucket graph replay. Broad
+optimization claims remain blocked until every benchmark reports exactly what
+executed on device, what fell back, and why.

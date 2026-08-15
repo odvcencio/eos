@@ -196,9 +196,14 @@ type KernelABI struct {
 // Type is the normalized C/C++ spelling, while AddressSpace, Access, and
 // Location carry the pieces that backend runtimes must not infer ad hoc.
 type KernelABIArg struct {
-	Index        int    `json:"index"`
-	Name         string `json:"name"`
-	Type         string `json:"type"`
+	Index int    `json:"index"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	// Kind is the launch ABI storage class. Pointer arguments are passed as
+	// device/resource addresses; value arguments are copied scalar values.
+	// Keeping this explicit lets a native adapter build a generic argument
+	// vector without reparsing the source or guessing from a type spelling.
+	Kind         string `json:"kind,omitempty"`
 	AddressSpace string `json:"address_space,omitempty"`
 	Access       string `json:"access,omitempty"`
 	Location     string `json:"location,omitempty"`
@@ -543,6 +548,9 @@ func validateKernelABI(kernelName string, variant KernelVariant) error {
 		seen[arg.Name] = true
 		if arg.Type == "" {
 			return fmt.Errorf("kernel %q variant ABI argument %q has empty type", kernelName, arg.Name)
+		}
+		if arg.Kind != "" && arg.Kind != "pointer" && arg.Kind != "value" {
+			return fmt.Errorf("kernel %q variant ABI argument %q has unsupported kind %q", kernelName, arg.Name, arg.Kind)
 		}
 		if arg.Access != "" && arg.Access != "read" && arg.Access != "write" && arg.Access != "read_write" && arg.Access != "value" {
 			return fmt.Errorf("kernel %q variant ABI argument %q has unsupported access %q", kernelName, arg.Name, arg.Access)

@@ -58,10 +58,11 @@ type CompiledKernel struct {
 
 // NativeKernelProgram is a backend-owned compiled kernel program.
 type NativeKernelProgram struct {
-	Compiled     CompiledKernel
-	LaunchConfig map[string]any
-	Fallback     func(inputs []*Tensor) ([]*Tensor, error)
-	Run          func(inputs []*Tensor) ([]*Tensor, error)
+	Compiled       CompiledKernel
+	LaunchContract KernelLaunchContract
+	LaunchConfig   map[string]any
+	Fallback       func(inputs []*Tensor) ([]*Tensor, error)
+	Run            func(inputs []*Tensor) ([]*Tensor, error)
 }
 
 // KernelDispatchResult is the result of dispatching a compiled backend kernel.
@@ -955,9 +956,41 @@ type StepDispatcher func(ctx context.Context, step eosartifact.Step, outputType 
 
 // Result is the execution response from a backend.
 type Result struct {
-	Outputs  map[string]Value
-	Metadata map[string]string
-	Trace    []TraceStep
+	Outputs    map[string]Value
+	Metadata   map[string]string
+	Trace      []TraceStep
+	Accounting ExecutionAccounting
+}
+
+// ExecutionAccounting is the run-level truth surface for performance and
+// correctness gates. HostSteps includes fallback steps; FallbackSteps is a
+// subset that identifies work that was expected to be accelerated but was
+// intentionally executed on the host. Counters are zero when a backend has no
+// applicable activity, never fabricated from the backend name alone.
+type ExecutionAccounting struct {
+	Backend              eosartifact.BackendKind
+	TotalSteps           int
+	KernelSteps          int
+	DeviceSteps          int
+	HostSteps            int
+	FallbackSteps        int
+	KernelLaunches       int
+	DeviceKernelLaunches int
+	HostKernelLaunches   int
+	UploadBytes          int64
+	DownloadBytes        int64
+	SyncCount            int64
+	GraphCaptures        int64
+	GraphReplays         int64
+	ResidencyHits        int64
+	ResidencyMisses      int64
+	FallbackReasons      map[string]int
+}
+
+// FullDeviceExecution reports whether every executable step ran on the
+// selected device path. An empty or host-only plan is deliberately false.
+func (a ExecutionAccounting) FullDeviceExecution() bool {
+	return a.TotalSteps > 0 && a.DeviceSteps > 0 && a.HostSteps == 0 && a.FallbackSteps == 0
 }
 
 // Executor runs a previously loaded Eos module.

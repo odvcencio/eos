@@ -123,6 +123,10 @@ func kernelABIArg(backend eosartifact.BackendKind, index int, parameter, paramet
 		raw = sourceSlice(source, parameter.StartByte(), uint32(end))
 	}
 	pointer := hasNodeType(declarator, lang, "pointer_declarator")
+	kind := "value"
+	if pointer {
+		kind = "pointer"
+	}
 	addressSpace := kernelABIAddressSpace(backend, raw, pointer)
 	access := "value"
 	if pointer {
@@ -137,6 +141,7 @@ func kernelABIArg(backend eosartifact.BackendKind, index int, parameter, paramet
 		Index:        index,
 		Name:         name,
 		Type:         typeText,
+		Kind:         kind,
 		AddressSpace: addressSpace,
 		Access:       access,
 		Location:     location,

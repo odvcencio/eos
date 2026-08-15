@@ -135,3 +135,58 @@ func TestCompileNativeKernelProgramRejectsBackendSourceMismatch(t *testing.T) {
 		t.Fatal("expected backend source mismatch")
 	}
 }
+
+func TestCompileNativeKernelProgramValidatesLaunchContract(t *testing.T) {
+	bundle, err := compiler.Build(nil, compiler.Options{ModuleName: "tiny_embed", Preset: compiler.PresetTinyEmbed})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	kernel := bundle.Artifact.Kernels[0]
+	compiled, err := CompileVariants(bundle.Artifact, eosartifact.BackendCUDA)
+	if err != nil {
+		t.Fatalf("compile variants: %v", err)
+	}
+	prog, err := CompileNativeKernelProgram(eosartifact.BackendCUDA, kernel, compiled[kernel.Name])
+	if err != nil {
+		t.Fatalf("compile native kernel: %v", err)
+	}
+	if got := prog.LaunchConfig["launch_abi_status"]; got != "validated" {
+		t.Fatalf("launch_abi_status = %v, want validated", got)
+	}
+	if got := prog.LaunchConfig["launch_contract_shape"]; got != "row_wise" {
+		t.Fatalf("launch_contract_shape = %v, want row_wise", got)
+	}
+	if got := prog.LaunchConfig["launch_arg_count"]; got != 4 {
+		t.Fatalf("launch_arg_count = %v, want 4", got)
+	}
+	if prog.LaunchContract.Fingerprint == "" {
+		t.Fatal("launch contract fingerprint is empty")
+	}
+
+	compiled[kernel.Name].ABI.Args[1].Name = "wrong_output"
+	if _, err := CompileNativeKernelProgram(eosartifact.BackendCUDA, kernel, compiled[kernel.Name]); err == nil {
+		t.Fatal("expected launch ABI argument mismatch")
+	}
+}
+
+func TestCompileNativeKernelProgramMetalContractOmitsBuiltins(t *testing.T) {
+	bundle, err := compiler.Build(nil, compiler.Options{ModuleName: "tiny_embed", Preset: compiler.PresetTinyEmbed})
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	kernel := bundle.Artifact.Kernels[0]
+	compiled, err := CompileVariants(bundle.Artifact, eosartifact.BackendMetal)
+	if err != nil {
+		t.Fatalf("compile variants: %v", err)
+	}
+	prog, err := CompileNativeKernelProgram(eosartifact.BackendMetal, kernel, compiled[kernel.Name])
+	if err != nil {
+		t.Fatalf("compile native kernel: %v", err)
+	}
+	if got := prog.LaunchConfig["launch_arg_count"]; got != 4 {
+		t.Fatalf("launch_arg_count = %v, want 4 runtime buffer args", got)
+	}
+	if got := prog.LaunchConfig["launch_abi_status"]; got != "validated" {
+		t.Fatalf("launch_abi_status = %v, want validated", got)
+	}
+}

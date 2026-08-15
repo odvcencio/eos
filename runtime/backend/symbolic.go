@@ -3,6 +3,9 @@ package backend
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
 )
@@ -85,6 +88,10 @@ func ExecuteSymbolic(ctx context.Context, mod *eosartifact.Module, weights map[s
 			"params_total":              fmt.Sprintf("%d", len(mod.Params)),
 			"params_eager_materialized": fmt.Sprintf("%d", eagerMaterialized),
 		},
+		Accounting: ExecutionAccounting{
+			Backend:         kind,
+			FallbackReasons: map[string]int{},
+		},
 	}
 
 	for _, step := range steps {
@@ -110,6 +117,7 @@ func ExecuteSymbolic(ctx context.Context, mod *eosartifact.Module, weights map[s
 		if err != nil {
 			return Result{}, fmt.Errorf("entrypoint %q step %q: %w", entry.Name, step.Name, err)
 		}
+		result.Accounting.recordStep(step, values)
 		trace = append(trace, TraceStep{
 			Entry:   step.Entry,
 			Kind:    step.Kind,
@@ -158,8 +166,179 @@ func ExecuteSymbolic(ctx context.Context, mod *eosartifact.Module, weights map[s
 	result.Metadata["params_released"] = fmt.Sprintf("%d", releasedParams)
 	result.Metadata["params_unused_for_entry"] = fmt.Sprintf("%d", unusedEntryParams)
 	result.Metadata["param_materialization"] = paramMaterializationMode(eagerMaterialized, lazyMaterialized)
+	result.Accounting.writeMetadata(result.Metadata)
 	result.Trace = trace
 	return result, nil
+}
+
+func (a *ExecutionAccounting) recordStep(step eosartifact.Step, values []Value) {
+	if a == nil {
+		return
+	}
+	a.TotalSteps++
+	if step.Kind == eosartifact.StepLaunchKernel {
+		a.KernelSteps++
+		a.KernelLaunches++
+	}
+	meta := firstExecutionMetadata(values)
+	mode := executionMetadataString(meta, "execution_mode")
+	device := executionMetadataBool(meta, "device_execution") || strings.HasSuffix(mode, "_device")
+	fallbackReason := executionMetadataString(meta, "fallback_reason")
+	fallback := mode == "host_fallback" || fallbackReason != ""
+	if device {
+		a.DeviceSteps++
+		if step.Kind == eosartifact.StepLaunchKernel {
+			a.DeviceKernelLaunches++
+		}
+	} else {
+		a.HostSteps++
+		if step.Kind == eosartifact.StepLaunchKernel {
+			a.HostKernelLaunches++
+		}
+	}
+	if fallback {
+		a.FallbackSteps++
+		if fallbackReason == "" {
+			fallbackReason = "host_fallback"
+		}
+		if a.FallbackReasons == nil {
+			a.FallbackReasons = map[string]int{}
+		}
+		a.FallbackReasons[fallbackReason]++
+	}
+	a.UploadBytes += executionMetadataInt64(meta, "uploaded_bytes", "upload_bytes")
+	a.DownloadBytes += executionMetadataInt64(meta, "downloaded_bytes", "download_bytes")
+	a.SyncCount += executionMetadataInt64(meta, "sync_count", "syncs", "synchronizations")
+	a.GraphCaptures += executionMetadataInt64(meta, "graph_captures", "graph_capture_count")
+	a.GraphReplays += executionMetadataInt64(meta, "graph_replays", "graph_replay_count")
+	a.ResidencyHits += executionMetadataInt64(meta, "residency_hits", "resident_cache_hits")
+	a.ResidencyMisses += executionMetadataInt64(meta, "residency_misses", "resident_cache_misses")
+}
+
+func firstExecutionMetadata(values []Value) map[string]any {
+	for _, value := range values {
+		if len(value.Metadata) != 0 {
+			return value.Metadata
+		}
+	}
+	return nil
+}
+
+func executionMetadataString(meta map[string]any, key string) string {
+	if meta == nil {
+		return ""
+	}
+	value, ok := meta[key]
+	if !ok {
+		return ""
+	}
+	if text, ok := value.(string); ok {
+		return text
+	}
+	return fmt.Sprint(value)
+}
+
+func executionMetadataBool(meta map[string]any, key string) bool {
+	if meta == nil {
+		return false
+	}
+	value, ok := meta[key]
+	if !ok {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		parsed, err := strconv.ParseBool(typed)
+		return err == nil && parsed
+	default:
+		return false
+	}
+}
+
+func executionMetadataInt64(meta map[string]any, keys ...string) int64 {
+	if meta == nil {
+		return 0
+	}
+	for _, key := range keys {
+		value, ok := meta[key]
+		if !ok {
+			continue
+		}
+		switch typed := value.(type) {
+		case int:
+			return int64(typed)
+		case int8:
+			return int64(typed)
+		case int16:
+			return int64(typed)
+		case int32:
+			return int64(typed)
+		case int64:
+			return typed
+		case uint:
+			return int64(typed)
+		case uint8:
+			return int64(typed)
+		case uint16:
+			return int64(typed)
+		case uint32:
+			return int64(typed)
+		case uint64:
+			if typed <= uint64(^uint64(0)>>1) {
+				return int64(typed)
+			}
+		case float32:
+			return int64(typed)
+		case float64:
+			return int64(typed)
+		case string:
+			if parsed, err := strconv.ParseInt(typed, 10, 64); err == nil {
+				return parsed
+			}
+		}
+	}
+	return 0
+}
+
+func (a *ExecutionAccounting) writeMetadata(meta map[string]string) {
+	if a == nil || meta == nil {
+		return
+	}
+	meta["total_steps"] = strconv.Itoa(a.TotalSteps)
+	meta["kernel_steps"] = strconv.Itoa(a.KernelSteps)
+	meta["device_step_count"] = strconv.Itoa(a.DeviceSteps)
+	meta["host_step_count"] = strconv.Itoa(a.HostSteps)
+	meta["fallback_step_count"] = strconv.Itoa(a.FallbackSteps)
+	meta["kernel_launch_count"] = strconv.Itoa(a.KernelLaunches)
+	meta["device_kernel_launch_count"] = strconv.Itoa(a.DeviceKernelLaunches)
+	meta["host_kernel_launch_count"] = strconv.Itoa(a.HostKernelLaunches)
+	meta["upload_bytes"] = strconv.FormatInt(a.UploadBytes, 10)
+	meta["download_bytes"] = strconv.FormatInt(a.DownloadBytes, 10)
+	meta["sync_count"] = strconv.FormatInt(a.SyncCount, 10)
+	meta["graph_captures"] = strconv.FormatInt(a.GraphCaptures, 10)
+	meta["graph_replays"] = strconv.FormatInt(a.GraphReplays, 10)
+	meta["residency_hits"] = strconv.FormatInt(a.ResidencyHits, 10)
+	meta["residency_misses"] = strconv.FormatInt(a.ResidencyMisses, 10)
+	meta["full_device_execution"] = strconv.FormatBool(a.FullDeviceExecution())
+	meta["fallback_reasons"] = formatFallbackReasons(a.FallbackReasons)
+}
+
+func formatFallbackReasons(reasons map[string]int) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(reasons))
+	for key := range reasons {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+strconv.Itoa(reasons[key]))
+	}
+	return strings.Join(parts, ",")
 }
 
 func shouldEagerMaterializeParam(weight WeightBinding) bool {

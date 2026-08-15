@@ -30,6 +30,9 @@ extern "C" __global__ void score_cuda(const float* query, const float* docs, flo
 	if got, want := abi.Args[0].Access, "read"; got != want {
 		t.Fatalf("query access = %q, want %q", got, want)
 	}
+	if got, want := abi.Args[0].Kind, "pointer"; got != want {
+		t.Fatalf("query kind = %q, want %q", got, want)
+	}
 	if got, want := abi.Args[0].AddressSpace, "global"; got != want {
 		t.Fatalf("query address space = %q, want %q", got, want)
 	}
@@ -38,6 +41,9 @@ extern "C" __global__ void score_cuda(const float* query, const float* docs, flo
 	}
 	if got, want := abi.Args[3].Location, "value"; got != want {
 		t.Fatalf("rows location = %q, want %q", got, want)
+	}
+	if got, want := abi.Args[3].Kind, "value"; got != want {
+		t.Fatalf("rows kind = %q, want %q", got, want)
 	}
 }
 

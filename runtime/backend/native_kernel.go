@@ -1,12 +1,179 @@
 package backend
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strconv"
 	"strings"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
 )
+
+// KernelLaunchArg describes the runtime-visible portion of a generated
+// kernel's launch ABI. Built-in execution identifiers (for example Metal's
+// thread_position_in_grid) are intentionally omitted: the backend supplies
+// those values as part of dispatch rather than through the buffer argument
+// vector.
+type KernelLaunchArg struct {
+	Name   string
+	Kind   string
+	Access string
+}
+
+// KernelLaunchContract is the backend-neutral launch shape derived from the
+// kernel body. The ABI fingerprint is stable for a given backend/shape and is
+// useful as a cache key for future generic launch bridges and fixed-shape
+// graph replay.
+type KernelLaunchContract struct {
+	Version     string
+	Backend     eosartifact.BackendKind
+	Shape       string
+	Fingerprint string
+	Args        []KernelLaunchArg
+}
+
+// ExpectedKernelLaunchContract returns the contract for the generated CUDA
+// and Metal kernel families currently dispatched directly by the runtime.
+// Kernels outside those families remain on the existing host/backend path and
+// deliberately do not receive a guessed argument contract.
+func ExpectedKernelLaunchContract(kind eosartifact.BackendKind, kernel eosartifact.Kernel) (KernelLaunchContract, bool) {
+	if kind != eosartifact.BackendCUDA && kind != eosartifact.BackendMetal {
+		return KernelLaunchContract{}, false
+	}
+	if len(kernel.Body) < 2 || kernel.Body[len(kernel.Body)-1].Op != "return" {
+		return KernelLaunchContract{}, false
+	}
+	var shape string
+	var args []KernelLaunchArg
+	switch kernel.Body[0].Op {
+	case "normalize", "rmsnorm", "layernorm", "softmax":
+		shape = "row_wise"
+		args = []KernelLaunchArg{
+			{Name: "in0", Kind: "pointer", Access: "read"},
+			{Name: "out0", Kind: "pointer", Access: "write"},
+			{Name: "rows", Kind: "value", Access: "value"},
+			{Name: "cols", Kind: "value", Access: "value"},
+		}
+	case "rope":
+		shape = "rope"
+		args = []KernelLaunchArg{
+			{Name: "in0", Kind: "pointer", Access: "read"},
+			{Name: "out0", Kind: "pointer", Access: "write"},
+			{Name: "rows", Kind: "value", Access: "value"},
+			{Name: "cols", Kind: "value", Access: "value"},
+			{Name: "seq_len", Kind: "value", Access: "value"},
+		}
+	case "binary_add", "binary_sub", "binary_mul", "binary_div":
+		shape = "elementwise_binary"
+		args = []KernelLaunchArg{
+			{Name: "lhs", Kind: "pointer", Access: "read"},
+			{Name: "rhs", Kind: "pointer", Access: "read"},
+			{Name: "out0", Kind: "pointer", Access: "write"},
+			{Name: "elements", Kind: "value", Access: "value"},
+		}
+	case "dequant", "gelu":
+		shape = "elementwise_unary"
+		args = []KernelLaunchArg{
+			{Name: "in0", Kind: "pointer", Access: "read"},
+			{Name: "out0", Kind: "pointer", Access: "write"},
+			{Name: "elements", Kind: "value", Access: "value"},
+		}
+	case "dot", "cosine", "l2_distance":
+		shape = "row_score"
+		args = []KernelLaunchArg{
+			{Name: "query", Kind: "pointer", Access: "read"},
+			{Name: "docs", Kind: "pointer", Access: "read"},
+			{Name: "out0", Kind: "pointer", Access: "write"},
+			{Name: "rows", Kind: "value", Access: "value"},
+			{Name: "cols", Kind: "value", Access: "value"},
+		}
+	default:
+		return KernelLaunchContract{}, false
+	}
+	contract := KernelLaunchContract{
+		Version: eosartifact.KernelABIVersion,
+		Backend: kind,
+		Shape:   shape,
+		Args:    args,
+	}
+	contract.Fingerprint = kernelLaunchContractFingerprint(contract)
+	return contract, true
+}
+
+func kernelLaunchContractFingerprint(contract KernelLaunchContract) string {
+	var b strings.Builder
+	b.WriteString(contract.Version)
+	b.WriteByte('|')
+	b.WriteString(string(contract.Backend))
+	b.WriteByte('|')
+	b.WriteString(contract.Shape)
+	for _, arg := range contract.Args {
+		b.WriteByte('|')
+		b.WriteString(arg.Name)
+		b.WriteByte(':')
+		b.WriteString(arg.Kind)
+		b.WriteByte(':')
+		b.WriteString(arg.Access)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// ValidateKernelLaunchContract checks that the typed source ABI agrees with
+// the arguments the backend launcher will actually pass. A nil ABI is a
+// legacy source-backed artifact and remains loadable, but is reported as
+// unverified in LaunchConfig; newly generated artifacts always carry an ABI.
+func ValidateKernelLaunchContract(kind eosartifact.BackendKind, kernel eosartifact.Kernel, compiled CompiledKernel) error {
+	contract, ok := ExpectedKernelLaunchContract(kind, kernel)
+	if !ok || compiled.ABI == nil {
+		return nil
+	}
+	args := make([]eosartifact.KernelABIArg, 0, len(compiled.ABI.Args))
+	for _, arg := range compiled.ABI.Args {
+		if kind == eosartifact.BackendMetal && strings.HasPrefix(arg.Location, "builtin:") {
+			continue
+		}
+		args = append(args, arg)
+	}
+	if len(args) != len(contract.Args) {
+		return fmt.Errorf("kernel %q launch ABI argument count %d does not match %s contract count %d", kernel.Name, len(args), contract.Shape, len(contract.Args))
+	}
+	for i, want := range contract.Args {
+		got := args[i]
+		if got.Name != want.Name {
+			return fmt.Errorf("kernel %q launch ABI argument %d is %q, want %q", kernel.Name, i, got.Name, want.Name)
+		}
+		argKind := got.Kind
+		if argKind == "" {
+			argKind = inferredKernelABIArgKind(got)
+		}
+		if argKind != want.Kind {
+			return fmt.Errorf("kernel %q launch ABI argument %q kind %q, want %q", kernel.Name, got.Name, argKind, want.Kind)
+		}
+		if got.Access != "" && got.Access != want.Access {
+			return fmt.Errorf("kernel %q launch ABI argument %q access %q, want %q", kernel.Name, got.Name, got.Access, want.Access)
+		}
+		if argKind == "pointer" {
+			if got.AddressSpace == "" && kind != eosartifact.BackendMetal {
+				return fmt.Errorf("kernel %q launch ABI pointer argument %q has no address space", kernel.Name, got.Name)
+			}
+			if got.Location == "" {
+				return fmt.Errorf("kernel %q launch ABI pointer argument %q has no location", kernel.Name, got.Name)
+			}
+		} else if got.AddressSpace != "" && got.AddressSpace != "constant" {
+			return fmt.Errorf("kernel %q launch ABI scalar argument %q has unexpected address space %q", kernel.Name, got.Name, got.AddressSpace)
+		}
+	}
+	return nil
+}
+
+func inferredKernelABIArgKind(arg eosartifact.KernelABIArg) string {
+	if strings.Contains(arg.Type, "*") || (arg.AddressSpace != "" && !strings.HasPrefix(arg.Location, "builtin:")) {
+		return "pointer"
+	}
+	return "value"
+}
 
 // CompileNativeKernelProgram builds a backend-owned kernel program from a
 // compiled variant plus the backend-neutral kernel body. The program still
@@ -22,15 +189,35 @@ func CompileNativeKernelProgram(kind eosartifact.BackendKind, kernel eosartifact
 	if err := validateCompiledKernelSource(kind, compiled); err != nil {
 		return NativeKernelProgram{}, err
 	}
+	contract, hasContract := ExpectedKernelLaunchContract(kind, kernel)
+	if hasContract {
+		if err := ValidateKernelLaunchContract(kind, kernel, compiled); err != nil {
+			return NativeKernelProgram{}, err
+		}
+	}
 	config := nativeLaunchConfig(kind, kernel, compiled)
+	if hasContract {
+		config["launch_contract_version"] = contract.Version
+		config["launch_contract_shape"] = contract.Shape
+		config["launch_contract_fingerprint"] = contract.Fingerprint
+		config["launch_arg_count"] = len(contract.Args)
+		if compiled.ABI == nil {
+			config["launch_abi_status"] = "legacy_unverified"
+		} else {
+			config["launch_abi_status"] = "validated"
+		}
+	} else {
+		config["launch_abi_status"] = "not_applicable"
+	}
 	fallback := func(inputs []*Tensor) ([]*Tensor, error) {
 		return executeKernel(kernel, inputs)
 	}
 	return NativeKernelProgram{
-		Compiled:     compiled,
-		LaunchConfig: config,
-		Fallback:     fallback,
-		Run:          fallback,
+		Compiled:       compiled,
+		LaunchContract: contract,
+		LaunchConfig:   config,
+		Fallback:       fallback,
+		Run:            fallback,
 	}, nil
 }
 
