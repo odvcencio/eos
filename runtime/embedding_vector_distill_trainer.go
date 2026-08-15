@@ -675,6 +675,11 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchResidentWithScratch(
 	if err := t.applyVectorDistillProjectionAdamWForStepStrict(proj, gradW, prospectiveProjStep); err != nil {
 		return EmbeddingTrainMetrics{}, proj, t.poisonAfterOptimizerLaunch(err)
 	}
+	if releaser, ok := t.compactTrainAccel.(backend.CompactTrainGradientReleaser); ok {
+		if err := releaser.ReleaseCompactTrainGradients(residentForward.stepID); err != nil {
+			return EmbeddingTrainMetrics{}, proj, t.poisonAfterOptimizerLaunch(err)
+		}
+	}
 	t.step = int(residentForward.stepID)
 	t.compactState.Step = t.step
 	t.compactOptimizerUpdates++

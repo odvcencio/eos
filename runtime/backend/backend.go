@@ -213,6 +213,8 @@ type CompactTrainAcceleratorStats struct {
 	LiveHandles                 int64
 	ArenaReuseHits              int64
 	ArenaAllocations            int64
+	GradientReuseHits           int64
+	GradientAllocations         int64
 	GradientZeroCalls           int64
 	ResidentGradBytes           int64
 	ActivationArenaBytes        int64
@@ -806,6 +808,14 @@ type CompactForwardStatsProvider interface {
 // selected accelerator can report them.
 type CompactTrainStatsProvider interface {
 	CompactTrainStats() CompactTrainAcceleratorStats
+}
+
+// CompactTrainGradientReleaser lets a trainer return sealed resident-gradient
+// buffers to a backend pool once all optimizer consumers have finished. It is
+// optional so older compact-train implementations retain their existing
+// lifecycle.
+type CompactTrainGradientReleaser interface {
+	ReleaseCompactTrainGradients(stepID uint64) error
 }
 
 // CompactForwardConfigurator configures model-specific compact-forward names.

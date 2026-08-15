@@ -56,6 +56,50 @@ func TestCompactTrainArenaPoolResetOnRecycle(t *testing.T) {
 	}
 }
 
+func TestCompactTrainGradientBuffersWarmAfterTwoSteps(t *testing.T) {
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	for step := uint64(1); step <= 3; step++ {
+		if err := accel.BeginCompactTrainStep(step, refs); err != nil {
+			t.Fatalf("begin step %d: %v", step, err)
+		}
+		if err := accel.EndCompactTrainStep(step); err != nil {
+			t.Fatalf("end step %d: %v", step, err)
+		}
+		if err := accel.ReleaseCompactTrainGradients(step); err != nil {
+			t.Fatalf("release gradients step %d: %v", step, err)
+		}
+	}
+	stats := accel.CompactTrainStats()
+	wantRefs := int64(len(refs))
+	if stats.GradientAllocations != wantRefs || stats.GradientReuseHits != 2*wantRefs {
+		t.Fatalf("gradient allocations/reuse = %d/%d, want %d/%d: %+v", stats.GradientAllocations, stats.GradientReuseHits, wantRefs, 2*wantRefs, stats)
+	}
+	if stats.GradientZeroCalls != 3 {
+		t.Fatalf("gradient zero calls = %d, want 3", stats.GradientZeroCalls)
+	}
+	if err := accel.AbortCompactTrainStep(3); err != nil {
+		t.Fatalf("abort warm gradient step: %v", err)
+	}
+}
+
+func TestFlattenInt32IntoReusesCapacity(t *testing.T) {
+	first := flattenInt32Into(make([]int32, 0, 8), [][]int32{{1, 2}, {3, 4}})
+	if len(first) != 4 || first[0] != 1 || first[3] != 4 {
+		t.Fatalf("first flatten = %v, want [1 2 3 4]", first)
+	}
+	addr := &first[0]
+	second := flattenInt32Into(first, [][]int32{{5}, {6, 7}})
+	if &second[0] != addr {
+		t.Fatal("flattened staging did not reuse backing storage")
+	}
+	if len(second) != 3 || second[0] != 5 || second[2] != 7 {
+		t.Fatalf("second flatten = %v, want [5 6 7]", second)
+	}
+}
+
 func BenchmarkCompactTrainArenaPoolHit(b *testing.B) {
 	shape := backend.CompactForwardShape{Batch: 1, Tokens: 3, ModelDim: 4, FFNDim: 8, Heads: 2, HeadDim: 2, Layers: 1, OutputDim: 4}
 	accel := &CompactTrainAccelerator{

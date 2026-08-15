@@ -119,6 +119,35 @@ weights remained within the existing hard parity tolerance. This is a
 correctness and reuse signal, not a throughput claim or a release-shape
 benchmark.
 
+## Current Preparation Checkpoint: K3 (2026-08-15)
+
+The next compact-train preparation slice removes another warm-step transfer and
+allocation source:
+
+- Resident gradient buffers now warm in an exact-element-count pool. A normal
+  step still gets fresh generation/token metadata, while a later step reuses
+  the device allocation after the prior step's resident-gradient consumers have
+  finished. Reconfiguration and close flush the pool; abort recycles it safely.
+- Gradient initialization uses CUDA `cuMemsetD32` instead of allocating a host
+  zero slice and copying it over the driver boundary for every resident
+  parameter. The old host-side path is no longer on the compact resident-train
+  step boundary.
+- Compact-forward and compact-train token and mask flattening reuse host
+  staging capacity under their accelerator mutexes, so repeated buckets do not
+  allocate short-lived flattened slices before the device copy.
+- `GradientReuseHits` and `GradientAllocations` make the warm-up behavior
+  observable alongside the K2 arena counters.
+
+K3 verification is limited to lifecycle/allocation correctness and native-only
+build safety. It does not claim a device throughput win until the target-shape
+warm benchmark measures the reduced allocation and transfer path.
+
+The live two-step `B=1,T=2,D=4,H=6,L=2` CUDA parity fixture now records
+`GradientReuseHits=15`, `GradientAllocations=15`, and `GradientZeroCalls=2`
+after the trainer releases sealed gradients; hard parity, `136` launches, and
+`4` synchronizations remain unchanged. This is a warm-path readiness signal,
+not a release-shape throughput result.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -243,6 +272,9 @@ Phase 0, weeks 1-2, close safety and observability:
 - K2 preparation slice: warm exact-shape compact-train arenas and staging
   buffers, use the typed CUDA launch bridge for promoted generated families,
   and repair Metal RoPE ABI parity before the next embedder training run.
+- K3 preparation slice: device-zero resident gradients, warm gradient buffers,
+  and reuse compact-train host flattening capacity before the target-shape warm
+  benchmark.
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 

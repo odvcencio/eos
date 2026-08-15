@@ -346,6 +346,8 @@ type CompactForwardAccelerator struct {
 	layers                                  []CompactForwardLayerNames
 	outName                                 string
 	bridged                                 map[string]*optimizerResidentParameterToken
+	hostTokens                              []int32
+	hostMasks                               []int32
 }
 
 type CompactForwardLayerNames struct {
@@ -464,6 +466,8 @@ func (a *CompactForwardAccelerator) Close() {
 	a.device.destroyAuxKernel(a.kernels.packI)
 	a.device.close()
 	a.device = nil
+	a.hostTokens = nil
+	a.hostMasks = nil
 }
 
 func (a *CompactForwardAccelerator) Stats() backend.CompactForwardAcceleratorStats {
@@ -679,8 +683,10 @@ func (a *CompactForwardAccelerator) runCompactForwardLocked(req backend.CompactF
 	ffnElems := rows * H
 	scoreElems := B * shape.Heads * T * T
 	outputElems := rows * O
-	tokensFlat := flattenInt32(req.Tokens)
-	masksFlat := flattenInt32(req.Masks)
+	a.hostTokens = flattenInt32Into(a.hostTokens, req.Tokens)
+	a.hostMasks = flattenInt32Into(a.hostMasks, req.Masks)
+	tokensFlat := a.hostTokens
+	masksFlat := a.hostMasks
 	tokBuf, err := a.device.uploadInt32(tokensFlat)
 	if err != nil {
 		return backend.CompactForwardResult{}, err
@@ -1516,15 +1522,24 @@ func compactForwardMemoryEstimateBytes(shape backend.CompactForwardShape, vocabR
 }
 
 func flattenInt32(in [][]int32) []int32 {
+	return flattenInt32Into(nil, in)
+}
+
+func flattenInt32Into(dst []int32, in [][]int32) []int32 {
 	n := 0
 	for _, row := range in {
 		n += len(row)
 	}
-	out := make([]int32, 0, n)
-	for _, row := range in {
-		out = append(out, row...)
+	if cap(dst) < n {
+		dst = make([]int32, n)
+	} else {
+		dst = dst[:n]
 	}
-	return out
+	pos := 0
+	for _, row := range in {
+		pos += copy(dst[pos:], row)
+	}
+	return dst
 }
 
 func compactForwardLayerSpanName(seq, layer int, field string) string {
