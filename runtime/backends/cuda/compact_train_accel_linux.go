@@ -134,7 +134,9 @@ import "C"
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -144,25 +146,34 @@ import (
 
 type CompactTrainAccelerator struct {
 	*CompactForwardAccelerator
-	stats              backend.CompactTrainAcceleratorStats
-	arenas             map[*compactTrainHandleToken]*compactTrainArena
-	arenaPool          map[backend.CompactForwardShape][]*compactTrainArena
-	trainKernels       compactTrainKernels
-	grads              map[string]*compactTrainGradient
-	gradientSlab       *compactTrainGradientSlab
-	gradientSlabPool   map[string][]*compactTrainGradientSlab
-	hostTokens         []int32
-	hostMasks          []int32
-	gradGen            uint64
-	stepID             uint64
-	stepActive         bool
-	stepSealed         bool
-	stepPoisoned       bool
-	nextHandleID       uint64
-	closed             bool
-	compactTrainCublas bool
+	stats                         backend.CompactTrainAcceleratorStats
+	arenas                        map[*compactTrainHandleToken]*compactTrainArena
+	arenaPool                     map[backend.CompactForwardShape][]*compactTrainArena
+	trainKernels                  compactTrainKernels
+	grads                         map[string]*compactTrainGradient
+	gradientSlab                  *compactTrainGradientSlab
+	gradientSlabPool              map[string][]*compactTrainGradientSlab
+	hostTokens                    []int32
+	hostMasks                     []int32
+	gradGen                       uint64
+	stepID                        uint64
+	stepActive                    bool
+	stepSealed                    bool
+	stepPoisoned                  bool
+	nextHandleID                  uint64
+	nextArenaAllocationGeneration uint64
+	closed                        bool
+	compactTrainCublas            bool
+	forwardGraphCache             map[string]*compactTrainForwardGraph
 
 	debugForceBackwardFailureAfterGradMutation bool
+	debugForceForwardGraphCaptureFailure       bool
+	debugForceForwardGraphReplayFailure        bool
+	// debugForceForwardGraphBoundaryFailure is a one-shot test hook. It is
+	// consumed only after a real graph enqueue succeeds, before the normal
+	// boundary wait, so the failure path can be exercised without corrupting
+	// the CUDA driver or pretending that enqueue itself failed.
+	debugForceForwardGraphBoundaryFailure bool
 }
 
 type compactTrainKernels struct {
@@ -232,9 +243,18 @@ type compactTrainArena struct {
 	shape      backend.CompactForwardShape
 	id         uint64
 	generation uint64
-	live       bool
-	token      *compactTrainHandleToken
-	geluFast   bool
+	// allocationGeneration identifies the lifetime of the backing device
+	// storage, independently from generation (which is the public handle
+	// freshness token). It remains stable while an arena is pooled/reused and
+	// changes whenever storage is newly allocated.
+	allocationGeneration uint64
+	// forwardWorkspaceGeneration is tied to the forward activation workspace;
+	// backward-only workspace growth must not invalidate a captured forward.
+	forwardWorkspaceGeneration uint64
+	workspaceGeneration        uint64
+	live                       bool
+	token                      *compactTrainHandleToken
+	geluFast                   bool
 
 	tokens C.CUdeviceptr
 	masks  C.CUdeviceptr
@@ -266,6 +286,15 @@ type compactTrainArena struct {
 	layers              []compactTrainLayerArena
 	bytes               int64
 	workspaceBytes      int64
+}
+
+type compactTrainForwardGraph struct {
+	key                       string
+	graph                     *cudaGraph
+	shape                     backend.CompactForwardShape
+	arena                     *compactTrainArena
+	arenaAllocationGeneration uint64
+	nodes                     int64
 }
 
 type compactTrainLayerArena struct {
@@ -789,6 +818,7 @@ func NewCompactTrainAccelerator() (*CompactTrainAccelerator, error) {
 		gradientSlabPool:   map[string][]*compactTrainGradientSlab{},
 		arenas:             map[*compactTrainHandleToken]*compactTrainArena{},
 		arenaPool:          map[backend.CompactForwardShape][]*compactTrainArena{},
+		forwardGraphCache:  map[string]*compactTrainForwardGraph{},
 	}, nil
 }
 
@@ -808,6 +838,7 @@ func (a *CompactTrainAccelerator) configureCompactTrain(names []CompactForwardLa
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.forwardGraphInvalidateLocked("configure")
 	a.releaseArenasLocked()
 	a.releaseArenaPoolLocked()
 	a.releaseGradientsLocked()
@@ -827,6 +858,7 @@ func (a *CompactTrainAccelerator) Close() {
 	}
 	a.mu.Lock()
 	a.closed = true
+	a.forwardGraphInvalidateLocked("close")
 	a.releaseGradientsLocked()
 	a.releaseArenasLocked()
 	a.releaseArenaPoolLocked()
@@ -859,11 +891,244 @@ func (a *CompactTrainAccelerator) CompactTrainStats() backend.CompactTrainAccele
 	return a.stats
 }
 
+func compactTrainForwardGraphPointerKey(parts []string, name string, ptr C.CUdeviceptr) []string {
+	return append(parts, fmt.Sprintf("%s=%x", name, uint64(ptr)))
+}
+
+// compactTrainForwardGraphKeyLocked is deliberately exact. In particular,
+// allocation size is never used as a proxy for pointer stability: every
+// forward-bound device pointer and every allocator/weight/workspace
+// generation participates in the key.
+func (a *CompactTrainAccelerator) compactTrainForwardGraphKeyLocked(shape backend.CompactForwardShape, arena *compactTrainArena) string {
+	parts := []string{
+		"compact-train-forward-v1",
+		fmt.Sprintf("device=%d", a.device.deviceIdentity()),
+		fmt.Sprintf("context=%x", a.device.contextIdentity()),
+		fmt.Sprintf("stream=%x", a.device.streamIdentity()),
+		fmt.Sprintf("shape=%d,%d,%d,%d,%d,%d,%d,%d,%t", shape.Batch, shape.Tokens, shape.ModelDim, shape.FFNDim, shape.Heads, shape.HeadDim, shape.Layers, shape.OutputDim, shape.HasOutputProjection),
+		fmt.Sprintf("gelu=%t", arena.geluFast),
+		fmt.Sprintf("rope=%t", a.useRoPE),
+		fmt.Sprintf("cublas=%t", a.compactTrainCublas),
+		fmt.Sprintf("arena_generation=%d", arena.allocationGeneration),
+		fmt.Sprintf("forward_workspace_generation=%d", arena.forwardWorkspaceGeneration),
+	}
+	for _, item := range []struct {
+		name string
+		ptr  C.CUdeviceptr
+	}{
+		{"tokens", arena.tokens},
+		{"masks", arena.masks},
+		{"roles", arena.roles},
+		{"status", arena.status},
+		{"input", arena.input},
+		{"active", arena.active},
+		{"finalNorm", arena.finalNorm},
+		{"outputRows", arena.outputRows},
+		{"preProjectionPooled", arena.preProjectionPooled},
+		{"finalPooled", arena.finalPooled},
+	} {
+		parts = compactTrainForwardGraphPointerKey(parts, item.name, item.ptr)
+	}
+	for i, ptr := range arena.modelScratch {
+		parts = compactTrainForwardGraphPointerKey(parts, fmt.Sprintf("modelScratch[%d]", i), ptr)
+	}
+	for i, ptr := range arena.ffnScratch {
+		parts = compactTrainForwardGraphPointerKey(parts, fmt.Sprintf("ffnScratch[%d]", i), ptr)
+	}
+	for i, layer := range arena.layers {
+		for _, item := range []struct {
+			name string
+			ptr  C.CUdeviceptr
+		}{
+			{"hidden", layer.hidden},
+			{"attnQ", layer.attnQ},
+			{"attnK", layer.attnK},
+			{"attnV", layer.attnV},
+			{"attnScores", layer.attnScores},
+			{"attnMixed", layer.attnMixed},
+			{"attnResidual", layer.attnResidual},
+			{"ffnHidden", layer.ffnHidden},
+			{"activated", layer.activated},
+			{"ffnResidual", layer.ffnResidual},
+			{"projected", layer.projected},
+		} {
+			parts = compactTrainForwardGraphPointerKey(parts, fmt.Sprintf("layers[%d].%s", i, item.name), item.ptr)
+		}
+	}
+	seen := map[string]bool{}
+	for _, name := range a.requiredResidentNames(shape) {
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		binding, _ := a.bindingForName(name)
+		generation := uint64(0)
+		if token := a.bridged[name]; token != nil {
+			generation = token.generation
+		}
+		parts = append(parts, fmt.Sprintf("weight[%s]=%x/generation=%d", name, uint64(binding.ptr), generation))
+	}
+	return strings.Join(parts, "|")
+}
+
+func (a *CompactTrainAccelerator) forwardGraphInvalidateLocked(reason string) {
+	if a == nil || len(a.forwardGraphCache) == 0 {
+		return
+	}
+	_ = reason // Retained in the API for telemetry/debug call sites.
+	for key, entry := range a.forwardGraphCache {
+		if entry != nil && entry.graph != nil {
+			entry.graph.destroy()
+		}
+		delete(a.forwardGraphCache, key)
+		a.stats.GraphInvalidations++
+	}
+}
+
+func (a *CompactTrainAccelerator) forwardGraphInvalidateArenaLocked(arena *compactTrainArena, reason string) {
+	if a == nil || arena == nil || len(a.forwardGraphCache) == 0 {
+		return
+	}
+	_ = reason
+	for key, entry := range a.forwardGraphCache {
+		if entry == nil || entry.arena != arena {
+			continue
+		}
+		if entry.graph != nil {
+			entry.graph.destroy()
+		}
+		delete(a.forwardGraphCache, key)
+		a.stats.GraphInvalidations++
+	}
+}
+
+// forwardGraphLookupOrCapture performs the exact-key lookup portion of the
+// cache contract. Capture publication is separate so a failed capture can
+// never leave a partial entry visible to a later request.
+func (a *CompactTrainAccelerator) forwardGraphLookupOrCapture(key string, shape backend.CompactForwardShape, arena *compactTrainArena) (*compactTrainForwardGraph, bool) {
+	if a == nil || !eosCudaCompactTrainForwardGraphEnabled || a.CompactForwardAccelerator == nil || a.CompactForwardAccelerator.syncEachLaunch {
+		return nil, false
+	}
+	if entry, ok := a.forwardGraphCache[key]; ok && entry != nil && entry.graph != nil && entry.arena == arena && entry.shape == shape && entry.arenaAllocationGeneration == arena.allocationGeneration {
+		return entry, true
+	}
+	// A miss for one exact bucket must not destroy independent buckets. Any
+	// stale entry tied to this arena is invalidated; shape/pointer changes on a
+	// different pooled arena remain independently replayable.
+	a.forwardGraphInvalidateArenaLocked(arena, "exact-key-miss")
+	return nil, false
+}
+
+func (a *CompactTrainAccelerator) forwardGraphReplay(entry *compactTrainForwardGraph) error {
+	if a == nil || entry == nil || entry.graph == nil {
+		return fmt.Errorf("cuda compact train forward graph handle is nil")
+	}
+	if a.debugForceForwardGraphReplayFailure {
+		return fmt.Errorf("cuda compact train forward graph replay forced failure")
+	}
+	return a.device.launchGraphNoSync(entry.graph)
+}
+
+func (a *CompactTrainAccelerator) captureForwardGraphLocked(key string, shape backend.CompactForwardShape, arena *compactTrainArena, issue func() error) error {
+	fail := func(err error) error {
+		a.stats.GraphCaptureFailures++
+		a.stats.GraphFallbacks++
+		return err
+	}
+	if a.debugForceForwardGraphCaptureFailure {
+		return fail(fmt.Errorf("cuda compact train forward graph capture forced failure"))
+	}
+	// The CUDA capture mode is THREAD_LOCAL. Keep begin, every recorded launch,
+	// and end on one OS thread; otherwise separate cgo calls may migrate the Go
+	// goroutine and leave a partial or invalid capture state.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := a.device.beginCapture(); err != nil {
+		return fail(err)
+	}
+	a.CompactForwardAccelerator.beginForwardGraphCapture()
+	captureErr := issue()
+	nodes := a.CompactForwardAccelerator.endForwardGraphCapture()
+	g, endErr := a.device.endCapture()
+	if captureErr != nil {
+		if g != nil {
+			g.destroy()
+		}
+		return fail(captureErr)
+	}
+	if endErr != nil {
+		if g != nil {
+			g.destroy()
+		}
+		return fail(endErr)
+	}
+	if g == nil || g.ptr == nil {
+		return fail(fmt.Errorf("cuda compact train forward graph capture returned nil handle"))
+	}
+	// Publish only after capture has ended and instantiation succeeded.
+	if a.forwardGraphCache == nil {
+		a.forwardGraphCache = map[string]*compactTrainForwardGraph{}
+	}
+	a.forwardGraphCache[key] = &compactTrainForwardGraph{
+		key:                       key,
+		graph:                     g,
+		shape:                     shape,
+		arena:                     arena,
+		arenaAllocationGeneration: arena.allocationGeneration,
+		nodes:                     nodes,
+	}
+	a.stats.GraphCaptures++
+	a.stats.GraphNodes += nodes
+	return nil
+}
+
+func (a *CompactTrainAccelerator) drainForwardGraphFailureLocked() error {
+	if a == nil || a.device == nil {
+		return fmt.Errorf("cuda compact train forward graph runtime is closed")
+	}
+	// A failed cuGraphLaunch may have queued a prefix before returning an
+	// error. Drain before invalidating/falling back so direct work cannot
+	// overlap captured work. This is failure-path only; successful replay uses
+	// the existing compact forward boundary below.
+	if err := a.device.synchronize(); err != nil {
+		return err
+	}
+	a.CompactForwardAccelerator.recordKernelSynchronization()
+	a.stats.GraphSynchronizations++
+	return nil
+}
+
 func (a *CompactTrainAccelerator) BindCompactTrainResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
+	return a.bindCompactTrainResident(name, tensor, ref)
+}
+
+// BindResident is overridden for the embedded forward accelerator so callers
+// cannot rebind a training resident parameter without invalidating an exact
+// forward graph.
+func (a *CompactTrainAccelerator) BindResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
+	return a.bindCompactTrainResident(name, tensor, ref)
+}
+
+func (a *CompactTrainAccelerator) bindCompactTrainResident(name string, tensor *backend.Tensor, ref backend.OptimizerResidentParameter) error {
 	if a == nil || a.CompactForwardAccelerator == nil {
 		return fmt.Errorf("cuda compact train accelerator is not initialized")
 	}
-	return a.BindResident(name, tensor, ref)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	priorBinding, priorBound := a.bindingForName(name)
+	priorToken := a.bridged[name]
+	if err := a.bindResidentLocked(name, tensor, ref); err != nil {
+		return err
+	}
+	// A successful replacement must invalidate even when shape/size are
+	// unchanged: the captured graph records the old resident pointer and
+	// allocator/weight generation.
+	currentBinding, currentBound := a.bindingForName(name)
+	currentToken := a.bridged[name]
+	if !priorBound || !currentBound || priorBinding != currentBinding || priorToken != currentToken || priorToken == nil || currentToken == nil || priorToken.generation != currentToken.generation {
+		a.forwardGraphInvalidateLocked("resident-rebind")
+	}
+	return nil
 }
 
 func (a *CompactTrainAccelerator) PreflightCompactTrainForward(req backend.CompactTrainForwardRequest) error {
@@ -1824,6 +2089,7 @@ func (a *CompactTrainAccelerator) ensureBackwardWorkspaceLocked(arena *compactTr
 		}
 		*dst = ptr
 		arena.workspaceBytes += int64(elems * 4)
+		arena.workspaceGeneration++
 		return nil
 	}
 	if err := alloc(&arena.gradPooled, shape.Batch*shape.OutputDim); err != nil {
@@ -2021,6 +2287,10 @@ func (a *CompactTrainAccelerator) launchCublasGemm(lhs, rhs, out C.CUdeviceptr, 
 }
 
 func (a *CompactTrainAccelerator) recordCublasGemmCall() error {
+	if a.CompactForwardAccelerator != nil && a.CompactForwardAccelerator.forwardGraphCaptureActive {
+		a.CompactForwardAccelerator.forwardGraphCaptureNodes++
+		return nil
+	}
 	a.stats.CublasGemmCalls++
 	a.launchesSinceBoundary++
 	if a.syncEachLaunch {
@@ -2139,6 +2409,8 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
 	cublasBefore := a.stats.CublasGemmCalls
 	var uploaded, pooledBytes, statusBytes, activeBytes int64
+	var forwardGraphNodesExecuted int64
+	graphBoundaryDrainFailed := false
 	statsPublished := false
 	publishForwardStats := func(failed bool) {
 		if statsPublished {
@@ -2148,6 +2420,8 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		forwardLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
 		forwardSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
 		forwardCublas := a.stats.CublasGemmCalls - cublasBefore
+		forwardDirectSubmissions := forwardLaunches + forwardCublas
+		forwardDeviceKernelWork := forwardDirectSubmissions + forwardGraphNodesExecuted
 		if failed && forwardLaunches == 0 && forwardSyncs == 0 && forwardCublas == 0 && uploaded == 0 && pooledBytes == 0 && statusBytes == 0 && activeBytes == 0 {
 			return
 		}
@@ -2161,6 +2435,10 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		a.stats.LastForwardLaunches = forwardLaunches
 		a.stats.LastForwardCublasGemmCalls = forwardCublas
 		a.stats.LastForwardSyncs = forwardSyncs
+		a.stats.DirectForwardSubmissions += forwardDirectSubmissions
+		a.stats.ForwardDeviceKernelWork += forwardDeviceKernelWork
+		a.stats.LastForwardDirectSubmissions = forwardDirectSubmissions
+		a.stats.LastForwardDeviceKernelWork = forwardDeviceKernelWork
 		if failed {
 			a.stats.FallbackOrUnhandled++
 		}
@@ -2194,7 +2472,12 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	}()
 	defer func() {
 		if err != nil {
-			err = a.drainKernelError(err)
+			// A graph-boundary failure already attempted its dedicated drain.
+			// Do not issue a second, potentially misleading drain when that
+			// attempt failed; the accelerator remains fail-closed for this step.
+			if !graphBoundaryDrainFailed {
+				err = a.drainKernelError(err)
+			}
 			publishForwardStats(true)
 		}
 	}()
@@ -2209,84 +2492,203 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	a.hostMasks = flattenInt32Into(a.hostMasks, req.Masks)
 	tokensFlat := a.hostTokens
 	masksFlat := a.hostMasks
-	if err := a.replaceUploadedInt32(&arena.tokens, tokensFlat); err != nil {
+	replaceArenaInt32 := func(dst *C.CUdeviceptr, data []int32) error {
+		before := *dst
+		if err := a.replaceUploadedInt32(dst, data); err != nil {
+			return err
+		}
+		if before != *dst {
+			// A pointer replacement is an allocator-generation transition, even
+			// when the requested shape/size is unchanged.
+			arena.allocationGeneration++
+			a.forwardGraphInvalidateArenaLocked(arena, "arena-pointer-rebind")
+		}
+		return nil
+	}
+	if err := replaceArenaInt32(&arena.tokens, tokensFlat); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	if err := a.replaceUploadedInt32(&arena.masks, masksFlat); err != nil {
+	if err := replaceArenaInt32(&arena.masks, masksFlat); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	if err := a.replaceUploadedInt32(&arena.roles, req.Roles); err != nil {
+	if err := replaceArenaInt32(&arena.roles, req.Roles); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
-	if err := a.replaceUploadedInt32(&arena.status, []int32{0}); err != nil {
+	if err := replaceArenaInt32(&arena.status, []int32{0}); err != nil {
 		return backend.CompactTrainForwardResult{}, err
 	}
 	uploaded = int64((len(tokensFlat) + len(masksFlat) + len(req.Roles) + 1) * 4)
-	if err := a.launchGather(a.bindings.token, a.bindings.role, arena.tokens, arena.roles, arena.input, arena.status, shape); err != nil {
-		return backend.CompactTrainForwardResult{}, err
-	}
-	current := arena.input
-	for layerIdx := 0; layerIdx < L; layerIdx++ {
-		layer := a.bindings.layer[layerIdx]
-		saved := &arena.layers[layerIdx]
-		saved.input = current
-		attnOut := arena.modelScratch[0]
-		ffnOut := arena.modelScratch[1]
-		if err := a.launchMM(current, layer.q, saved.attnQ, rows, D, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchMM(current, layer.k, saved.attnK, rows, D, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchMM(current, layer.v, saved.attnV, rows, D, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchAttention(saved.attnQ, saved.attnK, saved.attnV, arena.masks, saved.attnScores, saved.attnMixed, shape); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchMM(saved.attnMixed, layer.o, attnOut, rows, D, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchResidualLayerNorm(attnOut, current, saved.hidden, saved.attnResidual, rows, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchCompactTrainForwardLinear(saved.hidden, layer.up, saved.ffnHidden, rows, D, H); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchGELU(saved.ffnHidden, saved.activated, rows*H, geluFast); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchCompactTrainForwardLinear(saved.activated, layer.down, ffnOut, rows, H, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchResidualLayerNorm(ffnOut, saved.hidden, saved.projected, saved.ffnResidual, rows, D); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if layerIdx == 0 && a.debugForceForwardFailureAfterFirstLayer {
-			return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forced forward failure after first layer")
-		}
-		current = saved.projected
-	}
-	firstPooled := arena.finalPooled
-	if shape.HasOutputProjection {
-		firstPooled = arena.preProjectionPooled
-	}
-	if err := a.launchFinalize(current, arena.masks, arena.finalNorm, firstPooled, arena.active, B, T, D, true); err != nil {
-		return backend.CompactTrainForwardResult{}, err
-	}
-	outputRows := arena.finalNorm
-	if shape.HasOutputProjection {
-		outputRows = arena.outputRows
-		if err := a.launchCompactTrainForwardLinear(arena.finalNorm, a.bindings.out, outputRows, rows, D, O); err != nil {
-			return backend.CompactTrainForwardResult{}, err
-		}
-		if err := a.launchFinalize(outputRows, arena.masks, outputRows, arena.finalPooled, arena.active, B, T, O, false); err != nil {
-			return backend.CompactTrainForwardResult{}, err
+	// Keep the Go-side backward metadata current even when a graph replay skips
+	// the issue closure. Pooled arenas clear layer.input on reuse, while the
+	// backward path uses those exact per-layer source pointers.
+	setForwardLayerInputs := func() {
+		current := arena.input
+		for layerIdx := 0; layerIdx < L; layerIdx++ {
+			arena.layers[layerIdx].input = current
+			current = arena.layers[layerIdx].projected
 		}
 	}
-	_ = outputRows
-	if err := a.synchronizeKernelBoundary(); err != nil {
-		return backend.CompactTrainForwardResult{}, err
+	// issueForward is the complete compact forward compute body. H2D uploads
+	// above and K6 status/pooled/active readback below remain outside it.
+	issueForward := func() error {
+		if err := a.launchGather(a.bindings.token, a.bindings.role, arena.tokens, arena.roles, arena.input, arena.status, shape); err != nil {
+			return err
+		}
+		current := arena.input
+		for layerIdx := 0; layerIdx < L; layerIdx++ {
+			layer := a.bindings.layer[layerIdx]
+			saved := &arena.layers[layerIdx]
+			saved.input = current
+			attnOut := arena.modelScratch[0]
+			ffnOut := arena.modelScratch[1]
+			if err := a.launchMM(current, layer.q, saved.attnQ, rows, D, D); err != nil {
+				return err
+			}
+			if err := a.launchMM(current, layer.k, saved.attnK, rows, D, D); err != nil {
+				return err
+			}
+			if err := a.launchMM(current, layer.v, saved.attnV, rows, D, D); err != nil {
+				return err
+			}
+			if err := a.launchAttention(saved.attnQ, saved.attnK, saved.attnV, arena.masks, saved.attnScores, saved.attnMixed, shape); err != nil {
+				return err
+			}
+			if err := a.launchMM(saved.attnMixed, layer.o, attnOut, rows, D, D); err != nil {
+				return err
+			}
+			if err := a.launchResidualLayerNorm(attnOut, current, saved.hidden, saved.attnResidual, rows, D); err != nil {
+				return err
+			}
+			if err := a.launchCompactTrainForwardLinear(saved.hidden, layer.up, saved.ffnHidden, rows, D, H); err != nil {
+				return err
+			}
+			if err := a.launchGELU(saved.ffnHidden, saved.activated, rows*H, geluFast); err != nil {
+				return err
+			}
+			if err := a.launchCompactTrainForwardLinear(saved.activated, layer.down, ffnOut, rows, H, D); err != nil {
+				return err
+			}
+			if err := a.launchResidualLayerNorm(ffnOut, saved.hidden, saved.projected, saved.ffnResidual, rows, D); err != nil {
+				return err
+			}
+			if layerIdx == 0 && a.debugForceForwardFailureAfterFirstLayer {
+				return fmt.Errorf("cuda compact train forced forward failure after first layer")
+			}
+			current = saved.projected
+		}
+		firstPooled := arena.finalPooled
+		if shape.HasOutputProjection {
+			firstPooled = arena.preProjectionPooled
+		}
+		if err := a.launchFinalize(current, arena.masks, arena.finalNorm, firstPooled, arena.active, B, T, D, true); err != nil {
+			return err
+		}
+		if shape.HasOutputProjection {
+			outputRows := arena.outputRows
+			if err := a.launchCompactTrainForwardLinear(arena.finalNorm, a.bindings.out, outputRows, rows, D, O); err != nil {
+				return err
+			}
+			if err := a.launchFinalize(outputRows, arena.masks, outputRows, arena.finalPooled, arena.active, B, T, O, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// runDirectForward is the canonical direct submission path. Keep this in
+	// one closure so an accepted graph enqueue whose boundary fails cannot
+	// accidentally return through readback without submitting the direct
+	// fallback. Capturing is deliberately after the successful direct boundary
+	// and is attempted at most once per invocation.
+	runDirectForward := func(capture bool, graphKey string) error {
+		if err := issueForward(); err != nil {
+			return err
+		}
+		if err := a.synchronizeKernelBoundary(); err != nil {
+			return err
+		}
+		if capture {
+			_ = a.captureForwardGraphLocked(graphKey, shape, arena, issueForward)
+		}
+		return nil
+	}
+	setForwardLayerInputs()
+
+	graphEnabled := eosCudaCompactTrainForwardGraphEnabled && !a.CompactForwardAccelerator.syncEachLaunch
+	graphKey := ""
+	var graphEntry *compactTrainForwardGraph
+	graphReplayed := false
+	if graphEnabled {
+		graphKey = a.compactTrainForwardGraphKeyLocked(shape, arena)
+		graphEntry, graphReplayed = a.forwardGraphLookupOrCapture(graphKey, shape, arena)
+		if graphReplayed {
+			if replayErr := a.forwardGraphReplay(graphEntry); replayErr != nil {
+				a.stats.GraphReplayFailures++
+				a.stats.GraphFallbacks++
+				if drainErr := a.drainForwardGraphFailureLocked(); drainErr != nil {
+					graphBoundaryDrainFailed = true
+					return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward graph replay failed: %v (drain: %w)", replayErr, drainErr)
+				}
+				a.forwardGraphInvalidateArenaLocked(arena, "replay-failure")
+				graphReplayed = false
+			} else {
+				// Count the enqueue immediately, but defer replay/executed-node
+				// success until the existing forward boundary completes. A
+				// boundary error leaves completion unknown and must not be
+				// reported as successful graph work.
+				a.stats.GraphLaunches++
+				a.CompactForwardAccelerator.recordForwardGraphLaunch()
+			}
+		}
+	}
+	if !graphReplayed {
+		if err := runDirectForward(graphEnabled, graphKey); err != nil {
+			return backend.CompactTrainForwardResult{}, err
+		}
+	} else {
+		var boundaryErr error
+		if a.debugForceForwardGraphBoundaryFailure {
+			// The enqueue above is real; force only the first boundary result and
+			// let drainForwardGraphFailureLocked perform the actual safe wait.
+			a.debugForceForwardGraphBoundaryFailure = false
+			boundaryErr = fmt.Errorf("cuda compact train forward graph boundary forced failure")
+		} else {
+			boundaryErr = a.synchronizeKernelBoundary()
+		}
+		if boundaryErr != nil {
+			// The graph launch was accepted but its completion is unknown. Drain
+			// before destroying the captured handle. If the drain itself fails,
+			// invalidate and fail closed; never submit direct work on an unknown
+			// stream state.
+			a.stats.GraphReplayFailures++
+			drainErr := a.drainForwardGraphFailureLocked()
+			a.forwardGraphInvalidateArenaLocked(arena, "replay-boundary-failure")
+			if drainErr != nil {
+				graphBoundaryDrainFailed = true
+				return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward graph boundary failed: %v (drain: %w)", boundaryErr, drainErr)
+			}
+			// A failed graph may have left gather's status word set. Reset it
+			// before the canonical direct body is submitted, then reuse the
+			// normal direct path below. The graph's failed replay contributes no
+			// replay or executed-node count.
+			if err := a.device.copyInt32ToBuffer(arena.status, []int32{0}); err != nil {
+				return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward graph fallback status reset failed: %w", err)
+			}
+			uploaded += 4
+			a.stats.GraphFallbacks++
+			graphReplayed = false
+		}
+		if graphReplayed {
+			a.stats.GraphReplays++
+			forwardGraphNodesExecuted = graphEntry.nodes
+			a.stats.GraphExecutedNodes += graphEntry.nodes
+		}
+		if !graphReplayed {
+			// Keep the existing first-call policy: direct fallback returns its
+			// result, then recaptures exactly once for a later request.
+			if err := runDirectForward(graphEnabled, graphKey); err != nil {
+				return backend.CompactTrainForwardResult{}, err
+			}
+		}
 	}
 	status := []int32{0}
 	pooled := make([]float32, B*O)
@@ -2377,6 +2779,9 @@ func (a *CompactTrainAccelerator) prepareArenaLocked(shape backend.CompactForwar
 		return arena, nil
 	}
 	arena := &compactTrainArena{shape: shape}
+	a.nextArenaAllocationGeneration++
+	arena.allocationGeneration = a.nextArenaAllocationGeneration
+	arena.forwardWorkspaceGeneration = arena.allocationGeneration
 	B, T, D, H := shape.Batch, shape.Tokens, shape.ModelDim, shape.FFNDim
 	rows := B * T
 	modelElems := rows * D
@@ -2647,6 +3052,10 @@ func (a *CompactTrainAccelerator) freeArena(arena *compactTrainArena) {
 	if a == nil || a.device == nil || arena == nil {
 		return
 	}
+	// Destroy any graph before releasing a pointer referenced by its captured
+	// body. This covers live-handle cleanup, allocation failures, configure,
+	// and teardown paths.
+	a.forwardGraphInvalidateArenaLocked(arena, "arena-free")
 	for _, ptr := range []C.CUdeviceptr{arena.tokens, arena.masks, arena.roles, arena.status, arena.input, arena.active, arena.finalNorm, arena.outputRows, arena.preProjectionPooled, arena.finalPooled, arena.gradPooled, arena.gradOutputRows, arena.gradNormalized, arena.gradHidden, arena.gradFFNResidual, arena.gradActivatedPre, arena.gradActivated, arena.gradHiddenFromFFN, arena.gradAttention, arena.gradMixed, arena.gradQ, arena.gradK, arena.gradV, arena.gradRoPE} {
 		if ptr != 0 {
 			_ = a.device.freeBuffer(ptr)
@@ -2673,4 +3082,34 @@ func (a *CompactTrainAccelerator) freeArena(arena *compactTrainArena) {
 	if arena.token != nil {
 		arena.token.alive.Store(false)
 	}
+	arena.tokens = 0
+	arena.masks = 0
+	arena.roles = 0
+	arena.status = 0
+	arena.input = 0
+	arena.active = 0
+	arena.finalNorm = 0
+	arena.outputRows = 0
+	arena.preProjectionPooled = 0
+	arena.finalPooled = 0
+	arena.gradPooled = 0
+	arena.gradOutputRows = 0
+	arena.gradNormalized = 0
+	arena.gradHidden = 0
+	arena.gradFFNResidual = 0
+	arena.gradActivatedPre = 0
+	arena.gradActivated = 0
+	arena.gradHiddenFromFFN = 0
+	arena.gradAttention = 0
+	arena.gradMixed = 0
+	arena.gradQ = 0
+	arena.gradK = 0
+	arena.gradV = 0
+	arena.gradRoPE = 0
+	arena.modelScratch = nil
+	arena.ffnScratch = nil
+	arena.layers = nil
+	arena.bytes = 0
+	arena.workspaceBytes = 0
+	arena.workspaceGeneration = 0
 }

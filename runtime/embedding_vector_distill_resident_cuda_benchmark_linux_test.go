@@ -67,8 +67,15 @@ func BenchmarkVectorDistillCompactResidentTrainCUDAWarm(b *testing.B) {
 
 	b.Setenv(compactResidentTrainEnv, "1")
 	b.Setenv(compactPackedForwardEnv, "0")
-	if _, ok := os.LookupEnv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH"); !ok {
-		b.Setenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH", "0")
+	// The exact K7 launch contract is the compact boundary configuration. Set
+	// these before constructing the accelerator so constructor-time flags cannot
+	// select the per-launch or cuBLAS variants.
+	b.Setenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH", "0")
+	b.Setenv("EOS_CUDA_COMPACT_TRAIN_CUBLAS", "0")
+	graphEnabled := false
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("EOS_CUDA_COMPACT_TRAIN_FORWARD_GRAPH"))) {
+	case "1", "true", "yes":
+		graphEnabled = true
 	}
 
 	checkpoint := compactResidentCUDAWarmBenchCheckpoint(shape)
@@ -112,6 +119,8 @@ func BenchmarkVectorDistillCompactResidentTrainCUDAWarm(b *testing.B) {
 	if warmStats.FallbackOrUnhandled != 0 {
 		b.Fatalf("compact resident CUDA warm-up reported compact-train fallback/unhandled=%d", warmStats.FallbackOrUnhandled)
 	}
+	assertCompactResidentCUDAWarmBenchGraphStep(b, "warmup", warmStats, shape, graphEnabled, false)
+	assertCompactResidentCUDAWarmBenchK5(b, "warmup", warmDelta.Optimizer)
 	b.Logf("scope=diagnostic_only warmup_excluded=true warmup_steps=1 profile=%s shape=%s", compactResidentCUDAWarmBenchProfileLabel(shape), shape.String())
 	b.Logf("warmup_counters compact_train=%+v optimizer=%+v", compactResidentCUDAWarmBenchCompactStats(warmDelta), warmDelta.Optimizer)
 
@@ -138,16 +147,9 @@ func BenchmarkVectorDistillCompactResidentTrainCUDAWarm(b *testing.B) {
 	if stats.FallbackOrUnhandled != 0 {
 		b.Fatalf("compact resident CUDA measured step reported compact-train fallback/unhandled=%d", stats.FallbackOrUnhandled)
 	}
-	if stats.ForwardReadbackBatchEntries != 1 || stats.ForwardReadbackContextSets != 1 || stats.ForwardReadbackDeviceCopies != 3 {
-		b.Fatalf("compact resident CUDA measured readback telemetry = %d/%d/%d; want 1/1/3", stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies)
-	}
+	assertCompactResidentCUDAWarmBenchGraphStep(b, "measured", stats, shape, graphEnabled, true)
 	optimizerStats := measuredDelta.Optimizer
-	if optimizerStats.ResidentGradBatchCalls != 1 ||
-		optimizerStats.ResidentGradBatchKernelSyncs != 1 ||
-		optimizerStats.ResidentGradBatchKernelLaunches != optimizerStats.ResidentGradUpdateCalls ||
-		optimizerStats.ResidentGradUpdateCalls <= 0 {
-		b.Fatalf("compact resident CUDA measured batch telemetry = calls=%d kernel_launches=%d kernel_syncs=%d resident_grad_updates=%d; want calls=1, syncs=1, launches=updates>0", optimizerStats.ResidentGradBatchCalls, optimizerStats.ResidentGradBatchKernelLaunches, optimizerStats.ResidentGradBatchKernelSyncs, optimizerStats.ResidentGradUpdateCalls)
-	}
+	assertCompactResidentCUDAWarmBenchK5(b, "measured", optimizerStats)
 	steps := b.N
 	if steps <= 0 {
 		steps = 1
@@ -174,6 +176,18 @@ func BenchmarkVectorDistillCompactResidentTrainCUDAWarm(b *testing.B) {
 	b.ReportMetric(perStep(stats.FallbackOrUnhandled), "compact_train_fallback_or_unhandled/step")
 	b.ReportMetric(perStep(stats.GraphCaptures), "graph_captures/step")
 	b.ReportMetric(perStep(stats.GraphReplays), "graph_replays/step")
+	b.ReportMetric(perStep(stats.GraphLaunches), "graph_launches/step")
+	b.ReportMetric(perStep(stats.GraphNodes), "graph_nodes_recorded/step")
+	b.ReportMetric(perStep(stats.GraphExecutedNodes), "graph_executed_nodes/step")
+	b.ReportMetric(perStep(stats.DirectForwardSubmissions), "direct_forward_submissions/step")
+	b.ReportMetric(perStep(stats.ForwardDeviceKernelWork), "forward_device_kernel_work/step")
+	b.ReportMetric(perStep(stats.KernelLaunches+stats.GraphExecutedNodes), "direct_plus_graph_nodes/step")
+	b.ReportMetric(perStep(stats.GraphCaptureFailures), "graph_capture_failures/step")
+	b.ReportMetric(perStep(stats.GraphReplayFailures), "graph_replay_failures/step")
+	b.ReportMetric(perStep(stats.GraphInvalidations), "graph_invalidations/step")
+	b.ReportMetric(perStep(stats.GraphParityFailures), "graph_parity_failures/step")
+	b.ReportMetric(perStep(stats.GraphFallbacks), "graph_fallbacks/step")
+	b.ReportMetric(perStep(stats.GraphSynchronizations), "graph_syncs/step")
 	b.ReportMetric(perStep(measuredDelta.Optimizer.UploadedBytes), "optimizer_upload_B/step")
 	b.ReportMetric(perStep(measuredDelta.Optimizer.DownloadedBytes), "optimizer_download_B/step")
 	b.ReportMetric(perStep(optimizerStats.ResidentGradBatchCalls), "resident_grad_batch_calls/step")
@@ -212,6 +226,36 @@ func compactResidentCUDAWarmBenchProfileLabel(shape compactResidentCUDAWarmBench
 		return "canonical_fixture"
 	}
 	return shape.Profile
+}
+
+func TestCompactResidentCUDAWarmBenchExactProfiles(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		profile               string
+		wantForward, wantBack int64
+		wantWhole             int64
+	}{
+		{name: "canonical", profile: "canonical", wantForward: 24, wantBack: 44, wantWhole: 68},
+		{name: "next", profile: "next", wantForward: 22, wantBack: 43, wantWhole: 65},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("EOS_CUDA_WARM_BENCH_PROFILE", tc.profile)
+			shape, err := compactResidentCUDAWarmBenchShapeFromEnv()
+			if err != nil {
+				t.Fatalf("profile shape: %v", err)
+			}
+			forward, backward, whole := compactResidentCUDAWarmBenchExpectedKernelCounts(shape)
+			if forward != tc.wantForward || backward != tc.wantBack || whole != tc.wantWhole {
+				t.Fatalf("profile %s exact counts = forward/backward/whole %d/%d/%d, want %d/%d/%d", tc.profile, forward, backward, whole, tc.wantForward, tc.wantBack, tc.wantWhole)
+			}
+			if shape.Profile == "canonical_fixture" && (shape.Batch != 4 || shape.Tokens != 4 || shape.ModelDim != 4 || shape.FFNDim != 6 || shape.Layers != 2 || shape.OutputDim != 3) {
+				t.Fatalf("canonical profile shape = %s", shape.String())
+			}
+			if shape.Profile == "next_descriptor_shape" && (shape.Batch != 1 || shape.Tokens != 256 || shape.ModelDim != 128 || shape.FFNDim != 256 || shape.Layers != 2 || shape.OutputDim != 128) {
+				t.Fatalf("next profile shape = %s", shape.String())
+			}
+		})
+	}
 }
 
 func compactResidentCUDAWarmBenchShapeFromEnv() (compactResidentCUDAWarmBenchShape, error) {
@@ -365,6 +409,63 @@ func compactResidentCUDAWarmBenchBatch(shape compactResidentCUDAWarmBenchShape) 
 
 func compactResidentCUDAWarmBenchCompactStats(profile EmbeddingTrainProfile) *backend.CompactTrainAcceleratorStats {
 	return profile.CompactTrain
+}
+
+func compactResidentCUDAWarmBenchExpectedKernelCounts(shape compactResidentCUDAWarmBenchShape) (forward, backward, whole int64) {
+	// K7's exact profiles are the only accepted benchmark shapes. P is one
+	// when the output projection is present, so F=2+10L+2P yields 24/22.
+	if shape.OutputDim != shape.ModelDim {
+		return 24, 44, 68
+	}
+	return 22, 43, 65
+}
+
+func assertCompactResidentCUDAWarmBenchGraphStep(b *testing.B, label string, stats *backend.CompactTrainAcceleratorStats, shape compactResidentCUDAWarmBenchShape, graphEnabled, measured bool) {
+	b.Helper()
+	if stats == nil {
+		b.Fatalf("%s compact-train stats are nil", label)
+	}
+	forward, backward, whole := compactResidentCUDAWarmBenchExpectedKernelCounts(shape)
+	wantCaptures, wantReplays, wantGraphLaunches, wantGraphNodes := int64(0), int64(0), int64(0), int64(0)
+	wantDirectForward, wantGraphExecuted := forward, int64(0)
+	wantWholeDirect := whole
+	if graphEnabled {
+		if !measured {
+			wantCaptures, wantGraphNodes = 1, forward
+		} else {
+			wantReplays, wantGraphLaunches = 1, 1
+			wantDirectForward, wantGraphExecuted = 0, forward
+			wantWholeDirect = backward
+		}
+	}
+	if stats.GraphCaptures != wantCaptures || stats.GraphReplays != wantReplays || stats.GraphLaunches != wantGraphLaunches || stats.GraphNodes != wantGraphNodes {
+		b.Fatalf("%s graph capture/replay telemetry = captures=%d replays=%d launches=%d nodes=%d, want %d/%d/%d/%d (graph_enabled=%t)", label, stats.GraphCaptures, stats.GraphReplays, stats.GraphLaunches, stats.GraphNodes, wantCaptures, wantReplays, wantGraphLaunches, wantGraphNodes, graphEnabled)
+	}
+	if stats.DirectForwardSubmissions != wantDirectForward || stats.LastForwardDirectSubmissions != wantDirectForward {
+		b.Fatalf("%s direct forward submissions = cumulative=%d last=%d, want %d/%d", label, stats.DirectForwardSubmissions, stats.LastForwardDirectSubmissions, wantDirectForward, wantDirectForward)
+	}
+	if stats.GraphExecutedNodes != wantGraphExecuted || stats.ForwardDeviceKernelWork != forward || stats.LastForwardDeviceKernelWork != forward {
+		b.Fatalf("%s forward device work = graph_executed=%d cumulative=%d last=%d, want %d/%d/%d", label, stats.GraphExecutedNodes, stats.ForwardDeviceKernelWork, stats.LastForwardDeviceKernelWork, wantGraphExecuted, forward, forward)
+	}
+	if stats.GraphCaptureFailures != 0 || stats.GraphReplayFailures != 0 || stats.GraphInvalidations != 0 || stats.GraphParityFailures != 0 || stats.GraphFallbacks != 0 || stats.GraphSynchronizations != 0 {
+		b.Fatalf("%s graph failure/fallback/sync telemetry = capture_failures=%d replay_failures=%d invalidations=%d parity_failures=%d fallbacks=%d graph_syncs=%d, want all zero", label, stats.GraphCaptureFailures, stats.GraphReplayFailures, stats.GraphInvalidations, stats.GraphParityFailures, stats.GraphFallbacks, stats.GraphSynchronizations)
+	}
+	if stats.KernelLaunches != wantWholeDirect || stats.KernelSynchronizations != 2 || stats.KernelLaunches+stats.GraphExecutedNodes != whole {
+		b.Fatalf("%s compact direct/device work = direct_kernels=%d compact_syncs=%d direct_plus_graph=%d, want %d/2/%d", label, stats.KernelLaunches, stats.KernelSynchronizations, stats.KernelLaunches+stats.GraphExecutedNodes, wantWholeDirect, whole)
+	}
+	if stats.ForwardReadbackBatchEntries != 1 || stats.ForwardReadbackContextSets != 1 || stats.ForwardReadbackDeviceCopies != 3 {
+		b.Fatalf("%s K6 readback telemetry = %d/%d/%d, want 1/1/3", label, stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies)
+	}
+}
+
+func assertCompactResidentCUDAWarmBenchK5(b *testing.B, label string, stats backend.OptimizerAcceleratorStats) {
+	b.Helper()
+	if stats.ResidentGradBatchCalls != 1 ||
+		stats.ResidentGradBatchKernelSyncs != 1 ||
+		stats.ResidentGradBatchKernelLaunches != stats.ResidentGradUpdateCalls ||
+		stats.ResidentGradUpdateCalls <= 0 {
+		b.Fatalf("%s K5 batch telemetry = calls=%d kernel_launches=%d kernel_syncs=%d resident_grad_updates=%d; want calls=1, syncs=1, launches=updates>0", label, stats.ResidentGradBatchCalls, stats.ResidentGradBatchKernelLaunches, stats.ResidentGradBatchKernelSyncs, stats.ResidentGradUpdateCalls)
+	}
 }
 
 func closeCompactResidentCUDAWarmBenchAccelerator(accel backend.CompactTrainAccelerator) {

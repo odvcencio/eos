@@ -276,6 +276,44 @@ CUDA D2H fault injector is still a residual coverage gap for pooled- and
 active-copy failures; status-first early-stop, validation, stage-progress
 cleanup, and zero-successful-batch behavior are covered by tests and review.
 
+## Current Preparation Checkpoint: K7 (2026-08-15)
+
+K7 completes the `CUDA-GRAPH` investigation as a bounded correctness and
+counter gate for the default-off `EOS_CUDA_COMPACT_TRAIN_FORWARD_GRAPH` flag:
+
+- The graph covers forward compute only. H2D uploads, K6 status/pooled/active
+  readback, backward, and optimizer work remain outside it. The first exact-key
+  call runs direct and then records a non-executing capture; later exact-key
+  calls replay.
+- A cache hit requires the exact shape/configuration plus stable bound pointers,
+  allocator/arena/workspace/resident generations, and device, CUDA-context, and
+  stream identities. Pointer equality is mandatory; a near-shape or same-size
+  replacement is not a hit. Compact graph owners now close before
+  optimizer-owned resident weights, including constructor rollback and
+  alias-safe teardown.
+
+| warm profile | direct forward submissions | whole-step direct submissions | graph executed nodes | total device work |
+| --- | ---: | ---: | ---: | ---: |
+| canonical | `24 -> 0` | `68 -> 44` | `24` | `68` |
+| next | `22 -> 0` | `65 -> 43` | `22` | `65` |
+
+Total compact synchronizations remain `2`, graph-local normal synchronizations
+remain `0`, and K5 resident-optimizer plus K6 packed-readback counters are
+unchanged. With the flag off, the direct baseline remains `24/68` (canonical)
+and `22/65` (next), with graph counters at zero.
+
+Failure staging is truthful: failed capture never publishes a partial cache;
+post-enqueue replay/boundary failure drains the queued work, invalidates the
+cache, records failure/fallback, resets gather state, and runs the direct
+fallback. Teardown uses a context-safe graph owner. K7 reduces a narrow CUDA
+cgo boundary but does not make CUDA FFI zero. These synthetic exact-profile
+checks make no speedup claim. Reset-generation/runtime-health invalidation,
+cache eviction for many exact buckets, and expanded graph-on/off activation and
+backward parity remain risks. Representative repeated end-to-end performance,
+including H2D and D2H, must still show at least `10%` improvement for
+promotion; the selected-package BGE/FiQA training remains blocked and must not
+start.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -626,21 +664,25 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 ### CUDA-GRAPH / Fixed-Bucket CUDA Graph Replay
 
-- status: next bounded investigation only; no implementation claim.
+- status: complete only as a bounded correctness/counter gate; no speedup claim.
 - role/profile: `tiller-worker`.
-- objective: capture and replay fixed-shape resident training/inference buckets after allocations and stream work are stable.
+- objective: capture and replay fixed-shape resident training/inference buckets after allocations and stream work are stable. **Completed for forward-only compact-train replay.**
 - context paths: `runtime/backends/cuda/matmul_accel.go`; resident train stats; backend graph counters.
-- constraints: first confirm exact device-pointer stability and exclude H2D and
-  compact readback from the candidate slice; keep capture/replay default-off,
-  preserve normal dispatch fallback, and compare a typed launch-array option
-  separately rather than claiming either path is implemented.
-- expected outputs: capture cache, replay counters, fixed-bucket tests, A/B report.
-- verification target: graph capture/replay counters and >=`10%` representative end-to-end replay win without parity drift; `5%` is diagnostic signal only.
+- constraints: forward only; exclude H2D, compact readback, backward, and
+  optimizer work; require exact pointer/generation/device/context/stream keys;
+  keep capture/replay default-off and preserve drained direct fallback. A
+  typed launch-array option remains a separate next efficiency slice.
+- expected outputs: **met** — capture cache, replay counters, fixed-bucket
+  tests, exact-profile report, and lifecycle/failure repairs.
+- verification target: **met for bounded canonical/next correctness and
+  counters**; representative repeated end-to-end improvement of >=`10%`
+  without parity drift remains the promotion gate (`5%` is diagnostic only).
 - budget tier/model ceiling: medium.
 - sandbox/permission needs: CUDA.
 - dependencies/blockers: S3E-STEP; OBS-EXEC; K6 readback completion; stable
-  device pointers.
-- checkpoint criteria: fixed-bucket replay is optional and measured.
+  device pointers. BGE/FiQA training remains blocked.
+- checkpoint criteria: **met only as a bounded correctness/counter gate**;
+  promotion and any speedup claim remain withheld.
 - report contract: Outcome; capture shapes; counters; tests; caveats; next action.
 
 ### PACKED-FORWARD-READBACK / Narrow cgo Readback Fan-Out
@@ -864,13 +906,14 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 ## Immediate Next Action
 
 The old K1-first action and packed-forward readback are historical; K4, K5,
-and K6 are now verified checkpoints. The next bounded performance step is an
-investigation, not an implementation claim: compare fixed-bucket compact CUDA
-Graph replay with a typed launch-array path only after confirming exact device-
-pointer stability and explicitly excluding H2D and compact readback from the
-candidate slice. Keep either path default-off, expose capture/replay or launch
-telemetry, require hard parity, and require a representative end-to-end win of
-at least `10%` before promotion (`5%` is diagnostic only).
+K6, and the bounded K7 CUDA-Graph correctness/counter gate are now verified.
+The next bounded efficiency slice is an investigation, not an implementation
+claim: prefer a measured typed launch-array, kernel-fusion/coalescing, or
+resident-transfer-reduction path after selecting a stable bottleneck. Keep new
+work default-off, expose truthful launch/transfer telemetry, require hard
+parity, and require a representative repeated end-to-end win of at least `10%`
+before promotion (`5%` is diagnostic only). Do not start training for this
+slice.
 
 The next controlled encoder-v2.1 training run remains blocked by the selected-
 package BGE FiQA export and related pretrained/export jobs. Hold it and do not

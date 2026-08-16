@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -661,33 +662,12 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 	}
 	compactForwardAccel, compactForwardBackend, err := newTrainerCompactForwardAccelerator()
 	if err != nil {
-		if accel != nil {
-			accel.Close()
-		}
-		if optimizerAccel != nil {
-			optimizerAccel.Close()
-		}
-		if activationAccel != nil {
-			activationAccel.Close()
-		}
+		closeTrainerAccelerators(compactForwardAccel, accel, optimizerAccel, activationAccel)
 		return nil, err
 	}
 	compactTrainAccel, compactTrainBackend, err := newTrainerCompactTrainAccelerator()
 	if err != nil {
-		if accel != nil {
-			accel.Close()
-		}
-		if optimizerAccel != nil {
-			optimizerAccel.Close()
-		}
-		if activationAccel != nil {
-			activationAccel.Close()
-		}
-		if compactForwardAccel != nil {
-			if closer, ok := compactForwardAccel.(interface{ Close() }); ok {
-				closer.Close()
-			}
-		}
+		closeTrainerAccelerators(compactTrainAccel, compactForwardAccel, accel, optimizerAccel, activationAccel)
 		return nil, err
 	}
 	if accelBackend == "" {
@@ -955,40 +935,98 @@ func (t *EmbeddingTrainer) releaseAccelerators() {
 	if t == nil {
 		return
 	}
-	if t.forwardMatMul != nil {
-		t.forwardMatMul.Close()
-		t.forwardMatMul = nil
-		t.forwardBackend = ""
-	}
-	if t.optimizerAccel != nil {
-		t.optimizerAccel.Close()
-		t.optimizerAccel = nil
-		t.optimizerBackend = ""
-	}
-	if t.activationAccel != nil {
-		t.activationAccel.Close()
-		t.activationAccel = nil
-		t.activationBackend = ""
-	}
-	if t.contrastiveAccel != nil {
-		t.contrastiveAccel.Close()
-		t.contrastiveAccel = nil
-		t.contrastiveBackend = ""
-	}
-	if t.compactForwardAccel != nil {
-		if closer, ok := t.compactForwardAccel.(interface{ Close() }); ok {
-			closer.Close()
+	// Compact forward/train accelerators may own CUDA graph handles that refer
+	// to optimizer-resident parameter storage. Invalidate/destroy those graph
+	// owners before optimizer.Close frees the resident allocations. The
+	// factories are independent, but a backend may legally expose one object
+	// through multiple accelerator interfaces, so close aliased values once.
+	compactTrain := t.compactTrainAccel
+	compactForward := t.compactForwardAccel
+	forwardMatMul := t.forwardMatMul
+	optimizer := t.optimizerAccel
+	activation := t.activationAccel
+	contrastive := t.contrastiveAccel
+	closeTrainerAccelerators(compactTrain, compactForward, forwardMatMul, optimizer, activation, contrastive)
+	t.compactTrainAccel = nil
+	t.compactTrainBackend = ""
+	t.compactForwardAccel = nil
+	t.compactForwardBackend = ""
+	t.compactForwardSelected = false
+	t.forwardMatMul = nil
+	t.forwardBackend = ""
+	t.optimizerAccel = nil
+	t.optimizerBackend = ""
+	t.activationAccel = nil
+	t.activationBackend = ""
+	t.contrastiveAccel = nil
+	t.contrastiveBackend = ""
+}
+
+// closeTrainerAccelerators closes each close-capable accelerator at most once,
+// in the order supplied. Compact graph owners must be listed before optimizer
+// state so their captured resident pointers are invalidated before the
+// optimizer frees those allocations.
+func closeTrainerAccelerators(accelerators ...any) {
+	closed := make([]any, 0, len(accelerators))
+	for _, accelerator := range accelerators {
+		if trainerAcceleratorNil(accelerator) {
+			continue
 		}
-		t.compactForwardAccel = nil
-		t.compactForwardBackend = ""
-		t.compactForwardSelected = false
-	}
-	if t.compactTrainAccel != nil {
-		if closer, ok := t.compactTrainAccel.(interface{ Close() }); ok {
-			closer.Close()
+		closer, ok := accelerator.(interface{ Close() })
+		if !ok {
+			continue
 		}
-		t.compactTrainAccel = nil
-		t.compactTrainBackend = ""
+		alreadyClosed := false
+		for _, prior := range closed {
+			if sameTrainerAccelerator(prior, accelerator) {
+				alreadyClosed = true
+				break
+			}
+		}
+		if alreadyClosed {
+			continue
+		}
+		closed = append(closed, accelerator)
+		closer.Close()
+	}
+}
+
+func trainerAcceleratorNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	rv := reflect.ValueOf(value)
+	switch rv.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Ptr, reflect.Slice:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
+// sameTrainerAccelerator reports whether two interface views identify the
+// same concrete accelerator without relying on an interface == comparison
+// (which panics for non-comparable dynamic values).
+func sameTrainerAccelerator(left, right any) bool {
+	if trainerAcceleratorNil(left) || trainerAcceleratorNil(right) {
+		return false
+	}
+	lv, rv := reflect.ValueOf(left), reflect.ValueOf(right)
+	if !lv.IsValid() || !rv.IsValid() || lv.Type() != rv.Type() {
+		return false
+	}
+	if lv.Type().Comparable() {
+		return lv.Interface() == rv.Interface()
+	}
+	switch lv.Kind() {
+	case reflect.Map:
+		return lv.Pointer() == rv.Pointer()
+	case reflect.Slice:
+		return lv.Pointer() == rv.Pointer() && lv.Len() == rv.Len() && lv.Cap() == rv.Cap()
+	case reflect.Chan, reflect.UnsafePointer:
+		return lv.Pointer() == rv.Pointer()
+	default:
+		return false
 	}
 }
 

@@ -1068,7 +1068,12 @@ static int eosCudaBeginCapture(EosCudaRuntime* rt, char** err) {
 // executable graph, and returns both (the graph is retained for teardown).
 static int eosCudaEndCapture(EosCudaRuntime* rt, EosCudaGraph** out, char** err) {
 	CUgraph graph = NULL;
-	CUresult cuRes = cuStreamEndCapture(rt->stream, &graph);
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	cuRes = cuStreamEndCapture(rt->stream, &graph);
 	if (cuRes != CUDA_SUCCESS) {
 		*err = manta_dup_cu_error("cuStreamEndCapture", cuRes);
 		return 1;
@@ -1096,7 +1101,7 @@ static int eosCudaEndCapture(EosCudaRuntime* rt, EosCudaGraph** out, char** err)
 // eosCudaGraphLaunch replays a captured graph and synchronizes once. The
 // graph references the device pointers recorded at capture time, so replay
 // recomputes against whatever those (stable) buffers currently hold.
-static int eosCudaGraphLaunch(EosCudaRuntime* rt, EosCudaGraph* g, char** err) {
+static int eosCudaGraphLaunchNoSync(EosCudaRuntime* rt, EosCudaGraph* g, char** err) {
 	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
 	if (cuRes != CUDA_SUCCESS) {
 		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
@@ -1107,12 +1112,31 @@ static int eosCudaGraphLaunch(EosCudaRuntime* rt, EosCudaGraph* g, char** err) {
 		*err = manta_dup_cu_error("cuGraphLaunch", cuRes);
 		return 1;
 	}
-	cuRes = cuStreamSynchronize(rt->stream);
+	return 0;
+}
+
+static int eosCudaGraphLaunch(EosCudaRuntime* rt, EosCudaGraph* g, char** err) {
+	if (eosCudaGraphLaunchNoSync(rt, g, err) != 0) {
+		return 1;
+	}
+	CUresult cuRes = cuStreamSynchronize(rt->stream);
 	if (cuRes != CUDA_SUCCESS) {
 		*err = manta_dup_cu_error("cuStreamSynchronize", cuRes);
 		return 1;
 	}
 	return 0;
+}
+
+static uint64_t eosCudaRuntimeContextIdentity(EosCudaRuntime* rt) {
+	return rt == NULL ? 0 : (uint64_t)(uintptr_t)rt->ctx;
+}
+
+static int eosCudaRuntimeDeviceIdentity(EosCudaRuntime* rt) {
+	return rt == NULL ? -1 : (int)rt->device;
+}
+
+static uint64_t eosCudaRuntimeStreamIdentity(EosCudaRuntime* rt) {
+	return rt == NULL ? 0 : (uint64_t)(uintptr_t)rt->stream;
 }
 
 static void eosCudaGraphDestroy(EosCudaGraph* g) {
@@ -1126,6 +1150,39 @@ static void eosCudaGraphDestroy(EosCudaGraph* g) {
 		cuGraphDestroy(g->graph);
 	}
 	free(g);
+}
+
+static int eosCudaGraphDestroyWithRuntime(EosCudaRuntime* rt, EosCudaGraph* g, char** err) {
+	if (g == NULL) {
+		return 0;
+	}
+	if (rt == NULL) {
+		*err = manta_dup_format("eosCudaGraphDestroyWithRuntime", "missing runtime");
+		return 1;
+	}
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	if (g->exec != NULL) {
+		cuRes = cuGraphExecDestroy(g->exec);
+		if (cuRes != CUDA_SUCCESS) {
+			*err = manta_dup_cu_error("cuGraphExecDestroy", cuRes);
+			return 1;
+		}
+		g->exec = NULL;
+	}
+	if (g->graph != NULL) {
+		cuRes = cuGraphDestroy(g->graph);
+		if (cuRes != CUDA_SUCCESS) {
+			*err = manta_dup_cu_error("cuGraphDestroy", cuRes);
+			return 1;
+		}
+		g->graph = NULL;
+	}
+	free(g);
+	return 0;
 }
 */
 import "C"
@@ -2492,6 +2549,9 @@ extern "C" __global__ void manta_bert_attention_context(
 
 type deviceRuntime struct {
 	ptr                         *C.EosCudaRuntime
+	contextID                   uint64
+	deviceID                    int
+	streamID                    uint64
 	bgeFullEncoderMu            sync.Mutex
 	residentMatrices            map[string]residentMatrix
 	bertResidentTensors         map[string]residentTensor
@@ -2599,7 +2659,14 @@ func newDeviceRuntime() (*deviceRuntime, error) {
 	if C.eosCudaRuntimeCreate(&rt, &errStr) != 0 {
 		return nil, cStringError(errStr)
 	}
-	return &deviceRuntime{ptr: rt, residentMatrices: map[string]residentMatrix{}, bertResidentTensors: map[string]residentTensor{}, bertResidentCache: map[string]bertCUDAResidentBindingCache{}, bertSelectedContractCache: map[string]bertCUDASelectedContract{}, matMulScratch: map[string]deviceScratchBuffer{}, graphCache: map[string]*cudaGraph{}}, nil
+	device := &deviceRuntime{ptr: rt, residentMatrices: map[string]residentMatrix{}, bertResidentTensors: map[string]residentTensor{}, bertResidentCache: map[string]bertCUDAResidentBindingCache{}, bertSelectedContractCache: map[string]bertCUDASelectedContract{}, matMulScratch: map[string]deviceScratchBuffer{}, graphCache: map[string]*cudaGraph{}}
+	// These identities are immutable for the lifetime of a runtime. Cache them
+	// once so exact graph-key construction does not add cgo crossings to every
+	// forward invocation.
+	device.contextID = uint64(C.eosCudaRuntimeContextIdentity(rt))
+	device.deviceID = int(C.eosCudaRuntimeDeviceIdentity(rt))
+	device.streamID = uint64(C.eosCudaRuntimeStreamIdentity(rt))
+	return device, nil
 }
 
 func (rt *deviceRuntime) close() {
@@ -5379,9 +5446,16 @@ func cStringValue(value *C.char) string {
 // + named scratch); see project_manta_cuda_graph.
 var eosCudaGraphEnabled = os.Getenv("EOS_CUDA_GRAPH") == "1"
 
+// eosCudaCompactTrainForwardGraphEnabled gates the fixed-bucket compact-train
+// forward graph independently from the existing generic GEMM graph gate. It
+// is intentionally default-off until the exact-shape correctness/telemetry
+// gate is complete.
+var eosCudaCompactTrainForwardGraphEnabled = cudaEnvFlagEnabled("EOS_CUDA_COMPACT_TRAIN_FORWARD_GRAPH")
+
 // cudaGraph wraps an instantiated, replayable CUDA graph.
 type cudaGraph struct {
-	ptr *C.EosCudaGraph
+	ptr     *C.EosCudaGraph
+	runtime *deviceRuntime
 }
 
 // beginCapture puts rt's stream into capture mode. Warm up cuBLAS workspace
@@ -5402,7 +5476,7 @@ func (rt *deviceRuntime) endCapture() (*cudaGraph, error) {
 	if C.eosCudaEndCapture(rt.ptr, &g, &errStr) != 0 {
 		return nil, cStringError(errStr)
 	}
-	return &cudaGraph{ptr: g}, nil
+	return &cudaGraph{ptr: g, runtime: rt}, nil
 }
 
 // launchGraph replays a captured graph and synchronizes once.
@@ -5417,12 +5491,68 @@ func (rt *deviceRuntime) launchGraph(g *cudaGraph) error {
 	return nil
 }
 
+// launchGraphNoSync queues a replay on the runtime stream without adding a
+// graph-local or wrapper synchronization. Compact-train forward uses the
+// existing forward boundary after this call so the total compact sync count
+// remains unchanged.
+func (rt *deviceRuntime) launchGraphNoSync(g *cudaGraph) error {
+	if g == nil || g.ptr == nil {
+		return errors.New("cuda: launch of nil graph")
+	}
+	var errStr *C.char
+	if C.eosCudaGraphLaunchNoSync(rt.ptr, g.ptr, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) contextIdentity() uint64 {
+	if rt == nil {
+		return 0
+	}
+	return rt.contextID
+}
+
+func (rt *deviceRuntime) deviceIdentity() int {
+	if rt == nil {
+		return -1
+	}
+	return rt.deviceID
+}
+
+func (rt *deviceRuntime) streamIdentity() uint64 {
+	if rt == nil {
+		return 0
+	}
+	return rt.streamID
+}
+
 func (g *cudaGraph) destroy() {
 	if g == nil || g.ptr == nil {
 		return
 	}
+	if g.runtime != nil {
+		_ = g.runtime.destroyGraph(g)
+		return
+	}
 	C.eosCudaGraphDestroy(g.ptr)
 	g.ptr = nil
+}
+
+func (rt *deviceRuntime) destroyGraph(g *cudaGraph) error {
+	if rt == nil || rt.ptr == nil {
+		return errors.New("cuda: destroy graph on nil runtime")
+	}
+	if g == nil || g.ptr == nil {
+		return nil
+	}
+	var errStr *C.char
+	if C.eosCudaGraphDestroyWithRuntime(rt.ptr, g.ptr, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	g.ptr = nil
+	g.runtime = nil
+	return nil
 }
 
 func (rt *deviceRuntime) runBERTEmbeddingAffineLayerNorm(tokenEmbeddings, positionEmbeddings, tokenTypeEmbeddings, gamma, beta, inputIDs, tokenTypeIDs *backend.Tensor, epsilon float64) (*backend.Tensor, error) {

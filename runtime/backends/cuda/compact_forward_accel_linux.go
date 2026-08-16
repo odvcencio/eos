@@ -348,6 +348,12 @@ type CompactForwardAccelerator struct {
 	bridged                                 map[string]*optimizerResidentParameterToken
 	hostTokens                              []int32
 	hostMasks                               []int32
+	// forwardGraphCaptureActive suppresses direct-submission accounting while
+	// the same forward body is recorded into a CUDA graph. Captured launches
+	// are counted as graph nodes instead; no synchronization is permitted while
+	// this mode is active.
+	forwardGraphCaptureActive bool
+	forwardGraphCaptureNodes  int64
 }
 
 type CompactForwardLayerNames struct {
@@ -1202,6 +1208,10 @@ func (a *CompactForwardAccelerator) packIntCopy(src, dst C.CUdeviceptr, srcOffse
 }
 
 func (a *CompactForwardAccelerator) recordKernelLaunch() error {
+	if a.forwardGraphCaptureActive {
+		a.forwardGraphCaptureNodes++
+		return nil
+	}
 	a.stats.KernelLaunches++
 	a.launchesSinceBoundary++
 	if a.syncEachLaunch {
@@ -1211,6 +1221,25 @@ func (a *CompactForwardAccelerator) recordKernelLaunch() error {
 		a.recordKernelSynchronization()
 	}
 	return nil
+}
+
+func (a *CompactForwardAccelerator) beginForwardGraphCapture() {
+	a.forwardGraphCaptureActive = true
+	a.forwardGraphCaptureNodes = 0
+}
+
+func (a *CompactForwardAccelerator) endForwardGraphCapture() int64 {
+	nodes := a.forwardGraphCaptureNodes
+	a.forwardGraphCaptureActive = false
+	a.forwardGraphCaptureNodes = 0
+	return nodes
+}
+
+func (a *CompactForwardAccelerator) recordForwardGraphLaunch() {
+	// Keep this pending-work marker separate from KernelLaunches: graph launch
+	// telemetry is reported independently from direct kernel submissions, while
+	// the existing compact boundary still performs exactly one synchronization.
+	a.launchesSinceBoundary++
 }
 
 func (a *CompactForwardAccelerator) recordKernelSynchronization() {

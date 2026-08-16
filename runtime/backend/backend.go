@@ -242,17 +242,39 @@ type CompactTrainAcceleratorStats struct {
 	KernelSynchronizations      int64
 	GraphCaptures               int64
 	GraphReplays                int64
-	FallbackOrUnhandled         int64
-	ForwardNanos                int64
-	BackwardNanos               int64
-	OptimizerResidentGradNanos  int64
-	LastShape                   CompactForwardShape
-	LastForwardLaunches         int64
-	LastBackwardLaunches        int64
-	LastForwardCublasGemmCalls  int64
-	LastBackwardCublasGemmCalls int64
-	LastForwardSyncs            int64
-	LastBackwardSyncs           int64
+	// GraphLaunches counts accepted CUDA graph-launch enqueues separately from
+	// direct kernel submissions; GraphReplays counts launches whose existing
+	// forward boundary completed successfully. GraphNodes counts nodes recorded
+	// by successful forward captures; the failure/invalidation/fallback
+	// counters describe the default-off compact-train forward graph gate.
+	GraphLaunches         int64
+	GraphNodes            int64
+	GraphCaptureFailures  int64
+	GraphReplayFailures   int64
+	GraphInvalidations    int64
+	GraphParityFailures   int64
+	GraphFallbacks        int64
+	GraphSynchronizations int64
+	// DirectForwardSubmissions excludes graph-recording launches and counts
+	// only direct forward submissions. ForwardDeviceKernelWork includes direct work
+	// plus executed graph nodes, preserving the distinction needed by the
+	// compact exact-profile launch contract.
+	DirectForwardSubmissions     int64
+	GraphExecutedNodes           int64
+	ForwardDeviceKernelWork      int64
+	FallbackOrUnhandled          int64
+	ForwardNanos                 int64
+	BackwardNanos                int64
+	OptimizerResidentGradNanos   int64
+	LastShape                    CompactForwardShape
+	LastForwardLaunches          int64
+	LastBackwardLaunches         int64
+	LastForwardCublasGemmCalls   int64
+	LastBackwardCublasGemmCalls  int64
+	LastForwardSyncs             int64
+	LastBackwardSyncs            int64
+	LastForwardDirectSubmissions int64
+	LastForwardDeviceKernelWork  int64
 }
 
 // ContrastiveGradResult contains pooled embedding gradients and unnormalized row metrics.

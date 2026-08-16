@@ -477,44 +477,106 @@ func TestTrainProfileCompactForwardReadbackCounterActivity(t *testing.T) {
 	}
 }
 
+func TestTrainProfileCompactForwardGraphCounterActivity(t *testing.T) {
+	cases := []struct {
+		name string
+		set  func(*backend.CompactTrainAcceleratorStats)
+	}{
+		{name: "graph captures", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphCaptures = 1 }},
+		{name: "graph replays", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphReplays = 1 }},
+		{name: "graph launches", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphLaunches = 1 }},
+		{name: "graph nodes", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphNodes = 1 }},
+		{name: "graph capture failures", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphCaptureFailures = 1 }},
+		{name: "graph replay failures", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphReplayFailures = 1 }},
+		{name: "graph invalidations", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphInvalidations = 1 }},
+		{name: "graph parity failures", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphParityFailures = 1 }},
+		{name: "graph fallbacks", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphFallbacks = 1 }},
+		{name: "graph synchronizations", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphSynchronizations = 1 }},
+		{name: "direct forward submissions", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.DirectForwardSubmissions = 1 }},
+		{name: "graph executed nodes", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.GraphExecutedNodes = 1 }},
+		{name: "forward device kernel work", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.ForwardDeviceKernelWork = 1 }},
+		{name: "last forward direct submissions", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.LastForwardDirectSubmissions = 1 }},
+		{name: "last forward device kernel work", set: func(stats *backend.CompactTrainAcceleratorStats) { stats.LastForwardDeviceKernelWork = 1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stats := backend.CompactTrainAcceleratorStats{}
+			tc.set(&stats)
+			if !hasTrainProfileActivity(EmbeddingTrainProfile{CompactTrain: &stats}) {
+				t.Fatalf("expected compact-train graph activity for %+v", stats)
+			}
+		})
+	}
+}
+
 func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *testing.T) {
 	start := &backend.CompactTrainAcceleratorStats{
-		ArenaAllocations:            1,
-		ArenaReuseHits:              1,
-		GradientAllocations:         1,
-		GradientReuseHits:           1,
-		LiveHandles:                 2,
-		ActivationArenaBytes:        4096,
-		WorkspaceArenaBytes:         2048,
-		ForwardReadbackBatchEntries: 4,
-		ForwardReadbackContextSets:  5,
-		ForwardReadbackDeviceCopies: 12,
-		LastShape:                   backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8},
-		LastForwardLaunches:         3,
-		LastBackwardLaunches:        4,
-		LastForwardCublasGemmCalls:  1,
-		LastBackwardCublasGemmCalls: 2,
-		LastForwardSyncs:            1,
-		LastBackwardSyncs:           1,
+		ArenaAllocations:             1,
+		ArenaReuseHits:               1,
+		GradientAllocations:          1,
+		GradientReuseHits:            1,
+		LiveHandles:                  2,
+		ActivationArenaBytes:         4096,
+		WorkspaceArenaBytes:          2048,
+		ForwardReadbackBatchEntries:  4,
+		ForwardReadbackContextSets:   5,
+		ForwardReadbackDeviceCopies:  12,
+		GraphCaptures:                2,
+		GraphReplays:                 3,
+		GraphLaunches:                4,
+		GraphNodes:                   5,
+		GraphCaptureFailures:         6,
+		GraphReplayFailures:          7,
+		GraphInvalidations:           8,
+		GraphParityFailures:          9,
+		GraphFallbacks:               10,
+		GraphSynchronizations:        11,
+		DirectForwardSubmissions:     12,
+		GraphExecutedNodes:           13,
+		ForwardDeviceKernelWork:      14,
+		LastShape:                    backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8},
+		LastForwardLaunches:          3,
+		LastBackwardLaunches:         4,
+		LastForwardCublasGemmCalls:   1,
+		LastBackwardCublasGemmCalls:  2,
+		LastForwardSyncs:             1,
+		LastBackwardSyncs:            1,
+		LastForwardDirectSubmissions: 1,
+		LastForwardDeviceKernelWork:  2,
 	}
 	end := &backend.CompactTrainAcceleratorStats{
-		ArenaAllocations:            1,
-		ArenaReuseHits:              2,
-		GradientAllocations:         1,
-		GradientReuseHits:           2,
-		LiveHandles:                 1,
-		ActivationArenaBytes:        8192,
-		WorkspaceArenaBytes:         4096,
-		ForwardReadbackBatchEntries: 6,
-		ForwardReadbackContextSets:  7,
-		ForwardReadbackDeviceCopies: 18,
-		LastShape:                   backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8, FFNDim: 16},
-		LastForwardLaunches:         5,
-		LastBackwardLaunches:        6,
-		LastForwardCublasGemmCalls:  3,
-		LastBackwardCublasGemmCalls: 4,
-		LastForwardSyncs:            2,
-		LastBackwardSyncs:           2,
+		ArenaAllocations:             1,
+		ArenaReuseHits:               2,
+		GradientAllocations:          1,
+		GradientReuseHits:            2,
+		LiveHandles:                  1,
+		ActivationArenaBytes:         8192,
+		WorkspaceArenaBytes:          4096,
+		ForwardReadbackBatchEntries:  6,
+		ForwardReadbackContextSets:   7,
+		ForwardReadbackDeviceCopies:  18,
+		GraphCaptures:                11,
+		GraphReplays:                 15,
+		GraphLaunches:                17,
+		GraphNodes:                   19,
+		GraphCaptureFailures:         21,
+		GraphReplayFailures:          23,
+		GraphInvalidations:           25,
+		GraphParityFailures:          27,
+		GraphFallbacks:               29,
+		GraphSynchronizations:        31,
+		DirectForwardSubmissions:     33,
+		GraphExecutedNodes:           35,
+		ForwardDeviceKernelWork:      37,
+		LastShape:                    backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8, FFNDim: 16},
+		LastForwardLaunches:          5,
+		LastBackwardLaunches:         6,
+		LastForwardCublasGemmCalls:   3,
+		LastBackwardCublasGemmCalls:  4,
+		LastForwardSyncs:             2,
+		LastBackwardSyncs:            2,
+		LastForwardDirectSubmissions: 3,
+		LastForwardDeviceKernelWork:  4,
 	}
 
 	got := diffCompactTrainStats(start, end)
@@ -530,6 +592,25 @@ func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *tes
 	if got.ForwardReadbackBatchEntries != 2 || got.ForwardReadbackContextSets != 2 || got.ForwardReadbackDeviceCopies != 6 {
 		t.Fatalf("forward readback counters = %d/%d/%d, want 2/2/6", got.ForwardReadbackBatchEntries, got.ForwardReadbackContextSets, got.ForwardReadbackDeviceCopies)
 	}
+	assertCompactTrainGraphCounters(t, got, &backend.CompactTrainAcceleratorStats{
+		GraphCaptures:            9,
+		GraphReplays:             12,
+		GraphLaunches:            13,
+		GraphNodes:               14,
+		GraphCaptureFailures:     15,
+		GraphReplayFailures:      16,
+		GraphInvalidations:       17,
+		GraphParityFailures:      18,
+		GraphFallbacks:           19,
+		GraphSynchronizations:    20,
+		DirectForwardSubmissions: 21,
+		GraphExecutedNodes:       22,
+		ForwardDeviceKernelWork:  23,
+	})
+	assertCompactTrainGraphSnapshots(t, got, &backend.CompactTrainAcceleratorStats{
+		LastForwardDirectSubmissions: 3,
+		LastForwardDeviceKernelWork:  4,
+	})
 	if got.LiveHandles != end.LiveHandles {
 		t.Fatalf("live handles = %d, want end snapshot %d", got.LiveHandles, end.LiveHandles)
 	}
@@ -545,65 +626,125 @@ func TestCompactTrainProfileRestoreMergePreservesPoolDeltasAndSnapshots(t *testi
 	start := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:                 2,
-			ArenaReuseHits:              1,
-			ArenaAllocations:            1,
-			GradientReuseHits:           1,
-			GradientAllocations:         1,
-			ResidentGradBytes:           100,
-			ActivationArenaBytes:        1000,
-			WorkspaceArenaBytes:         2000,
-			ForwardReadbackBatchEntries: 1,
-			ForwardReadbackContextSets:  1,
-			ForwardReadbackDeviceCopies: 3,
+			LiveHandles:                  2,
+			ArenaReuseHits:               1,
+			ArenaAllocations:             1,
+			GradientReuseHits:            1,
+			GradientAllocations:          1,
+			ResidentGradBytes:            100,
+			ActivationArenaBytes:         1000,
+			WorkspaceArenaBytes:          2000,
+			ForwardReadbackBatchEntries:  1,
+			ForwardReadbackContextSets:   1,
+			ForwardReadbackDeviceCopies:  3,
+			GraphCaptures:                1,
+			GraphReplays:                 2,
+			GraphLaunches:                3,
+			GraphNodes:                   4,
+			GraphCaptureFailures:         5,
+			GraphReplayFailures:          6,
+			GraphInvalidations:           7,
+			GraphParityFailures:          8,
+			GraphFallbacks:               9,
+			GraphSynchronizations:        10,
+			DirectForwardSubmissions:     11,
+			GraphExecutedNodes:           12,
+			ForwardDeviceKernelWork:      13,
+			LastForwardDirectSubmissions: 14,
+			LastForwardDeviceKernelWork:  15,
 		},
 	}
 	preRestoreEnd := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:                 1,
-			ArenaReuseHits:              3,
-			ArenaAllocations:            2,
-			GradientReuseHits:           4,
-			GradientAllocations:         2,
-			ResidentGradBytes:           150,
-			ActivationArenaBytes:        1100,
-			WorkspaceArenaBytes:         2200,
-			ForwardReadbackBatchEntries: 3,
-			ForwardReadbackContextSets:  3,
-			ForwardReadbackDeviceCopies: 9,
+			LiveHandles:                  1,
+			ArenaReuseHits:               3,
+			ArenaAllocations:             2,
+			GradientReuseHits:            4,
+			GradientAllocations:          2,
+			ResidentGradBytes:            150,
+			ActivationArenaBytes:         1100,
+			WorkspaceArenaBytes:          2200,
+			ForwardReadbackBatchEntries:  3,
+			ForwardReadbackContextSets:   3,
+			ForwardReadbackDeviceCopies:  9,
+			GraphCaptures:                4,
+			GraphReplays:                 6,
+			GraphLaunches:                8,
+			GraphNodes:                   10,
+			GraphCaptureFailures:         12,
+			GraphReplayFailures:          14,
+			GraphInvalidations:           16,
+			GraphParityFailures:          18,
+			GraphFallbacks:               20,
+			GraphSynchronizations:        22,
+			DirectForwardSubmissions:     24,
+			GraphExecutedNodes:           26,
+			ForwardDeviceKernelWork:      28,
+			LastForwardDirectSubmissions: 29,
+			LastForwardDeviceKernelWork:  30,
 		},
 	}
 	restoreStart := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:                 4,
-			ArenaReuseHits:              10,
-			ArenaAllocations:            5,
-			GradientReuseHits:           11,
-			GradientAllocations:         5,
-			ResidentGradBytes:           200,
-			ActivationArenaBytes:        3000,
-			WorkspaceArenaBytes:         6000,
-			ForwardReadbackBatchEntries: 4,
-			ForwardReadbackContextSets:  4,
-			ForwardReadbackDeviceCopies: 12,
+			LiveHandles:                  4,
+			ArenaReuseHits:               10,
+			ArenaAllocations:             5,
+			GradientReuseHits:            11,
+			GradientAllocations:          5,
+			ResidentGradBytes:            200,
+			ActivationArenaBytes:         3000,
+			WorkspaceArenaBytes:          6000,
+			ForwardReadbackBatchEntries:  4,
+			ForwardReadbackContextSets:   4,
+			ForwardReadbackDeviceCopies:  12,
+			GraphCaptures:                30,
+			GraphReplays:                 40,
+			GraphLaunches:                50,
+			GraphNodes:                   60,
+			GraphCaptureFailures:         70,
+			GraphReplayFailures:          80,
+			GraphInvalidations:           90,
+			GraphParityFailures:          100,
+			GraphFallbacks:               110,
+			GraphSynchronizations:        120,
+			DirectForwardSubmissions:     130,
+			GraphExecutedNodes:           140,
+			ForwardDeviceKernelWork:      150,
+			LastForwardDirectSubmissions: 31,
+			LastForwardDeviceKernelWork:  32,
 		},
 	}
 	final := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:                 3,
-			ArenaReuseHits:              12,
-			ArenaAllocations:            6,
-			GradientReuseHits:           13,
-			GradientAllocations:         6,
-			ResidentGradBytes:           230,
-			ActivationArenaBytes:        3300,
-			WorkspaceArenaBytes:         6600,
-			ForwardReadbackBatchEntries: 6,
-			ForwardReadbackContextSets:  6,
-			ForwardReadbackDeviceCopies: 18,
+			LiveHandles:                  3,
+			ArenaReuseHits:               12,
+			ArenaAllocations:             6,
+			GradientReuseHits:            13,
+			GradientAllocations:          6,
+			ResidentGradBytes:            230,
+			ActivationArenaBytes:         3300,
+			WorkspaceArenaBytes:          6600,
+			ForwardReadbackBatchEntries:  6,
+			ForwardReadbackContextSets:   6,
+			ForwardReadbackDeviceCopies:  18,
+			GraphCaptures:                35,
+			GraphReplays:                 47,
+			GraphLaunches:                59,
+			GraphNodes:                   71,
+			GraphCaptureFailures:         83,
+			GraphReplayFailures:          95,
+			GraphInvalidations:           107,
+			GraphParityFailures:          119,
+			GraphFallbacks:               131,
+			GraphSynchronizations:        143,
+			DirectForwardSubmissions:     155,
+			GraphExecutedNodes:           167,
+			ForwardDeviceKernelWork:      179,
+			LastForwardDirectSubmissions: 41,
+			LastForwardDeviceKernelWork:  42,
 		},
 	}
 
@@ -613,30 +754,60 @@ func TestCompactTrainProfileRestoreMergePreservesPoolDeltasAndSnapshots(t *testi
 	endProfile := applyTrainProfileDelta(preRestoreEnd, postRestoreDelta)
 
 	assertCompactTrainProfileStats(t, mergedDelta.CompactTrain, &backend.CompactTrainAcceleratorStats{
-		LiveHandles:                 3,
-		ArenaReuseHits:              4,
-		ArenaAllocations:            2,
-		GradientReuseHits:           5,
-		GradientAllocations:         2,
-		ResidentGradBytes:           80,
-		ActivationArenaBytes:        3300,
-		WorkspaceArenaBytes:         6600,
-		ForwardReadbackBatchEntries: 4,
-		ForwardReadbackContextSets:  4,
-		ForwardReadbackDeviceCopies: 12,
+		LiveHandles:                  3,
+		ArenaReuseHits:               4,
+		ArenaAllocations:             2,
+		GradientReuseHits:            5,
+		GradientAllocations:          2,
+		ResidentGradBytes:            80,
+		ActivationArenaBytes:         3300,
+		WorkspaceArenaBytes:          6600,
+		ForwardReadbackBatchEntries:  4,
+		ForwardReadbackContextSets:   4,
+		ForwardReadbackDeviceCopies:  12,
+		GraphCaptures:                8,
+		GraphReplays:                 11,
+		GraphLaunches:                14,
+		GraphNodes:                   17,
+		GraphCaptureFailures:         20,
+		GraphReplayFailures:          23,
+		GraphInvalidations:           26,
+		GraphParityFailures:          29,
+		GraphFallbacks:               32,
+		GraphSynchronizations:        35,
+		DirectForwardSubmissions:     38,
+		GraphExecutedNodes:           41,
+		ForwardDeviceKernelWork:      44,
+		LastForwardDirectSubmissions: 41,
+		LastForwardDeviceKernelWork:  42,
 	})
 	assertCompactTrainProfileStats(t, endProfile.CompactTrain, &backend.CompactTrainAcceleratorStats{
-		LiveHandles:                 3,
-		ArenaReuseHits:              5,
-		ArenaAllocations:            3,
-		GradientReuseHits:           6,
-		GradientAllocations:         3,
-		ResidentGradBytes:           180,
-		ActivationArenaBytes:        3300,
-		WorkspaceArenaBytes:         6600,
-		ForwardReadbackBatchEntries: 5,
-		ForwardReadbackContextSets:  5,
-		ForwardReadbackDeviceCopies: 15,
+		LiveHandles:                  3,
+		ArenaReuseHits:               5,
+		ArenaAllocations:             3,
+		GradientReuseHits:            6,
+		GradientAllocations:          3,
+		ResidentGradBytes:            180,
+		ActivationArenaBytes:         3300,
+		WorkspaceArenaBytes:          6600,
+		ForwardReadbackBatchEntries:  5,
+		ForwardReadbackContextSets:   5,
+		ForwardReadbackDeviceCopies:  15,
+		GraphCaptures:                8,
+		GraphReplays:                 11,
+		GraphLaunches:                14,
+		GraphNodes:                   17,
+		GraphCaptureFailures:         20,
+		GraphReplayFailures:          23,
+		GraphInvalidations:           26,
+		GraphParityFailures:          29,
+		GraphFallbacks:               32,
+		GraphSynchronizations:        35,
+		DirectForwardSubmissions:     38,
+		GraphExecutedNodes:           41,
+		ForwardDeviceKernelWork:      44,
+		LastForwardDirectSubmissions: 41,
+		LastForwardDeviceKernelWork:  42,
 	})
 }
 
@@ -647,6 +818,32 @@ func assertCompactTrainProfileStats(t *testing.T, got, want *backend.CompactTrai
 	}
 	if got.LiveHandles != want.LiveHandles || got.ArenaReuseHits != want.ArenaReuseHits || got.ArenaAllocations != want.ArenaAllocations || got.GradientReuseHits != want.GradientReuseHits || got.GradientAllocations != want.GradientAllocations || got.ResidentGradBytes != want.ResidentGradBytes || got.ActivationArenaBytes != want.ActivationArenaBytes || got.WorkspaceArenaBytes != want.WorkspaceArenaBytes || got.ForwardReadbackBatchEntries != want.ForwardReadbackBatchEntries || got.ForwardReadbackContextSets != want.ForwardReadbackContextSets || got.ForwardReadbackDeviceCopies != want.ForwardReadbackDeviceCopies {
 		t.Fatalf("compact train stats = %+v, want selected counters/snapshots %+v", *got, *want)
+	}
+}
+
+func assertCompactTrainGraphCounters(t *testing.T, got, want *backend.CompactTrainAcceleratorStats) {
+	t.Helper()
+	if got.GraphCaptures != want.GraphCaptures ||
+		got.GraphReplays != want.GraphReplays ||
+		got.GraphLaunches != want.GraphLaunches ||
+		got.GraphNodes != want.GraphNodes ||
+		got.GraphCaptureFailures != want.GraphCaptureFailures ||
+		got.GraphReplayFailures != want.GraphReplayFailures ||
+		got.GraphInvalidations != want.GraphInvalidations ||
+		got.GraphParityFailures != want.GraphParityFailures ||
+		got.GraphFallbacks != want.GraphFallbacks ||
+		got.GraphSynchronizations != want.GraphSynchronizations ||
+		got.DirectForwardSubmissions != want.DirectForwardSubmissions ||
+		got.GraphExecutedNodes != want.GraphExecutedNodes ||
+		got.ForwardDeviceKernelWork != want.ForwardDeviceKernelWork {
+		t.Fatalf("compact-train graph counters = %+v, want %+v", *got, *want)
+	}
+}
+
+func assertCompactTrainGraphSnapshots(t *testing.T, got, want *backend.CompactTrainAcceleratorStats) {
+	t.Helper()
+	if got.LastForwardDirectSubmissions != want.LastForwardDirectSubmissions || got.LastForwardDeviceKernelWork != want.LastForwardDeviceKernelWork {
+		t.Fatalf("compact-train graph snapshots = direct=%d/work=%d, want direct=%d/work=%d", got.LastForwardDirectSubmissions, got.LastForwardDeviceKernelWork, want.LastForwardDirectSubmissions, want.LastForwardDeviceKernelWork)
 	}
 }
 

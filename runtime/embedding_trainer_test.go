@@ -212,6 +212,7 @@ type fakeResidentOptimizerAccelerator struct {
 	residentApplyCalls  int64
 	syncErr             error
 	closed              bool
+	closeOrder          *[]string
 	stats               backend.OptimizerAcceleratorStats
 }
 
@@ -298,6 +299,9 @@ func (a *fakeResidentOptimizerAccelerator) Stats() backend.OptimizerAcceleratorS
 
 func (a *fakeResidentOptimizerAccelerator) Close() {
 	a.closed = true
+	if a.closeOrder != nil {
+		*a.closeOrder = append(*a.closeOrder, "optimizer")
+	}
 	for _, token := range a.resident {
 		token.alive = false
 	}
@@ -375,6 +379,7 @@ type fakeCompactForwardAccelerator struct {
 	corruptResult  bool
 	preflightCalls int64
 	stats          backend.CompactForwardAcceleratorStats
+	closeOrder     *[]string
 }
 
 type fakeCompactTrainHandleToken struct {
@@ -428,6 +433,7 @@ type fakeCompactTrainAccelerator struct {
 	endErr          error
 	releaseErr      error
 	closed          bool
+	closeOrder      *[]string
 	stats           backend.CompactTrainAcceleratorStats
 }
 
@@ -437,6 +443,9 @@ func (a *fakeCompactTrainAccelerator) Backend() eosartifact.BackendKind {
 
 func (a *fakeCompactTrainAccelerator) Close() {
 	a.closed = true
+	if a.closeOrder != nil {
+		*a.closeOrder = append(*a.closeOrder, "compact-train")
+	}
 	for _, token := range a.live {
 		token.alive = false
 	}
@@ -611,8 +620,25 @@ func (a *fakeCompactTrainAccelerator) CompactTrainStats() backend.CompactTrainAc
 	return a.stats
 }
 
+// fakeAliasedCompactAccelerator exposes the same close-capable object through
+// both compact accelerator interfaces. It models a backend that shares one
+// graph owner across the independently invoked trainer factories.
+type fakeAliasedCompactAccelerator struct {
+	fakeCompactTrainAccelerator
+}
+
+func (a *fakeAliasedCompactAccelerator) RunCompactForward(backend.CompactForwardRequest) (backend.CompactForwardResult, error) {
+	return backend.CompactForwardResult{}, nil
+}
+
 func (a *fakeCompactForwardAccelerator) Backend() eosartifact.BackendKind {
 	return eosartifact.BackendCUDA
+}
+
+func (a *fakeCompactForwardAccelerator) Close() {
+	if a.closeOrder != nil {
+		*a.closeOrder = append(*a.closeOrder, "compact-forward")
+	}
 }
 
 func (a *fakeCompactForwardAccelerator) ConfigureCompactForward(layers []backend.CompactForwardLayerConfig, tokenName, roleName, outputProjectionName string, useRoPE bool) {
@@ -3218,10 +3244,13 @@ func TestCompactEmbeddingTrainerResidentTrainGateOnNoRegisteredImplementationIsN
 
 func TestCompactEmbeddingTrainerResidentTrainFactoryFailureFailsClosedAndCleansUp(t *testing.T) {
 	t.Setenv(compactResidentTrainEnv, "1")
+	closeOrder := []string{}
 	matmul := &countingMatMulAccelerator{}
-	optimizer := &fakeResidentOptimizerAccelerator{}
+	optimizer := &fakeResidentOptimizerAccelerator{closeOrder: &closeOrder}
 	activation := &countingActivationAccelerator{}
-	compactForward := &fakeCompactForwardAccelerator{}
+	compact := &fakeAliasedCompactAccelerator{
+		fakeCompactTrainAccelerator: fakeCompactTrainAccelerator{closeOrder: &closeOrder},
+	}
 	overrideTrainerConstructorsForTest(t,
 		func() (backend.MatMulAccelerator, eosartifact.BackendKind, error) {
 			return matmul, eosartifact.BackendCUDA, nil
@@ -3233,10 +3262,10 @@ func TestCompactEmbeddingTrainerResidentTrainFactoryFailureFailsClosedAndCleansU
 			return activation, eosartifact.BackendCUDA, trainerActivationAccelMode{fullBackward: true}, nil
 		},
 		func() (backend.CompactForwardAccelerator, eosartifact.BackendKind, error) {
-			return compactForward, eosartifact.BackendCUDA, nil
+			return compact, eosartifact.BackendCUDA, nil
 		},
 		func() (backend.CompactTrainAccelerator, eosartifact.BackendKind, error) {
-			return nil, "", fmt.Errorf("forced compact train factory failure")
+			return compact, eosartifact.BackendCUDA, fmt.Errorf("forced compact train factory failure")
 		},
 	)
 
@@ -3253,8 +3282,70 @@ func TestCompactEmbeddingTrainerResidentTrainFactoryFailureFailsClosedAndCleansU
 	if !strings.Contains(err.Error(), "forced compact train factory failure") {
 		t.Fatalf("constructor error = %v, want forced compact train factory failure", err)
 	}
+	wantCloseOrder := []string{"compact-train", "optimizer"}
+	if fmt.Sprint(closeOrder) != fmt.Sprint(wantCloseOrder) {
+		t.Fatalf("constructor cleanup close order = %v, want %v", closeOrder, wantCloseOrder)
+	}
 	if !matmul.closed || !optimizer.closed || !activation.closed {
 		t.Fatalf("constructor cleanup matmul/optimizer/activation closed = %t/%t/%t, want all true", matmul.closed, optimizer.closed, activation.closed)
+	}
+}
+
+func TestEmbeddingTrainerReleaseAcceleratorsClosesCompactBeforeOptimizer(t *testing.T) {
+	closeOrder := []string{}
+	matmul := &countingMatMulAccelerator{}
+	optimizer := &fakeResidentOptimizerAccelerator{closeOrder: &closeOrder}
+	compactForward := &fakeCompactForwardAccelerator{closeOrder: &closeOrder}
+	compactTrain := &fakeCompactTrainAccelerator{closeOrder: &closeOrder}
+	activation := &countingActivationAccelerator{}
+	contrastive := &fakeContrastiveAccelerator{}
+	trainer := &EmbeddingTrainer{
+		forwardMatMul:          matmul,
+		forwardBackend:         eosartifact.BackendCUDA,
+		optimizerAccel:         optimizer,
+		optimizerBackend:       eosartifact.BackendCUDA,
+		activationAccel:        activation,
+		activationBackend:      eosartifact.BackendCUDA,
+		contrastiveAccel:       contrastive,
+		contrastiveBackend:     eosartifact.BackendCUDA,
+		compactForwardAccel:    compactForward,
+		compactForwardBackend:  eosartifact.BackendCUDA,
+		compactForwardSelected: true,
+		compactTrainAccel:      compactTrain,
+		compactTrainBackend:    eosartifact.BackendCUDA,
+	}
+
+	trainer.releaseAccelerators()
+
+	want := []string{"compact-train", "compact-forward", "optimizer"}
+	if fmt.Sprint(closeOrder) != fmt.Sprint(want) {
+		t.Fatalf("accelerator close order = %v, want %v", closeOrder, want)
+	}
+	if trainer.compactTrainAccel != nil || trainer.compactTrainBackend != "" || trainer.compactForwardAccel != nil || trainer.compactForwardBackend != "" || trainer.compactForwardSelected || trainer.optimizerAccel != nil || trainer.optimizerBackend != "" || trainer.forwardMatMul != nil || trainer.forwardBackend != "" || trainer.activationAccel != nil || trainer.activationBackend != "" || trainer.contrastiveAccel != nil || trainer.contrastiveBackend != "" {
+		t.Fatalf("accelerator fields after release = train=%T/%q forward=%T/%q selected=%t optimizer=%T/%q matmul=%T/%q activation=%T/%q contrastive=%T/%q, want cleared", trainer.compactTrainAccel, trainer.compactTrainBackend, trainer.compactForwardAccel, trainer.compactForwardBackend, trainer.compactForwardSelected, trainer.optimizerAccel, trainer.optimizerBackend, trainer.forwardMatMul, trainer.forwardBackend, trainer.activationAccel, trainer.activationBackend, trainer.contrastiveAccel, trainer.contrastiveBackend)
+	}
+	if !matmul.closed || !activation.closed || !contrastive.closed {
+		t.Fatalf("non-compact accelerator close flags = matmul=%t activation=%t contrastive=%t, want all true", matmul.closed, activation.closed, contrastive.closed)
+	}
+}
+
+func TestEmbeddingTrainerReleaseAcceleratorsClosesAliasedCompactOnce(t *testing.T) {
+	closeOrder := []string{}
+	compact := &fakeAliasedCompactAccelerator{
+		fakeCompactTrainAccelerator: fakeCompactTrainAccelerator{closeOrder: &closeOrder},
+	}
+	optimizer := &fakeResidentOptimizerAccelerator{closeOrder: &closeOrder}
+	trainer := &EmbeddingTrainer{
+		compactForwardAccel: compact,
+		compactTrainAccel:   compact,
+		optimizerAccel:      optimizer,
+	}
+
+	trainer.releaseAccelerators()
+
+	want := []string{"compact-train", "optimizer"}
+	if fmt.Sprint(closeOrder) != fmt.Sprint(want) {
+		t.Fatalf("aliased accelerator close order = %v, want %v", closeOrder, want)
 	}
 }
 

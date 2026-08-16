@@ -347,6 +347,17 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		out.KernelSynchronizations -= start.KernelSynchronizations
 		out.GraphCaptures -= start.GraphCaptures
 		out.GraphReplays -= start.GraphReplays
+		out.GraphLaunches -= start.GraphLaunches
+		out.GraphNodes -= start.GraphNodes
+		out.GraphCaptureFailures -= start.GraphCaptureFailures
+		out.GraphReplayFailures -= start.GraphReplayFailures
+		out.GraphInvalidations -= start.GraphInvalidations
+		out.GraphParityFailures -= start.GraphParityFailures
+		out.GraphFallbacks -= start.GraphFallbacks
+		out.GraphSynchronizations -= start.GraphSynchronizations
+		out.DirectForwardSubmissions -= start.DirectForwardSubmissions
+		out.GraphExecutedNodes -= start.GraphExecutedNodes
+		out.ForwardDeviceKernelWork -= start.ForwardDeviceKernelWork
 		out.FallbackOrUnhandled -= start.FallbackOrUnhandled
 		out.ForwardNanos -= start.ForwardNanos
 		out.BackwardNanos -= start.BackwardNanos
@@ -392,6 +403,17 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.KernelSynchronizations += right.KernelSynchronizations
 		out.GraphCaptures += right.GraphCaptures
 		out.GraphReplays += right.GraphReplays
+		out.GraphLaunches += right.GraphLaunches
+		out.GraphNodes += right.GraphNodes
+		out.GraphCaptureFailures += right.GraphCaptureFailures
+		out.GraphReplayFailures += right.GraphReplayFailures
+		out.GraphInvalidations += right.GraphInvalidations
+		out.GraphParityFailures += right.GraphParityFailures
+		out.GraphFallbacks += right.GraphFallbacks
+		out.GraphSynchronizations += right.GraphSynchronizations
+		out.DirectForwardSubmissions += right.DirectForwardSubmissions
+		out.GraphExecutedNodes += right.GraphExecutedNodes
+		out.ForwardDeviceKernelWork += right.ForwardDeviceKernelWork
 		out.FallbackOrUnhandled += right.FallbackOrUnhandled
 		out.ForwardNanos += right.ForwardNanos
 		out.BackwardNanos += right.BackwardNanos
@@ -401,6 +423,8 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.LastBackwardLaunches = right.LastBackwardLaunches
 		out.LastForwardSyncs = right.LastForwardSyncs
 		out.LastBackwardSyncs = right.LastBackwardSyncs
+		out.LastForwardDirectSubmissions = right.LastForwardDirectSubmissions
+		out.LastForwardDeviceKernelWork = right.LastForwardDeviceKernelWork
 	}
 	return &out
 }

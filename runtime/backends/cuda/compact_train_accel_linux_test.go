@@ -588,6 +588,354 @@ func TestCompactTrainForwardHandleLifecycle(t *testing.T) {
 	}
 }
 
+func TestCompactTrainForwardGraphCaptureReplayContract(t *testing.T) {
+	previous := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardGraphEnabled = true
+	defer func() { eosCudaCompactTrainForwardGraphEnabled = previous }()
+
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(170, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		GELUMode:     backend.CompactForwardGELUExact,
+		StepID:       170,
+	}
+	nodes := expectedCompactTrainForwardLaunches(shape)
+	first, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("first forward: %v", err)
+	}
+	firstStats := accel.CompactTrainStats()
+	if firstStats.GraphCaptures != 1 || firstStats.GraphReplays != 0 || firstStats.GraphLaunches != 0 || firstStats.GraphNodes != nodes || firstStats.GraphExecutedNodes != 0 || firstStats.GraphSynchronizations != 0 {
+		t.Fatalf("first capture telemetry = %+v, want capture=1 replay/launch/executed/sync=0 nodes=%d", firstStats, nodes)
+	}
+	if firstStats.DirectForwardSubmissions != nodes || firstStats.LastForwardDirectSubmissions != nodes || firstStats.LastForwardDeviceKernelWork != nodes {
+		t.Fatalf("first capture direct/device work = %+v, want %d", firstStats, nodes)
+	}
+	if err := accel.ReleaseCompactTrainHandle(first.Handle); err != nil {
+		t.Fatalf("release first handle: %v", err)
+	}
+
+	second, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("warm forward: %v", err)
+	}
+	warmStats := accel.CompactTrainStats()
+	if warmStats.GraphCaptures != 1 || warmStats.GraphReplays != 1 || warmStats.GraphLaunches != 1 || warmStats.GraphExecutedNodes != nodes || warmStats.GraphSynchronizations != 0 {
+		t.Fatalf("warm replay telemetry = %+v, want capture=1 replay/launch/executed=%d sync=0", warmStats, nodes)
+	}
+	if warmStats.DirectForwardSubmissions != nodes || warmStats.LastForwardDirectSubmissions != 0 || warmStats.LastForwardDeviceKernelWork != nodes {
+		t.Fatalf("warm replay direct/device work = %+v, want cumulative direct=%d and warm device=%d", warmStats, nodes, nodes)
+	}
+	if err := accel.ReleaseCompactTrainHandle(second.Handle); err != nil {
+		t.Fatalf("release warm handle: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(170); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+}
+
+func TestCompactTrainForwardGraphDefaultOffBaseline(t *testing.T) {
+	previous := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardGraphEnabled = false
+	defer func() { eosCudaCompactTrainForwardGraphEnabled = previous }()
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(174, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	result, err := accel.RunCompactTrainForward(backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, GELUMode: backend.CompactForwardGELUExact, StepID: 174})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	want := int64(expectedCompactTrainForwardLaunches(shape))
+	if stats.GraphCaptures != 0 || stats.GraphReplays != 0 || stats.GraphLaunches != 0 || stats.GraphNodes != 0 || stats.GraphExecutedNodes != 0 || stats.GraphFallbacks != 0 || stats.DirectForwardSubmissions != want || stats.ForwardDeviceKernelWork != want || stats.LastForwardDirectSubmissions != want || stats.LastForwardDeviceKernelWork != want || stats.LastForwardSyncs != expectedCompactCUDASyncsForLaunches(want) {
+		t.Fatalf("graph-off baseline stats = %+v, want direct=%d and no graph work", stats, want)
+	}
+	if err := accel.ReleaseCompactTrainHandle(result.Handle); err != nil {
+		t.Fatalf("release handle: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(174); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+}
+
+func TestCompactTrainForwardGraphReplayThenBackwardCycle(t *testing.T) {
+	previous := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardGraphEnabled = true
+	defer func() { eosCudaCompactTrainForwardGraphEnabled = previous }()
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(172, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, GELUMode: backend.CompactForwardGELUExact, StepID: 172}
+	first, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("first forward: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainHandle(first.Handle); err != nil {
+		t.Fatalf("first release: %v", err)
+	}
+	secondReq := req
+	secondReq.Tokens = [][]int32{{3, 4}}
+	secondReq.Masks = [][]int32{{1, 0}}
+	secondReq.Roles = []int32{1}
+	second, err := accel.RunCompactTrainForward(secondReq)
+	if err != nil {
+		t.Fatalf("second forward: %v", err)
+	}
+	for i, value := range second.Pooled.F32 {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			t.Fatalf("replay pooled non-finite at %d: %g", i, value)
+		}
+	}
+	wantPacked := hostCompactForwardForCUDATest(backend.CompactForwardRequest{Shape: shape, Tokens: secondReq.Tokens, Masks: secondReq.Masks, Roles: secondReq.Roles, ResidentRefs: refs, GELUMode: secondReq.GELUMode}, false, false)
+	wantPooled := make([]float32, 0, shape.Batch*shape.OutputDim)
+	for b := 0; b < shape.Batch; b++ {
+		span := compactForwardSpanByName(wantPacked.Layout, compactForwardSequenceSpanName(b, "final.pooled"))
+		wantPooled = append(wantPooled, wantPacked.Data[span.Offset:span.Offset+span.Len]...)
+	}
+	assertFloatSlicesClose(t, second.Pooled.F32, wantPooled, 1e-6)
+	if _, err := accel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{Handle: second.Handle, GradPooled: backend.NewTensorF32([]int{1, 4}, seqData(4, 0.019, -0.023))}); err != nil {
+		t.Fatalf("second backward: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(172); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+}
+
+func TestCompactTrainForwardGraphResidentBindingInvalidation(t *testing.T) {
+	previous := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardGraphEnabled = true
+	defer func() { eosCudaCompactTrainForwardGraphEnabled = previous }()
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(175, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	result, err := accel.RunCompactTrainForward(backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, GELUMode: backend.CompactForwardGELUExact, StepID: 175})
+	if err != nil {
+		t.Fatalf("forward: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainHandle(result.Handle); err != nil {
+		t.Fatalf("release handle: %v", err)
+	}
+	if len(accel.forwardGraphCache) != 1 {
+		t.Fatalf("captured graph cache entries = %d, want 1", len(accel.forwardGraphCache))
+	}
+	name := refs[0].Name
+	binding, ok := accel.bindingForName(name)
+	if !ok {
+		t.Fatalf("binding %q missing", name)
+	}
+	originalRef := backend.OptimizerResidentParameter{Backend: accel.Backend(), Token: accel.bridged[name], Elements: binding.elements}
+	if err := accel.BindCompactTrainResident(name, backend.NewTensorF32([]int{binding.rows, binding.cols}, make([]float32, binding.elements)), originalRef); err != nil {
+		t.Fatalf("same binding: %v", err)
+	}
+	if len(accel.forwardGraphCache) != 1 || accel.CompactTrainStats().GraphInvalidations != 0 {
+		t.Fatalf("same binding invalidated graph cache=%d stats=%+v", len(accel.forwardGraphCache), accel.CompactTrainStats())
+	}
+	optAny, err := NewOptimizerAccelerator()
+	if err != nil {
+		t.Fatalf("replacement optimizer: %v", err)
+	}
+	opt := optAny.(*optimizerAccelerator)
+	defer opt.Close()
+	replacement := backend.NewTensorF32([]int{binding.rows, binding.cols}, seqData(binding.elements, 0.00011, -0.002))
+	zero := backend.NewTensorF32(replacement.Shape, make([]float32, binding.elements))
+	if err := opt.ApplyUpdate(name, backend.OptimizerUpdateConfig{Optimizer: "sgd", LearningRate: 0, Scale: 1, DeferSync: true}, replacement.Clone(), nil, nil, zero); err != nil {
+		t.Fatalf("replacement resident: %v", err)
+	}
+	replacementRef, ok := opt.ResidentParameter(name)
+	if !ok {
+		t.Fatalf("replacement resident ref missing")
+	}
+	if err := accel.BindCompactTrainResident(name, replacement, replacementRef); err != nil {
+		t.Fatalf("replacement binding: %v", err)
+	}
+	if len(accel.forwardGraphCache) != 0 || accel.CompactTrainStats().GraphInvalidations != 1 {
+		t.Fatalf("replacement binding cache=%d stats=%+v, want invalidation", len(accel.forwardGraphCache), accel.CompactTrainStats())
+	}
+	if err := accel.EndCompactTrainStep(175); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+}
+
+func TestCompactTrainForwardGraphFailuresFallbackAndInvalidate(t *testing.T) {
+	previous := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardGraphEnabled = true
+	defer func() { eosCudaCompactTrainForwardGraphEnabled = previous }()
+
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(171, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		GELUMode:     backend.CompactForwardGELUExact,
+		StepID:       171,
+	}
+	accel.debugForceForwardGraphCaptureFailure = true
+	first, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("capture-fallback forward: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	if stats.GraphCaptures != 0 || stats.GraphCaptureFailures != 1 || stats.GraphFallbacks != 1 || len(accel.forwardGraphCache) != 0 {
+		t.Fatalf("capture failure telemetry/cache = %+v/%d", stats, len(accel.forwardGraphCache))
+	}
+	if err := accel.ReleaseCompactTrainHandle(first.Handle); err != nil {
+		t.Fatalf("release capture-fallback handle: %v", err)
+	}
+	accel.debugForceForwardGraphCaptureFailure = false
+	second, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("capture recovery forward: %v", err)
+	}
+	if stats = accel.CompactTrainStats(); stats.GraphCaptures != 1 || stats.GraphCaptureFailures != 1 {
+		t.Fatalf("capture recovery telemetry = %+v", stats)
+	}
+	if err := accel.ReleaseCompactTrainHandle(second.Handle); err != nil {
+		t.Fatalf("release captured handle: %v", err)
+	}
+	accel.debugForceForwardGraphReplayFailure = true
+	third, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("replay-fallback forward: %v", err)
+	}
+	stats = accel.CompactTrainStats()
+	if stats.GraphReplayFailures != 1 || stats.GraphFallbacks != 2 || stats.GraphInvalidations != 1 || stats.GraphCaptures != 2 || stats.GraphSynchronizations != 1 || len(accel.forwardGraphCache) != 1 {
+		t.Fatalf("replay failure telemetry/cache = %+v/%d", stats, len(accel.forwardGraphCache))
+	}
+	if err := accel.ReleaseCompactTrainHandle(third.Handle); err != nil {
+		t.Fatalf("release replay-fallback handle: %v", err)
+	}
+	// Exercise a failure reported at the existing boundary after a real graph
+	// enqueue. The one-shot hook leaves the enqueue and the drain real, then
+	// the implementation must invalidate and run the canonical direct body.
+	accel.debugForceForwardGraphReplayFailure = false
+	accel.debugForceForwardGraphBoundaryFailure = true
+	beforeBoundaryStats := accel.CompactTrainStats()
+	fourthReq := req
+	fourthReq.Tokens = [][]int32{{4, 3}}
+	fourthReq.Masks = [][]int32{{1, 0}}
+	fourthReq.Roles = []int32{2}
+	fourth, err := accel.RunCompactTrainForward(fourthReq)
+	if err != nil {
+		t.Fatalf("post-enqueue boundary fallback forward: %v", err)
+	}
+	wantPacked := hostCompactForwardForCUDATest(backend.CompactForwardRequest{
+		Shape:        shape,
+		Tokens:       fourthReq.Tokens,
+		Masks:        fourthReq.Masks,
+		Roles:        fourthReq.Roles,
+		ResidentRefs: refs,
+		GELUMode:     fourthReq.GELUMode,
+	}, false, false)
+	wantPooled := make([]float32, 0, shape.Batch*shape.OutputDim)
+	for b := 0; b < shape.Batch; b++ {
+		span := compactForwardSpanByName(wantPacked.Layout, compactForwardSequenceSpanName(b, "final.pooled"))
+		wantPooled = append(wantPooled, wantPacked.Data[span.Offset:span.Offset+span.Len]...)
+	}
+	assertFloatSlicesClose(t, fourth.Pooled.F32, wantPooled, 1e-6)
+	stats = accel.CompactTrainStats()
+	wantDirectFallback := int64(expectedCompactTrainForwardLaunches(shape))
+	if stats.GraphReplayFailures != 2 || stats.GraphFallbacks != 3 || stats.GraphInvalidations != 2 || stats.GraphCaptures != 3 || stats.GraphLaunches != 1 || stats.GraphReplays != 0 || stats.GraphExecutedNodes != 0 || stats.GraphSynchronizations != 2 || stats.DirectForwardSubmissions-beforeBoundaryStats.DirectForwardSubmissions != wantDirectFallback || stats.LastForwardDirectSubmissions != wantDirectFallback || stats.LastForwardDeviceKernelWork != wantDirectFallback || len(accel.forwardGraphCache) != 1 {
+		t.Fatalf("post-enqueue boundary fallback telemetry/cache = %+v/%d", stats, len(accel.forwardGraphCache))
+	}
+	if err := accel.ReleaseCompactTrainHandle(fourth.Handle); err != nil {
+		t.Fatalf("release post-enqueue boundary fallback handle: %v", err)
+	}
+	// The failed handle must not be replayed again. The direct fallback's
+	// single recapture is the only cache entry, so the next request should be a
+	// normal warm replay with graph work counted exactly once.
+	fifthReq := fourthReq
+	fifthReq.Tokens = [][]int32{{1, 4}}
+	fifthReq.Masks = [][]int32{{1, 1}}
+	fifthReq.Roles = []int32{0}
+	fifth, err := accel.RunCompactTrainForward(fifthReq)
+	if err != nil {
+		t.Fatalf("warm replay after boundary fallback: %v", err)
+	}
+	wantPacked = hostCompactForwardForCUDATest(backend.CompactForwardRequest{
+		Shape:        shape,
+		Tokens:       fifthReq.Tokens,
+		Masks:        fifthReq.Masks,
+		Roles:        fifthReq.Roles,
+		ResidentRefs: refs,
+		GELUMode:     fifthReq.GELUMode,
+	}, false, false)
+	wantPooled = wantPooled[:0]
+	for b := 0; b < shape.Batch; b++ {
+		span := compactForwardSpanByName(wantPacked.Layout, compactForwardSequenceSpanName(b, "final.pooled"))
+		wantPooled = append(wantPooled, wantPacked.Data[span.Offset:span.Offset+span.Len]...)
+	}
+	assertFloatSlicesClose(t, fifth.Pooled.F32, wantPooled, 1e-6)
+	stats = accel.CompactTrainStats()
+	if stats.GraphReplays != 1 || stats.GraphLaunches != 2 || stats.GraphExecutedNodes != expectedCompactTrainForwardLaunches(shape) || stats.LastForwardDirectSubmissions != 0 || stats.LastForwardDeviceKernelWork != expectedCompactTrainForwardLaunches(shape) || len(accel.forwardGraphCache) != 1 {
+		t.Fatalf("warm replay after boundary fallback telemetry/cache = %+v/%d", stats, len(accel.forwardGraphCache))
+	}
+	if err := accel.ReleaseCompactTrainHandle(fifth.Handle); err != nil {
+		t.Fatalf("release warm replay after boundary fallback handle: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(171); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+}
+
+func TestCompactTrainForwardGraphKeyRequiresExactPointersAndStream(t *testing.T) {
+	base := &CompactForwardAccelerator{device: &deviceRuntime{contextID: 11, deviceID: 7, streamID: 19}}
+	accel := &CompactTrainAccelerator{CompactForwardAccelerator: base}
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 0, OutputDim: 4}
+	arena := &compactTrainArena{
+		shape:                      shape,
+		allocationGeneration:       3,
+		forwardWorkspaceGeneration: 3,
+		input:                      101,
+		active:                     102,
+		finalNorm:                  103,
+		finalPooled:                104,
+		tokens:                     105,
+		masks:                      106,
+		roles:                      107,
+		status:                     108,
+	}
+	key := accel.compactTrainForwardGraphKeyLocked(shape, arena)
+	arena.tokens = 205 // same-size replacement must not reuse the key.
+	if replacement := accel.compactTrainForwardGraphKeyLocked(shape, arena); replacement == key {
+		t.Fatal("same-size token pointer replacement reused forward graph key")
+	}
+	arena.tokens = 105
+	base.device.streamID = 29
+	if streamMismatch := accel.compactTrainForwardGraphKeyLocked(shape, arena); streamMismatch == key {
+		t.Fatal("stream mismatch reused forward graph key")
+	}
+}
+
 func TestCompactTrainMultipleVaryingLengthHandlesOutOfOrder(t *testing.T) {
 	accel, cleanup := newBoundCompactTrainTestAccelerator(t, true, false)
 	defer cleanup()
