@@ -29,6 +29,323 @@ func TestCompactTrainForwardReadbackValidation(t *testing.T) {
 	}
 }
 
+func TestCompactTrainForwardInputUploadValidation(t *testing.T) {
+	tokens := []int32{1, 2}
+	masks := []int32{1, 1}
+	roles := []int32{0}
+	status := []int32{0}
+	sizes, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, 1, 2, 3, 4)
+	if err != nil {
+		t.Fatalf("valid input upload descriptors: %v", err)
+	}
+	if sizes.Total != int64((len(tokens)+len(masks)+len(roles)+len(status))*4) {
+		t.Fatalf("input upload total bytes = %d, want %d", sizes.Total, (len(tokens)+len(masks)+len(roles)+len(status))*4)
+	}
+	if _, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, nil, 1, 2, 3, 4); err == nil || !strings.Contains(err.Error(), "status length") {
+		t.Fatalf("missing status validation error = %v", err)
+	}
+	if _, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, 0, 2, 3, 4); err == nil || !strings.Contains(err.Error(), "tokens destination") {
+		t.Fatalf("missing tokens destination validation error = %v", err)
+	}
+	if _, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, 1, 0, 3, 4); err == nil || !strings.Contains(err.Error(), "masks destination") {
+		t.Fatalf("missing masks destination validation error = %v", err)
+	}
+	if _, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, 1, 2, 0, 4); err == nil || !strings.Contains(err.Error(), "roles destination") {
+		t.Fatalf("missing roles destination validation error = %v", err)
+	}
+	if _, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, 1, 2, 3, 0); err == nil || !strings.Contains(err.Error(), "status destination") {
+		t.Fatalf("missing status destination validation error = %v", err)
+	}
+	if _, err := checkedCompactTrainForwardInputUploadBytes("test", -1); err == nil {
+		t.Fatal("negative input upload length unexpectedly accepted")
+	}
+}
+
+func TestCompactTrainForwardInputUploadSuccessAndOrder(t *testing.T) {
+	rt, err := newDeviceRuntime()
+	if err != nil {
+		t.Skipf("cuda runtime unavailable: %v", err)
+	}
+	defer rt.close()
+	tokens := []int32{11, 12}
+	masks := []int32{21, 22}
+	roles := []int32{31}
+	status := []int32{41}
+	tokensDst, err := rt.allocInt32(len(tokens))
+	if err != nil {
+		t.Fatalf("allocate tokens destination: %v", err)
+	}
+	defer rt.freeBuffer(tokensDst)
+	masksDst, err := rt.allocInt32(len(masks))
+	if err != nil {
+		t.Fatalf("allocate masks destination: %v", err)
+	}
+	defer rt.freeBuffer(masksDst)
+	rolesDst, err := rt.allocInt32(len(roles))
+	if err != nil {
+		t.Fatalf("allocate roles destination: %v", err)
+	}
+	defer rt.freeBuffer(rolesDst)
+	statusDst, err := rt.allocInt32(len(status))
+	if err != nil {
+		t.Fatalf("allocate status destination: %v", err)
+	}
+	defer rt.freeBuffer(statusDst)
+	progress, err := rt.uploadCompactTrainForwardInputs(tokens, masks, roles, status, tokensDst, masksDst, rolesDst, statusDst, 0)
+	if err != nil {
+		t.Fatalf("input upload bridge: %v", err)
+	}
+	if progress.ContextSets != 1 || progress.DeviceCopies != 4 || progress.CompletedStages != 4 || progress.CompletedBytes != int64((len(tokens)+len(masks)+len(roles)+len(status))*4) {
+		t.Fatalf("input upload progress = %+v, want context=1 copies=4 stages=4 complete bytes", progress)
+	}
+	for _, tc := range []struct {
+		name string
+		read func([]int32) error
+		want []int32
+	}{
+		{name: "tokens", read: func(dst []int32) error { return rt.downloadInt32(dst, tokensDst) }, want: tokens},
+		{name: "masks", read: func(dst []int32) error { return rt.downloadInt32(dst, masksDst) }, want: masks},
+		{name: "roles", read: func(dst []int32) error { return rt.downloadInt32(dst, rolesDst) }, want: roles},
+		{name: "status", read: func(dst []int32) error { return rt.downloadInt32(dst, statusDst) }, want: status},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make([]int32, len(tc.want))
+			if err := tc.read(got); err != nil {
+				t.Fatalf("download %s: %v", tc.name, err)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("%s destination = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCompactTrainForwardInputUploadPartialStageFailures(t *testing.T) {
+	rt, err := newDeviceRuntime()
+	if err != nil {
+		t.Skipf("cuda runtime unavailable: %v", err)
+	}
+	defer rt.close()
+	tokens := []int32{11, 12}
+	masks := []int32{21, 22}
+	roles := []int32{31}
+	status := []int32{41}
+	for stage := 1; stage <= 4; stage++ {
+		t.Run(fmt.Sprintf("before_stage_%d", stage), func(t *testing.T) {
+			tokensDst, err := rt.allocInt32(len(tokens))
+			if err != nil {
+				t.Fatalf("allocate tokens destination: %v", err)
+			}
+			defer rt.freeBuffer(tokensDst)
+			masksDst, err := rt.allocInt32(len(masks))
+			if err != nil {
+				t.Fatalf("allocate masks destination: %v", err)
+			}
+			defer rt.freeBuffer(masksDst)
+			rolesDst, err := rt.allocInt32(len(roles))
+			if err != nil {
+				t.Fatalf("allocate roles destination: %v", err)
+			}
+			defer rt.freeBuffer(rolesDst)
+			statusDst, err := rt.allocInt32(len(status))
+			if err != nil {
+				t.Fatalf("allocate status destination: %v", err)
+			}
+			defer rt.freeBuffer(statusDst)
+			progress, err := rt.uploadCompactTrainForwardInputs(tokens, masks, roles, status, tokensDst, masksDst, rolesDst, statusDst, stage)
+			if err == nil || !strings.Contains(err.Error(), "forced failure before stage") {
+				t.Fatalf("stage %d error = %v, want deterministic stage failure", stage, err)
+			}
+			wantCopies := stage - 1
+			wantBytes := int64(0)
+			for _, values := range [][]int32{tokens, masks, roles, status}[:wantCopies] {
+				wantBytes += int64(len(values) * 4)
+			}
+			if progress.ContextSets != 1 || progress.DeviceCopies != wantCopies || progress.CompletedStages != wantCopies || progress.CompletedBytes != wantBytes {
+				t.Fatalf("stage %d progress = %+v, want context=1 copies/stages=%d bytes=%d", stage, progress, wantCopies, wantBytes)
+			}
+		})
+	}
+}
+
+func TestCompactTrainForwardInputUploadColdScalarFallback(t *testing.T) {
+	previousBatch := eosCudaCompactTrainForwardUploadBatchEnabled
+	previousGraph := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardUploadBatchEnabled = true
+	eosCudaCompactTrainForwardGraphEnabled = false
+	defer func() {
+		eosCudaCompactTrainForwardUploadBatchEnabled = previousBatch
+		eosCudaCompactTrainForwardGraphEnabled = previousGraph
+	}()
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(401, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, StepID: 401}
+	forward, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("cold scalar forward: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainHandle(forward.Handle); err != nil {
+		t.Fatalf("release cold scalar handle: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(401); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	if stats.ForwardInputUploadBatchCalls != 0 || stats.ForwardInputUploadContextSets != 0 || stats.ForwardInputUploadDeviceCopies != 0 || stats.ForwardInputUploadFailures != 0 || stats.ForwardInputUploadScalarFallbacks != 1 {
+		t.Fatalf("cold scalar upload telemetry = %+v, want only one scalar fallback", stats)
+	}
+}
+
+func TestCompactTrainForwardInputUploadWarmSuccessCounters(t *testing.T) {
+	previousBatch := eosCudaCompactTrainForwardUploadBatchEnabled
+	previousGraph := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardUploadBatchEnabled = true
+	eosCudaCompactTrainForwardGraphEnabled = false
+	defer func() {
+		eosCudaCompactTrainForwardUploadBatchEnabled = previousBatch
+		eosCudaCompactTrainForwardGraphEnabled = previousGraph
+	}()
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(402, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, StepID: 402}
+	first, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("cold warmup forward: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainHandle(first.Handle); err != nil {
+		t.Fatalf("release warmup handle: %v", err)
+	}
+	beforeWarm := accel.CompactTrainStats()
+	second, err := accel.RunCompactTrainForward(req)
+	if err != nil {
+		t.Fatalf("warm bridge forward: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainHandle(second.Handle); err != nil {
+		t.Fatalf("release warm bridge handle: %v", err)
+	}
+	if err := accel.EndCompactTrainStep(402); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	if stats.ForwardInputUploadBatchCalls-beforeWarm.ForwardInputUploadBatchCalls != 1 || stats.ForwardInputUploadContextSets-beforeWarm.ForwardInputUploadContextSets != 1 || stats.ForwardInputUploadDeviceCopies-beforeWarm.ForwardInputUploadDeviceCopies != 4 || stats.ForwardInputUploadFailures != beforeWarm.ForwardInputUploadFailures || stats.ForwardInputUploadScalarFallbacks != beforeWarm.ForwardInputUploadScalarFallbacks {
+		t.Fatalf("warm bridge upload telemetry delta = calls:%d contexts:%d copies:%d failures:%d scalar:%d, want 1/1/4/0/0", stats.ForwardInputUploadBatchCalls-beforeWarm.ForwardInputUploadBatchCalls, stats.ForwardInputUploadContextSets-beforeWarm.ForwardInputUploadContextSets, stats.ForwardInputUploadDeviceCopies-beforeWarm.ForwardInputUploadDeviceCopies, stats.ForwardInputUploadFailures-beforeWarm.ForwardInputUploadFailures, stats.ForwardInputUploadScalarFallbacks-beforeWarm.ForwardInputUploadScalarFallbacks)
+	}
+	wantBytes := int64((shape.Batch*shape.Tokens + shape.Batch*shape.Tokens + shape.Batch + 1) * 4)
+	if stats.UploadedBytes-beforeWarm.UploadedBytes != wantBytes || stats.ForwardReadbackBatchEntries-beforeWarm.ForwardReadbackBatchEntries != 1 || stats.ForwardReadbackContextSets-beforeWarm.ForwardReadbackContextSets != 1 || stats.ForwardReadbackDeviceCopies-beforeWarm.ForwardReadbackDeviceCopies != 3 {
+		t.Fatalf("warm bridge transfer delta = upload:%d readback:%d/%d/%d, want %d and 1/1/3", stats.UploadedBytes-beforeWarm.UploadedBytes, stats.ForwardReadbackBatchEntries-beforeWarm.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets-beforeWarm.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies-beforeWarm.ForwardReadbackDeviceCopies, wantBytes)
+	}
+}
+
+func TestCompactTrainForwardInputUploadPartialFailureCleansArena(t *testing.T) {
+	previousBatch := eosCudaCompactTrainForwardUploadBatchEnabled
+	previousGraph := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardUploadBatchEnabled = true
+	eosCudaCompactTrainForwardGraphEnabled = false
+	defer func() {
+		eosCudaCompactTrainForwardUploadBatchEnabled = previousBatch
+		eosCudaCompactTrainForwardGraphEnabled = previousGraph
+	}()
+	for stage := 1; stage <= 4; stage++ {
+		t.Run(fmt.Sprintf("before_stage_%d", stage), func(t *testing.T) {
+			accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+			defer cleanup()
+			shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+			refs := compactTrainResidentRefsForTest(t, accel, shape)
+			stepID := uint64(410 + stage)
+			if err := accel.BeginCompactTrainStep(stepID, refs); err != nil {
+				t.Fatalf("begin step: %v", err)
+			}
+			req := backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, StepID: stepID}
+			warmup, err := accel.RunCompactTrainForward(req)
+			if err != nil {
+				t.Fatalf("cold warmup forward: %v", err)
+			}
+			if err := accel.ReleaseCompactTrainHandle(warmup.Handle); err != nil {
+				t.Fatalf("release warmup handle: %v", err)
+			}
+			before := accel.CompactTrainStats()
+			accel.debugForceForwardInputUploadFailureStage = stage
+			_, err = accel.RunCompactTrainForward(req)
+			if err == nil || !strings.Contains(err.Error(), "forced failure before stage") {
+				t.Fatalf("stage %d forward error = %v, want deterministic upload failure", stage, err)
+			}
+			accel.debugForceForwardInputUploadFailureStage = 0
+			after := accel.CompactTrainStats()
+			wantCopies := int64(stage - 1)
+			wantUpload := int64(0)
+			inputValues := [][]int32{{2, 1}, {1, 1}, {0}, {0}}
+			for _, values := range inputValues[:stage-1] {
+				wantUpload += int64(len(values) * 4)
+			}
+			if after.ForwardInputUploadBatchCalls-before.ForwardInputUploadBatchCalls != 1 || after.ForwardInputUploadContextSets-before.ForwardInputUploadContextSets != 1 || after.ForwardInputUploadDeviceCopies-before.ForwardInputUploadDeviceCopies != wantCopies || after.ForwardInputUploadFailures-before.ForwardInputUploadFailures != 1 || after.ForwardInputUploadScalarFallbacks != before.ForwardInputUploadScalarFallbacks || after.UploadedBytes-before.UploadedBytes != wantUpload {
+				t.Fatalf("stage %d telemetry delta = calls:%d contexts:%d copies:%d failures:%d scalar:%d upload:%d, want 1/1/%d/1/0/%d", stage, after.ForwardInputUploadBatchCalls-before.ForwardInputUploadBatchCalls, after.ForwardInputUploadContextSets-before.ForwardInputUploadContextSets, after.ForwardInputUploadDeviceCopies-before.ForwardInputUploadDeviceCopies, after.ForwardInputUploadFailures-before.ForwardInputUploadFailures, after.ForwardInputUploadScalarFallbacks-before.ForwardInputUploadScalarFallbacks, after.UploadedBytes-before.UploadedBytes, wantCopies, wantUpload)
+			}
+			if after.HandlesCreated != before.HandlesCreated || after.LiveHandles != 0 || after.ForwardReadbackBatchEntries != before.ForwardReadbackBatchEntries || after.KernelLaunches != before.KernelLaunches || after.KernelSynchronizations != before.KernelSynchronizations || after.FallbackOrUnhandled-before.FallbackOrUnhandled != 1 || after.ActivationArenaBytes != 0 || len(accel.arenas) != 0 {
+				t.Fatalf("stage %d failure published work or retained arena: before=%+v after=%+v arenas=%d", stage, before, after, len(accel.arenas))
+			}
+			if err := accel.AbortCompactTrainStep(stepID); err != nil {
+				t.Fatalf("abort after stage %d upload failure: %v", stage, err)
+			}
+		})
+	}
+}
+
+func TestCompactTrainForwardInputUploadGraphCompatibility(t *testing.T) {
+	previousBatch := eosCudaCompactTrainForwardUploadBatchEnabled
+	previousGraph := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardUploadBatchEnabled = true
+	eosCudaCompactTrainForwardGraphEnabled = true
+	defer func() {
+		eosCudaCompactTrainForwardUploadBatchEnabled = previousBatch
+		eosCudaCompactTrainForwardGraphEnabled = previousGraph
+	}()
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	// This test owns graph mode explicitly; the bridge must remain compatible
+	// with graph capture/replay while H2D stays outside the captured closure.
+	accel.CompactForwardAccelerator.syncEachLaunch = false
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(430, refs); err != nil {
+		t.Fatalf("begin step: %v", err)
+	}
+	req := backend.CompactTrainForwardRequest{Shape: shape, Tokens: [][]int32{{2, 1}}, Masks: [][]int32{{1, 1}}, Roles: []int32{0}, ResidentRefs: refs, StepID: 430}
+	for i := 0; i < 3; i++ {
+		forward, err := accel.RunCompactTrainForward(req)
+		if err != nil {
+			t.Fatalf("graph-compatible forward %d: %v", i, err)
+		}
+		if err := accel.ReleaseCompactTrainHandle(forward.Handle); err != nil {
+			t.Fatalf("release graph-compatible handle %d: %v", i, err)
+		}
+	}
+	if err := accel.EndCompactTrainStep(430); err != nil {
+		t.Fatalf("end step: %v", err)
+	}
+	stats := accel.CompactTrainStats()
+	wantForward := expectedCompactTrainForwardLaunches(shape)
+	if stats.ForwardInputUploadBatchCalls != 2 || stats.ForwardInputUploadContextSets != 2 || stats.ForwardInputUploadDeviceCopies != 8 || stats.ForwardInputUploadFailures != 0 || stats.ForwardInputUploadScalarFallbacks != 1 {
+		t.Fatalf("graph upload telemetry = %+v, want batch/context/copies/failure/scalar=2/2/8/0/1", stats)
+	}
+	if stats.GraphCaptures != 1 || stats.GraphReplays != 2 || stats.GraphLaunches != 2 || stats.GraphNodes != wantForward || stats.GraphExecutedNodes != 2*wantForward || stats.DirectForwardSubmissions != wantForward || stats.ForwardDeviceKernelWork != 3*wantForward || stats.KernelSynchronizations != 3 || stats.GraphSynchronizations != 0 {
+		t.Fatalf("graph compatibility telemetry = %+v, want capture=1 replay=2 nodes=%d direct=%d work=%d syncs=3", stats, wantForward, wantForward, 3*wantForward)
+	}
+	wantUpload := int64(3 * (shape.Batch*shape.Tokens + shape.Batch*shape.Tokens + shape.Batch + 1) * 4)
+	if stats.UploadedBytes != wantUpload || stats.ForwardReadbackBatchEntries != 3 || stats.ForwardReadbackContextSets != 3 || stats.ForwardReadbackDeviceCopies != 9 {
+		t.Fatalf("graph transfer telemetry = upload:%d readback:%d/%d/%d, want %d and 3/3/9", stats.UploadedBytes, stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies, wantUpload)
+	}
+}
+
 func TestCompactTrainCublasRowMajorMatMulNoSyncParity(t *testing.T) {
 	rt, err := newDeviceRuntime()
 	if err != nil {

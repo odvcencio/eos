@@ -74,6 +74,15 @@ typedef struct {
 	int status_value;
 } EosCudaCompactTrainForwardReadbackProgress;
 
+// EosCudaCompactTrainForwardInputUploadProgress is written by the synchronous
+// compact-forward input upload bridge before it returns. The bridge borrows
+// each Go host slice only for this call and never retains a host pointer.
+typedef struct {
+	int context_sets;
+	int completed_stages;
+	int device_copies;
+} EosCudaCompactTrainForwardInputUploadProgress;
+
 static char* manta_dup_cstr(const char* s) {
 	if (s == NULL) {
 		return NULL;
@@ -545,6 +554,97 @@ static int eosCudaMemcpyCompactTrainForwardReadback(
 	}
 	progress->active_copied = 1;
 	progress->device_copies = 3;
+	return 0;
+}
+
+// eosCudaMemcpyCompactTrainForwardInputUpload performs the four compact
+// forward input uploads in their existing semantic order. It sets the CUDA
+// context once and issues synchronous cuMemcpyHtoD calls for tokens, masks,
+// roles, and status. fail_stage is an unexported deterministic test hook: a
+// value in [1, 4] fails immediately before that stage; zero is production
+// behavior. No Go pointer is retained after this synchronous call and no
+// stream synchronization is introduced.
+static int eosCudaMemcpyCompactTrainForwardInputUpload(
+	EosCudaRuntime* rt,
+	CUdeviceptr tokens_dst,
+	const void* tokens_src,
+	size_t tokens_bytes,
+	CUdeviceptr masks_dst,
+	const void* masks_src,
+	size_t masks_bytes,
+	CUdeviceptr roles_dst,
+	const void* roles_src,
+	size_t roles_bytes,
+	CUdeviceptr status_dst,
+	const void* status_src,
+	size_t status_bytes,
+	int fail_stage,
+	EosCudaCompactTrainForwardInputUploadProgress* progress,
+	char** err) {
+	if (progress == NULL) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "missing progress output");
+		return 1;
+	}
+	memset(progress, 0, sizeof(*progress));
+	if (rt == NULL || tokens_dst == 0 || masks_dst == 0 || roles_dst == 0 || status_dst == 0 ||
+		(fail_stage < 0 || fail_stage > 4) ||
+		(tokens_bytes != 0 && tokens_src == NULL) ||
+		(masks_bytes != 0 && masks_src == NULL) ||
+		(roles_bytes != 0 && roles_src == NULL) ||
+		(status_bytes != 0 && status_src == NULL)) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "invalid input upload arguments");
+		return 1;
+	}
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	progress->context_sets = 1;
+	if (fail_stage == 1) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 1");
+		return 1;
+	}
+	cuRes = cuMemcpyHtoD(tokens_dst, tokens_src, tokens_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyHtoD(tokens)", cuRes);
+		return 1;
+	}
+	progress->completed_stages = 1;
+	progress->device_copies = 1;
+	if (fail_stage == 2) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 2");
+		return 1;
+	}
+	cuRes = cuMemcpyHtoD(masks_dst, masks_src, masks_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyHtoD(masks)", cuRes);
+		return 1;
+	}
+	progress->completed_stages = 2;
+	progress->device_copies = 2;
+	if (fail_stage == 3) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 3");
+		return 1;
+	}
+	cuRes = cuMemcpyHtoD(roles_dst, roles_src, roles_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyHtoD(roles)", cuRes);
+		return 1;
+	}
+	progress->completed_stages = 3;
+	progress->device_copies = 3;
+	if (fail_stage == 4) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 4");
+		return 1;
+	}
+	cuRes = cuMemcpyHtoD(status_dst, status_src, status_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyHtoD(status)", cuRes);
+		return 1;
+	}
+	progress->completed_stages = 4;
+	progress->device_copies = 4;
 	return 0;
 }
 
@@ -1193,6 +1293,7 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -3431,6 +3532,175 @@ type cudaCompactTrainForwardReadbackProgress struct {
 	StatusValue  int32
 }
 
+type cudaCompactTrainForwardInputUploadProgress struct {
+	ContextSets     int
+	DeviceCopies    int
+	CompletedStages int
+	CompletedBytes  int64
+}
+
+type cudaCompactTrainForwardInputUploadSizes struct {
+	Tokens C.size_t
+	Masks  C.size_t
+	Roles  C.size_t
+	Status C.size_t
+	Total  int64
+}
+
+func checkedCompactTrainForwardInputUploadBytes(label string, elements int) (C.size_t, error) {
+	bytes, err := checkedCUDABytes(label, elements, 4)
+	if err != nil {
+		return 0, err
+	}
+	if uint64(bytes) > maxCSizeTValue() {
+		return 0, fmt.Errorf("%s byte size %d overflows C.size_t", label, uint64(bytes))
+	}
+	return bytes, nil
+}
+
+func checkedCompactTrainForwardInputUploadTotalBytes(label string, sizes ...C.size_t) (int64, error) {
+	maxSize := maxCSizeTValue()
+	maxInt64 := uint64(^uint64(0) >> 1)
+	var total uint64
+	for _, size := range sizes {
+		value := uint64(size)
+		if value > maxSize || value > maxInt64 || total > maxSize-value || total > maxInt64-value {
+			return 0, fmt.Errorf("%s byte size overflows checked total", label)
+		}
+		total += value
+	}
+	return int64(total), nil
+}
+
+func validateCompactTrainForwardInputUpload(tokens, masks, roles, status []int32, tokensDst, masksDst, rolesDst, statusDst C.CUdeviceptr) (cudaCompactTrainForwardInputUploadSizes, error) {
+	if len(status) != 1 {
+		return cudaCompactTrainForwardInputUploadSizes{}, fmt.Errorf("cuda compact train forward input upload status length %d, want 1", len(status))
+	}
+	if tokensDst == 0 {
+		return cudaCompactTrainForwardInputUploadSizes{}, fmt.Errorf("cuda compact train forward input upload tokens destination pointer is nil")
+	}
+	if masksDst == 0 {
+		return cudaCompactTrainForwardInputUploadSizes{}, fmt.Errorf("cuda compact train forward input upload masks destination pointer is nil")
+	}
+	if rolesDst == 0 {
+		return cudaCompactTrainForwardInputUploadSizes{}, fmt.Errorf("cuda compact train forward input upload roles destination pointer is nil")
+	}
+	if statusDst == 0 {
+		return cudaCompactTrainForwardInputUploadSizes{}, fmt.Errorf("cuda compact train forward input upload status destination pointer is nil")
+	}
+	tokensBytes, err := checkedCompactTrainForwardInputUploadBytes("cuda compact train forward input upload tokens", len(tokens))
+	if err != nil {
+		return cudaCompactTrainForwardInputUploadSizes{}, err
+	}
+	masksBytes, err := checkedCompactTrainForwardInputUploadBytes("cuda compact train forward input upload masks", len(masks))
+	if err != nil {
+		return cudaCompactTrainForwardInputUploadSizes{}, err
+	}
+	rolesBytes, err := checkedCompactTrainForwardInputUploadBytes("cuda compact train forward input upload roles", len(roles))
+	if err != nil {
+		return cudaCompactTrainForwardInputUploadSizes{}, err
+	}
+	statusBytes, err := checkedCompactTrainForwardInputUploadBytes("cuda compact train forward input upload status", len(status))
+	if err != nil {
+		return cudaCompactTrainForwardInputUploadSizes{}, err
+	}
+	total, err := checkedCompactTrainForwardInputUploadTotalBytes("cuda compact train forward input upload", tokensBytes, masksBytes, rolesBytes, statusBytes)
+	if err != nil {
+		return cudaCompactTrainForwardInputUploadSizes{}, err
+	}
+	return cudaCompactTrainForwardInputUploadSizes{
+		Tokens: tokensBytes,
+		Masks:  masksBytes,
+		Roles:  rolesBytes,
+		Status: statusBytes,
+		Total:  total,
+	}, nil
+}
+
+// uploadCompactTrainForwardInputs is the typed, synchronous compact-forward
+// input upload bridge. All validation happens before cgo. The C wrapper uses
+// the Go slices only during this call and retains no Go pointer. A failure
+// returns completed prefix progress so callers can account for only the
+// copies that actually completed.
+func (rt *deviceRuntime) uploadCompactTrainForwardInputs(tokens, masks, roles, status []int32, tokensDst, masksDst, rolesDst, statusDst C.CUdeviceptr, failureStage int) (cudaCompactTrainForwardInputUploadProgress, error) {
+	var progress cudaCompactTrainForwardInputUploadProgress
+	if rt == nil || rt.ptr == nil {
+		return progress, fmt.Errorf("cuda compact train forward input upload runtime is not initialized")
+	}
+	if failureStage < 0 || failureStage > 4 {
+		return progress, fmt.Errorf("cuda compact train forward input upload failure stage %d is invalid", failureStage)
+	}
+	sizes, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, tokensDst, masksDst, rolesDst, statusDst)
+	if err != nil {
+		return progress, err
+	}
+	var tokensSrc, masksSrc, rolesSrc, statusSrc unsafe.Pointer
+	if len(tokens) > 0 {
+		tokensSrc = unsafe.Pointer(&tokens[0])
+	}
+	if len(masks) > 0 {
+		masksSrc = unsafe.Pointer(&masks[0])
+	}
+	if len(roles) > 0 {
+		rolesSrc = unsafe.Pointer(&roles[0])
+	}
+	if len(status) > 0 {
+		statusSrc = unsafe.Pointer(&status[0])
+	}
+	var cProgress C.EosCudaCompactTrainForwardInputUploadProgress
+	var errStr *C.char
+	rc := C.eosCudaMemcpyCompactTrainForwardInputUpload(
+		rt.ptr,
+		tokensDst, tokensSrc, sizes.Tokens,
+		masksDst, masksSrc, sizes.Masks,
+		rolesDst, rolesSrc, sizes.Roles,
+		statusDst, statusSrc, sizes.Status,
+		C.int(failureStage), &cProgress, &errStr,
+	)
+	runtime.KeepAlive(tokens)
+	runtime.KeepAlive(masks)
+	runtime.KeepAlive(roles)
+	runtime.KeepAlive(status)
+	completedStages := int(cProgress.completed_stages)
+	if completedStages < 0 || completedStages > 4 {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid completed stage count %d", completedStages)
+	}
+	deviceCopies := int(cProgress.device_copies)
+	if deviceCopies < 0 || deviceCopies > 4 {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid device copy count %d", deviceCopies)
+	}
+	contextSets := int(cProgress.context_sets)
+	if contextSets < 0 || contextSets > 1 {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid context set count %d", contextSets)
+	}
+	completedBytes := int64(0)
+	if completedStages >= 1 {
+		completedBytes += int64(sizes.Tokens)
+	}
+	if completedStages >= 2 {
+		completedBytes += int64(sizes.Masks)
+	}
+	if completedStages >= 3 {
+		completedBytes += int64(sizes.Roles)
+	}
+	if completedStages >= 4 {
+		completedBytes += int64(sizes.Status)
+	}
+	progress = cudaCompactTrainForwardInputUploadProgress{
+		ContextSets:     contextSets,
+		DeviceCopies:    deviceCopies,
+		CompletedStages: completedStages,
+		CompletedBytes:  completedBytes,
+	}
+	if rc != 0 {
+		return progress, cStringError(errStr)
+	}
+	if contextSets != 1 || completedStages != 4 || deviceCopies != 4 {
+		return progress, fmt.Errorf("cuda compact train forward input upload incomplete: context_sets=%d completed_stages=%d device_copies=%d", contextSets, completedStages, deviceCopies)
+	}
+	return progress, nil
+}
+
 func checkedCompactTrainForwardReadbackBytes(label string, elements int) (C.size_t, error) {
 	bytes, err := checkedCUDABytes(label, elements, 4)
 	if err != nil {
@@ -5451,6 +5721,11 @@ var eosCudaGraphEnabled = os.Getenv("EOS_CUDA_GRAPH") == "1"
 // is intentionally default-off until the exact-shape correctness/telemetry
 // gate is complete.
 var eosCudaCompactTrainForwardGraphEnabled = cudaEnvFlagEnabled("EOS_CUDA_COMPACT_TRAIN_FORWARD_GRAPH")
+
+// eosCudaCompactTrainForwardUploadBatchEnabled gates the warm-only typed
+// compact-train forward input upload bridge. It is intentionally default-off;
+// cold and mixed-zero arenas always retain the scalar allocation/copy path.
+var eosCudaCompactTrainForwardUploadBatchEnabled = cudaEnvFlagEnabled("EOS_CUDA_COMPACT_TRAIN_FORWARD_UPLOAD_BATCH")
 
 // cudaGraph wraps an instantiated, replayable CUDA graph.
 type cudaGraph struct {

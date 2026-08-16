@@ -174,6 +174,10 @@ type CompactTrainAccelerator struct {
 	// boundary wait, so the failure path can be exercised without corrupting
 	// the CUDA driver or pretending that enqueue itself failed.
 	debugForceForwardGraphBoundaryFailure bool
+	// debugForceForwardInputUploadFailureStage is a deterministic test hook for
+	// the typed four-stage input upload bridge. Zero is production behavior;
+	// stages 1-4 fail immediately before that stage's copy.
+	debugForceForwardInputUploadFailureStage int
 }
 
 type compactTrainKernels struct {
@@ -2411,6 +2415,7 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	var uploaded, pooledBytes, statusBytes, activeBytes int64
 	var forwardGraphNodesExecuted int64
 	graphBoundaryDrainFailed := false
+	inputUploadAttempted := false
 	statsPublished := false
 	publishForwardStats := func(failed bool) {
 		if statsPublished {
@@ -2422,7 +2427,7 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		forwardCublas := a.stats.CublasGemmCalls - cublasBefore
 		forwardDirectSubmissions := forwardLaunches + forwardCublas
 		forwardDeviceKernelWork := forwardDirectSubmissions + forwardGraphNodesExecuted
-		if failed && forwardLaunches == 0 && forwardSyncs == 0 && forwardCublas == 0 && uploaded == 0 && pooledBytes == 0 && statusBytes == 0 && activeBytes == 0 {
+		if failed && forwardLaunches == 0 && forwardSyncs == 0 && forwardCublas == 0 && uploaded == 0 && pooledBytes == 0 && statusBytes == 0 && activeBytes == 0 && !inputUploadAttempted {
 			return
 		}
 		a.stats.UploadedBytes += uploaded
@@ -2468,6 +2473,7 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	defer func() {
 		if !keepArena {
 			a.freeArena(arena)
+			a.refreshArenaStatsLocked()
 		}
 	}()
 	defer func() {
@@ -2505,19 +2511,44 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		}
 		return nil
 	}
-	if err := replaceArenaInt32(&arena.tokens, tokensFlat); err != nil {
-		return backend.CompactTrainForwardResult{}, err
+	statusInput := []int32{0}
+	allInputDestinationsReady := arena.tokens != 0 && arena.masks != 0 && arena.roles != 0 && arena.status != 0
+	if eosCudaCompactTrainForwardUploadBatchEnabled && allInputDestinationsReady {
+		inputUploadAttempted = true
+		a.stats.ForwardInputUploadBatchCalls++
+		inputUpload, uploadErr := a.device.uploadCompactTrainForwardInputs(
+			tokensFlat, masksFlat, req.Roles, statusInput,
+			arena.tokens, arena.masks, arena.roles, arena.status,
+			a.debugForceForwardInputUploadFailureStage,
+		)
+		a.stats.ForwardInputUploadContextSets += int64(inputUpload.ContextSets)
+		a.stats.ForwardInputUploadDeviceCopies += int64(inputUpload.DeviceCopies)
+		uploaded = inputUpload.CompletedBytes
+		if uploadErr != nil {
+			a.stats.ForwardInputUploadFailures++
+			return backend.CompactTrainForwardResult{}, uploadErr
+		}
+	} else {
+		if eosCudaCompactTrainForwardUploadBatchEnabled {
+			// The bridge is deliberately warm-only. Count one scalar fallback for
+			// each flag-enabled cold or mixed-zero forward call, while retaining the
+			// four existing allocation/copy calls and pointer-generation behavior.
+			a.stats.ForwardInputUploadScalarFallbacks++
+		}
+		if err := replaceArenaInt32(&arena.tokens, tokensFlat); err != nil {
+			return backend.CompactTrainForwardResult{}, err
+		}
+		if err := replaceArenaInt32(&arena.masks, masksFlat); err != nil {
+			return backend.CompactTrainForwardResult{}, err
+		}
+		if err := replaceArenaInt32(&arena.roles, req.Roles); err != nil {
+			return backend.CompactTrainForwardResult{}, err
+		}
+		if err := replaceArenaInt32(&arena.status, statusInput); err != nil {
+			return backend.CompactTrainForwardResult{}, err
+		}
+		uploaded = int64((len(tokensFlat) + len(masksFlat) + len(req.Roles) + 1) * 4)
 	}
-	if err := replaceArenaInt32(&arena.masks, masksFlat); err != nil {
-		return backend.CompactTrainForwardResult{}, err
-	}
-	if err := replaceArenaInt32(&arena.roles, req.Roles); err != nil {
-		return backend.CompactTrainForwardResult{}, err
-	}
-	if err := replaceArenaInt32(&arena.status, []int32{0}); err != nil {
-		return backend.CompactTrainForwardResult{}, err
-	}
-	uploaded = int64((len(tokensFlat) + len(masksFlat) + len(req.Roles) + 1) * 4)
 	// Keep the Go-side backward metadata current even when a graph replay skips
 	// the issue closure. Pooled arenas clear layer.input on reuse, while the
 	// backward path uses those exact per-layer source pointers.

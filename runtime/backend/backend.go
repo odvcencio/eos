@@ -235,13 +235,25 @@ type CompactTrainAcceleratorStats struct {
 	ForwardReadbackBatchEntries int64
 	ForwardReadbackContextSets  int64
 	ForwardReadbackDeviceCopies int64
-	PackedBytesAvoided          int64
-	HostGradUploadBytesAvoided  int64
-	KernelLaunches              int64
-	CublasGemmCalls             int64
-	KernelSynchronizations      int64
-	GraphCaptures               int64
-	GraphReplays                int64
+	// ForwardInputUploadBatchCalls counts every attempted warm typed four-stage
+	// input-upload bridge call. ForwardInputUploadContextSets and
+	// ForwardInputUploadDeviceCopies count the context sets and completed H2D
+	// copies reported by those attempts, including a completed prefix on
+	// failure. ForwardInputUploadFailures counts bridge failures, while
+	// ForwardInputUploadScalarFallbacks counts one scalar cold/mixed-zero call
+	// whenever the default-off upload-batch flag is enabled.
+	ForwardInputUploadBatchCalls      int64
+	ForwardInputUploadContextSets     int64
+	ForwardInputUploadDeviceCopies    int64
+	ForwardInputUploadFailures        int64
+	ForwardInputUploadScalarFallbacks int64
+	PackedBytesAvoided                int64
+	HostGradUploadBytesAvoided        int64
+	KernelLaunches                    int64
+	CublasGemmCalls                   int64
+	KernelSynchronizations            int64
+	GraphCaptures                     int64
+	GraphReplays                      int64
 	// GraphLaunches counts accepted CUDA graph-launch enqueues separately from
 	// direct kernel submissions; GraphReplays counts launches whose existing
 	// forward boundary completed successfully. GraphNodes counts nodes recorded

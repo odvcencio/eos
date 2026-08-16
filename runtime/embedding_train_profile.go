@@ -340,6 +340,11 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		out.ForwardReadbackBatchEntries -= start.ForwardReadbackBatchEntries
 		out.ForwardReadbackContextSets -= start.ForwardReadbackContextSets
 		out.ForwardReadbackDeviceCopies -= start.ForwardReadbackDeviceCopies
+		out.ForwardInputUploadBatchCalls -= start.ForwardInputUploadBatchCalls
+		out.ForwardInputUploadContextSets -= start.ForwardInputUploadContextSets
+		out.ForwardInputUploadDeviceCopies -= start.ForwardInputUploadDeviceCopies
+		out.ForwardInputUploadFailures -= start.ForwardInputUploadFailures
+		out.ForwardInputUploadScalarFallbacks -= start.ForwardInputUploadScalarFallbacks
 		out.PackedBytesAvoided -= start.PackedBytesAvoided
 		out.HostGradUploadBytesAvoided -= start.HostGradUploadBytesAvoided
 		out.KernelLaunches -= start.KernelLaunches
@@ -396,6 +401,11 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.ForwardReadbackBatchEntries += right.ForwardReadbackBatchEntries
 		out.ForwardReadbackContextSets += right.ForwardReadbackContextSets
 		out.ForwardReadbackDeviceCopies += right.ForwardReadbackDeviceCopies
+		out.ForwardInputUploadBatchCalls += right.ForwardInputUploadBatchCalls
+		out.ForwardInputUploadContextSets += right.ForwardInputUploadContextSets
+		out.ForwardInputUploadDeviceCopies += right.ForwardInputUploadDeviceCopies
+		out.ForwardInputUploadFailures += right.ForwardInputUploadFailures
+		out.ForwardInputUploadScalarFallbacks += right.ForwardInputUploadScalarFallbacks
 		out.PackedBytesAvoided += right.PackedBytesAvoided
 		out.HostGradUploadBytesAvoided += right.HostGradUploadBytesAvoided
 		out.KernelLaunches += right.KernelLaunches

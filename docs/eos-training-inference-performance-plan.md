@@ -1,7 +1,7 @@
 ---
 mdpp: "0.1"
 title: "EOS Training And Inference Performance Plan"
-date: 2026-08-15
+date: 2026-08-16
 status: draft
 scope: "10-14 week implementation specification for EOS training quality, training efficiency, inference performance, Apple acceleration, and Go SIMD experiments"
 ---
@@ -314,6 +314,39 @@ including H2D and D2H, must still show at least `10%` improvement for
 promotion; the selected-package BGE/FiQA training remains blocked and must not
 start.
 
+## Current Preparation Checkpoint: K8 (2026-08-16)
+
+K8 completes a bounded, default-off compact-forward input-upload bridge behind
+`EOS_CUDA_COMPACT_TRAIN_FORWARD_UPLOAD_BATCH`:
+
+- The bridge is selected only for warm exact-arena reuse. Cold and mixed-zero
+  destinations retain the scalar allocation/copy path as the correctness
+  oracle.
+- One typed synchronous Go→C bridge sets the CUDA context once and issues
+  synchronous H2D copies in exact `tokens → masks → roles → status` order. It
+  retains no Go pointers and adds no stream synchronization. Four Go/C+context
+  boundaries become one; the underlying device copies remain four.
+- Forward upload bytes are unchanged: canonical `148 B`, next `2,056 B`; whole
+  compact upload `196 B` and `2,568 B`. K7 work remains graph-off `68/65`, and
+  graph-on direct `44/43` plus graph nodes `24/22`; compact synchronizations
+  remain `2`. K6 readback remains `1/1/3`, and K5 remains canonical `1/15/1`
+  and next `1/14/1` (batch calls / launches / syncs).
+- Normal warm telemetry is `1/1/4/0/0` (calls / context sets / device copies /
+  failures / scalar fallbacks). With the flag off, all five are zero; a cold or
+  mixed-zero flag-on call records scalar fallback. Partial failure reports the
+  truthful completed-copy and completed-byte prefix, publishes no handle, and
+  performs cleanup plus graph invalidation. The graph-boundary status reset
+  remains a separate path and is not counted as a four-stage upload batch.
+- The adversarial code review found no P0/P1 issue. Full cgo and no-cgo
+  repository tests and vet are green. This is synthetic/runtime evidence only;
+  no BGE/FiQA training ran, and that training remains blocked.
+- The isolated promotion campaign used 56 processes (7 pairs per cell) under
+  high, variable host load. Unpaired median changes were canonical graph-off
+  `-6.69%` (regression), canonical graph-on `+17.26%` (outlier-sensitive), next
+  graph-off `+0.60%`, and next graph-on `+0.009%`; the aggregate paired-ratio
+  median was about `0.9937`. Keep the flag default-off: this supports no speedup
+  or promotion claim.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -480,11 +513,12 @@ Phase 0, weeks 1-2, close safety and observability:
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 
-- Critical path: investigate fixed-bucket compact CUDA Graph or typed launch-
-  array execution after K6 readback completion, first confirming exact device-
-  pointer stability and excluding H2D/readback from the candidate slice;
-  resident-step coordination, duplicate-ref-safe download elision,
-  host/device/fallback accounting, and S3e full-step gradients remain in scope.
+- Critical path: K7 fixed-bucket graph replay and K8 warm input-upload bridging
+  are verified as default-off diagnostic slices. K9 starts with a residual
+  launch-boundary/device-time investigation; only stable evidence may select
+  exactly one typed launch-array or kernel-fusion/coalescing slice. Resident-
+  step coordination, duplicate-ref-safe download elision, host/device/fallback
+  accounting, and S3e full-step gradients remain in scope.
 - Exit gate: deterministic counters prove fewer calls/syncs, quiet-host mini smoke is non-regressing, and fallback reasons are exhaustive.
 
 Phase 2, weeks 4-7, CUDA performance reference:
@@ -888,6 +922,14 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 ## Risks And Open Decisions
 
 - Wall-clock noise on shared host: use deterministic counters first; require quiet-host timing and loadavg for 5-10% claims.
+- K8's 56-process campaign ran under high, variable load and does not support
+  promotion: canonical graph-off regressed, canonical graph-on was
+  outlier-sensitive, and the next profile was effectively flat. A lower-load
+  K8 timing repeat is optional only if promotion is revisited.
+- K9 scope is open until the residual launch-boundary/device-time breakdown is
+  profiled. Select exactly one default-off typed launch-array or
+  kernel-fusion/coalescing slice only when the evidence is stable; do not infer
+  a K9 implementation from this checkpoint.
 - K6 D2H fault injection: status-first early stop and stage-progress cleanup are
   covered, but deterministic injected failures at pooled/active copy points
   remain residual test-hardening work.
@@ -906,14 +948,15 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 ## Immediate Next Action
 
 The old K1-first action and packed-forward readback are historical; K4, K5,
-K6, and the bounded K7 CUDA-Graph correctness/counter gate are now verified.
-The next bounded efficiency slice is an investigation, not an implementation
-claim: prefer a measured typed launch-array, kernel-fusion/coalescing, or
-resident-transfer-reduction path after selecting a stable bottleneck. Keep new
-work default-off, expose truthful launch/transfer telemetry, require hard
-parity, and require a representative repeated end-to-end win of at least `10%`
-before promotion (`5%` is diagnostic only). Do not start training for this
-slice.
+K6, K7, and the K8 warm input-upload correctness/counter gate are now verified.
+K9 is an investigation, not an implementation claim: profile the residual
+launch-boundary/device-time breakdown, then choose exactly one default-off typed
+launch-array or kernel-fusion/coalescing slice only if stable evidence selects
+it. A lower-load K8 timing repeat is optional only if promotion is revisited.
+Keep new work default-off, expose truthful launch/transfer telemetry, require
+hard parity, and require a representative repeated end-to-end win of at least
+`10%` before promotion (`5%` is diagnostic only). Do not claim a K9
+implementation or start training for this slice.
 
 The next controlled encoder-v2.1 training run remains blocked by the selected-
 package BGE FiQA export and related pretrained/export jobs. Hold it and do not
