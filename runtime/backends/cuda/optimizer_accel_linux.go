@@ -170,7 +170,66 @@ func (a *optimizerAccelerator) Stats() backend.OptimizerAcceleratorStats {
 		stats.TensorUpdateCalls = stats.UpdateCalls
 	}
 	stats.ResidentParams = int64(len(a.resident))
+	stats.CompactTrainTelemetry = backend.CloneCompactTrainTelemetry(a.stats.CompactTrainTelemetry)
 	return stats
+}
+
+func (a *optimizerAccelerator) addCompactTrainTelemetry(phase backend.CompactTrainTelemetryPhase, delta backend.CompactTrainPhaseTelemetry) {
+	if a == nil || !eosCudaCompactProfileEventsEnabled {
+		return
+	}
+	if a.stats.CompactTrainTelemetry == nil {
+		a.stats.CompactTrainTelemetry = &backend.CompactTrainTelemetry{}
+	}
+	a.stats.CompactTrainTelemetry.Enabled = true
+	if a.stats.CompactTrainTelemetry.View == "" {
+		a.stats.CompactTrainTelemetry.View = backend.CompactTrainTelemetryViewOptimizer
+	}
+	backend.AddCompactTrainTelemetryPhase(a.stats.CompactTrainTelemetry, phase, delta)
+}
+
+// compactTrainK5WorkloadTelemetry is the workload-only accounting boundary
+// for the existing native optimizer batch bridge. It intentionally does not
+// include event-control calls; callers add those diagnostics separately.
+func compactTrainK5WorkloadTelemetry(progress optimizerUpdateBatchProgress) backend.CompactTrainPhaseTelemetry {
+	phase := backend.CompactTrainPhaseTelemetry{
+		HostDescriptorAllocs: boolInt64(progress.DescriptorAllocated),
+		Attempted:            int64(progress.Attempted),
+		Enqueued:             int64(progress.Enqueued),
+		KernelLaunches:       int64(progress.Enqueued),
+	}
+	if !progress.Called {
+		if progress.Err != nil {
+			phase.Failures = 1
+			phase.FailureStage = progress.FailureStage
+		}
+		if phase.FailureStage == "" {
+			phase.FailureStage = progress.FailureStage
+		}
+		return phase
+	}
+	phase.GoCalls = 1
+	// ContextSets is the attempted cuCtxSetCurrent count. A context failure is
+	// carried by FailureStage; successful completion is the success signal.
+	phase.ContextSets = 1
+	phase.DriverCalls = int64(progress.Attempted)
+	if progress.FailureStage != "context" {
+		// The bridge's existing completion barrier is one driver-side
+		// synchronization attempt after the launch prefix.
+		phase.DriverCalls++
+		phase.StreamSynchronizes = 1
+	}
+	if progress.Err == nil {
+		phase.Completed = int64(progress.Enqueued)
+	} else {
+		phase.Failures = 1
+		phase.FailureStage = progress.FailureStage
+	}
+	if progress.FailIndex >= 0 {
+		phase.FailIndex = int64(progress.FailIndex)
+		phase.HasFailIndex = true
+	}
+	return phase
 }
 
 func (a *optimizerAccelerator) ApplyUpdate(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2, grad *backend.Tensor) error {
@@ -738,7 +797,119 @@ func (a *optimizerAccelerator) ApplyUpdateWithResidentGradBatch(updates []backen
 		return nil
 	}
 	start := time.Now()
-	enqueued, attempted, err := a.device.launchOptimizerUpdateBatch(a.kernel, launches)
+	if !eosCudaCompactProfileEventsEnabled {
+		enqueued, attempted, launchErr := a.device.launchOptimizerUpdateBatch(a.kernel, launches)
+		if launchErr != nil {
+			return a.poisonResidentGradientBatchLocked(owner, fmt.Errorf("cuda optimizer resident-gradient batch launch (attempted=%t, %d/%d enqueued): %w", attempted, enqueued, len(launches), launchErr))
+		}
+		if enqueued != len(launches) {
+			return a.poisonResidentGradientBatchLocked(owner, fmt.Errorf("cuda optimizer resident-gradient batch reported %d/%d enqueued without error", enqueued, len(launches)))
+		}
+		// The native batch call has completed its single stream barrier at this
+		// point. Commit all device-work accounting before any immediate host
+		// readbacks so a later D2H failure still reports the completed batch.
+		elapsed := time.Since(start).Nanoseconds()
+		a.commitResidentGradientBatchDeviceWork(updates, validated, owner, len(launches), elapsed)
+		if err := a.readbackResidentGradientBatch(updates, validated, func(dst []float32, ptr uint64) error {
+			return a.device.downloadFloat32(dst, C.CUdeviceptr(ptr))
+		}); err != nil {
+			return a.poisonResidentGradientBatchLocked(owner, err)
+		}
+		return nil
+	}
+	k5Event := false
+	k5EndRecorded := false
+	eventRecords := int64(0)
+	k5TelemetryGoCalls := int64(0)
+	k5EventControlFailures := int64(0)
+	k5EventControlStage := ""
+	k5EventProgress := profileEventProgress{}
+	if eosCudaCompactProfileEventsEnabled {
+		startResult, startErr := a.device.profileEventRecordStats(string(backend.CompactTrainPhaseK5Batch), false)
+		if startResult.PairCreateCalled {
+			k5TelemetryGoCalls++
+		}
+		if startResult.RecordCalled {
+			k5TelemetryGoCalls++
+		}
+		k5EventProgress = addProfileEventProgress(k5EventProgress, startResult.Progress)
+		if startErr == nil {
+			eventRecords++
+			// Binding is a cgo control call; it does not issue a CUDA
+			// context or driver operation.
+			k5TelemetryGoCalls++
+			if a.device.profileEventBindK5End(string(backend.CompactTrainPhaseK5Batch), true) == nil {
+				k5Event = true
+			} else {
+				k5EventControlFailures++
+				k5EventControlStage = "event_bind"
+				k5TelemetryGoCalls++
+				if err := a.device.profileEventBindK5End(string(backend.CompactTrainPhaseK5Batch), false); err != nil {
+					k5EventControlFailures++
+					k5EventControlStage = "event_bind"
+				}
+			}
+		}
+	}
+	batchProgress := a.device.launchOptimizerUpdateBatchWithProgress(a.kernel, launches)
+	enqueued := batchProgress.Enqueued
+	attempted := batchProgress.Attempted != 0
+	err = batchProgress.Err
+	if eosCudaCompactProfileEventsEnabled && k5Event {
+		// The native batch wrapper records the end marker immediately before
+		// its existing barrier. Never add a Go-side end record after the
+		// wrapper has returned: that would not bracket the queued work.
+		k5EndRecorded, endProgress := a.device.profileEventK5EndProgress()
+		k5EventProgress = addProfileEventProgress(k5EventProgress, endProgress)
+		k5TelemetryGoCalls++ // cgo getter; no context/driver operation.
+		if k5EndRecorded {
+			eventRecords++
+		}
+		k5TelemetryGoCalls++ // cgo unbind; no context/driver operation.
+		if unbindErr := a.device.profileEventBindK5End(string(backend.CompactTrainPhaseK5Batch), false); unbindErr != nil {
+			k5EventControlFailures++
+			k5EventControlStage = "event_bind"
+		}
+	}
+	k5Phase := compactTrainK5WorkloadTelemetry(batchProgress)
+	// Event-control progress is added separately from workload progress. The K5
+	// end marker is recorded by the existing batch bridge immediately before
+	// its barrier, and its typed attempted/success result is merged below.
+	k5Phase.GoCalls += k5TelemetryGoCalls
+	k5Phase.HostNanos = time.Since(start).Nanoseconds()
+	k5Phase.EventRecords = eventRecords
+	k5Phase.EventControlFailures += k5EventControlFailures
+	if k5EventControlStage != "" {
+		k5Phase.EventControlStage = k5EventControlStage
+	}
+	addCompactTrainEventProgress(&k5Phase, k5EventProgress, false, "")
+	a.addCompactTrainTelemetry(backend.CompactTrainPhaseK5Batch, k5Phase)
+	if owner != nil {
+		owner.telemetryAdd(backend.CompactTrainPhaseK5Batch, k5Phase)
+	}
+	if k5Event && k5EndRecorded && err == nil {
+		nanos, queryCalled, queryProgress, elapsedErr := a.device.profileEventElapsedStats(string(backend.CompactTrainPhaseK5Batch))
+		if queryCalled {
+			query := backend.CompactTrainPhaseTelemetry{GoCalls: 1}
+			addCompactTrainEventProgress(&query, queryProgress, elapsedErr != nil, "event_query")
+			if elapsedErr == nil {
+				query.EventQueries = 1
+				query.DeviceElapsedNanos = nanos
+				if a.stats.CompactTrainTelemetry != nil {
+					a.stats.CompactTrainTelemetry.EventTiming = true
+				}
+				if owner != nil {
+					if owner.stats.Telemetry != nil {
+						owner.stats.Telemetry.EventTiming = true
+					}
+				}
+			}
+			a.addCompactTrainTelemetry(backend.CompactTrainPhaseK5Batch, query)
+			if owner != nil {
+				owner.telemetryAdd(backend.CompactTrainPhaseK5Batch, query)
+			}
+		}
+	}
 	if err != nil {
 		return a.poisonResidentGradientBatchLocked(owner, fmt.Errorf("cuda optimizer resident-gradient batch launch (attempted=%t, %d/%d enqueued): %w", attempted, enqueued, len(launches), err))
 	}

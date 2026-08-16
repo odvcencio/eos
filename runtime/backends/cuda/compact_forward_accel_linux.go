@@ -3,26 +3,12 @@
 package cuda
 
 /*
-#cgo CFLAGS: -I/usr/local/cuda/include
+#cgo CFLAGS: -I/usr/local/cuda/include -I${SRCDIR}
 #include <cuda.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
-
-typedef struct {
-	CUcontext ctx;
-	CUdevice device;
-	int major;
-	int minor;
-	int primary_ctx;
-	void* blas;
-	CUstream stream;
-} EosCudaRuntime;
-
-typedef struct {
-	CUmodule module;
-	CUfunction function;
-} EosCudaKernel;
+#include "eos_cuda_abi.h"
 
 static int eosCudaLaunchCompactGather(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr token, CUdeviceptr role, CUdeviceptr tokens, CUdeviceptr roles, CUdeviceptr out0, CUdeviceptr status, int batch, int seq, int modelDim, int vocab, int roleRows, int useRole, int useRoPE, char** err);
 static int eosCudaLaunchCompactMatmul(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr lhs, CUdeviceptr rhs, CUdeviceptr out0, int rows, int inner, int cols, char** err);
@@ -352,8 +338,10 @@ type CompactForwardAccelerator struct {
 	// the same forward body is recorded into a CUDA graph. Captured launches
 	// are counted as graph nodes instead; no synchronization is permitted while
 	// this mode is active.
-	forwardGraphCaptureActive bool
-	forwardGraphCaptureNodes  int64
+	forwardGraphCaptureActive      bool
+	forwardGraphCaptureNodes       int64
+	forwardGraphCaptureKernelNodes int64
+	forwardGraphCaptureCublasNodes int64
 }
 
 type CompactForwardLayerNames struct {
@@ -1210,6 +1198,9 @@ func (a *CompactForwardAccelerator) packIntCopy(src, dst C.CUdeviceptr, srcOffse
 func (a *CompactForwardAccelerator) recordKernelLaunch() error {
 	if a.forwardGraphCaptureActive {
 		a.forwardGraphCaptureNodes++
+		if eosCudaCompactProfileEventsEnabled {
+			a.forwardGraphCaptureKernelNodes++
+		}
 		return nil
 	}
 	a.stats.KernelLaunches++
@@ -1226,13 +1217,28 @@ func (a *CompactForwardAccelerator) recordKernelLaunch() error {
 func (a *CompactForwardAccelerator) beginForwardGraphCapture() {
 	a.forwardGraphCaptureActive = true
 	a.forwardGraphCaptureNodes = 0
+	a.forwardGraphCaptureKernelNodes = 0
+	a.forwardGraphCaptureCublasNodes = 0
 }
 
 func (a *CompactForwardAccelerator) endForwardGraphCapture() int64 {
 	nodes := a.forwardGraphCaptureNodes
 	a.forwardGraphCaptureActive = false
 	a.forwardGraphCaptureNodes = 0
+	a.forwardGraphCaptureKernelNodes = 0
+	a.forwardGraphCaptureCublasNodes = 0
 	return nodes
+}
+
+func (a *CompactForwardAccelerator) endForwardGraphCaptureCounts() (int64, int64, int64) {
+	nodes := a.forwardGraphCaptureNodes
+	kernels := a.forwardGraphCaptureKernelNodes
+	cublas := a.forwardGraphCaptureCublasNodes
+	a.forwardGraphCaptureActive = false
+	a.forwardGraphCaptureNodes = 0
+	a.forwardGraphCaptureKernelNodes = 0
+	a.forwardGraphCaptureCublasNodes = 0
+	return nodes, kernels, cublas
 }
 
 func (a *CompactForwardAccelerator) recordForwardGraphLaunch() {

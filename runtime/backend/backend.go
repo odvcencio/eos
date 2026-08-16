@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -133,6 +134,7 @@ type OptimizerAcceleratorStats struct {
 	ResidentGradUpdateNanos         int64
 	SyncNanos                       int64
 	ResidentParams                  int64
+	CompactTrainTelemetry           *CompactTrainTelemetry `json:"compact_train_telemetry,omitempty"`
 }
 
 // OptimizerResidentParameter is a backend-owned device parameter reference.
@@ -287,6 +289,331 @@ type CompactTrainAcceleratorStats struct {
 	LastBackwardSyncs            int64
 	LastForwardDirectSubmissions int64
 	LastForwardDeviceKernelWork  int64
+	Telemetry                    *CompactTrainTelemetry `json:"telemetry,omitempty"`
+}
+
+// CompactTrainTelemetryPhase names one externally visible compact resident
+// training phase. Values are stable strings because profiles are serialized
+// and consumed by tooling outside the runtime package.
+type CompactTrainTelemetryPhase string
+
+const (
+	CompactTrainPhaseBeginZero         CompactTrainTelemetryPhase = "begin_zero"
+	CompactTrainPhaseInputH2D          CompactTrainTelemetryPhase = "input_h2d"
+	CompactTrainPhaseForwardDirect     CompactTrainTelemetryPhase = "forward_direct"
+	CompactTrainPhaseForwardCapture    CompactTrainTelemetryPhase = "forward_capture"
+	CompactTrainPhaseForwardReplay     CompactTrainTelemetryPhase = "forward_replay"
+	CompactTrainPhaseForwardBoundary   CompactTrainTelemetryPhase = "forward_boundary"
+	CompactTrainPhaseGradH2D           CompactTrainTelemetryPhase = "grad_h2d"
+	CompactTrainPhaseBackwardFinal     CompactTrainTelemetryPhase = "backward_final"
+	CompactTrainPhaseBackwardFFN       CompactTrainTelemetryPhase = "backward_ffn"
+	CompactTrainPhaseBackwardAttention CompactTrainTelemetryPhase = "backward_attention"
+	CompactTrainPhaseBackwardBoundary  CompactTrainTelemetryPhase = "backward_boundary"
+	CompactTrainPhaseK6Readback        CompactTrainTelemetryPhase = "k6_readback"
+	CompactTrainPhaseK5Batch           CompactTrainTelemetryPhase = "k5_batch"
+	CompactTrainPhaseOuterOptimizer    CompactTrainTelemetryPhase = "outer_optimizer"
+)
+
+// CompactTrainPhaseTelemetry is cumulative per-phase telemetry. HostNanos
+// measures the Go-side span; DeviceElapsedNanos is populated only from CUDA
+// events read after an already-required stream synchronization. ContextSets
+// counts attempted cuCtxSetCurrent calls, including a failed call; a context
+// failure is identified by FailureStage/EventControlStage.
+type CompactTrainPhaseTelemetry struct {
+	GoCalls              int64  `json:"go_calls,omitempty"`
+	ContextSets          int64  `json:"context_sets,omitempty"`
+	DriverCalls          int64  `json:"driver_calls,omitempty"`
+	KernelLaunches       int64  `json:"kernel_launches,omitempty"`
+	CublasCalls          int64  `json:"cublas_calls,omitempty"`
+	GraphBegin           int64  `json:"graph_begin,omitempty"`
+	GraphEnd             int64  `json:"graph_end,omitempty"`
+	GraphInstantiate     int64  `json:"graph_instantiate,omitempty"`
+	GraphLaunches        int64  `json:"graph_launches,omitempty"`
+	GraphNodes           int64  `json:"graph_nodes,omitempty"`
+	GraphKernelNodes     int64  `json:"graph_kernel_nodes,omitempty"`
+	GraphCublasNodes     int64  `json:"graph_cublas_nodes,omitempty"`
+	GraphUnknownNodes    int64  `json:"graph_unknown_nodes,omitempty"`
+	H2DCopies            int64  `json:"h2d_copies,omitempty"`
+	H2DBytes             int64  `json:"h2d_bytes,omitempty"`
+	D2HCopies            int64  `json:"d2h_copies,omitempty"`
+	D2HBytes             int64  `json:"d2h_bytes,omitempty"`
+	MemsetCalls          int64  `json:"memset_calls,omitempty"`
+	HostDescriptorAllocs int64  `json:"host_descriptor_allocs,omitempty"`
+	StreamSynchronizes   int64  `json:"stream_syncs,omitempty"`
+	EventRecords         int64  `json:"event_records,omitempty"`
+	EventQueries         int64  `json:"event_queries,omitempty"`
+	HostNanos            int64  `json:"host_nanos,omitempty"`
+	DeviceElapsedNanos   int64  `json:"device_elapsed_nanos,omitempty"`
+	Attempted            int64  `json:"attempted,omitempty"`
+	Enqueued             int64  `json:"enqueued,omitempty"`
+	Completed            int64  `json:"completed,omitempty"`
+	Failures             int64  `json:"failures,omitempty"`
+	FailIndex            int64  `json:"fail_index,omitempty"`
+	HasFailIndex         bool   `json:"has_fail_index,omitempty"`
+	FailureStage         string `json:"failure_stage,omitempty"`
+	EventControlFailures int64  `json:"event_control_failures,omitempty"`
+	EventControlStage    string `json:"event_control_stage,omitempty"`
+}
+
+const CompactTrainTelemetryPhaseCount = 14
+const CompactTrainTelemetrySchemaVersion = 1
+
+const (
+	CompactTrainTelemetryViewCompactTrain = "compact_train"
+	CompactTrainTelemetryViewOptimizer    = "optimizer"
+	CompactTrainTelemetryViewMixed        = "mixed"
+)
+
+var compactTrainTelemetryPhaseNames = [...]CompactTrainTelemetryPhase{
+	CompactTrainPhaseBeginZero,
+	CompactTrainPhaseInputH2D,
+	CompactTrainPhaseForwardDirect,
+	CompactTrainPhaseForwardCapture,
+	CompactTrainPhaseForwardReplay,
+	CompactTrainPhaseForwardBoundary,
+	CompactTrainPhaseGradH2D,
+	CompactTrainPhaseBackwardFinal,
+	CompactTrainPhaseBackwardFFN,
+	CompactTrainPhaseBackwardAttention,
+	CompactTrainPhaseBackwardBoundary,
+	CompactTrainPhaseK6Readback,
+	CompactTrainPhaseK5Batch,
+	CompactTrainPhaseOuterOptimizer,
+}
+
+// CompactTrainTelemetry is a cumulative phase schema. The fixed internal
+// array preserves existing comparability; optional stats pointers keep the
+// default-off path nil and JSON-compatible with legacy profiles.
+type CompactTrainTelemetry struct {
+	Enabled     bool                                                        `json:"enabled,omitempty"`
+	EventTiming bool                                                        `json:"event_timing,omitempty"`
+	View        string                                                      `json:"view,omitempty"`
+	Phases      [CompactTrainTelemetryPhaseCount]CompactTrainPhaseTelemetry `json:"-"`
+	present     [CompactTrainTelemetryPhaseCount]bool
+}
+
+func (t *CompactTrainTelemetry) SetPhasePresent(index int) {
+	if t != nil && index >= 0 && index < CompactTrainTelemetryPhaseCount {
+		t.present[index] = true
+	}
+}
+
+func (t CompactTrainTelemetry) MarshalJSON() ([]byte, error) {
+	phases := make(map[string]CompactTrainPhaseTelemetry)
+	for i, name := range compactTrainTelemetryPhaseNames {
+		if t.present[i] || t.Phases[i] != (CompactTrainPhaseTelemetry{}) {
+			phases[string(name)] = t.Phases[i]
+		}
+	}
+	return json.Marshal(struct {
+		SchemaVersion int                                   `json:"schema_version"`
+		Enabled       bool                                  `json:"enabled,omitempty"`
+		EventTiming   bool                                  `json:"event_timing,omitempty"`
+		View          string                                `json:"view,omitempty"`
+		Phases        map[string]CompactTrainPhaseTelemetry `json:"phases,omitempty"`
+	}{CompactTrainTelemetrySchemaVersion, t.Enabled, t.EventTiming, t.View, phases})
+}
+
+func (t *CompactTrainTelemetry) UnmarshalJSON(data []byte) error {
+	if t == nil {
+		return fmt.Errorf("cannot unmarshal compact telemetry into nil receiver")
+	}
+	var wire struct {
+		SchemaVersion int                                   `json:"schema_version"`
+		Enabled       bool                                  `json:"enabled"`
+		EventTiming   bool                                  `json:"event_timing"`
+		View          string                                `json:"view"`
+		Phases        map[string]CompactTrainPhaseTelemetry `json:"phases"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	if wire.SchemaVersion != CompactTrainTelemetrySchemaVersion {
+		return fmt.Errorf("compact telemetry schema version %d is unsupported, want %d", wire.SchemaVersion, CompactTrainTelemetrySchemaVersion)
+	}
+	decoded := CompactTrainTelemetry{Enabled: wire.Enabled, EventTiming: wire.EventTiming, View: wire.View}
+	for name, phase := range wire.Phases {
+		index := CompactTrainTelemetryPhaseIndex(CompactTrainTelemetryPhase(name))
+		if index < 0 {
+			continue
+		}
+		decoded.Phases[index] = phase
+		decoded.present[index] = true
+	}
+	*t = decoded
+	return nil
+}
+
+func CompactTrainTelemetryPhaseIndex(phase CompactTrainTelemetryPhase) int {
+	switch phase {
+	case CompactTrainPhaseBeginZero:
+		return 0
+	case CompactTrainPhaseInputH2D:
+		return 1
+	case CompactTrainPhaseForwardDirect:
+		return 2
+	case CompactTrainPhaseForwardCapture:
+		return 3
+	case CompactTrainPhaseForwardReplay:
+		return 4
+	case CompactTrainPhaseForwardBoundary:
+		return 5
+	case CompactTrainPhaseGradH2D:
+		return 6
+	case CompactTrainPhaseBackwardFinal:
+		return 7
+	case CompactTrainPhaseBackwardFFN:
+		return 8
+	case CompactTrainPhaseBackwardAttention:
+		return 9
+	case CompactTrainPhaseBackwardBoundary:
+		return 10
+	case CompactTrainPhaseK6Readback:
+		return 11
+	case CompactTrainPhaseK5Batch:
+		return 12
+	case CompactTrainPhaseOuterOptimizer:
+		return 13
+	default:
+		return -1
+	}
+}
+
+func (t CompactTrainTelemetry) Phase(phase CompactTrainTelemetryPhase) CompactTrainPhaseTelemetry {
+	index := CompactTrainTelemetryPhaseIndex(phase)
+	if index < 0 {
+		return CompactTrainPhaseTelemetry{}
+	}
+	return t.Phases[index]
+}
+
+func ResetCompactTrainTelemetry(t *CompactTrainTelemetry) {
+	if t != nil {
+		*t = CompactTrainTelemetry{}
+	}
+}
+
+func addCompactTrainPhaseTelemetry(left, right CompactTrainPhaseTelemetry) CompactTrainPhaseTelemetry {
+	out := CompactTrainPhaseTelemetry{
+		GoCalls: left.GoCalls + right.GoCalls, ContextSets: left.ContextSets + right.ContextSets,
+		DriverCalls: left.DriverCalls + right.DriverCalls, KernelLaunches: left.KernelLaunches + right.KernelLaunches,
+		CublasCalls: left.CublasCalls + right.CublasCalls, GraphBegin: left.GraphBegin + right.GraphBegin,
+		GraphEnd: left.GraphEnd + right.GraphEnd, GraphInstantiate: left.GraphInstantiate + right.GraphInstantiate,
+		GraphLaunches: left.GraphLaunches + right.GraphLaunches, GraphNodes: left.GraphNodes + right.GraphNodes,
+		GraphKernelNodes: left.GraphKernelNodes + right.GraphKernelNodes, GraphCublasNodes: left.GraphCublasNodes + right.GraphCublasNodes,
+		GraphUnknownNodes: left.GraphUnknownNodes + right.GraphUnknownNodes, H2DCopies: left.H2DCopies + right.H2DCopies,
+		H2DBytes: left.H2DBytes + right.H2DBytes, D2HCopies: left.D2HCopies + right.D2HCopies,
+		D2HBytes: left.D2HBytes + right.D2HBytes, MemsetCalls: left.MemsetCalls + right.MemsetCalls,
+		HostDescriptorAllocs: left.HostDescriptorAllocs + right.HostDescriptorAllocs,
+		StreamSynchronizes:   left.StreamSynchronizes + right.StreamSynchronizes, EventRecords: left.EventRecords + right.EventRecords,
+		EventQueries: left.EventQueries + right.EventQueries, HostNanos: left.HostNanos + right.HostNanos,
+		DeviceElapsedNanos: left.DeviceElapsedNanos + right.DeviceElapsedNanos, Attempted: left.Attempted + right.Attempted,
+		Enqueued: left.Enqueued + right.Enqueued, Completed: left.Completed + right.Completed, Failures: left.Failures + right.Failures,
+		FailIndex: left.FailIndex, HasFailIndex: left.HasFailIndex, FailureStage: left.FailureStage,
+		EventControlFailures: left.EventControlFailures + right.EventControlFailures, EventControlStage: left.EventControlStage,
+	}
+	if right.Failures != 0 {
+		out.FailIndex, out.HasFailIndex, out.FailureStage = right.FailIndex, right.HasFailIndex, right.FailureStage
+	}
+	if right.EventControlFailures != 0 {
+		out.EventControlStage = right.EventControlStage
+	}
+	return out
+}
+
+// AddCompactTrainTelemetryPhase aggregates one phase without allocating a
+// second telemetry object or copying the full fixed array.
+func AddCompactTrainTelemetryPhase(t *CompactTrainTelemetry, phase CompactTrainTelemetryPhase, delta CompactTrainPhaseTelemetry) {
+	if t == nil {
+		return
+	}
+	index := CompactTrainTelemetryPhaseIndex(phase)
+	if index < 0 {
+		return
+	}
+	t.Phases[index] = addCompactTrainPhaseTelemetry(t.Phases[index], delta)
+	t.present[index] = t.present[index] || delta != (CompactTrainPhaseTelemetry{})
+}
+
+func mergeCompactTrainTelemetryView(left, right string) string {
+	if left == "" {
+		return right
+	}
+	if right == "" || left == right {
+		return left
+	}
+	return CompactTrainTelemetryViewMixed
+}
+
+func CloneCompactTrainTelemetry(src *CompactTrainTelemetry) *CompactTrainTelemetry {
+	if src == nil {
+		return nil
+	}
+	clone := *src
+	return &clone
+}
+
+func DiffCompactTrainTelemetry(start, end *CompactTrainTelemetry) *CompactTrainTelemetry {
+	if end == nil {
+		return nil
+	}
+	out := &CompactTrainTelemetry{Enabled: end.Enabled, EventTiming: end.EventTiming, View: end.View}
+	if start != nil {
+		out.View = mergeCompactTrainTelemetryView(start.View, end.View)
+	}
+	for i, endStats := range end.Phases {
+		startStats := CompactTrainPhaseTelemetry{}
+		if start != nil {
+			startStats = start.Phases[i]
+		}
+		out.Phases[i] = CompactTrainPhaseTelemetry{
+			GoCalls: endStats.GoCalls - startStats.GoCalls, ContextSets: endStats.ContextSets - startStats.ContextSets,
+			DriverCalls: endStats.DriverCalls - startStats.DriverCalls, KernelLaunches: endStats.KernelLaunches - startStats.KernelLaunches,
+			CublasCalls: endStats.CublasCalls - startStats.CublasCalls, GraphBegin: endStats.GraphBegin - startStats.GraphBegin,
+			GraphEnd: endStats.GraphEnd - startStats.GraphEnd, GraphInstantiate: endStats.GraphInstantiate - startStats.GraphInstantiate,
+			GraphLaunches: endStats.GraphLaunches - startStats.GraphLaunches, GraphNodes: endStats.GraphNodes - startStats.GraphNodes,
+			GraphKernelNodes: endStats.GraphKernelNodes - startStats.GraphKernelNodes, GraphCublasNodes: endStats.GraphCublasNodes - startStats.GraphCublasNodes,
+			GraphUnknownNodes: endStats.GraphUnknownNodes - startStats.GraphUnknownNodes, H2DCopies: endStats.H2DCopies - startStats.H2DCopies,
+			H2DBytes: endStats.H2DBytes - startStats.H2DBytes, D2HCopies: endStats.D2HCopies - startStats.D2HCopies,
+			D2HBytes: endStats.D2HBytes - startStats.D2HBytes, MemsetCalls: endStats.MemsetCalls - startStats.MemsetCalls,
+			HostDescriptorAllocs: endStats.HostDescriptorAllocs - startStats.HostDescriptorAllocs,
+			StreamSynchronizes:   endStats.StreamSynchronizes - startStats.StreamSynchronizes, EventRecords: endStats.EventRecords - startStats.EventRecords,
+			EventQueries: endStats.EventQueries - startStats.EventQueries, HostNanos: endStats.HostNanos - startStats.HostNanos,
+			DeviceElapsedNanos: endStats.DeviceElapsedNanos - startStats.DeviceElapsedNanos, Attempted: endStats.Attempted - startStats.Attempted,
+			Enqueued: endStats.Enqueued - startStats.Enqueued, Completed: endStats.Completed - startStats.Completed,
+			Failures: endStats.Failures - startStats.Failures, EventControlFailures: endStats.EventControlFailures - startStats.EventControlFailures,
+		}
+		failureDelta := endStats.Failures - startStats.Failures
+		if failureDelta > 0 || (start != nil && endStats.Failures < startStats.Failures && endStats.Failures > 0) {
+			out.Phases[i].FailIndex, out.Phases[i].HasFailIndex, out.Phases[i].FailureStage = endStats.FailIndex, endStats.HasFailIndex, endStats.FailureStage
+		}
+		if endStats.EventControlFailures-startStats.EventControlFailures > 0 {
+			out.Phases[i].EventControlStage = endStats.EventControlStage
+		}
+		out.present[i] = out.Phases[i] != (CompactTrainPhaseTelemetry{})
+	}
+	return out
+}
+
+func AddCompactTrainTelemetry(left, right *CompactTrainTelemetry) *CompactTrainTelemetry {
+	if left == nil && right == nil {
+		return nil
+	}
+	out := &CompactTrainTelemetry{}
+	if left != nil {
+		*out = *left
+	}
+	if right == nil {
+		return out
+	}
+	out.Enabled = out.Enabled || right.Enabled
+	out.EventTiming = out.EventTiming || right.EventTiming
+	out.View = mergeCompactTrainTelemetryView(out.View, right.View)
+	for i, stats := range right.Phases {
+		out.Phases[i] = addCompactTrainPhaseTelemetry(out.Phases[i], stats)
+		out.present[i] = out.present[i] || right.present[i] || stats != (CompactTrainPhaseTelemetry{})
+	}
+	return out
 }
 
 // ContrastiveGradResult contains pooled embedding gradients and unnormalized row metrics.

@@ -3,26 +3,12 @@
 package cuda
 
 /*
-#cgo CFLAGS: -I/usr/local/cuda/include
+#cgo CFLAGS: -I/usr/local/cuda/include -I${SRCDIR}
 #include <cuda.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
-
-typedef struct {
-	CUcontext ctx;
-	CUdevice device;
-	int major;
-	int minor;
-	int primary_ctx;
-	void* blas;
-	CUstream stream;
-} EosCudaRuntime;
-
-typedef struct {
-	CUmodule module;
-	CUfunction function;
-} EosCudaKernel;
+#include "eos_cuda_abi.h"
 
 static int eosCudaLaunchCompactTrainFinalProjectionGrad(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr normalized, CUdeviceptr gradRows, CUdeviceptr gradOutProjection, int rows, int modelDim, int outDim, char** err);
 static int eosCudaLaunchCompactTrainFinalHiddenGrad(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr projected, CUdeviceptr normalized, CUdeviceptr outputProjection, CUdeviceptr gradPooled, CUdeviceptr masks, CUdeviceptr active, CUdeviceptr gradRows, CUdeviceptr gradNormalized, CUdeviceptr gradHidden, int batch, int seq, int modelDim, int outDim, int hasProjection, char** err);
@@ -178,6 +164,141 @@ type CompactTrainAccelerator struct {
 	// the typed four-stage input upload bridge. Zero is production behavior;
 	// stages 1-4 fail immediately before that stage's copy.
 	debugForceForwardInputUploadFailureStage int
+}
+
+func boolInt64(value bool) int64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func compactTelemetryNow() time.Time {
+	if !eosCudaCompactProfileEventsEnabled {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+func compactTelemetrySince(start time.Time) int64 {
+	if start.IsZero() {
+		return 0
+	}
+	return time.Since(start).Nanoseconds()
+}
+
+func (a *CompactTrainAccelerator) compactTelemetryPhaseStart() (time.Time, int64, int64, int64) {
+	if a == nil || !eosCudaCompactProfileEventsEnabled {
+		return time.Time{}, 0, 0, 0
+	}
+	return time.Now(), a.CompactForwardAccelerator.stats.KernelLaunches, a.CompactForwardAccelerator.stats.KernelSynchronizations, a.stats.CublasGemmCalls
+}
+
+func compactTrainReadbackTelemetry(progress cudaCompactTrainForwardReadbackProgress, statusBytes, pooledBytes, activeBytes, hostNanos int64, readbackErr error) backend.CompactTrainPhaseTelemetry {
+	completedCopies := progress.CompletedCopies
+	attemptedCopies := progress.AttemptedCopies
+	if completedCopies == 0 {
+		switch {
+		case progress.ActiveCopied:
+			completedCopies = 3
+		case progress.PooledCopied:
+			completedCopies = 2
+		case progress.StatusCopied:
+			completedCopies = 1
+		}
+	}
+	if attemptedCopies < completedCopies {
+		attemptedCopies = completedCopies
+	}
+	failureStage := progress.FailureStage
+	if progress.StatusValue != 0 {
+		// The native bridge stops after the status copy. Do not infer pooled or
+		// active work from stale/synthetic flags in a test progress value.
+		completedCopies = 1
+		attemptedCopies = 1
+		failureStage = "status"
+	} else if failureStage == "" && readbackErr != nil {
+		if progress.ContextAttempted && !progress.ContextSucceeded {
+			failureStage = "context"
+		} else {
+			failureStage = "d2h"
+			if attemptedCopies == completedCopies && completedCopies < 3 {
+				attemptedCopies = completedCopies + 1
+			}
+		}
+	}
+	if completedCopies > 3 {
+		completedCopies = 3
+	}
+	if attemptedCopies > 3 {
+		attemptedCopies = 3
+	}
+	completedBytes := int64(0)
+	if completedCopies >= 1 {
+		completedBytes += statusBytes
+	}
+	if completedCopies >= 2 {
+		completedBytes += pooledBytes
+	}
+	if completedCopies >= 3 {
+		completedBytes += activeBytes
+	}
+	preCgo := failureStage == "preflight" || failureStage == "validation"
+	phase := backend.CompactTrainPhaseTelemetry{
+		GoCalls: boolInt64(!preCgo), ContextSets: boolInt64(progress.ContextAttempted), DriverCalls: int64(attemptedCopies),
+		D2HCopies: int64(completedCopies), D2HBytes: completedBytes,
+		HostNanos: hostNanos, Attempted: int64(attemptedCopies), Completed: int64(completedCopies),
+	}
+	if failureStage != "" || readbackErr != nil || completedCopies != 3 {
+		phase.Failures = 1
+		if failureStage == "" {
+			failureStage = "d2h"
+		}
+		phase.FailureStage = failureStage
+	}
+	return phase
+}
+
+func compactTrainInputUploadTelemetry(progress cudaCompactTrainForwardInputUploadProgress, hostNanos int64, readbackErr error) backend.CompactTrainPhaseTelemetry {
+	completedCopies := progress.CompletedCopies
+	attemptedCopies := progress.AttemptedCopies
+	if completedCopies == 0 && progress.CompletedStages != 0 {
+		completedCopies = progress.CompletedStages
+	}
+	if attemptedCopies < completedCopies {
+		attemptedCopies = completedCopies
+	}
+	failureStage := progress.FailureStage
+	if failureStage == "" && readbackErr != nil {
+		if progress.ContextAttempted && !progress.ContextSucceeded {
+			failureStage = "context"
+		} else {
+			failureStage = "h2d"
+			if attemptedCopies == completedCopies && completedCopies < 4 {
+				attemptedCopies = completedCopies + 1
+			}
+		}
+	}
+	if completedCopies > 4 {
+		completedCopies = 4
+	}
+	if attemptedCopies > 4 {
+		attemptedCopies = 4
+	}
+	preCgo := failureStage == "preflight" || failureStage == "validation"
+	phase := backend.CompactTrainPhaseTelemetry{
+		GoCalls: boolInt64(!preCgo), ContextSets: boolInt64(progress.ContextAttempted), DriverCalls: int64(attemptedCopies),
+		H2DCopies: int64(completedCopies), H2DBytes: progress.CompletedBytes,
+		HostNanos: hostNanos, Attempted: int64(attemptedCopies), Completed: int64(completedCopies),
+	}
+	if failureStage != "" || readbackErr != nil || completedCopies != 4 {
+		phase.Failures = 1
+		if failureStage == "" {
+			failureStage = "h2d"
+		}
+		phase.FailureStage = failureStage
+	}
+	return phase
 }
 
 type compactTrainKernels struct {
@@ -892,7 +1013,124 @@ func (a *CompactTrainAccelerator) CompactTrainStats() backend.CompactTrainAccele
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.stats
+	stats := a.stats
+	stats.Telemetry = backend.CloneCompactTrainTelemetry(a.stats.Telemetry)
+	return stats
+}
+
+// telemetryAdd updates a phase atomically with respect to the accelerator's
+// existing mutex. It is intentionally a no-op on the default path.
+func (a *CompactTrainAccelerator) telemetryAdd(phase backend.CompactTrainTelemetryPhase, delta backend.CompactTrainPhaseTelemetry) {
+	if a == nil || !eosCudaCompactProfileEventsEnabled {
+		return
+	}
+	index := backend.CompactTrainTelemetryPhaseIndex(phase)
+	if index < 0 {
+		return
+	}
+	if a.stats.Telemetry == nil {
+		a.stats.Telemetry = &backend.CompactTrainTelemetry{}
+	}
+	a.stats.Telemetry.Enabled = true
+	if a.stats.Telemetry.View == "" {
+		a.stats.Telemetry.View = backend.CompactTrainTelemetryViewCompactTrain
+	}
+	backend.AddCompactTrainTelemetryPhase(a.stats.Telemetry, phase, delta)
+}
+
+// addCompactTrainEventProgress keeps event-control work separate from
+// workload progress. ContextSets counts attempted cuCtxSetCurrent calls;
+// DriverCalls counts attempted event-create/record/query calls, including a
+// failed driver call. EventRecords/EventQueries are added only by successful
+// owners.
+func addCompactTrainEventProgress(delta *backend.CompactTrainPhaseTelemetry, progress profileEventProgress, failed bool, fallback string) {
+	if delta == nil {
+		return
+	}
+	delta.ContextSets += int64(progress.ContextSetAttempts)
+	delta.DriverCalls += int64(progress.DriverAttempted)
+	if progress.FailureStage != "" {
+		delta.EventControlFailures++
+		delta.EventControlStage = progress.FailureStage
+	} else if failed {
+		delta.EventControlFailures++
+		delta.EventControlStage = fallback
+	}
+}
+
+func (a *CompactTrainAccelerator) telemetryEventStart(phase backend.CompactTrainTelemetryPhase) bool {
+	return a.telemetryEventStartNamed(string(phase), phase)
+}
+
+func (a *CompactTrainAccelerator) telemetryEventStartNamed(name string, phase backend.CompactTrainTelemetryPhase) bool {
+	if a == nil || a.device == nil || !eosCudaCompactProfileEventsEnabled || a.CompactForwardAccelerator.forwardGraphCaptureActive {
+		return false
+	}
+	result, err := a.device.profileEventRecordStats(name, false)
+	delta := backend.CompactTrainPhaseTelemetry{}
+	if result.PairCreateCalled {
+		delta.GoCalls++
+	}
+	if result.RecordCalled {
+		delta.GoCalls++
+	}
+	addCompactTrainEventProgress(&delta, result.Progress, err != nil, "event_record")
+	if err != nil {
+		a.telemetryAdd(phase, delta)
+		return false
+	}
+	delta.EventRecords = 1
+	a.telemetryAdd(phase, delta)
+	return true
+}
+
+func (a *CompactTrainAccelerator) telemetryEventEnd(phase backend.CompactTrainTelemetryPhase) bool {
+	return a.telemetryEventEndNamed(string(phase), phase)
+}
+
+func (a *CompactTrainAccelerator) telemetryEventEndNamed(name string, phase backend.CompactTrainTelemetryPhase) bool {
+	if a == nil || a.device == nil || !eosCudaCompactProfileEventsEnabled || a.CompactForwardAccelerator.forwardGraphCaptureActive {
+		return false
+	}
+	result, err := a.device.profileEventRecordStats(name, true)
+	delta := backend.CompactTrainPhaseTelemetry{}
+	if result.RecordCalled {
+		delta.GoCalls++
+	}
+	addCompactTrainEventProgress(&delta, result.Progress, err != nil, "event_record")
+	if err != nil {
+		a.telemetryAdd(phase, delta)
+		return false
+	}
+	delta.EventRecords = 1
+	a.telemetryAdd(phase, delta)
+	return true
+}
+
+func (a *CompactTrainAccelerator) telemetryEventElapsed(phase backend.CompactTrainTelemetryPhase, recorded bool) {
+	a.telemetryEventElapsedNamed(string(phase), phase, recorded)
+}
+
+func (a *CompactTrainAccelerator) telemetryEventElapsedNamed(name string, phase backend.CompactTrainTelemetryPhase, recorded bool) {
+	if !recorded || a == nil || a.device == nil || !eosCudaCompactProfileEventsEnabled {
+		return
+	}
+	nanos, called, progress, err := a.device.profileEventElapsedStats(name)
+	if called {
+		delta := backend.CompactTrainPhaseTelemetry{GoCalls: 1}
+		addCompactTrainEventProgress(&delta, progress, err != nil, "event_query")
+		if err == nil {
+			delta.EventQueries = 1
+			delta.DeviceElapsedNanos = nanos
+		}
+		a.telemetryAdd(phase, delta)
+	}
+	if err != nil {
+		return
+	}
+	if a.stats.Telemetry != nil {
+		a.stats.Telemetry.EventTiming = true
+	}
 }
 
 func compactTrainForwardGraphPointerKey(parts []string, name string, ptr C.CUdeviceptr) []string {
@@ -1033,11 +1271,27 @@ func (a *CompactTrainAccelerator) forwardGraphReplay(entry *compactTrainForwardG
 	return a.device.launchGraphNoSync(entry.graph)
 }
 
-func (a *CompactTrainAccelerator) captureForwardGraphLocked(key string, shape backend.CompactForwardShape, arena *compactTrainArena, issue func() error) error {
-	fail := func(err error) error {
+type compactForwardCaptureProgress struct {
+	BeginCalled       bool
+	BeginCompleted    bool
+	EndCalled         bool
+	EndCompleted      bool
+	InstantiateCalled bool
+	InstantiateDone   bool
+	IssueFailed       bool
+	GraphNodes        int64
+	GraphKernelNodes  int64
+	GraphCublasNodes  int64
+	ContextSets       int64
+	DriverCalls       int64
+}
+
+func (a *CompactTrainAccelerator) captureForwardGraphLocked(key string, shape backend.CompactForwardShape, arena *compactTrainArena, issue func() error) (error, compactForwardCaptureProgress) {
+	progress := compactForwardCaptureProgress{}
+	fail := func(err error) (error, compactForwardCaptureProgress) {
 		a.stats.GraphCaptureFailures++
 		a.stats.GraphFallbacks++
-		return err
+		return err, progress
 	}
 	if a.debugForceForwardGraphCaptureFailure {
 		return fail(fmt.Errorf("cuda compact train forward graph capture forced failure"))
@@ -1047,13 +1301,28 @@ func (a *CompactTrainAccelerator) captureForwardGraphLocked(key string, shape ba
 	// goroutine and leave a partial or invalid capture state.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := a.device.beginCapture(); err != nil {
-		return fail(err)
+	progress.BeginCalled = true
+	beginProgress, beginErr := a.device.beginCaptureWithProgress()
+	progress.ContextSets += int64(beginProgress.ContextSets)
+	progress.DriverCalls += int64(beginProgress.DriverCalls)
+	progress.BeginCompleted = beginProgress.Completed
+	if beginErr != nil {
+		return fail(beginErr)
 	}
 	a.CompactForwardAccelerator.beginForwardGraphCapture()
 	captureErr := issue()
-	nodes := a.CompactForwardAccelerator.endForwardGraphCapture()
-	g, endErr := a.device.endCapture()
+	progress.IssueFailed = captureErr != nil
+	nodes, kernelNodes, cublasNodes := a.CompactForwardAccelerator.endForwardGraphCaptureCounts()
+	progress.GraphNodes = nodes
+	progress.GraphKernelNodes = kernelNodes
+	progress.GraphCublasNodes = cublasNodes
+	progress.EndCalled = true
+	g, endProgress, endErr := a.device.endCaptureWithProgress()
+	progress.ContextSets += int64(endProgress.ContextSets)
+	progress.DriverCalls += int64(endProgress.DriverCalls) + nodes
+	progress.EndCompleted = endProgress.EndCompleted
+	progress.InstantiateCalled = endProgress.InstantiateAttempted
+	progress.InstantiateDone = endProgress.InstantiateCompleted
 	if captureErr != nil {
 		if g != nil {
 			g.destroy()
@@ -1083,7 +1352,7 @@ func (a *CompactTrainAccelerator) captureForwardGraphLocked(key string, shape ba
 	}
 	a.stats.GraphCaptures++
 	a.stats.GraphNodes += nodes
-	return nil
+	return nil, progress
 }
 
 func (a *CompactTrainAccelerator) drainForwardGraphFailureLocked() error {
@@ -1201,8 +1470,12 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 	if err != nil {
 		return err
 	}
+	zeroStart := compactTelemetryNow()
 	slab, reused, err := a.takeGradientSlabLocked(layout)
 	if err != nil {
+		if eosCudaCompactProfileEventsEnabled {
+			a.telemetryAdd(backend.CompactTrainPhaseBeginZero, backend.CompactTrainPhaseTelemetry{GoCalls: 1, HostNanos: compactTelemetrySince(zeroStart), Attempted: 1, Failures: 1, FailureStage: "allocation"})
+		}
 		return err
 	}
 	freePending := func() {
@@ -1214,7 +1487,13 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 	}
 	if err := a.device.memsetFloat32Zero(slab.ptr, slab.elements); err != nil {
 		freePending()
+		if eosCudaCompactProfileEventsEnabled {
+			a.telemetryAdd(backend.CompactTrainPhaseBeginZero, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, MemsetCalls: 1, HostNanos: compactTelemetrySince(zeroStart), Attempted: 1, Failures: 1, FailureStage: "memset"})
+		}
 		return err
+	}
+	if eosCudaCompactProfileEventsEnabled {
+		a.telemetryAdd(backend.CompactTrainPhaseBeginZero, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, MemsetCalls: 1, HostNanos: compactTelemetrySince(zeroStart), Attempted: 1, Completed: 1})
 	}
 	pending := make(map[string]*compactTrainGradient, len(layout.entries))
 	var bytes int64
@@ -1347,32 +1626,238 @@ func (a *CompactTrainAccelerator) RunCompactTrainBackward(req backend.CompactTra
 	launchesBefore := a.CompactForwardAccelerator.stats.KernelLaunches
 	syncsBefore := a.CompactForwardAccelerator.stats.KernelSynchronizations
 	cublasBefore := a.stats.CublasGemmCalls
+	telemetryEnabled := eosCudaCompactProfileEventsEnabled
+	var backwardCompletions []struct {
+		phase backend.CompactTrainTelemetryPhase
+		calls int64
+	}
+	var phaseRecord func(backend.CompactTrainTelemetryPhase, time.Time, int64, int64, int64, bool)
+	if telemetryEnabled {
+		phaseRecord = func(phase backend.CompactTrainTelemetryPhase, phaseStart time.Time, launchStart, syncStart, cublasStart int64, failed bool) {
+			launches := a.CompactForwardAccelerator.stats.KernelLaunches - launchStart
+			syncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncStart
+			cublas := a.stats.CublasGemmCalls - cublasStart
+			calls := launches + cublas
+			failedOps := int64(0)
+			if failed && calls+syncs != 0 {
+				failedOps = 1
+			}
+			item := backend.CompactTrainPhaseTelemetry{
+				GoCalls: calls + syncs + failedOps, ContextSets: calls + syncs + failedOps, DriverCalls: calls + syncs + failedOps,
+				KernelLaunches: launches, CublasCalls: cublas,
+				StreamSynchronizes: syncs, HostNanos: compactTelemetrySince(phaseStart),
+				Attempted: calls + syncs + failedOps, Enqueued: calls,
+			}
+			if failed {
+				item.Failures = 1
+				item.FailureStage = "body"
+			}
+			a.telemetryAdd(phase, item)
+			if !failed && calls != 0 {
+				backwardCompletions = append(backwardCompletions, struct {
+					phase backend.CompactTrainTelemetryPhase
+					calls int64
+				}{phase: phase, calls: calls})
+			}
+		}
+	}
+	type backwardTelemetryEvent struct {
+		name     string
+		phase    backend.CompactTrainTelemetryPhase
+		recorded bool
+	}
+	var backwardEvents []backwardTelemetryEvent
+	if telemetryEnabled {
+		backwardEvents = make([]backwardTelemetryEvent, 0, shape.Layers*2+3)
+		backwardCompletions = make([]struct {
+			phase backend.CompactTrainTelemetryPhase
+			calls int64
+		}, 0, shape.Layers*2+3)
+	}
+	var finalStart time.Time
+	var finalLaunchesBefore, finalSyncsBefore, finalCublasBefore int64
+	if telemetryEnabled {
+		finalStart, finalLaunchesBefore, finalSyncsBefore, finalCublasBefore = a.compactTelemetryPhaseStart()
+	}
+	finalEventName := ""
+	finalEventStarted := false
+	if telemetryEnabled {
+		finalEventName = string(backend.CompactTrainPhaseBackwardFinal) + "/final"
+		finalEventStarted = a.telemetryEventStartNamed(finalEventName, backend.CompactTrainPhaseBackwardFinal)
+	}
 	if err := a.runFinalOutputBackwardLocked(req, arena, shape); err != nil {
+		if telemetryEnabled && finalEventStarted {
+			_ = a.telemetryEventEndNamed(finalEventName, backend.CompactTrainPhaseBackwardFinal)
+		}
+		if telemetryEnabled {
+			phaseRecord(backend.CompactTrainPhaseBackwardFinal, finalStart, finalLaunchesBefore, finalSyncsBefore, finalCublasBefore, true)
+		}
 		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
 	}
+	finalEventEnded := false
+	if telemetryEnabled && finalEventStarted {
+		finalEventEnded = a.telemetryEventEndNamed(finalEventName, backend.CompactTrainPhaseBackwardFinal)
+	}
+	if telemetryEnabled {
+		backwardEvents = append(backwardEvents, backwardTelemetryEvent{name: finalEventName, phase: backend.CompactTrainPhaseBackwardFinal, recorded: finalEventStarted && finalEventEnded})
+	}
+	if telemetryEnabled {
+		phaseRecord(backend.CompactTrainPhaseBackwardFinal, finalStart, finalLaunchesBefore, finalSyncsBefore, finalCublasBefore, false)
+	}
+
 	for layerIdx := shape.Layers - 1; layerIdx >= 0; layerIdx-- {
+		var ffnStart time.Time
+		var ffnLaunchesBefore, ffnSyncsBefore, ffnCublasBefore int64
+		if telemetryEnabled {
+			ffnStart, ffnLaunchesBefore, ffnSyncsBefore, ffnCublasBefore = a.compactTelemetryPhaseStart()
+		}
+		ffnEventName := ""
+		ffnEventStarted := false
+		if telemetryEnabled {
+			ffnEventName = fmt.Sprintf("%s/layer-%d", backend.CompactTrainPhaseBackwardFFN, layerIdx)
+			ffnEventStarted = a.telemetryEventStartNamed(ffnEventName, backend.CompactTrainPhaseBackwardFFN)
+		}
 		if err := a.runLayerFFNBackwardLocked(layerIdx, arena, shape); err != nil {
+			if telemetryEnabled && ffnEventStarted {
+				_ = a.telemetryEventEndNamed(ffnEventName, backend.CompactTrainPhaseBackwardFFN)
+			}
+			if telemetryEnabled {
+				phaseRecord(backend.CompactTrainPhaseBackwardFFN, ffnStart, ffnLaunchesBefore, ffnSyncsBefore, ffnCublasBefore, true)
+			}
 			return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
+		}
+		ffnEventEnded := false
+		if telemetryEnabled && ffnEventStarted {
+			ffnEventEnded = a.telemetryEventEndNamed(ffnEventName, backend.CompactTrainPhaseBackwardFFN)
+		}
+		if telemetryEnabled {
+			backwardEvents = append(backwardEvents, backwardTelemetryEvent{name: ffnEventName, phase: backend.CompactTrainPhaseBackwardFFN, recorded: ffnEventStarted && ffnEventEnded})
+		}
+		if telemetryEnabled {
+			phaseRecord(backend.CompactTrainPhaseBackwardFFN, ffnStart, ffnLaunchesBefore, ffnSyncsBefore, ffnCublasBefore, false)
 		}
 		if a.debugForceBackwardFailureAfterGradMutation {
 			return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(fmt.Errorf("cuda compact train forced failure after gradient mutation"), launchesBefore, syncsBefore, cublasBefore, start)
 		}
+		var attentionStart time.Time
+		var attentionLaunchesBefore, attentionSyncsBefore, attentionCublasBefore int64
+		if telemetryEnabled {
+			attentionStart, attentionLaunchesBefore, attentionSyncsBefore, attentionCublasBefore = a.compactTelemetryPhaseStart()
+		}
+		attentionEventName := ""
+		attentionEventStarted := false
+		if telemetryEnabled {
+			attentionEventName = fmt.Sprintf("%s/layer-%d", backend.CompactTrainPhaseBackwardAttention, layerIdx)
+			attentionEventStarted = a.telemetryEventStartNamed(attentionEventName, backend.CompactTrainPhaseBackwardAttention)
+		}
 		if err := a.runLayerAttentionBackwardLocked(layerIdx, arena, shape); err != nil {
+			if telemetryEnabled && attentionEventStarted {
+				_ = a.telemetryEventEndNamed(attentionEventName, backend.CompactTrainPhaseBackwardAttention)
+			}
+			if telemetryEnabled {
+				phaseRecord(backend.CompactTrainPhaseBackwardAttention, attentionStart, attentionLaunchesBefore, attentionSyncsBefore, attentionCublasBefore, true)
+			}
 			return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
+		}
+		attentionEventEnded := false
+		if telemetryEnabled && attentionEventStarted {
+			attentionEventEnded = a.telemetryEventEndNamed(attentionEventName, backend.CompactTrainPhaseBackwardAttention)
+		}
+		if telemetryEnabled {
+			backwardEvents = append(backwardEvents, backwardTelemetryEvent{name: attentionEventName, phase: backend.CompactTrainPhaseBackwardAttention, recorded: attentionEventStarted && attentionEventEnded})
+		}
+		if telemetryEnabled {
+			phaseRecord(backend.CompactTrainPhaseBackwardAttention, attentionStart, attentionLaunchesBefore, attentionSyncsBefore, attentionCublasBefore, false)
 		}
 	}
 	scatterInput := arena.gradHidden
 	if a.useRoPE {
+		var ropeStart time.Time
+		var ropeLaunchesBefore, ropeSyncsBefore, ropeCublasBefore int64
+		if telemetryEnabled {
+			ropeStart, ropeLaunchesBefore, ropeSyncsBefore, ropeCublasBefore = a.compactTelemetryPhaseStart()
+		}
+		ropeEventName := ""
+		ropeEventStarted := false
+		if telemetryEnabled {
+			ropeEventName = string(backend.CompactTrainPhaseBackwardAttention) + "/rope"
+			ropeEventStarted = a.telemetryEventStartNamed(ropeEventName, backend.CompactTrainPhaseBackwardAttention)
+		}
 		if err := a.launchRoPETranspose(arena.gradHidden, arena.gradRoPE, shape.Batch*shape.Tokens, shape.ModelDim, shape.Tokens); err != nil {
+			if telemetryEnabled && ropeEventStarted {
+				_ = a.telemetryEventEndNamed(ropeEventName, backend.CompactTrainPhaseBackwardAttention)
+			}
+			if telemetryEnabled {
+				phaseRecord(backend.CompactTrainPhaseBackwardAttention, ropeStart, ropeLaunchesBefore, ropeSyncsBefore, ropeCublasBefore, true)
+			}
 			return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
+		}
+		ropeEventEnded := false
+		if telemetryEnabled && ropeEventStarted {
+			ropeEventEnded = a.telemetryEventEndNamed(ropeEventName, backend.CompactTrainPhaseBackwardAttention)
+		}
+		if telemetryEnabled {
+			phaseRecord(backend.CompactTrainPhaseBackwardAttention, ropeStart, ropeLaunchesBefore, ropeSyncsBefore, ropeCublasBefore, false)
+		}
+		if telemetryEnabled {
+			backwardEvents = append(backwardEvents, backwardTelemetryEvent{name: ropeEventName, phase: backend.CompactTrainPhaseBackwardAttention, recorded: ropeEventStarted && ropeEventEnded})
 		}
 		scatterInput = arena.gradRoPE
 	}
+	var scatterStart time.Time
+	var scatterLaunchesBefore, scatterSyncsBefore, scatterCublasBefore int64
+	if telemetryEnabled {
+		scatterStart, scatterLaunchesBefore, scatterSyncsBefore, scatterCublasBefore = a.compactTelemetryPhaseStart()
+	}
+	scatterEventName := ""
+	scatterEventStarted := false
+	if telemetryEnabled {
+		scatterEventName = string(backend.CompactTrainPhaseBackwardAttention) + "/scatter"
+		scatterEventStarted = a.telemetryEventStartNamed(scatterEventName, backend.CompactTrainPhaseBackwardAttention)
+	}
 	if err := a.runInputScatterBackwardLocked(scatterInput, arena, shape); err != nil {
+		if telemetryEnabled && scatterEventStarted {
+			_ = a.telemetryEventEndNamed(scatterEventName, backend.CompactTrainPhaseBackwardAttention)
+		}
+		if telemetryEnabled {
+			phaseRecord(backend.CompactTrainPhaseBackwardAttention, scatterStart, scatterLaunchesBefore, scatterSyncsBefore, scatterCublasBefore, true)
+		}
 		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
 	}
+	scatterEventEnded := false
+	if telemetryEnabled && scatterEventStarted {
+		scatterEventEnded = a.telemetryEventEndNamed(scatterEventName, backend.CompactTrainPhaseBackwardAttention)
+	}
+	if telemetryEnabled {
+		phaseRecord(backend.CompactTrainPhaseBackwardAttention, scatterStart, scatterLaunchesBefore, scatterSyncsBefore, scatterCublasBefore, false)
+	}
+	if telemetryEnabled {
+		backwardEvents = append(backwardEvents, backwardTelemetryEvent{name: scatterEventName, phase: backend.CompactTrainPhaseBackwardAttention, recorded: scatterEventStarted && scatterEventEnded})
+	}
+	backwardBoundaryStart := time.Time{}
+	backwardBoundarySyncsBefore := int64(0)
+	if telemetryEnabled {
+		backwardBoundaryStart = time.Now()
+		backwardBoundarySyncsBefore = a.CompactForwardAccelerator.stats.KernelSynchronizations
+	}
 	if err := a.synchronizeKernelBoundary(); err != nil {
+		if telemetryEnabled {
+			boundarySyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - backwardBoundarySyncsBefore
+			a.telemetryAdd(backend.CompactTrainPhaseBackwardBoundary, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, StreamSynchronizes: 1, HostNanos: compactTelemetrySince(backwardBoundaryStart), Attempted: 1, Completed: boundarySyncs, Failures: 1, FailureStage: "boundary"})
+		}
 		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
+	}
+	if telemetryEnabled {
+		boundarySyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - backwardBoundarySyncsBefore
+		if boundarySyncs != 0 {
+			a.telemetryAdd(backend.CompactTrainPhaseBackwardBoundary, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: boundarySyncs, StreamSynchronizes: boundarySyncs, HostNanos: compactTelemetrySince(backwardBoundaryStart), Attempted: 1, Completed: boundarySyncs})
+		}
+		for _, event := range backwardEvents {
+			a.telemetryEventElapsedNamed(event.name, event.phase, event.recorded)
+		}
+		for _, completion := range backwardCompletions {
+			a.telemetryAdd(completion.phase, backend.CompactTrainPhaseTelemetry{Completed: completion.calls})
+		}
 	}
 	if err := a.consumeHandleLocked(req.Handle); err != nil {
 		return backend.CompactTrainBackwardResult{}, a.poisonBackwardErrorLocked(err, launchesBefore, syncsBefore, cublasBefore, start)
@@ -1628,8 +2113,15 @@ func (a *CompactTrainAccelerator) runFinalOutputBackwardLocked(req backend.Compa
 	if err := a.ensureBackwardWorkspaceLocked(arena); err != nil {
 		return err
 	}
+	gradUploadStart := compactTelemetryNow()
 	if err := a.device.copyFloat32ToBuffer(arena.gradPooled, req.GradPooled.F32); err != nil {
+		if eosCudaCompactProfileEventsEnabled {
+			a.telemetryAdd(backend.CompactTrainPhaseGradH2D, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, H2DBytes: 0, HostNanos: compactTelemetrySince(gradUploadStart), Attempted: 1, Failures: 1, FailureStage: "h2d"})
+		}
 		return err
+	}
+	if eosCudaCompactProfileEventsEnabled {
+		a.telemetryAdd(backend.CompactTrainPhaseGradH2D, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, H2DCopies: 1, H2DBytes: int64(len(req.GradPooled.F32) * 4), HostNanos: compactTelemetrySince(gradUploadStart), Attempted: 1, Completed: 1})
 	}
 	a.stats.UploadedBytes += int64(len(req.GradPooled.F32) * 4)
 	a.stats.GradPooledUploadedBytes += int64(len(req.GradPooled.F32) * 4)
@@ -2293,6 +2785,9 @@ func (a *CompactTrainAccelerator) launchCublasGemm(lhs, rhs, out C.CUdeviceptr, 
 func (a *CompactTrainAccelerator) recordCublasGemmCall() error {
 	if a.CompactForwardAccelerator != nil && a.CompactForwardAccelerator.forwardGraphCaptureActive {
 		a.CompactForwardAccelerator.forwardGraphCaptureNodes++
+		if eosCudaCompactProfileEventsEnabled {
+			a.CompactForwardAccelerator.forwardGraphCaptureCublasNodes++
+		}
 		return nil
 	}
 	a.stats.CublasGemmCalls++
@@ -2498,10 +2993,44 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	a.hostMasks = flattenInt32Into(a.hostMasks, req.Masks)
 	tokensFlat := a.hostTokens
 	masksFlat := a.hostMasks
+	telemetryEnabled := eosCudaCompactProfileEventsEnabled
+	inputUploadStart := compactTelemetryNow()
+	var inputTelemetry backend.CompactTrainPhaseTelemetry
+	var recordInputTelemetry func()
+	if telemetryEnabled {
+		recordInputTelemetry = func() {
+			if inputTelemetry.Attempted == 0 && inputTelemetry.FailureStage != "preflight" && inputTelemetry.FailureStage != "validation" {
+				inputTelemetry.Attempted = inputTelemetry.Completed
+				if inputTelemetry.Failures != 0 {
+					inputTelemetry.Attempted++
+				}
+			}
+			inputTelemetry.HostNanos = compactTelemetrySince(inputUploadStart)
+			a.telemetryAdd(backend.CompactTrainPhaseInputH2D, inputTelemetry)
+		}
+	}
 	replaceArenaInt32 := func(dst *C.CUdeviceptr, data []int32) error {
 		before := *dst
 		if err := a.replaceUploadedInt32(dst, data); err != nil {
+			if telemetryEnabled {
+				inputTelemetry.Failures++
+				inputTelemetry.FailureStage = "h2d"
+			}
 			return err
+		}
+		if telemetryEnabled {
+			calls := int64(1)
+			if before == 0 {
+				// A cold/mixed-zero destination retains the existing allocation plus
+				// copy calls. Count only after both existing bridges succeed.
+				calls++
+			}
+			inputTelemetry.GoCalls += calls
+			inputTelemetry.ContextSets += calls
+			inputTelemetry.DriverCalls += calls
+			inputTelemetry.H2DCopies++
+			inputTelemetry.H2DBytes += int64(len(data) * 4)
+			inputTelemetry.Completed++
 		}
 		if before != *dst {
 			// A pointer replacement is an allocator-generation transition, even
@@ -2524,9 +3053,18 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		a.stats.ForwardInputUploadContextSets += int64(inputUpload.ContextSets)
 		a.stats.ForwardInputUploadDeviceCopies += int64(inputUpload.DeviceCopies)
 		uploaded = inputUpload.CompletedBytes
+		if telemetryEnabled {
+			inputTelemetry = compactTrainInputUploadTelemetry(inputUpload, compactTelemetrySince(inputUploadStart), uploadErr)
+		}
 		if uploadErr != nil {
 			a.stats.ForwardInputUploadFailures++
+			if telemetryEnabled {
+				recordInputTelemetry()
+			}
 			return backend.CompactTrainForwardResult{}, uploadErr
+		}
+		if telemetryEnabled {
+			recordInputTelemetry()
 		}
 	} else {
 		if eosCudaCompactTrainForwardUploadBatchEnabled {
@@ -2536,18 +3074,36 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 			a.stats.ForwardInputUploadScalarFallbacks++
 		}
 		if err := replaceArenaInt32(&arena.tokens, tokensFlat); err != nil {
+			if telemetryEnabled {
+				recordInputTelemetry()
+			}
 			return backend.CompactTrainForwardResult{}, err
 		}
 		if err := replaceArenaInt32(&arena.masks, masksFlat); err != nil {
+			if telemetryEnabled {
+				recordInputTelemetry()
+			}
 			return backend.CompactTrainForwardResult{}, err
 		}
 		if err := replaceArenaInt32(&arena.roles, req.Roles); err != nil {
+			if telemetryEnabled {
+				recordInputTelemetry()
+			}
 			return backend.CompactTrainForwardResult{}, err
 		}
 		if err := replaceArenaInt32(&arena.status, statusInput); err != nil {
+			if telemetryEnabled {
+				recordInputTelemetry()
+			}
 			return backend.CompactTrainForwardResult{}, err
 		}
 		uploaded = int64((len(tokensFlat) + len(masksFlat) + len(req.Roles) + 1) * 4)
+		if telemetryEnabled {
+			inputTelemetry.Attempted = 4
+		}
+		if telemetryEnabled {
+			recordInputTelemetry()
+		}
 	}
 	// Keep the Go-side backward metadata current even when a graph replay skips
 	// the issue closure. Pooled arenas clear layer.input on reuse, while the
@@ -2631,14 +3187,127 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	// fallback. Capturing is deliberately after the successful direct boundary
 	// and is attempted at most once per invocation.
 	runDirectForward := func(capture bool, graphKey string) error {
+		directStart := time.Time{}
+		launchesBefore := int64(0)
+		syncsBeforeBody := int64(0)
+		cublasBefore := int64(0)
+		directEventStarted := false
+		if telemetryEnabled {
+			directStart = time.Now()
+			launchesBefore = a.CompactForwardAccelerator.stats.KernelLaunches
+			syncsBeforeBody = a.CompactForwardAccelerator.stats.KernelSynchronizations
+			cublasBefore = a.stats.CublasGemmCalls
+			directEventStarted = a.telemetryEventStart(backend.CompactTrainPhaseForwardDirect)
+		}
 		if err := issueForward(); err != nil {
+			if telemetryEnabled && directEventStarted {
+				_ = a.telemetryEventEnd(backend.CompactTrainPhaseForwardDirect)
+			}
+			if telemetryEnabled {
+				directLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
+				directCublas := a.stats.CublasGemmCalls - cublasBefore
+				directSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBeforeBody
+				calls := directLaunches + directCublas
+				// A validation/dispatch error can return before any CUDA bridge
+				// or driver operation. Only charge a failed operation when this
+				// invocation already made measurable workload progress.
+				failedOp := int64(0)
+				if calls+directSyncs != 0 {
+					failedOp = 1
+				}
+				a.telemetryAdd(backend.CompactTrainPhaseForwardDirect, backend.CompactTrainPhaseTelemetry{
+					GoCalls: calls + directSyncs + failedOp, ContextSets: calls + directSyncs + failedOp,
+					DriverCalls: calls + directSyncs + failedOp, KernelLaunches: directLaunches, CublasCalls: directCublas,
+					StreamSynchronizes: directSyncs, HostNanos: compactTelemetrySince(directStart),
+					Attempted: calls + directSyncs + failedOp, Enqueued: calls, Failures: 1, FailureStage: "body",
+				})
+			}
 			return err
 		}
-		if err := a.synchronizeKernelBoundary(); err != nil {
-			return err
+		directEvent := false
+		if telemetryEnabled {
+			directEventEnded := false
+			if directEventStarted {
+				directEventEnded = a.telemetryEventEnd(backend.CompactTrainPhaseForwardDirect)
+			}
+			directEvent = directEventStarted && directEventEnded
+			directLaunches := a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore
+			directSyncs := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBeforeBody
+			directCublas := a.stats.CublasGemmCalls - cublasBefore
+			directCalls := directLaunches + directCublas
+			a.telemetryAdd(backend.CompactTrainPhaseForwardDirect, backend.CompactTrainPhaseTelemetry{
+				GoCalls: directCalls + directSyncs, ContextSets: directCalls + directSyncs, DriverCalls: directCalls + directSyncs,
+				KernelLaunches: directLaunches, CublasCalls: directCublas,
+				StreamSynchronizes: directSyncs,
+				HostNanos:          compactTelemetrySince(directStart), Attempted: directCalls + directSyncs, Enqueued: directCalls,
+			})
+		}
+		boundaryStart := time.Time{}
+		syncsBefore := int64(0)
+		if telemetryEnabled {
+			boundaryStart = time.Now()
+			syncsBefore = a.CompactForwardAccelerator.stats.KernelSynchronizations
+		}
+		boundaryErr := a.synchronizeKernelBoundary()
+		if telemetryEnabled {
+			syncDelta := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
+			if syncDelta != 0 || boundaryErr != nil {
+				boundary := backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: syncDelta, StreamSynchronizes: syncDelta, HostNanos: compactTelemetrySince(boundaryStart), Attempted: 1, Completed: syncDelta}
+				if boundaryErr != nil {
+					boundary.DriverCalls = 1
+					boundary.StreamSynchronizes = 1
+					boundary.Failures = 1
+					boundary.FailureStage = "boundary"
+				}
+				a.telemetryAdd(backend.CompactTrainPhaseForwardBoundary, boundary)
+			}
+		}
+		if boundaryErr != nil {
+			directEvent = false
+			return boundaryErr
+		}
+		if telemetryEnabled {
+			directCalls := (a.CompactForwardAccelerator.stats.KernelLaunches - launchesBefore) + (a.stats.CublasGemmCalls - cublasBefore)
+			a.telemetryAdd(backend.CompactTrainPhaseForwardDirect, backend.CompactTrainPhaseTelemetry{Completed: directCalls})
+			a.telemetryEventElapsed(backend.CompactTrainPhaseForwardDirect, directEvent)
 		}
 		if capture {
-			_ = a.captureForwardGraphLocked(graphKey, shape, arena, issueForward)
+			captureStart := time.Time{}
+			if telemetryEnabled {
+				captureStart = time.Now()
+			}
+			captureErr, captureProgress := a.captureForwardGraphLocked(graphKey, shape, arena, issueForward)
+			if telemetryEnabled {
+				graphUnknownNodes := captureProgress.GraphNodes - captureProgress.GraphKernelNodes - captureProgress.GraphCublasNodes
+				if graphUnknownNodes < 0 {
+					graphUnknownNodes = 0
+				}
+				failedIssue := boolInt64(captureProgress.IssueFailed)
+				beginDone := boolInt64(captureProgress.BeginCompleted)
+				endDone := boolInt64(captureProgress.EndCompleted)
+				instantiateDone := boolInt64(captureProgress.InstantiateDone)
+				attempted := captureProgress.GraphNodes + boolInt64(captureProgress.BeginCalled) + boolInt64(captureProgress.EndCalled) + boolInt64(captureProgress.InstantiateCalled) + failedIssue
+				capturePhase := backend.CompactTrainPhaseTelemetry{
+					GoCalls: boolInt64(captureProgress.BeginCalled) + boolInt64(captureProgress.EndCalled) + captureProgress.GraphNodes + failedIssue, ContextSets: captureProgress.ContextSets + captureProgress.GraphNodes + failedIssue,
+					DriverCalls: captureProgress.DriverCalls + failedIssue, GraphNodes: captureProgress.GraphNodes,
+					GraphKernelNodes: captureProgress.GraphKernelNodes, GraphCublasNodes: captureProgress.GraphCublasNodes,
+					GraphUnknownNodes: graphUnknownNodes, KernelLaunches: captureProgress.GraphKernelNodes,
+					CublasCalls: captureProgress.GraphCublasNodes, GraphBegin: beginDone, GraphEnd: endDone, GraphInstantiate: instantiateDone,
+					HostNanos: compactTelemetrySince(captureStart), Attempted: attempted,
+				}
+				if captureErr != nil {
+					capturePhase.Failures = 1
+					capturePhase.FailureStage = "capture"
+				} else {
+					capturePhase.Completed = captureProgress.GraphNodes + beginDone + endDone + instantiateDone
+				}
+				a.telemetryAdd(backend.CompactTrainPhaseForwardCapture, capturePhase)
+			}
+			if captureErr != nil {
+				// Capture failure is intentionally best-effort, matching the
+				// pre-existing direct fallback contract.
+				return nil
+			}
 		}
 		return nil
 	}
@@ -2648,20 +3317,47 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	graphKey := ""
 	var graphEntry *compactTrainForwardGraph
 	graphReplayed := false
+	var replayEvent bool
 	if graphEnabled {
 		graphKey = a.compactTrainForwardGraphKeyLocked(shape, arena)
 		graphEntry, graphReplayed = a.forwardGraphLookupOrCapture(graphKey, shape, arena)
 		if graphReplayed {
+			replayStart := time.Time{}
+			if telemetryEnabled {
+				replayStart = time.Now()
+				replayEvent = a.telemetryEventStart(backend.CompactTrainPhaseForwardReplay)
+			}
 			if replayErr := a.forwardGraphReplay(graphEntry); replayErr != nil {
+				if telemetryEnabled && replayEvent {
+					_ = a.telemetryEventEnd(backend.CompactTrainPhaseForwardReplay)
+				}
+				replayEvent = false
+				if telemetryEnabled {
+					a.telemetryAdd(backend.CompactTrainPhaseForwardReplay, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, HostNanos: compactTelemetrySince(replayStart), Attempted: 1, Failures: 1, FailureStage: "graph_launch"})
+				}
 				a.stats.GraphReplayFailures++
 				a.stats.GraphFallbacks++
 				if drainErr := a.drainForwardGraphFailureLocked(); drainErr != nil {
 					graphBoundaryDrainFailed = true
 					return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward graph replay failed: %v (drain: %w)", replayErr, drainErr)
 				}
+				if telemetryEnabled {
+					// This is the recovery drain after a failed workload
+					// boundary; it is a completed synchronization, not completed
+					// graph work. Keep workload Completed at zero.
+					a.telemetryAdd(backend.CompactTrainPhaseForwardBoundary, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, StreamSynchronizes: 1, Attempted: 1})
+				}
 				a.forwardGraphInvalidateArenaLocked(arena, "replay-failure")
 				graphReplayed = false
 			} else {
+				replayEventEnded := false
+				if telemetryEnabled && replayEvent {
+					replayEventEnded = a.telemetryEventEnd(backend.CompactTrainPhaseForwardReplay)
+				}
+				replayEvent = replayEvent && replayEventEnded
+				if telemetryEnabled {
+					a.telemetryAdd(backend.CompactTrainPhaseForwardReplay, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, GraphLaunches: 1, HostNanos: compactTelemetrySince(replayStart), Attempted: 1, Enqueued: 1})
+				}
 				// Count the enqueue immediately, but defer replay/executed-node
 				// success until the existing forward boundary completes. A
 				// boundary error leaves completion unknown and must not be
@@ -2677,6 +3373,12 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		}
 	} else {
 		var boundaryErr error
+		boundaryStart := time.Time{}
+		syncsBefore := int64(0)
+		if telemetryEnabled {
+			boundaryStart = time.Now()
+			syncsBefore = a.CompactForwardAccelerator.stats.KernelSynchronizations
+		}
 		if a.debugForceForwardGraphBoundaryFailure {
 			// The enqueue above is real; force only the first boundary result and
 			// let drainForwardGraphFailureLocked perform the actual safe wait.
@@ -2684,6 +3386,17 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 			boundaryErr = fmt.Errorf("cuda compact train forward graph boundary forced failure")
 		} else {
 			boundaryErr = a.synchronizeKernelBoundary()
+		}
+		if telemetryEnabled {
+			syncDelta := a.CompactForwardAccelerator.stats.KernelSynchronizations - syncsBefore
+			boundary := backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: syncDelta, StreamSynchronizes: syncDelta, HostNanos: compactTelemetrySince(boundaryStart), Attempted: 1, Completed: syncDelta}
+			if boundaryErr != nil {
+				boundary.DriverCalls = 1
+				boundary.StreamSynchronizes = 1
+				boundary.Failures = 1
+				boundary.FailureStage = "boundary"
+			}
+			a.telemetryAdd(backend.CompactTrainPhaseForwardBoundary, boundary)
 		}
 		if boundaryErr != nil {
 			// The graph launch was accepted but its completion is unknown. Drain
@@ -2697,12 +3410,27 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 				graphBoundaryDrainFailed = true
 				return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward graph boundary failed: %v (drain: %w)", boundaryErr, drainErr)
 			}
+			if telemetryEnabled {
+				// Recovery drain completion does not make the failed graph
+				// launch complete; preserve replay Completed=0.
+				a.telemetryAdd(backend.CompactTrainPhaseForwardBoundary, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, StreamSynchronizes: 1, Attempted: 1})
+			}
 			// A failed graph may have left gather's status word set. Reset it
 			// before the canonical direct body is submitted, then reuse the
 			// normal direct path below. The graph's failed replay contributes no
 			// replay or executed-node count.
+			statusResetStart := time.Time{}
+			if telemetryEnabled {
+				statusResetStart = time.Now()
+			}
 			if err := a.device.copyInt32ToBuffer(arena.status, []int32{0}); err != nil {
+				if telemetryEnabled {
+					a.telemetryAdd(backend.CompactTrainPhaseInputH2D, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, H2DCopies: 1, H2DBytes: 0, HostNanos: compactTelemetrySince(statusResetStart), Attempted: 1, Failures: 1, FailureStage: "h2d"})
+				}
 				return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward graph fallback status reset failed: %w", err)
+			}
+			if telemetryEnabled {
+				a.telemetryAdd(backend.CompactTrainPhaseInputH2D, backend.CompactTrainPhaseTelemetry{GoCalls: 1, ContextSets: 1, DriverCalls: 1, H2DCopies: 1, H2DBytes: 4, HostNanos: compactTelemetrySince(statusResetStart), Attempted: 1, Completed: 1})
 			}
 			uploaded += 4
 			a.stats.GraphFallbacks++
@@ -2712,6 +3440,10 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 			a.stats.GraphReplays++
 			forwardGraphNodesExecuted = graphEntry.nodes
 			a.stats.GraphExecutedNodes += graphEntry.nodes
+			if telemetryEnabled {
+				a.telemetryAdd(backend.CompactTrainPhaseForwardReplay, backend.CompactTrainPhaseTelemetry{Completed: 1})
+				a.telemetryEventElapsed(backend.CompactTrainPhaseForwardReplay, replayEvent)
+			}
 		}
 		if !graphReplayed {
 			// Keep the existing first-call policy: direct fallback returns its
@@ -2724,6 +3456,10 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	status := []int32{0}
 	pooled := make([]float32, B*O)
 	activeCounts := make([]int32, B)
+	readbackStart := time.Time{}
+	if telemetryEnabled {
+		readbackStart = time.Now()
+	}
 	readback, readbackErr := a.device.downloadCompactTrainForwardReadback(status, pooled, activeCounts, arena.status, arena.finalPooled, arena.active)
 	if readback.StatusCopied {
 		statusBytes = int64(len(status) * 4)
@@ -2733,6 +3469,10 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 	}
 	if readback.ActiveCopied {
 		activeBytes = int64(len(activeCounts) * 4)
+	}
+	if telemetryEnabled {
+		readbackPhase := compactTrainReadbackTelemetry(readback, statusBytes, pooledBytes, activeBytes, compactTelemetrySince(readbackStart), readbackErr)
+		a.telemetryAdd(backend.CompactTrainPhaseK6Readback, readbackPhase)
 	}
 	if readbackErr != nil {
 		return backend.CompactTrainForwardResult{}, readbackErr

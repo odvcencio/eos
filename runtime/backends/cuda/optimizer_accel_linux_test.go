@@ -5,6 +5,7 @@ package cuda
 import (
 	"errors"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -76,7 +77,7 @@ func TestCUDAOptimizerAcceleratorKeepsResidentStateAcrossUpdates(t *testing.T) {
 	if err := accel.PreflightApplyUpdate("projection", cfg, preflightParam, preflightMom1, preflightMom2, preflightGrad); err != nil {
 		t.Fatalf("repeated optimizer preflight: %v", err)
 	}
-	if after := accel.Stats(); after != beforePreflight {
+	if after := accel.Stats(); !reflect.DeepEqual(after, beforePreflight) {
 		t.Fatalf("optimizer preflight mutated stats: before=%+v after=%+v", beforePreflight, after)
 	}
 	assertCloseF32Slice(t, "preflight param", preflightParam.F32, param.F32, 0)
@@ -390,10 +391,10 @@ func TestCUDAOptimizerApplyUpdateWithResidentGradParityAndFailures(t *testing.T)
 	if err := trainOpt.PreflightApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, gradRef); err != nil {
 		t.Fatalf("repeated resident grad preflight: %v", err)
 	}
-	if after := trainOpt.Stats(); after != beforePreflight {
+	if after := trainOpt.Stats(); !reflect.DeepEqual(after, beforePreflight) {
 		t.Fatalf("resident grad preflight mutated optimizer stats: before=%+v after=%+v", beforePreflight, after)
 	}
-	if after := trainAccel.CompactTrainStats(); after != beforeTrainPreflight {
+	if after := trainAccel.CompactTrainStats(); !reflect.DeepEqual(after, beforeTrainPreflight) {
 		t.Fatalf("resident grad preflight mutated compact train stats: before=%+v after=%+v", beforeTrainPreflight, after)
 	}
 	beforeResident := trainOpt.Stats()
@@ -479,7 +480,7 @@ func TestCUDAOptimizerResidentGradBatchPreflightRejectsInvalidSets(t *testing.T)
 	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{updateA}); err != nil {
 		t.Fatalf("valid batch preflight: %v", err)
 	}
-	if after := opt.Stats(); after != before {
+	if after := opt.Stats(); !reflect.DeepEqual(after, before) {
 		t.Fatalf("valid batch preflight changed optimizer stats: before=%+v after=%+v", before, after)
 	}
 
@@ -525,7 +526,7 @@ func TestCUDAOptimizerResidentGradBatchPreflightRejectsInvalidSets(t *testing.T)
 	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{updateA, updateB}); err == nil || !strings.Contains(err.Error(), "mixes gradient owners") {
 		t.Fatalf("mixed-owner batch preflight err = %v, want mixed owners", err)
 	}
-	if after := opt.Stats(); after != beforeMixed {
+	if after := opt.Stats(); !reflect.DeepEqual(after, beforeMixed) {
 		t.Fatalf("rejected mixed-owner batch preflight changed optimizer stats: before=%+v after=%+v", beforeMixed, after)
 	}
 }

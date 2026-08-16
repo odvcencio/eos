@@ -321,6 +321,15 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		return nil
 	}
 	out := *end
+	if end.Telemetry != nil {
+		if start != nil {
+			out.Telemetry = backend.DiffCompactTrainTelemetry(start.Telemetry, end.Telemetry)
+		} else {
+			out.Telemetry = backend.DiffCompactTrainTelemetry(nil, end.Telemetry)
+		}
+	} else {
+		out.Telemetry = nil
+	}
 	if start != nil {
 		out.ForwardCalls -= start.ForwardCalls
 		out.BackwardCalls -= start.BackwardCalls
@@ -378,6 +387,7 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 	out := backend.CompactTrainAcceleratorStats{}
 	if left != nil {
 		out = *left
+		out.Telemetry = backend.CloneCompactTrainTelemetry(left.Telemetry)
 	}
 	if right != nil {
 		out.ForwardCalls += right.ForwardCalls
@@ -428,6 +438,7 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.ForwardNanos += right.ForwardNanos
 		out.BackwardNanos += right.BackwardNanos
 		out.OptimizerResidentGradNanos += right.OptimizerResidentGradNanos
+		out.Telemetry = backend.AddCompactTrainTelemetry(out.Telemetry, right.Telemetry)
 		out.LastShape = right.LastShape
 		out.LastForwardLaunches = right.LastForwardLaunches
 		out.LastBackwardLaunches = right.LastBackwardLaunches
@@ -496,6 +507,7 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 		profile.Optimizer.DownloadedBytes != 0 ||
 		profile.Optimizer.UpdateNanos != 0 ||
 		profile.Optimizer.SyncNanos != 0 ||
+		profile.Optimizer.CompactTrainTelemetry != nil ||
 		profile.Activation.BindCalls != 0 ||
 		profile.Activation.GELUBackwardCalls != 0 ||
 		profile.Activation.SoftmaxBackwardCalls != 0 ||
@@ -575,6 +587,7 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 			ResidentGradUpdateNanos:         left.Optimizer.ResidentGradUpdateNanos + right.Optimizer.ResidentGradUpdateNanos,
 			SyncNanos:                       left.Optimizer.SyncNanos + right.Optimizer.SyncNanos,
 			ResidentParams:                  left.Optimizer.ResidentParams,
+			CompactTrainTelemetry:           backend.AddCompactTrainTelemetry(left.Optimizer.CompactTrainTelemetry, right.Optimizer.CompactTrainTelemetry),
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              left.Activation.BindCalls + right.Activation.BindCalls,
@@ -692,6 +705,7 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 			ResidentGradUpdateNanos:         base.Optimizer.ResidentGradUpdateNanos + delta.Optimizer.ResidentGradUpdateNanos,
 			SyncNanos:                       base.Optimizer.SyncNanos + delta.Optimizer.SyncNanos,
 			ResidentParams:                  base.Optimizer.ResidentParams,
+			CompactTrainTelemetry:           backend.AddCompactTrainTelemetry(base.Optimizer.CompactTrainTelemetry, delta.Optimizer.CompactTrainTelemetry),
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              base.Activation.BindCalls + delta.Activation.BindCalls,
@@ -778,6 +792,7 @@ func diffTrainProfile(start, end EmbeddingTrainProfile) EmbeddingTrainProfile {
 			ResidentGradUpdateNanos:         end.Optimizer.ResidentGradUpdateNanos - start.Optimizer.ResidentGradUpdateNanos,
 			SyncNanos:                       end.Optimizer.SyncNanos - start.Optimizer.SyncNanos,
 			ResidentParams:                  end.Optimizer.ResidentParams,
+			CompactTrainTelemetry:           backend.DiffCompactTrainTelemetry(start.Optimizer.CompactTrainTelemetry, end.Optimizer.CompactTrainTelemetry),
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              end.Activation.BindCalls - start.Activation.BindCalls,

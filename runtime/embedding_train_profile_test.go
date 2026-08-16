@@ -1,7 +1,9 @@
 package eosruntime
 
 import (
+	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -12,6 +14,144 @@ func TestDefaultEmbeddingTrainProfilePath(t *testing.T) {
 	got := DefaultEmbeddingTrainProfilePath("/tmp/tiny_train_embed_q8.mll")
 	if want := "/tmp/tiny_train_embed_q8.train-profile.mll"; got != want {
 		t.Fatalf("training profile path = %q, want %q", got, want)
+	}
+}
+
+func TestCompactTrainTelemetryDeltaAndAggregation(t *testing.T) {
+	forward := backend.CompactTrainTelemetryPhaseIndex(backend.CompactTrainPhaseForwardDirect)
+	if forward < 0 {
+		t.Fatal("forward telemetry phase has no stable index")
+	}
+	start := &backend.CompactTrainTelemetry{Enabled: true}
+	start.Phases[forward] = backend.CompactTrainPhaseTelemetry{GoCalls: 2, HostNanos: 10, FailIndex: 3, HasFailIndex: true, Failures: 1, FailureStage: "launch"}
+	end := *start
+	end.EventTiming = true
+	end.Phases[forward] = backend.CompactTrainPhaseTelemetry{GoCalls: 7, DriverCalls: 5, HostNanos: 40, DeviceElapsedNanos: 9, Failures: 2, FailIndex: 4, HasFailIndex: true, FailureStage: "launch"}
+	delta := backend.DiffCompactTrainTelemetry(start, &end)
+	got := delta.Phases[forward]
+	if got.GoCalls != 5 || got.DriverCalls != 5 || got.HostNanos != 30 || got.DeviceElapsedNanos != 9 || got.FailIndex != 4 || !got.HasFailIndex || got.FailureStage != "launch" || !delta.EventTiming {
+		t.Fatalf("telemetry delta = %+v, want go=5 driver=5 host=30 device=9 fail=4 enabled event", got)
+	}
+	merged := backend.AddCompactTrainTelemetry(start, delta)
+	if merged.Phases[forward] != end.Phases[forward] || !merged.Enabled || !merged.EventTiming {
+		t.Fatalf("telemetry aggregation = %+v, want end phase %+v", merged.Phases[forward], end.Phases[forward])
+	}
+	if got := backend.AddCompactTrainTelemetry(&end, nil).Phases[forward].FailIndex; got != end.Phases[forward].FailIndex {
+		t.Fatalf("zero telemetry aggregation changed failure index to %d", got)
+	}
+}
+
+func TestCompactTrainTelemetryEventControlsAndViews(t *testing.T) {
+	index := backend.CompactTrainTelemetryPhaseIndex(backend.CompactTrainPhaseK5Batch)
+	start := &backend.CompactTrainTelemetry{
+		Enabled: true,
+		View:    backend.CompactTrainTelemetryViewCompactTrain,
+	}
+	start.Phases[index] = backend.CompactTrainPhaseTelemetry{Completed: 3}
+	start.SetPhasePresent(index)
+	end := backend.CloneCompactTrainTelemetry(start)
+	end.View = backend.CompactTrainTelemetryViewOptimizer
+	end.Phases[index].EventControlFailures = 1
+	end.Phases[index].EventControlStage = "event_query"
+	end.SetPhasePresent(index)
+	delta := backend.DiffCompactTrainTelemetry(start, end)
+	got := delta.Phases[index]
+	if delta.View != backend.CompactTrainTelemetryViewMixed || got.Completed != 0 || got.Failures != 0 || got.EventControlFailures != 1 || got.EventControlStage != "event_query" {
+		t.Fatalf("event-control delta = view=%q phase=%+v, want mixed/event-only delta", delta.View, got)
+	}
+	merged := backend.AddCompactTrainTelemetry(start, delta)
+	if merged.View != backend.CompactTrainTelemetryViewMixed || merged.Phases[index].Completed != 3 || merged.Phases[index].EventControlFailures != 1 || merged.Phases[index].Failures != 0 {
+		t.Fatalf("event-control aggregation = view=%q phase=%+v", merged.View, merged.Phases[index])
+	}
+	encoded, err := json.Marshal(merged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"view":"mixed"`) || !strings.Contains(string(encoded), `"event_control_stage":"event_query"`) {
+		t.Fatalf("event-control/view JSON = %s", encoded)
+	}
+	var decoded backend.CompactTrainTelemetry
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.View != merged.View || decoded.Phases[index] != merged.Phases[index] {
+		t.Fatalf("event-control/view round-trip = %+v, want %+v", decoded, *merged)
+	}
+}
+
+func TestCompactTrainTelemetryOptionalNamedJSONAndDeepCopy(t *testing.T) {
+	zeroStats, err := json.Marshal(backend.CompactTrainAcceleratorStats{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(zeroStats), "telemetry") {
+		t.Fatalf("default compact stats unexpectedly serialized telemetry: %s", zeroStats)
+	}
+	zeroProfile, err := json.Marshal(EmbeddingTrainProfile{Version: EmbeddingTrainProfileVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(zeroProfile), "compact_train_telemetry") || strings.Contains(string(zeroProfile), "\"telemetry\"") {
+		t.Fatalf("default profile unexpectedly serialized telemetry: %s", zeroProfile)
+	}
+
+	index := backend.CompactTrainTelemetryPhaseIndex(backend.CompactTrainPhaseForwardDirect)
+	telemetry := &backend.CompactTrainTelemetry{Enabled: true}
+	telemetry.Phases[index] = backend.CompactTrainPhaseTelemetry{GoCalls: 2, Failures: 1, FailIndex: 0, HasFailIndex: true, FailureStage: "launch"}
+	telemetry.SetPhasePresent(index)
+	stats := backend.CompactTrainAcceleratorStats{Telemetry: telemetry}
+	encoded, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), "\"schema_version\":1") || !strings.Contains(string(encoded), "forward_direct") || strings.Contains(string(encoded), "\"phases\":[") || strings.Contains(string(encoded), "context_attempt") || strings.Contains(string(encoded), "context_success") {
+		t.Fatalf("enabled telemetry schema is not named/versioned: %s", encoded)
+	}
+	var decoded backend.CompactTrainAcceleratorStats
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Telemetry == nil || decoded.Telemetry.Phases[index] != telemetry.Phases[index] {
+		t.Fatalf("named telemetry round-trip lost phase: got %+v want %+v", decoded.Telemetry, telemetry)
+	}
+	clone := backend.CloneCompactTrainTelemetry(telemetry)
+	clone.Phases[index].GoCalls = 99
+	if telemetry.Phases[index].GoCalls == 99 {
+		t.Fatal("telemetry clone aliases source phase array")
+	}
+	profileClone := addCompactTrainStats(&stats, nil)
+	profileClone.Telemetry.Phases[index].GoCalls = 77
+	if stats.Telemetry.Phases[index].GoCalls == 77 {
+		t.Fatal("profile stats clone aliases source telemetry")
+	}
+}
+
+func TestCompactTrainTelemetryFailureDeltaPresenceAndReset(t *testing.T) {
+	index := backend.CompactTrainTelemetryPhaseIndex(backend.CompactTrainPhaseForwardDirect)
+	start := &backend.CompactTrainTelemetry{Enabled: true}
+	start.Phases[index] = backend.CompactTrainPhaseTelemetry{Failures: 1, FailIndex: 0, HasFailIndex: true, FailureStage: "launch"}
+	start.SetPhasePresent(index)
+	noActivity := backend.DiffCompactTrainTelemetry(start, start)
+	noActivityJSON, err := json.Marshal(noActivity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(noActivityJSON), "forward_direct") {
+		t.Fatalf("no-activity delta re-emitted stale empty phase: %s", noActivityJSON)
+	}
+	success := *start
+	success.Phases[index].GoCalls = 3
+	delta := backend.DiffCompactTrainTelemetry(start, &success)
+	if got := delta.Phases[index]; got.Failures != 0 || got.HasFailIndex || got.FailIndex != 0 || got.FailureStage != "" {
+		t.Fatalf("no-new-failure delta repeated metadata: %+v", got)
+	}
+	merged := backend.AddCompactTrainTelemetry(start, delta)
+	if got := merged.Phases[index]; !got.HasFailIndex || got.FailIndex != 0 || got.FailureStage != "launch" {
+		t.Fatalf("success add lost prior failure metadata: %+v", got)
+	}
+	backend.ResetCompactTrainTelemetry(merged)
+	if merged.Enabled || merged.Phases[index] != (backend.CompactTrainPhaseTelemetry{}) {
+		t.Fatalf("telemetry reset retained state: %+v", merged)
 	}
 }
 

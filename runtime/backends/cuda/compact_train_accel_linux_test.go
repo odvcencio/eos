@@ -11,6 +11,554 @@ import (
 	"m31labs.dev/eos/runtime/backend"
 )
 
+func TestCompactTrainProfileEventsDefaultOffAndPhaseClassification(t *testing.T) {
+	previous := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = false
+	defer func() { eosCudaCompactProfileEventsEnabled = previous }()
+	accel := &CompactTrainAccelerator{}
+	accel.telemetryAdd(backend.CompactTrainPhaseForwardDirect, backend.CompactTrainPhaseTelemetry{GoCalls: 3, DriverCalls: 3})
+	if accel.stats.Telemetry != nil || accel.CompactTrainStats().Telemetry != nil {
+		t.Fatalf("default-off telemetry = %+v, want zero", accel.stats.Telemetry)
+	}
+
+	eosCudaCompactProfileEventsEnabled = true
+	accel.telemetryAdd(backend.CompactTrainPhaseForwardDirect, backend.CompactTrainPhaseTelemetry{GoCalls: 3, DriverCalls: 3, Completed: 1})
+	accel.telemetryAdd(backend.CompactTrainPhaseForwardCapture, backend.CompactTrainPhaseTelemetry{GraphBegin: 1, GraphEnd: 1, GraphInstantiate: 1, Completed: 1})
+	accel.telemetryAdd(backend.CompactTrainPhaseForwardReplay, backend.CompactTrainPhaseTelemetry{GraphLaunches: 1, Completed: 1})
+	if accel.stats.Telemetry == nil {
+		t.Fatal("enabled telemetry remained nil")
+	}
+	for phase, want := range map[backend.CompactTrainTelemetryPhase]backend.CompactTrainPhaseTelemetry{
+		backend.CompactTrainPhaseForwardDirect:  {GoCalls: 3, DriverCalls: 3, Completed: 1},
+		backend.CompactTrainPhaseForwardCapture: {GraphBegin: 1, GraphEnd: 1, GraphInstantiate: 1, Completed: 1},
+		backend.CompactTrainPhaseForwardReplay:  {GraphLaunches: 1, Completed: 1},
+	} {
+		index := backend.CompactTrainTelemetryPhaseIndex(phase)
+		if got := accel.stats.Telemetry.Phases[index]; got != want {
+			t.Fatalf("phase %q = %+v, want %+v", phase, got, want)
+		}
+	}
+}
+
+func TestCompactTrainTelemetryEnabledAddDoesNotAllocateAfterWarmup(t *testing.T) {
+	previous := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previous }()
+	accel := &CompactTrainAccelerator{}
+	delta := backend.CompactTrainPhaseTelemetry{GoCalls: 1, DriverCalls: 1, Completed: 1}
+	accel.telemetryAdd(backend.CompactTrainPhaseForwardDirect, delta)
+	allocs := testing.AllocsPerRun(100, func() {
+		accel.telemetryAdd(backend.CompactTrainPhaseForwardDirect, delta)
+	})
+	if allocs != 0 {
+		t.Fatalf("warm compact telemetryAdd allocations = %v, want 0", allocs)
+	}
+	opt := &optimizerAccelerator{}
+	opt.addCompactTrainTelemetry(backend.CompactTrainPhaseK5Batch, delta)
+	allocs = testing.AllocsPerRun(100, func() {
+		opt.addCompactTrainTelemetry(backend.CompactTrainPhaseK5Batch, delta)
+	})
+	if allocs != 0 {
+		t.Fatalf("warm optimizer telemetryAdd allocations = %v, want 0", allocs)
+	}
+}
+
+func TestCompactTrainProfileEventWrapperValidationAndCleanup(t *testing.T) {
+	previous := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previous }()
+	rt := &deviceRuntime{}
+	if _, _, err := rt.profileEventPairLocked(""); err == nil {
+		t.Fatal("empty event phase unexpectedly accepted")
+	}
+	if err := rt.profileEventRecord("forward_direct", false); err == nil {
+		t.Fatal("uninitialized runtime event record unexpectedly succeeded")
+	}
+	if err := rt.profileEventRecord("forward_direct", true); err == nil {
+		t.Fatal("end event without a start unexpectedly succeeded")
+	}
+	if err := rt.profileEventBindK5End("forward_direct", false); err == nil {
+		t.Fatal("event unbind on a closed runtime unexpectedly succeeded")
+	}
+	if _, called, _, err := rt.profileEventElapsedStats("forward_direct"); err == nil || called {
+		t.Fatalf("event elapsed on a closed runtime = called=%t err=%v, want fail-closed", called, err)
+	}
+	if recorded, _ := rt.profileEventK5EndProgress(); recorded {
+		t.Fatal("closed runtime reported a recorded K5 event")
+	}
+	rt.destroyProfileEvents()
+	if len(rt.profileEvents) != 0 {
+		t.Fatalf("event cleanup retained %d pairs", len(rt.profileEvents))
+	}
+}
+
+func TestCompactTrainEventProgressAccounting(t *testing.T) {
+	tests := []struct {
+		name       string
+		progress   profileEventProgress
+		failed     bool
+		fallback   string
+		wantCtx    int64
+		wantDriver int64
+		wantFail   int64
+		wantStage  string
+	}{
+		{
+			name:       "event create driver failure",
+			progress:   profileEventProgress{ContextSetAttempts: 1, ContextSetSuccesses: 1, DriverAttempted: 2, DriverSucceeded: 1, FailureStage: "event_create"},
+			wantCtx:    1,
+			wantDriver: 2,
+			wantFail:   1,
+			wantStage:  "event_create",
+		},
+		{
+			name:       "event record context failure",
+			progress:   profileEventProgress{ContextSetAttempts: 1, FailureStage: "context"},
+			wantCtx:    1,
+			wantDriver: 0,
+			wantFail:   1,
+			wantStage:  "context",
+		},
+		{
+			name:       "event query driver failure",
+			progress:   profileEventProgress{ContextSetAttempts: 1, ContextSetSuccesses: 1, DriverAttempted: 1, FailureStage: "event_query"},
+			wantCtx:    1,
+			wantDriver: 1,
+			wantFail:   1,
+			wantStage:  "event_query",
+		},
+		{
+			name:      "go validation failure",
+			failed:    true,
+			fallback:  "validation",
+			wantFail:  1,
+			wantStage: "validation",
+		},
+		{
+			name:       "successful event control",
+			progress:   profileEventProgress{ContextSetAttempts: 1, ContextSetSuccesses: 1, DriverAttempted: 1, DriverSucceeded: 1},
+			wantCtx:    1,
+			wantDriver: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			delta := backend.CompactTrainPhaseTelemetry{}
+			addCompactTrainEventProgress(&delta, test.progress, test.failed, test.fallback)
+			if delta.ContextSets != test.wantCtx || delta.DriverCalls != test.wantDriver || delta.EventControlFailures != test.wantFail || delta.EventControlStage != test.wantStage {
+				t.Fatalf("event progress = %+v, want context=%d driver=%d failures=%d stage=%q", delta, test.wantCtx, test.wantDriver, test.wantFail, test.wantStage)
+			}
+		})
+	}
+	// K5's in-batch end marker uses the same accounting path. A failed
+	// cuEventRecord is an attempted driver operation but not a successful
+	// EventRecord.
+	k5 := backend.CompactTrainPhaseTelemetry{}
+	k5.EventRecords = 0
+	addCompactTrainEventProgress(&k5, profileEventProgress{ContextSetAttempts: 1, ContextSetSuccesses: 1, DriverAttempted: 1, FailureStage: "event_record"}, false, "")
+	if k5.ContextSets != 1 || k5.DriverCalls != 1 || k5.EventRecords != 0 || k5.EventControlFailures != 1 || k5.EventControlStage != "event_record" {
+		t.Fatalf("K5 failed end-record accounting = %+v", k5)
+	}
+}
+
+func TestCompactTrainTelemetryContextBoundaryIdentities(t *testing.T) {
+	// L=2 static warm topology from the audit. Each successful phase entry
+	// contributes one attempted context set; graph replay replaces the direct
+	// forward body with one graph launch. K8 replaces four input bridges with
+	// one bridge while retaining four copies.
+	sum := func(input, forward, final, ffnAttention, ropeScatter int64) int64 {
+		return 1 + input + forward + 1 + 1 + final + ffnAttention + ropeScatter + 1 + 1 + 1
+	}
+	if got := sum(4, 24, 2, 40, 2); got != 78 {
+		t.Fatalf("canonical scalar graph-off context identity = %d, want 78", got)
+	}
+	if got := sum(4, 22, 1, 40, 2); got != 75 {
+		t.Fatalf("next scalar graph-off context identity = %d, want 75", got)
+	}
+	if got := sum(1, 24, 2, 40, 2); got != 75 {
+		t.Fatalf("canonical K8 graph-off context identity = %d, want 75", got)
+	}
+	if got := sum(1, 22, 1, 40, 2); got != 72 {
+		t.Fatalf("next K8 graph-off context identity = %d, want 72", got)
+	}
+	if got := 1 + 4 + 1 + 1 + 1 + 2 + 40 + 2 + 1 + 1 + 1; got != 55 {
+		t.Fatalf("canonical scalar graph-replay context identity = %d, want 55", got)
+	}
+	if got := 1 + 4 + 1 + 1 + 1 + 1 + 40 + 2 + 1 + 1 + 1; got != 54 {
+		t.Fatalf("next scalar graph-replay context identity = %d, want 54", got)
+	}
+	if got := 1 + 1 + 1 + 1 + 1 + 2 + 40 + 2 + 1 + 1 + 1; got != 52 {
+		t.Fatalf("canonical K8 graph-replay context identity = %d, want 52", got)
+	}
+	if got := 1 + 1 + 1 + 1 + 1 + 1 + 40 + 2 + 1 + 1 + 1; got != 51 {
+		t.Fatalf("next K8 graph-replay context identity = %d, want 51", got)
+	}
+}
+
+func TestOptimizerTelemetrySnapshotDeepCopy(t *testing.T) {
+	previous := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previous }()
+	index := backend.CompactTrainTelemetryPhaseIndex(backend.CompactTrainPhaseK5Batch)
+	a := &optimizerAccelerator{
+		resident: map[string]residentOptimizerState{},
+		stats:    backend.OptimizerAcceleratorStats{CompactTrainTelemetry: &backend.CompactTrainTelemetry{Enabled: true}},
+	}
+	a.stats.CompactTrainTelemetry.Phases[index].GoCalls = 3
+	a.stats.CompactTrainTelemetry.SetPhasePresent(index)
+	snapshot := a.Stats()
+	if snapshot.CompactTrainTelemetry == nil {
+		t.Fatal("optimizer snapshot lost enabled telemetry")
+	}
+	snapshot.CompactTrainTelemetry.Phases[index].GoCalls = 99
+	if a.stats.CompactTrainTelemetry.Phases[index].GoCalls == 99 {
+		t.Fatal("optimizer stats snapshot aliases telemetry")
+	}
+}
+
+func TestOptimizerBatchProgressPreflightDoesNotClaimWork(t *testing.T) {
+	rt := &deviceRuntime{}
+	progress := rt.launchOptimizerUpdateBatchWithProgress(nil, []optimizerUpdateLaunch{{elements: 1}})
+	if progress.Called || progress.DescriptorAllocated || progress.Attempted != 0 || progress.Enqueued != 0 || progress.FailureStage != "preflight" {
+		t.Fatalf("preflight progress = %+v, want no bridge/descriptor/work", progress)
+	}
+	if optimizerUpdateBatchFailureStage(4) != "launch" || optimizerUpdateBatchFailureStage(5) != "barrier" || optimizerUpdateBatchFailureStage(6) != "drain" {
+		t.Fatal("optimizer batch failure-stage mapping changed")
+	}
+}
+
+func TestCompactTrainK5WorkloadTelemetryProgress(t *testing.T) {
+	tests := []struct {
+		name      string
+		progress  optimizerUpdateBatchProgress
+		wantTry   int64
+		wantQueue int64
+		wantDone  int64
+		wantDrv   int64
+		wantSync  int64
+		wantAlloc int64
+		wantStage string
+		wantIndex bool
+	}{
+		{
+			name:      "preflight",
+			progress:  optimizerUpdateBatchProgress{FailureStage: "preflight", Err: fmt.Errorf("validation"), FailIndex: -1},
+			wantStage: "preflight",
+		},
+		{
+			name:      "launch index zero",
+			progress:  optimizerUpdateBatchProgress{Called: true, DescriptorAllocated: true, Attempted: 1, FailureStage: "launch", FailIndex: 0, Err: fmt.Errorf("launch")},
+			wantTry:   1,
+			wantDrv:   2,
+			wantSync:  1,
+			wantAlloc: 1,
+			wantStage: "launch",
+			wantIndex: true,
+		},
+		{
+			name:      "barrier after prefix",
+			progress:  optimizerUpdateBatchProgress{Called: true, DescriptorAllocated: true, Attempted: 3, Enqueued: 3, FailureStage: "barrier", FailIndex: -1, Err: fmt.Errorf("barrier")},
+			wantTry:   3,
+			wantQueue: 3,
+			wantDrv:   4,
+			wantSync:  1,
+			wantAlloc: 1,
+			wantStage: "barrier",
+		},
+		{
+			name:      "drain retains launch index",
+			progress:  optimizerUpdateBatchProgress{Called: true, DescriptorAllocated: true, Attempted: 1, FailureStage: "drain", FailIndex: 0, Err: fmt.Errorf("launch; drain")},
+			wantTry:   1,
+			wantDrv:   2,
+			wantSync:  1,
+			wantAlloc: 1,
+			wantStage: "drain",
+			wantIndex: true,
+		},
+		{
+			name:      "success",
+			progress:  optimizerUpdateBatchProgress{Called: true, DescriptorAllocated: true, Attempted: 3, Enqueued: 3, FailIndex: -1},
+			wantTry:   3,
+			wantQueue: 3,
+			wantDone:  3,
+			wantDrv:   4,
+			wantSync:  1,
+			wantAlloc: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := compactTrainK5WorkloadTelemetry(test.progress)
+			if got.Attempted != test.wantTry || got.Enqueued != test.wantQueue || got.Completed != test.wantDone || got.DriverCalls != test.wantDrv || got.StreamSynchronizes != test.wantSync || got.HostDescriptorAllocs != test.wantAlloc || got.FailureStage != test.wantStage || got.HasFailIndex != test.wantIndex {
+				t.Fatalf("K5 workload telemetry = %+v, want attempted=%d enqueued=%d completed=%d driver=%d sync=%d alloc=%d stage=%q index=%t", got, test.wantTry, test.wantQueue, test.wantDone, test.wantDrv, test.wantSync, test.wantAlloc, test.wantStage, test.wantIndex)
+			}
+			if test.name == "launch index zero" && got.FailIndex != 0 {
+				t.Fatalf("launch index-zero telemetry lost index: %+v", got)
+			}
+			if test.name == "preflight" && (got.GoCalls != 0 || got.ContextSets != 0 || got.DriverCalls != 0) {
+				t.Fatalf("preflight invented bridge work: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCompactTrainReadbackTelemetryProgress(t *testing.T) {
+	statusFailure := compactTrainReadbackTelemetry(cudaCompactTrainForwardReadbackProgress{ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 3, CompletedCopies: 3, DeviceCopies: 3, StatusCopied: true, PooledCopied: true, ActiveCopied: true, StatusValue: 7}, 4, 8, 4, 10, nil)
+	if statusFailure.Attempted != 1 || statusFailure.Completed != 1 || statusFailure.Failures != 1 || statusFailure.FailureStage != "status" || statusFailure.DriverCalls != 1 {
+		t.Fatalf("status readback telemetry = %+v", statusFailure)
+	}
+	partial := compactTrainReadbackTelemetry(cudaCompactTrainForwardReadbackProgress{ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 1, CompletedCopies: 1, DeviceCopies: 1, StatusCopied: true}, 4, 0, 0, 10, fmt.Errorf("pooled d2h"))
+	if partial.Attempted != 2 || partial.Completed != 1 || partial.Failures != 1 || partial.FailureStage != "d2h" || partial.DriverCalls != 2 {
+		t.Fatalf("partial readback telemetry = %+v", partial)
+	}
+	success := compactTrainReadbackTelemetry(cudaCompactTrainForwardReadbackProgress{ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 3, CompletedCopies: 3, DeviceCopies: 3, StatusCopied: true, PooledCopied: true, ActiveCopied: true}, 4, 8, 4, 10, nil)
+	if success.Attempted != 3 || success.Completed != 3 || success.Failures != 0 || success.DriverCalls != 3 {
+		t.Fatalf("successful readback telemetry = %+v", success)
+	}
+}
+
+func TestCompactTrainReadbackTelemetryBoundaryAccounting(t *testing.T) {
+	tests := []struct {
+		name       string
+		progress   cudaCompactTrainForwardReadbackProgress
+		err        error
+		wantStage  string
+		wantDriver int64
+		wantCopies int64
+		wantBytes  int64
+		wantTry    int64
+		wantDone   int64
+	}{
+		{
+			name: "context failure",
+			progress: cudaCompactTrainForwardReadbackProgress{
+				ContextAttempted: true,
+				FailureStage:     "context",
+			},
+			err:        fmt.Errorf("context"),
+			wantStage:  "context",
+			wantDriver: 0,
+			wantCopies: 0,
+			wantBytes:  0,
+			wantTry:    0,
+			wantDone:   0,
+		},
+		{
+			name:      "validation before cgo",
+			progress:  cudaCompactTrainForwardReadbackProgress{FailureStage: "validation"},
+			err:       fmt.Errorf("validation"),
+			wantStage: "validation",
+		},
+		{
+			name: "status copy failure",
+			progress: cudaCompactTrainForwardReadbackProgress{
+				ContextAttempted: true, ContextSucceeded: true,
+				AttemptedCopies: 1, FailureStage: "status",
+			},
+			err:        fmt.Errorf("status"),
+			wantStage:  "status",
+			wantDriver: 1,
+			wantCopies: 0,
+			wantBytes:  0,
+			wantTry:    1,
+			wantDone:   0,
+		},
+		{
+			name: "pooled copy failure",
+			progress: cudaCompactTrainForwardReadbackProgress{
+				ContextAttempted: true, ContextSucceeded: true,
+				AttemptedCopies: 2, CompletedCopies: 1, StatusCopied: true, FailureStage: "pooled",
+			},
+			err:        fmt.Errorf("pooled"),
+			wantStage:  "pooled",
+			wantDriver: 2,
+			wantCopies: 1,
+			wantBytes:  4,
+			wantTry:    2,
+			wantDone:   1,
+		},
+		{
+			name: "active copy failure",
+			progress: cudaCompactTrainForwardReadbackProgress{
+				ContextAttempted: true, ContextSucceeded: true,
+				AttemptedCopies: 3, CompletedCopies: 2, StatusCopied: true, PooledCopied: true, FailureStage: "active",
+			},
+			err:        fmt.Errorf("active"),
+			wantStage:  "active",
+			wantDriver: 3,
+			wantCopies: 2,
+			wantBytes:  12,
+			wantTry:    3,
+			wantDone:   2,
+		},
+		{
+			name: "status word failure",
+			progress: cudaCompactTrainForwardReadbackProgress{
+				ContextAttempted: true, ContextSucceeded: true,
+				AttemptedCopies: 1, CompletedCopies: 1, StatusCopied: true, StatusValue: 7,
+			},
+			wantStage:  "status",
+			wantDriver: 1,
+			wantCopies: 1,
+			wantBytes:  4,
+			wantTry:    1,
+			wantDone:   1,
+		},
+		{
+			name: "success",
+			progress: cudaCompactTrainForwardReadbackProgress{
+				ContextAttempted: true, ContextSucceeded: true,
+				AttemptedCopies: 3, CompletedCopies: 3, StatusCopied: true, PooledCopied: true, ActiveCopied: true,
+			},
+			wantDriver: 3,
+			wantCopies: 3,
+			wantBytes:  16,
+			wantTry:    3,
+			wantDone:   3,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := compactTrainReadbackTelemetry(test.progress, 4, 8, 4, 10, test.err)
+			if got.FailureStage != test.wantStage || got.DriverCalls != test.wantDriver || got.D2HCopies != test.wantCopies || got.D2HBytes != test.wantBytes || got.Attempted != test.wantTry || got.Completed != test.wantDone {
+				t.Fatalf("readback telemetry = %+v, want stage=%q driver=%d copies=%d bytes=%d attempted=%d completed=%d", got, test.wantStage, test.wantDriver, test.wantCopies, test.wantBytes, test.wantTry, test.wantDone)
+			}
+			if got.ContextSets != boolInt64(test.progress.ContextAttempted) {
+				t.Fatalf("context accounting = attempted sets=%d, want %d", got.ContextSets, boolInt64(test.progress.ContextAttempted))
+			}
+			if test.wantStage == "" && got.Failures != 0 {
+				t.Fatalf("successful readback reported failure: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCompactTrainInputUploadTelemetryBoundaryAccounting(t *testing.T) {
+	tests := []struct {
+		name       string
+		progress   cudaCompactTrainForwardInputUploadProgress
+		err        error
+		wantStage  string
+		wantDriver int64
+		wantCopies int64
+		wantBytes  int64
+		wantTry    int64
+		wantDone   int64
+	}{
+		{
+			name: "context failure",
+			progress: cudaCompactTrainForwardInputUploadProgress{
+				ContextAttempted: true, FailureStage: "context",
+			},
+			err:        fmt.Errorf("context"),
+			wantStage:  "context",
+			wantDriver: 0,
+			wantCopies: 0,
+			wantBytes:  0,
+		},
+		{
+			name:      "validation before cgo",
+			progress:  cudaCompactTrainForwardInputUploadProgress{FailureStage: "validation"},
+			err:       fmt.Errorf("validation"),
+			wantStage: "validation",
+		},
+		{
+			name: "tokens copy failure",
+			progress: cudaCompactTrainForwardInputUploadProgress{
+				ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 1, FailureStage: "tokens",
+			},
+			err:        fmt.Errorf("tokens"),
+			wantStage:  "tokens",
+			wantDriver: 1,
+			wantCopies: 0,
+			wantTry:    1,
+		},
+		{
+			name: "masks copy failure",
+			progress: cudaCompactTrainForwardInputUploadProgress{
+				ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 2, CompletedCopies: 1, CompletedBytes: 4, FailureStage: "masks",
+			},
+			err:        fmt.Errorf("masks"),
+			wantStage:  "masks",
+			wantDriver: 2,
+			wantCopies: 1,
+			wantBytes:  4,
+			wantTry:    2,
+			wantDone:   1,
+		},
+		{
+			name: "roles copy failure",
+			progress: cudaCompactTrainForwardInputUploadProgress{
+				ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 3, CompletedCopies: 2, CompletedBytes: 12, FailureStage: "roles",
+			},
+			err:        fmt.Errorf("roles"),
+			wantStage:  "roles",
+			wantDriver: 3,
+			wantCopies: 2,
+			wantBytes:  12,
+			wantTry:    3,
+			wantDone:   2,
+		},
+		{
+			name: "status copy failure",
+			progress: cudaCompactTrainForwardInputUploadProgress{
+				ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 4, CompletedCopies: 3, CompletedBytes: 20, FailureStage: "status",
+			},
+			err:        fmt.Errorf("status"),
+			wantStage:  "status",
+			wantDriver: 4,
+			wantCopies: 3,
+			wantBytes:  20,
+			wantTry:    4,
+			wantDone:   3,
+		},
+		{
+			name: "success",
+			progress: cudaCompactTrainForwardInputUploadProgress{
+				ContextAttempted: true, ContextSucceeded: true, AttemptedCopies: 4, CompletedCopies: 4, CompletedBytes: 24,
+			},
+			wantDriver: 4,
+			wantCopies: 4,
+			wantBytes:  24,
+			wantTry:    4,
+			wantDone:   4,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := compactTrainInputUploadTelemetry(test.progress, 10, test.err)
+			if got.FailureStage != test.wantStage || got.DriverCalls != test.wantDriver || got.H2DCopies != test.wantCopies || got.H2DBytes != test.wantBytes || got.Attempted != test.wantTry || got.Completed != test.wantDone {
+				t.Fatalf("input telemetry = %+v, want stage=%q driver=%d copies=%d bytes=%d attempted=%d completed=%d", got, test.wantStage, test.wantDriver, test.wantCopies, test.wantBytes, test.wantTry, test.wantDone)
+			}
+			if got.ContextSets != boolInt64(test.progress.ContextAttempted) {
+				t.Fatalf("context accounting = attempted sets=%d, want %d", got.ContextSets, boolInt64(test.progress.ContextAttempted))
+			}
+			if test.wantStage == "" && got.Failures != 0 {
+				t.Fatalf("successful input upload reported failure: %+v", got)
+			}
+		})
+	}
+}
+
+func TestCompactTrainGraphCaptureNodeClassification(t *testing.T) {
+	previous := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previous }()
+	base := &CompactForwardAccelerator{}
+	base.beginForwardGraphCapture()
+	if err := base.recordKernelLaunch(); err != nil {
+		t.Fatal(err)
+	}
+	train := &CompactTrainAccelerator{CompactForwardAccelerator: base}
+	if err := train.recordCublasGemmCall(); err != nil {
+		t.Fatal(err)
+	}
+	nodes, kernels, cublas := base.endForwardGraphCaptureCounts()
+	if nodes != 2 || kernels != 1 || cublas != 1 {
+		t.Fatalf("capture node classification = nodes=%d kernels=%d cublas=%d", nodes, kernels, cublas)
+	}
+}
+
 func TestCompactTrainForwardReadbackValidation(t *testing.T) {
 	if _, _, _, err := validateCompactTrainForwardReadback(nil, []float32{0}, []int32{0}, 1, 1, 1); err == nil || !strings.Contains(err.Error(), "status length") {
 		t.Fatalf("status length validation = %v, want status length error", err)
@@ -661,6 +1209,9 @@ func TestCompactTrainForwardMidSequenceErrorDrainsBeforeAbortAndRebegin(t *testi
 
 func TestCompactTrainSyncEachLaunchExactForwardBackward(t *testing.T) {
 	t.Setenv("EOS_CUDA_COMPACT_SYNC_EACH_LAUNCH", "1")
+	previousEvents := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previousEvents }()
 	accel, cleanup := newBoundCompactTrainTestAccelerator(t, true, false)
 	defer cleanup()
 	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
@@ -696,6 +1247,9 @@ func TestCompactTrainSyncEachLaunchExactForwardBackward(t *testing.T) {
 	wantBackward := expectedCompactTrainBackwardLaunches(shape, true)
 	if stats.LastForwardLaunches != wantForward || stats.LastForwardSyncs != wantForward || stats.LastBackwardLaunches != wantBackward || stats.LastBackwardSyncs != wantBackward || stats.KernelLaunches != wantForward+wantBackward || stats.KernelSynchronizations != wantForward+wantBackward {
 		t.Fatalf("sync-each train stats = %+v, want forward %d/%d backward %d/%d total %d/%d", stats, wantForward, wantForward, wantBackward, wantBackward, wantForward+wantBackward, wantForward+wantBackward)
+	}
+	if stats.Telemetry != nil && stats.Telemetry.Phase(backend.CompactTrainPhaseBackwardBoundary) != (backend.CompactTrainPhaseTelemetry{}) {
+		t.Fatalf("sync-each successful no-op backward boundary emitted telemetry: %+v", stats.Telemetry.Phase(backend.CompactTrainPhaseBackwardBoundary))
 	}
 }
 
@@ -909,6 +1463,9 @@ func TestCompactTrainForwardGraphCaptureReplayContract(t *testing.T) {
 	previous := eosCudaCompactTrainForwardGraphEnabled
 	eosCudaCompactTrainForwardGraphEnabled = true
 	defer func() { eosCudaCompactTrainForwardGraphEnabled = previous }()
+	previousProfile := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previousProfile }()
 
 	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
 	defer cleanup()
@@ -938,6 +1495,10 @@ func TestCompactTrainForwardGraphCaptureReplayContract(t *testing.T) {
 	if firstStats.DirectForwardSubmissions != nodes || firstStats.LastForwardDirectSubmissions != nodes || firstStats.LastForwardDeviceKernelWork != nodes {
 		t.Fatalf("first capture direct/device work = %+v, want %d", firstStats, nodes)
 	}
+	capturePhase := firstStats.Telemetry.Phase(backend.CompactTrainPhaseForwardCapture)
+	if capturePhase.GraphNodes != nodes || capturePhase.GraphKernelNodes != nodes || capturePhase.GraphCublasNodes != 0 || capturePhase.GraphUnknownNodes != 0 || capturePhase.DriverCalls != nodes+3 || capturePhase.GraphBegin != 1 || capturePhase.GraphEnd != 1 || capturePhase.GraphInstantiate != 1 || capturePhase.Attempted != nodes+3 || capturePhase.Completed != nodes+3 {
+		t.Fatalf("capture phase identity = %+v, want nodes=%d driver=%d complete=%d", capturePhase, nodes, nodes+3, nodes+3)
+	}
 	if err := accel.ReleaseCompactTrainHandle(first.Handle); err != nil {
 		t.Fatalf("release first handle: %v", err)
 	}
@@ -952,6 +1513,10 @@ func TestCompactTrainForwardGraphCaptureReplayContract(t *testing.T) {
 	}
 	if warmStats.DirectForwardSubmissions != nodes || warmStats.LastForwardDirectSubmissions != 0 || warmStats.LastForwardDeviceKernelWork != nodes {
 		t.Fatalf("warm replay direct/device work = %+v, want cumulative direct=%d and warm device=%d", warmStats, nodes, nodes)
+	}
+	replayPhase := warmStats.Telemetry.Phase(backend.CompactTrainPhaseForwardReplay)
+	if replayPhase.GraphLaunches != 1 || replayPhase.GoCalls != 5 || replayPhase.ContextSets != 5 || replayPhase.DriverCalls != 6 || replayPhase.Attempted != 1 || replayPhase.Enqueued != 1 || replayPhase.Completed != 1 {
+		t.Fatalf("replay phase identity = %+v, want workload=1 plus truthful event controls", replayPhase)
 	}
 	if err := accel.ReleaseCompactTrainHandle(second.Handle); err != nil {
 		t.Fatalf("release warm handle: %v", err)
@@ -2452,6 +3017,9 @@ func TestCompactTrainPublicBackwardFullParityAndResidentRefs(t *testing.T) {
 			accel, cleanup := newBoundCompactTrainShapeTestAccelerator(t, shape, tc.rope, tc.projection, compactForwardTestWeights(tc.projection))
 			defer cleanup()
 			refs := compactTrainResidentRefsForTest(t, accel, shape)
+			previousProfileEvents := eosCudaCompactProfileEventsEnabled
+			eosCudaCompactProfileEventsEnabled = tc.layers == 2
+			defer func() { eosCudaCompactProfileEventsEnabled = previousProfileEvents }()
 			if err := accel.BeginCompactTrainStep(81, refs); err != nil {
 				t.Fatalf("begin step: %v", err)
 			}
@@ -2494,6 +3062,20 @@ func TestCompactTrainPublicBackwardFullParityAndResidentRefs(t *testing.T) {
 			stats := accel.CompactTrainStats()
 			if stats.BackwardCalls != 1 || stats.GradPooledUploadedBytes != int64(shape.Batch*shape.OutputDim*4) || stats.LiveHandles != 0 || stats.FallbackOrUnhandled != 0 {
 				t.Fatalf("public backward stats = %+v", stats)
+			}
+			if tc.layers == 2 {
+				ffn := stats.Telemetry.Phase(backend.CompactTrainPhaseBackwardFFN)
+				attention := stats.Telemetry.Phase(backend.CompactTrainPhaseBackwardAttention)
+				attentionOccurrences := int64(tc.layers + 1)
+				if tc.rope {
+					attentionOccurrences++
+				}
+				if ffn.EventRecords != int64(tc.layers*2) || ffn.EventQueries != int64(tc.layers) || ffn.DeviceElapsedNanos <= 0 {
+					t.Fatalf("two-layer FFN event telemetry = %+v, want %d records/%d queries and positive elapsed", ffn, tc.layers*2, tc.layers)
+				}
+				if attention.EventRecords != attentionOccurrences*2 || attention.EventQueries != attentionOccurrences || attention.DeviceElapsedNanos <= 0 {
+					t.Fatalf("two-layer attention event telemetry = %+v, want %d records/%d queries and positive elapsed", attention, attentionOccurrences*2, attentionOccurrences)
+				}
 			}
 			if base := accel.CompactForwardAccelerator.Stats(); base.PackedDownloads != 0 || base.PackedBytes != 0 {
 				t.Fatalf("packed stats changed on compact train path: %+v", base)
@@ -3735,7 +4317,13 @@ func assertFloatSlicesClose(t *testing.T, got, want []float32, tol float32) {
 
 func assertCompactTrainStatsUnchanged(t *testing.T, want, got backend.CompactTrainAcceleratorStats, label string) {
 	t.Helper()
-	if got != want {
+	telemetryEqual := want.Telemetry == nil && got.Telemetry == nil
+	if want.Telemetry != nil && got.Telemetry != nil {
+		telemetryEqual = *want.Telemetry == *got.Telemetry
+	}
+	want.Telemetry = nil
+	got.Telemetry = nil
+	if !telemetryEqual || got != want {
 		t.Fatalf("%s stats changed: got %+v want %+v", label, got, want)
 	}
 }

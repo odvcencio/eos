@@ -3,7 +3,7 @@
 package cuda
 
 /*
-#cgo CFLAGS: -I/usr/local/cuda/include
+#cgo CFLAGS: -I/usr/local/cuda/include -I${SRCDIR}
 #cgo LDFLAGS: -L/usr/local/cuda/lib64 -L/usr/lib/wsl/lib -L/usr/lib/x86_64-linux-gnu -lnvrtc -lcuda -lcublas
 #include <stdlib.h>
 #include <stdio.h>
@@ -12,21 +12,15 @@ package cuda
 #include <cuda.h>
 #include <nvrtc.h>
 #include <cublas_v2.h>
+#include "eos_cuda_abi.h"
 
+// EosCudaProfileEventPair owns the two driver events used by one optional
+// profile phase. The pair is allocated and destroyed in the existing CUDA C
+// bridge so no Go pointer or CUDA handle lifetime crosses cgo unexpectedly.
 typedef struct {
-	CUcontext ctx;
-	CUdevice device;
-	int major;
-	int minor;
-	int primary_ctx;
-	cublasHandle_t blas;
-	CUstream stream;
-} EosCudaRuntime;
-
-typedef struct {
-	CUmodule module;
-	CUfunction function;
-} EosCudaKernel;
+	CUevent start;
+	CUevent end;
+} EosCudaProfileEventPair;
 
 // EosCudaTypedLaunchArg is the small, backend-owned launch ABI used by the
 // generated pointwise/row-wise kernel families. Keeping the scalar storage in
@@ -60,28 +54,20 @@ typedef struct {
 	float scale;
 } EosCudaOptimizerUpdateDescriptor;
 
-// EosCudaCompactTrainForwardReadbackProgress is written by the synchronous
-// compact-forward readback bridge before it returns. The bridge never retains
-// any host pointer supplied by Go; the fields only report completed work so
-// the Go owner can account for a partial-copy failure without inventing a
-// successful batch.
-typedef struct {
-	int context_sets;
-	int status_copied;
-	int pooled_copied;
-	int active_copied;
-	int device_copies;
-	int status_value;
-} EosCudaCompactTrainForwardReadbackProgress;
+enum {
+	EOS_CUDA_PROFILE_EVENT_STAGE_NONE = 0,
+	EOS_CUDA_PROFILE_EVENT_STAGE_CONTEXT = 1,
+	EOS_CUDA_PROFILE_EVENT_STAGE_CREATE = 2,
+	EOS_CUDA_PROFILE_EVENT_STAGE_RECORD = 3,
+	EOS_CUDA_PROFILE_EVENT_STAGE_QUERY = 4,
+	EOS_CUDA_PROFILE_EVENT_STAGE_VALIDATION = 5
+};
 
-// EosCudaCompactTrainForwardInputUploadProgress is written by the synchronous
-// compact-forward input upload bridge before it returns. The bridge borrows
-// each Go host slice only for this call and never retains a host pointer.
-typedef struct {
-	int context_sets;
-	int completed_stages;
-	int device_copies;
-} EosCudaCompactTrainForwardInputUploadProgress;
+static void eosCudaProfileEventProgressReset(EosCudaProfileEventProgress* progress) {
+	if (progress != NULL) {
+		memset(progress, 0, sizeof(*progress));
+	}
+}
 
 static char* manta_dup_cstr(const char* s) {
 	if (s == NULL) {
@@ -221,6 +207,9 @@ static int eosCudaRuntimeCreate(EosCudaRuntime** out, char** err) {
 	rt->primary_ctx = 1;
 	rt->blas = blas;
 	rt->stream = NULL;
+	rt->profile_k5_end = NULL;
+	rt->profile_k5_end_recorded = 0;
+	eosCudaProfileEventProgressReset(&rt->profile_k5_end_progress);
 	// A created (non-default) stream is required so kernel launches and cuBLAS
 	// work can be captured into a CUDA graph; the legacy default stream (stream
 	// 0) cannot be captured. It must be a BLOCKING stream (CU_STREAM_DEFAULT):
@@ -291,6 +280,221 @@ static void eosCudaRuntimeDestroy(EosCudaRuntime* rt) {
 		}
 	}
 	free(rt);
+}
+
+static int eosCudaProfileEventPairCreate(EosCudaRuntime* rt, EosCudaProfileEventPair** out, EosCudaProfileEventProgress* progress, char** err) {
+	eosCudaProfileEventProgressReset(progress);
+	if (out == NULL) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_VALIDATION;
+		*err = manta_dup_format("cuEventCreate", "missing event-pair output");
+		return 1;
+	}
+	*out = NULL;
+	if (rt == NULL || rt->ctx == NULL) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_VALIDATION;
+		*err = manta_dup_format("cuEventCreate", "runtime is not initialized");
+		return 1;
+	}
+	if (progress != NULL) progress->context_attempted = 1;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_CONTEXT;
+		*err = manta_dup_cu_error("cuCtxSetCurrent(profile event)", cuRes);
+		return 1;
+	}
+	if (progress != NULL) progress->context_succeeded = 1;
+	EosCudaProfileEventPair* pair = (EosCudaProfileEventPair*)calloc(1, sizeof(EosCudaProfileEventPair));
+	if (pair == NULL) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_VALIDATION;
+		*err = manta_dup_format("malloc", "failed to allocate profile event pair");
+		return 1;
+	}
+	if (progress != NULL) progress->driver_attempted++;
+	cuRes = cuEventCreate(&pair->start, CU_EVENT_DEFAULT);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_CREATE;
+		free(pair);
+		*err = manta_dup_cu_error("cuEventCreate(start)", cuRes);
+		return 1;
+	}
+	if (progress != NULL) progress->driver_succeeded++;
+	if (progress != NULL) progress->driver_attempted++;
+	cuRes = cuEventCreate(&pair->end, CU_EVENT_DEFAULT);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_CREATE;
+		// Retain the wrapper whenever cleanup is unsuccessful. The caller owns
+		// the live start handle and can retry destruction under this context.
+		CUresult destroyRes = cuEventDestroy(pair->start);
+		if (destroyRes == CUDA_SUCCESS) {
+			pair->start = NULL;
+		}
+		*out = pair;
+		*err = manta_dup_cu_error("cuEventCreate(end)", cuRes);
+		return 1;
+	}
+	if (progress != NULL) progress->driver_succeeded++;
+	*out = pair;
+	return 0;
+}
+
+static int eosCudaProfileEventPairDestroy(EosCudaRuntime* rt, EosCudaProfileEventPair* pair, char** err) {
+	if (pair == NULL) {
+		return 0;
+	}
+	if (rt == NULL || rt->ctx == NULL) {
+		// The event handles are context-owned. Retain the pair for the caller
+		// rather than destroying it under an unrelated current context.
+		*err = manta_dup_format("cuEventDestroy", "runtime is not initialized");
+		return 1;
+	}
+	CUresult first = cuCtxSetCurrent(rt->ctx);
+	if (first != CUDA_SUCCESS) {
+		// Never destroy CUDA handles under an unconfirmed context. The caller
+		// retains ownership of the pair on this error so a later close/retry can
+		// perform cleanup under the correct context.
+		*err = manta_dup_cu_error("cuCtxSetCurrent(profile event destroy)", first);
+		return 1;
+	}
+	if (pair->start != NULL) {
+		CUresult current = cuEventDestroy(pair->start);
+		if (current == CUDA_SUCCESS) {
+			pair->start = NULL;
+		} else if (first == CUDA_SUCCESS) {
+			first = current;
+		}
+	}
+	if (pair->end != NULL) {
+		CUresult current = cuEventDestroy(pair->end);
+		if (current == CUDA_SUCCESS) {
+			pair->end = NULL;
+		} else if (first == CUDA_SUCCESS) {
+			first = current;
+		}
+	}
+	if (pair->start == NULL && pair->end == NULL) {
+		free(pair);
+	}
+	if (first != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuEventDestroy", first);
+		return 1;
+	}
+	return 0;
+}
+
+// eosCudaProfileEventPairAbandon releases only the host wrapper after the
+// owning CUDA context has been torn down. Any remaining event handles are
+// context-owned and are reclaimed with that context; this avoids leaking the
+// pair storage when a bounded destroy retry cannot run under the old context.
+static void eosCudaProfileEventPairAbandon(EosCudaProfileEventPair* pair) {
+	free(pair);
+}
+
+static int eosCudaProfileEventRecord(EosCudaRuntime* rt, EosCudaProfileEventPair* pair, int end, EosCudaProfileEventProgress* progress, char** err) {
+	eosCudaProfileEventProgressReset(progress);
+	if (rt == NULL || pair == NULL || (end == 0 ? pair->start : pair->end) == NULL) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_VALIDATION;
+		*err = manta_dup_format("cuEventRecord", "invalid profile event pair");
+		return 1;
+	}
+	if (progress != NULL) progress->context_attempted = 1;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_CONTEXT;
+		*err = manta_dup_cu_error("cuCtxSetCurrent(profile event)", cuRes);
+		return 1;
+	}
+	if (progress != NULL) {
+		progress->context_succeeded = 1;
+		progress->driver_attempted = 1;
+	}
+	cuRes = cuEventRecord(end == 0 ? pair->start : pair->end, rt->stream);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_RECORD;
+		*err = manta_dup_cu_error(end == 0 ? "cuEventRecord(start)" : "cuEventRecord(end)", cuRes);
+		return 1;
+	}
+	if (progress != NULL) progress->driver_succeeded = 1;
+	return 0;
+}
+
+// The caller must invoke this only after an existing required stream
+// synchronization. The elapsed query itself does not wait, preserving the
+// default stream-sync policy of compact training.
+static int eosCudaProfileEventElapsed(EosCudaRuntime* rt, EosCudaProfileEventPair* pair, float* milliseconds, EosCudaProfileEventProgress* progress, char** err) {
+	eosCudaProfileEventProgressReset(progress);
+	if (rt == NULL || pair == NULL || milliseconds == NULL || pair->start == NULL || pair->end == NULL) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_VALIDATION;
+		*err = manta_dup_format("cuEventElapsedTime", "invalid profile event pair");
+		return 1;
+	}
+	if (progress != NULL) progress->context_attempted = 1;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_CONTEXT;
+		*err = manta_dup_cu_error("cuCtxSetCurrent(profile event)", cuRes);
+		return 1;
+	}
+	if (progress != NULL) {
+		progress->context_succeeded = 1;
+		progress->driver_attempted = 1;
+	}
+	cuRes = cuEventElapsedTime(milliseconds, pair->start, pair->end);
+	if (cuRes != CUDA_SUCCESS) {
+		if (progress != NULL) progress->failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_QUERY;
+		*err = manta_dup_cu_error("cuEventElapsedTime", cuRes);
+		return 1;
+	}
+	if (progress != NULL) progress->driver_succeeded = 1;
+	return 0;
+}
+
+static int eosCudaProfileEventBindK5End(EosCudaRuntime* rt, EosCudaProfileEventPair* pair, char** err) {
+	if (rt == NULL) {
+		*err = manta_dup_format("cuEventRecord", "runtime is not initialized");
+		return 1;
+	}
+	rt->profile_k5_end = pair == NULL ? NULL : pair->end;
+	if (pair != NULL) {
+		rt->profile_k5_end_recorded = 0;
+		eosCudaProfileEventProgressReset(&rt->profile_k5_end_progress);
+	}
+	return 0;
+}
+
+static int eosCudaProfileEventK5EndProgress(EosCudaRuntime* rt, EosCudaProfileEventProgress* progress) {
+	if (progress != NULL) {
+		eosCudaProfileEventProgressReset(progress);
+		if (rt != NULL) *progress = rt->profile_k5_end_progress;
+	}
+	return rt != NULL && rt->profile_k5_end_recorded != 0;
+}
+
+// The K5 batch wrapper already owns the required stream barrier. Record the
+// end marker immediately before that barrier so the event brackets the
+// enqueued prefix without introducing another synchronization path. Event
+// failures remain telemetry-only and do not alter the batch's existing
+// launch/drain/poison contract.
+static void eosCudaProfileEventRecordK5End(EosCudaRuntime* rt) {
+	if (rt == NULL || rt->profile_k5_end == NULL) {
+		return;
+	}
+	rt->profile_k5_end_progress.context_attempted = 1;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		rt->profile_k5_end_progress.failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_CONTEXT;
+		rt->profile_k5_end = NULL;
+		return;
+	}
+	rt->profile_k5_end_progress.context_succeeded = 1;
+	rt->profile_k5_end_progress.driver_attempted = 1;
+	cuRes = cuEventRecord(rt->profile_k5_end, rt->stream);
+	if (cuRes == CUDA_SUCCESS) {
+		rt->profile_k5_end_progress.driver_succeeded = 1;
+		rt->profile_k5_end_recorded = 1;
+	} else {
+		rt->profile_k5_end_progress.failure_stage = EOS_CUDA_PROFILE_EVENT_STAGE_RECORD;
+	}
+	rt->profile_k5_end = NULL;
 }
 
 static int eosCudaCompileKernel(EosCudaRuntime* rt, const char* src, const char* entry, EosCudaKernel** out, char** log, char** err) {
@@ -521,38 +725,51 @@ static int eosCudaMemcpyCompactTrainForwardReadback(
 		pooled_dst == NULL || pooled_src == 0 || pooled_bytes == 0 ||
 		active_dst == NULL || active_src == 0 || active_bytes == 0) {
 		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardReadback", "invalid readback arguments");
+		progress->failure_stage = 5; // validation
 		return 1;
 	}
+	progress->context_attempted = 1;
 	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 1; // context
 		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
 		return 1;
 	}
-	progress->context_sets = 1;
+	progress->context_succeeded = 1;
+	progress->attempted_copies = 1;
 	cuRes = cuMemcpyDtoH(status_dst, status_src, status_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 2; // status
 		*err = manta_dup_cu_error("cuMemcpyDtoH(status)", cuRes);
 		return 1;
 	}
 	progress->status_copied = 1;
+	progress->completed_copies = 1;
 	progress->device_copies = 1;
 	progress->status_value = (int)*(const int32_t*)status_dst;
 	if (progress->status_value != 0) {
+		progress->failure_stage = 2; // status word
 		return 2;
 	}
+	progress->attempted_copies = 2;
 	cuRes = cuMemcpyDtoH(pooled_dst, pooled_src, pooled_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 3; // pooled
 		*err = manta_dup_cu_error("cuMemcpyDtoH(pooled)", cuRes);
 		return 1;
 	}
 	progress->pooled_copied = 1;
+	progress->completed_copies = 2;
 	progress->device_copies = 2;
+	progress->attempted_copies = 3;
 	cuRes = cuMemcpyDtoH(active_dst, active_src, active_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 4; // active
 		*err = manta_dup_cu_error("cuMemcpyDtoH(active)", cuRes);
 		return 1;
 	}
 	progress->active_copied = 1;
+	progress->completed_copies = 3;
 	progress->device_copies = 3;
 	return 0;
 }
@@ -593,57 +810,72 @@ static int eosCudaMemcpyCompactTrainForwardInputUpload(
 		(roles_bytes != 0 && roles_src == NULL) ||
 		(status_bytes != 0 && status_src == NULL)) {
 		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "invalid input upload arguments");
+		progress->failure_stage = 6; // validation
 		return 1;
 	}
+	progress->context_attempted = 1;
 	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 1; // context
 		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
 		return 1;
 	}
-	progress->context_sets = 1;
+	progress->context_succeeded = 1;
 	if (fail_stage == 1) {
 		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 1");
+		progress->failure_stage = 2; // tokens pre-copy hook
 		return 1;
 	}
+	progress->attempted_copies = 1;
 	cuRes = cuMemcpyHtoD(tokens_dst, tokens_src, tokens_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 2; // tokens
 		*err = manta_dup_cu_error("cuMemcpyHtoD(tokens)", cuRes);
 		return 1;
 	}
-	progress->completed_stages = 1;
+	progress->completed_copies = 1;
 	progress->device_copies = 1;
 	if (fail_stage == 2) {
 		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 2");
+		progress->failure_stage = 3; // masks pre-copy hook
 		return 1;
 	}
+	progress->attempted_copies = 2;
 	cuRes = cuMemcpyHtoD(masks_dst, masks_src, masks_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 3; // masks
 		*err = manta_dup_cu_error("cuMemcpyHtoD(masks)", cuRes);
 		return 1;
 	}
-	progress->completed_stages = 2;
+	progress->completed_copies = 2;
 	progress->device_copies = 2;
 	if (fail_stage == 3) {
 		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 3");
+		progress->failure_stage = 4; // roles pre-copy hook
 		return 1;
 	}
+	progress->attempted_copies = 3;
 	cuRes = cuMemcpyHtoD(roles_dst, roles_src, roles_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 4; // roles
 		*err = manta_dup_cu_error("cuMemcpyHtoD(roles)", cuRes);
 		return 1;
 	}
-	progress->completed_stages = 3;
+	progress->completed_copies = 3;
 	progress->device_copies = 3;
 	if (fail_stage == 4) {
 		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardInputUpload", "forced failure before stage 4");
+		progress->failure_stage = 5; // status pre-copy hook
 		return 1;
 	}
+	progress->attempted_copies = 4;
 	cuRes = cuMemcpyHtoD(status_dst, status_src, status_bytes);
 	if (cuRes != CUDA_SUCCESS) {
+		progress->failure_stage = 5; // status
 		*err = manta_dup_cu_error("cuMemcpyHtoD(status)", cuRes);
 		return 1;
 	}
-	progress->completed_stages = 4;
+	progress->completed_copies = 4;
 	progress->device_copies = 4;
 	return 0;
 }
@@ -768,19 +1000,22 @@ static int eosCudaLaunchOptimizerUpdate(EosCudaRuntime* rt, EosCudaKernel* kerne
 // enqueued reports the number of successfully submitted kernels even when a
 // later launch or the completion barrier fails, allowing the Go owner to
 // poison the step conservatively.
-static int eosCudaLaunchOptimizerUpdateBatch(EosCudaRuntime* rt, EosCudaKernel* kernel, EosCudaOptimizerUpdateDescriptor* descriptors, int count, int* enqueued, int* attempted, char** err) {
-	if (enqueued == NULL || attempted == NULL) {
+static int eosCudaLaunchOptimizerUpdateBatch(EosCudaRuntime* rt, EosCudaKernel* kernel, EosCudaOptimizerUpdateDescriptor* descriptors, int count, int* enqueued, int* attempted, int* failure_stage, int* failure_index, char** err) {
+	if (enqueued == NULL || attempted == NULL || failure_stage == NULL || failure_index == NULL) {
 		*err = manta_dup_format("eosCudaLaunchOptimizerUpdateBatch", "missing progress output");
 		return 1;
 	}
 	*enqueued = 0;
 	*attempted = 0;
+	*failure_stage = 0;
+	*failure_index = -1;
 	if (rt == NULL || kernel == NULL || descriptors == NULL || count <= 0) {
 		*err = manta_dup_format("eosCudaLaunchOptimizerUpdateBatch", "invalid batch arguments");
 		return 1;
 	}
 	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
 	if (cuRes != CUDA_SUCCESS) {
+		*failure_stage = 3; // context
 		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
 		return 1;
 	}
@@ -788,18 +1023,22 @@ static int eosCudaLaunchOptimizerUpdateBatch(EosCudaRuntime* rt, EosCudaKernel* 
 	for (int i = 0; i < count; i++) {
 		EosCudaOptimizerUpdateDescriptor* d = &descriptors[i];
 		void* args[] = {&d->param, &d->mom1, &d->mom2, &d->grad, &d->elements, &d->mode, &d->learning_rate, &d->weight_decay, &d->beta1, &d->beta2, &d->corr1, &d->corr2, &d->epsilon, &d->scale};
-		*attempted = 1;
+		*attempted = i + 1;
 		cuRes = cuLaunchKernel(kernel->function, d->grid, 1, 1, d->block, 1, 1, 0, rt->stream, args, NULL);
 		if (cuRes != CUDA_SUCCESS) {
 			launchError = cuRes;
+			*failure_stage = 4; // launch
+			*failure_index = i;
 			break;
 		}
 		*enqueued = i + 1;
 	}
 	if (launchError != CUDA_SUCCESS) {
 		char* primary = manta_dup_cu_error("cuLaunchKernel", launchError);
+		eosCudaProfileEventRecordK5End(rt);
 		CUresult drainRes = cuStreamSynchronize(rt->stream);
 		if (drainRes != CUDA_SUCCESS) {
+			*failure_stage = 6; // drain after launch failure
 			char* drain = manta_dup_cu_error("cuStreamSynchronize(drain)", drainRes);
 			if (primary != NULL && drain != NULL) {
 				size_t n = strlen(primary) + strlen(drain) + 3;
@@ -821,8 +1060,10 @@ static int eosCudaLaunchOptimizerUpdateBatch(EosCudaRuntime* rt, EosCudaKernel* 
 		*err = primary;
 		return 1;
 	}
+	eosCudaProfileEventRecordK5End(rt);
 	cuRes = cuStreamSynchronize(rt->stream);
 	if (cuRes != CUDA_SUCCESS) {
+		*failure_stage = 5; // barrier
 		*err = manta_dup_cu_error("cuStreamSynchronize", cuRes);
 		return 1;
 	}
@@ -1164,6 +1405,34 @@ static int eosCudaBeginCapture(EosCudaRuntime* rt, char** err) {
 	return 0;
 }
 
+static int eosCudaBeginCaptureProgress(EosCudaRuntime* rt, int* context_set, int* begin_attempted, int* begin_succeeded, char** err) {
+	if (context_set == NULL || begin_attempted == NULL || begin_succeeded == NULL) {
+		*err = manta_dup_format("cuStreamBeginCapture", "missing capture progress output");
+		return 1;
+	}
+	*context_set = 0;
+	*begin_attempted = 0;
+	*begin_succeeded = 0;
+	if (rt == NULL || rt->ctx == NULL) {
+		*err = manta_dup_format("cuStreamBeginCapture", "runtime is not initialized");
+		return 1;
+	}
+	*context_set = 1;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	*begin_attempted = 1;
+	cuRes = cuStreamBeginCapture(rt->stream, CU_STREAM_CAPTURE_MODE_THREAD_LOCAL);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuStreamBeginCapture", cuRes);
+		return 1;
+	}
+	*begin_succeeded = 1;
+	return 0;
+}
+
 // eosCudaEndCapture ends capture, instantiates the recorded graph into an
 // executable graph, and returns both (the graph is retained for teardown).
 static int eosCudaEndCapture(EosCudaRuntime* rt, EosCudaGraph** out, char** err) {
@@ -1185,6 +1454,57 @@ static int eosCudaEndCapture(EosCudaRuntime* rt, EosCudaGraph** out, char** err)
 		*err = manta_dup_cu_error("cuGraphInstantiate", cuRes);
 		return 1;
 	}
+	EosCudaGraph* g = (EosCudaGraph*)malloc(sizeof(EosCudaGraph));
+	if (g == NULL) {
+		cuGraphExecDestroy(exec);
+		cuGraphDestroy(graph);
+		*err = manta_dup_format("malloc", "failed to allocate graph");
+		return 1;
+	}
+	g->graph = graph;
+	g->exec = exec;
+	*out = g;
+	return 0;
+}
+
+static int eosCudaEndCaptureProgress(EosCudaRuntime* rt, EosCudaGraph** out, int* context_set, int* end_attempted, int* end_succeeded, int* instantiate_attempted, int* instantiate_succeeded, char** err) {
+	if (out == NULL || context_set == NULL || end_attempted == NULL || end_succeeded == NULL || instantiate_attempted == NULL || instantiate_succeeded == NULL) {
+		*err = manta_dup_format("cuStreamEndCapture", "missing capture progress output");
+		return 1;
+	}
+	*out = NULL;
+	*context_set = 0;
+	*end_attempted = 0;
+	*end_succeeded = 0;
+	*instantiate_attempted = 0;
+	*instantiate_succeeded = 0;
+	if (rt == NULL || rt->ctx == NULL) {
+		*err = manta_dup_format("cuStreamEndCapture", "runtime is not initialized");
+		return 1;
+	}
+	*context_set = 1;
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	CUgraph graph = NULL;
+	*end_attempted = 1;
+	cuRes = cuStreamEndCapture(rt->stream, &graph);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuStreamEndCapture", cuRes);
+		return 1;
+	}
+	*end_succeeded = 1;
+	CUgraphExec exec = NULL;
+	*instantiate_attempted = 1;
+	cuRes = cuGraphInstantiate(&exec, graph, 0);
+	if (cuRes != CUDA_SUCCESS) {
+		cuGraphDestroy(graph);
+		*err = manta_dup_cu_error("cuGraphInstantiate", cuRes);
+		return 1;
+	}
+	*instantiate_succeeded = 1;
 	EosCudaGraph* g = (EosCudaGraph*)malloc(sizeof(EosCudaGraph));
 	if (g == NULL) {
 		cuGraphExecDestroy(exec);
@@ -2685,6 +3005,8 @@ type deviceRuntime struct {
 	geluBackwardKernel          *auxKernel
 	matMulStats                 backend.MatMulAcceleratorStats
 	graphCache                  map[string]*cudaGraph
+	profileEventMu              sync.Mutex
+	profileEvents               map[string]*C.EosCudaProfileEventPair
 	// attnTrain holds the S3(b) attention-resident-train handle registry
 	// (see attention_resident_train_accel_linux.go); its type lives in that
 	// file so this struct's flat kernel-field list stays the single place
@@ -2696,6 +3018,54 @@ type deviceRuntime struct {
 	// block kinds -- see beginAttentionResidentTrainStep) rather than
 	// duplicating step lifecycle state.
 	ffnTrain ffnResidentTrainState
+}
+
+// profileEventProgress is the typed accounting returned by one event bridge.
+// ContextSets is derived from ContextSetAttempts; DriverCalls is derived from
+// DriverAttempted, while successful EventRecords/EventQueries are counted by
+// their owning operation only after the bridge reports success.
+type profileEventProgress struct {
+	ContextSetAttempts  int
+	ContextSetSuccesses int
+	DriverAttempted     int
+	DriverSucceeded     int
+	FailureStage        string
+}
+
+func profileEventProgressFromC(progress C.EosCudaProfileEventProgress) profileEventProgress {
+	result := profileEventProgress{
+		ContextSetAttempts:  int(progress.context_attempted),
+		ContextSetSuccesses: int(progress.context_succeeded),
+		DriverAttempted:     int(progress.driver_attempted),
+		DriverSucceeded:     int(progress.driver_succeeded),
+	}
+	switch int(progress.failure_stage) {
+	case 1:
+		result.FailureStage = "context"
+	case 2:
+		result.FailureStage = "event_create"
+	case 3:
+		result.FailureStage = "event_record"
+	case 4:
+		result.FailureStage = "event_query"
+	case 5:
+		result.FailureStage = "validation"
+	}
+	return result
+}
+
+func addProfileEventProgress(left, right profileEventProgress) profileEventProgress {
+	result := profileEventProgress{
+		ContextSetAttempts:  left.ContextSetAttempts + right.ContextSetAttempts,
+		ContextSetSuccesses: left.ContextSetSuccesses + right.ContextSetSuccesses,
+		DriverAttempted:     left.DriverAttempted + right.DriverAttempted,
+		DriverSucceeded:     left.DriverSucceeded + right.DriverSucceeded,
+		FailureStage:        left.FailureStage,
+	}
+	if right.FailureStage != "" {
+		result.FailureStage = right.FailureStage
+	}
+	return result
 }
 
 type residentMatrix struct {
@@ -2770,8 +3140,195 @@ func newDeviceRuntime() (*deviceRuntime, error) {
 	return device, nil
 }
 
-func (rt *deviceRuntime) close() {
+func (rt *deviceRuntime) profileEventPairLocked(name string) (*C.EosCudaProfileEventPair, profileEventProgress, error) {
 	if rt == nil || rt.ptr == nil {
+		return nil, profileEventProgress{}, fmt.Errorf("cuda profile event runtime is not initialized")
+	}
+	if name == "" {
+		return nil, profileEventProgress{}, fmt.Errorf("cuda profile event phase is empty")
+	}
+	if rt.profileEvents == nil {
+		rt.profileEvents = map[string]*C.EosCudaProfileEventPair{}
+	}
+	if pair := rt.profileEvents[name]; pair != nil {
+		return pair, profileEventProgress{}, nil
+	}
+	var pair *C.EosCudaProfileEventPair
+	var cProgress C.EosCudaProfileEventProgress
+	var errStr *C.char
+	if C.eosCudaProfileEventPairCreate(rt.ptr, &pair, &cProgress, &errStr) != 0 {
+		// An end-event creation failure may still own the start handle. Keep
+		// the host wrapper in the map so close can retry destruction while the
+		// context remains live.
+		if pair != nil {
+			rt.profileEvents[name] = pair
+		}
+		return pair, profileEventProgressFromC(cProgress), cStringError(errStr)
+	}
+	if pair == nil {
+		return nil, profileEventProgressFromC(cProgress), fmt.Errorf("cuda profile event pair create returned nil")
+	}
+	rt.profileEvents[name] = pair
+	return pair, profileEventProgressFromC(cProgress), nil
+}
+
+// profileEventRecord records one phase marker without waiting. Callers must
+// keep the event gate default-off and must never use this during graph capture.
+type profileEventRecordResult struct {
+	PairCreateCalled bool
+	PairCreated      bool
+	RecordCalled     bool
+	Progress         profileEventProgress
+}
+
+func (rt *deviceRuntime) profileEventRecordStats(name string, end bool) (profileEventRecordResult, error) {
+	result := profileEventRecordResult{}
+	if rt == nil || !eosCudaCompactProfileEventsEnabled {
+		return result, nil
+	}
+	rt.profileEventMu.Lock()
+	defer rt.profileEventMu.Unlock()
+	if end && (rt.profileEvents == nil || rt.profileEvents[name] == nil) {
+		return result, fmt.Errorf("cuda profile event phase %q is not initialized", name)
+	}
+	result.PairCreateCalled = !end && (rt.profileEvents == nil || rt.profileEvents[name] == nil)
+	pair, createProgress, err := rt.profileEventPairLocked(name)
+	result.Progress = createProgress
+	if err != nil {
+		return result, err
+	}
+	result.PairCreated = result.PairCreateCalled
+	result.RecordCalled = true
+	var errStr *C.char
+	endFlag := C.int(0)
+	if end {
+		endFlag = 1
+	}
+	var cProgress C.EosCudaProfileEventProgress
+	if C.eosCudaProfileEventRecord(rt.ptr, pair, endFlag, &cProgress, &errStr) != 0 {
+		result.Progress = addProfileEventProgress(result.Progress, profileEventProgressFromC(cProgress))
+		return result, cStringError(errStr)
+	}
+	result.Progress = addProfileEventProgress(result.Progress, profileEventProgressFromC(cProgress))
+	return result, nil
+}
+
+func (rt *deviceRuntime) profileEventRecord(name string, end bool) error {
+	_, err := rt.profileEventRecordStats(name, end)
+	return err
+}
+
+// profileEventBindK5End hands the reusable K5 event's end marker to the
+// existing C batch wrapper. The wrapper records it immediately before its
+// required stream barrier; bind=false clears the one-shot association after
+// the batch returns.
+func (rt *deviceRuntime) profileEventBindK5End(name string, bind bool) error {
+	if rt == nil || !eosCudaCompactProfileEventsEnabled {
+		return nil
+	}
+	rt.profileEventMu.Lock()
+	defer rt.profileEventMu.Unlock()
+	if rt.ptr == nil {
+		return fmt.Errorf("cuda profile event runtime is not initialized")
+	}
+	var pair *C.EosCudaProfileEventPair
+	var err error
+	if bind {
+		pair, _, err = rt.profileEventPairLocked(name)
+		if err != nil {
+			return err
+		}
+	}
+	var errStr *C.char
+	if C.eosCudaProfileEventBindK5End(rt.ptr, pair, &errStr) != 0 {
+		return cStringError(errStr)
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) profileEventK5EndProgress() (bool, profileEventProgress) {
+	if rt == nil || !eosCudaCompactProfileEventsEnabled {
+		return false, profileEventProgress{}
+	}
+	rt.profileEventMu.Lock()
+	defer rt.profileEventMu.Unlock()
+	if rt.ptr == nil {
+		return false, profileEventProgress{}
+	}
+	var cProgress C.EosCudaProfileEventProgress
+	recorded := C.eosCudaProfileEventK5EndProgress(rt.ptr, &cProgress) != 0
+	return recorded, profileEventProgressFromC(cProgress)
+}
+
+// profileEventElapsedStats reads a completed event pair. It intentionally does
+// not wait; callers invoke it only after an existing required stream boundary
+// has completed. called reports whether the cgo wrapper was entered, including
+// a CUDA-driver error returned by that wrapper.
+func (rt *deviceRuntime) profileEventElapsedStats(name string) (int64, bool, profileEventProgress, error) {
+	if rt == nil || !eosCudaCompactProfileEventsEnabled {
+		return 0, false, profileEventProgress{}, nil
+	}
+	rt.profileEventMu.Lock()
+	defer rt.profileEventMu.Unlock()
+	if rt.ptr == nil {
+		return 0, false, profileEventProgress{}, fmt.Errorf("cuda profile event runtime is not initialized")
+	}
+	pair := rt.profileEvents[name]
+	if pair == nil {
+		return 0, false, profileEventProgress{}, fmt.Errorf("cuda profile event phase %q is not initialized", name)
+	}
+	var milliseconds C.float
+	var cProgress C.EosCudaProfileEventProgress
+	var errStr *C.char
+	called := true
+	if C.eosCudaProfileEventElapsed(rt.ptr, pair, &milliseconds, &cProgress, &errStr) != 0 {
+		return 0, called, profileEventProgressFromC(cProgress), cStringError(errStr)
+	}
+	if milliseconds < 0 {
+		return 0, called, profileEventProgressFromC(cProgress), fmt.Errorf("cuda profile event phase %q returned negative elapsed time", name)
+	}
+	return int64(float64(milliseconds) * 1e6), called, profileEventProgressFromC(cProgress), nil
+}
+
+// profileEventElapsed is the compact compatibility wrapper for callers that
+// do not need cgo-call accounting.
+func (rt *deviceRuntime) profileEventElapsed(name string) (int64, error) {
+	nanos, _, _, err := rt.profileEventElapsedStats(name)
+	return nanos, err
+}
+
+func (rt *deviceRuntime) destroyProfileEventsLocked() {
+	if rt == nil || rt.ptr == nil {
+		return
+	}
+	for name, pair := range rt.profileEvents {
+		var errStr *C.char
+		if C.eosCudaProfileEventPairDestroy(rt.ptr, pair, &errStr) == 0 {
+			delete(rt.profileEvents, name)
+		}
+	}
+}
+
+func (rt *deviceRuntime) destroyProfileEvents() {
+	if rt == nil {
+		return
+	}
+	rt.profileEventMu.Lock()
+	defer rt.profileEventMu.Unlock()
+	rt.destroyProfileEventsLocked()
+}
+
+func (rt *deviceRuntime) close() {
+	if rt == nil {
+		return
+	}
+	if rt.ptr == nil {
+		rt.profileEventMu.Lock()
+		for name, pair := range rt.profileEvents {
+			C.eosCudaProfileEventPairAbandon(pair)
+			delete(rt.profileEvents, name)
+		}
+		rt.profileEventMu.Unlock()
 		return
 	}
 	for name, resident := range rt.residentMatrices {
@@ -2846,8 +3403,21 @@ func (rt *deviceRuntime) close() {
 		g.destroy()
 		delete(rt.graphCache, sig)
 	}
+	// Serialize event wrappers, bounded cleanup retries, and runtime teardown.
+	// A failed destroy retains its pair until the context is gone; only then do
+	// we abandon host wrapper storage because the context owns the remaining
+	// CUDA handles.
+	rt.profileEventMu.Lock()
+	for attempt := 0; attempt < 2 && len(rt.profileEvents) != 0; attempt++ {
+		rt.destroyProfileEventsLocked()
+	}
 	C.eosCudaRuntimeDestroy(rt.ptr)
 	rt.ptr = nil
+	for name, pair := range rt.profileEvents {
+		C.eosCudaProfileEventPairAbandon(pair)
+		delete(rt.profileEvents, name)
+	}
+	rt.profileEventMu.Unlock()
 }
 
 func (rt *deviceRuntime) matMulStatsSnapshot() backend.MatMulAcceleratorStats {
@@ -3524,19 +4094,29 @@ func (rt *deviceRuntime) downloadFloat32(dst []float32, src C.CUdeviceptr) error
 }
 
 type cudaCompactTrainForwardReadbackProgress struct {
-	ContextSets  int
-	DeviceCopies int
-	StatusCopied bool
-	PooledCopied bool
-	ActiveCopied bool
-	StatusValue  int32
+	ContextAttempted bool
+	ContextSucceeded bool
+	ContextSets      int
+	AttemptedCopies  int
+	CompletedCopies  int
+	DeviceCopies     int
+	FailureStage     string
+	StatusCopied     bool
+	PooledCopied     bool
+	ActiveCopied     bool
+	StatusValue      int32
 }
 
 type cudaCompactTrainForwardInputUploadProgress struct {
-	ContextSets     int
-	DeviceCopies    int
-	CompletedStages int
-	CompletedBytes  int64
+	ContextAttempted bool
+	ContextSucceeded bool
+	ContextSets      int
+	AttemptedCopies  int
+	CompletedCopies  int
+	DeviceCopies     int
+	FailureStage     string
+	CompletedStages  int
+	CompletedBytes   int64
 }
 
 type cudaCompactTrainForwardInputUploadSizes struct {
@@ -3545,6 +4125,42 @@ type cudaCompactTrainForwardInputUploadSizes struct {
 	Roles  C.size_t
 	Status C.size_t
 	Total  int64
+}
+
+func compactTrainReadbackFailureStage(stage C.int) string {
+	switch int(stage) {
+	case 1:
+		return "context"
+	case 2:
+		return "status"
+	case 3:
+		return "pooled"
+	case 4:
+		return "active"
+	case 5:
+		return "validation"
+	default:
+		return ""
+	}
+}
+
+func compactTrainInputUploadFailureStage(stage C.int) string {
+	switch int(stage) {
+	case 1:
+		return "context"
+	case 2:
+		return "tokens"
+	case 3:
+		return "masks"
+	case 4:
+		return "roles"
+	case 5:
+		return "status"
+	case 6:
+		return "validation"
+	default:
+		return ""
+	}
 }
 
 func checkedCompactTrainForwardInputUploadBytes(label string, elements int) (C.size_t, error) {
@@ -3625,13 +4241,16 @@ func validateCompactTrainForwardInputUpload(tokens, masks, roles, status []int32
 func (rt *deviceRuntime) uploadCompactTrainForwardInputs(tokens, masks, roles, status []int32, tokensDst, masksDst, rolesDst, statusDst C.CUdeviceptr, failureStage int) (cudaCompactTrainForwardInputUploadProgress, error) {
 	var progress cudaCompactTrainForwardInputUploadProgress
 	if rt == nil || rt.ptr == nil {
+		progress.FailureStage = "preflight"
 		return progress, fmt.Errorf("cuda compact train forward input upload runtime is not initialized")
 	}
 	if failureStage < 0 || failureStage > 4 {
+		progress.FailureStage = "preflight"
 		return progress, fmt.Errorf("cuda compact train forward input upload failure stage %d is invalid", failureStage)
 	}
 	sizes, err := validateCompactTrainForwardInputUpload(tokens, masks, roles, status, tokensDst, masksDst, rolesDst, statusDst)
 	if err != nil {
+		progress.FailureStage = "validation"
 		return progress, err
 	}
 	var tokensSrc, masksSrc, rolesSrc, statusSrc unsafe.Pointer
@@ -3661,42 +4280,56 @@ func (rt *deviceRuntime) uploadCompactTrainForwardInputs(tokens, masks, roles, s
 	runtime.KeepAlive(masks)
 	runtime.KeepAlive(roles)
 	runtime.KeepAlive(status)
-	completedStages := int(cProgress.completed_stages)
-	if completedStages < 0 || completedStages > 4 {
-		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid completed stage count %d", completedStages)
+	attemptedCopies := int(cProgress.attempted_copies)
+	if attemptedCopies < 0 || attemptedCopies > 4 {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid attempted copy count %d", attemptedCopies)
+	}
+	completedCopies := int(cProgress.completed_copies)
+	if completedCopies < 0 || completedCopies > 4 || completedCopies > attemptedCopies {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid completed copy count %d/%d", completedCopies, attemptedCopies)
 	}
 	deviceCopies := int(cProgress.device_copies)
-	if deviceCopies < 0 || deviceCopies > 4 {
-		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid device copy count %d", deviceCopies)
+	if deviceCopies < 0 || deviceCopies > 4 || deviceCopies != completedCopies {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid device copy count %d/%d", deviceCopies, completedCopies)
 	}
-	contextSets := int(cProgress.context_sets)
-	if contextSets < 0 || contextSets > 1 {
-		return progress, fmt.Errorf("cuda compact train forward input upload returned invalid context set count %d", contextSets)
+	contextAttempted := cProgress.context_attempted != 0
+	contextSucceeded := cProgress.context_succeeded != 0
+	if contextSucceeded && !contextAttempted {
+		return progress, fmt.Errorf("cuda compact train forward input upload returned context success without attempt")
 	}
+	failureStageName := compactTrainInputUploadFailureStage(cProgress.failure_stage)
 	completedBytes := int64(0)
-	if completedStages >= 1 {
+	if completedCopies >= 1 {
 		completedBytes += int64(sizes.Tokens)
 	}
-	if completedStages >= 2 {
+	if completedCopies >= 2 {
 		completedBytes += int64(sizes.Masks)
 	}
-	if completedStages >= 3 {
+	if completedCopies >= 3 {
 		completedBytes += int64(sizes.Roles)
 	}
-	if completedStages >= 4 {
+	if completedCopies >= 4 {
 		completedBytes += int64(sizes.Status)
 	}
 	progress = cudaCompactTrainForwardInputUploadProgress{
-		ContextSets:     contextSets,
-		DeviceCopies:    deviceCopies,
-		CompletedStages: completedStages,
-		CompletedBytes:  completedBytes,
+		ContextAttempted: contextAttempted,
+		ContextSucceeded: contextSucceeded,
+		ContextSets:      int(boolInt64(contextSucceeded)),
+		AttemptedCopies:  attemptedCopies,
+		CompletedCopies:  completedCopies,
+		DeviceCopies:     deviceCopies,
+		FailureStage:     failureStageName,
+		CompletedStages:  completedCopies,
+		CompletedBytes:   completedBytes,
 	}
 	if rc != 0 {
 		return progress, cStringError(errStr)
 	}
-	if contextSets != 1 || completedStages != 4 || deviceCopies != 4 {
-		return progress, fmt.Errorf("cuda compact train forward input upload incomplete: context_sets=%d completed_stages=%d device_copies=%d", contextSets, completedStages, deviceCopies)
+	if !contextSucceeded || completedCopies != 4 || attemptedCopies != 4 || deviceCopies != 4 {
+		if progress.FailureStage == "" {
+			progress.FailureStage = "validation"
+		}
+		return progress, fmt.Errorf("cuda compact train forward input upload incomplete: context=%t/%t attempted=%d completed=%d device_copies=%d", contextAttempted, contextSucceeded, attemptedCopies, completedCopies, deviceCopies)
 	}
 	return progress, nil
 }
@@ -3754,10 +4387,12 @@ func validateCompactTrainForwardReadback(status []int32, pooled []float32, activ
 func (rt *deviceRuntime) downloadCompactTrainForwardReadback(status []int32, pooled []float32, active []int32, statusSrc, pooledSrc, activeSrc C.CUdeviceptr) (cudaCompactTrainForwardReadbackProgress, error) {
 	var progress cudaCompactTrainForwardReadbackProgress
 	if rt == nil || rt.ptr == nil {
+		progress.FailureStage = "preflight"
 		return progress, fmt.Errorf("cuda compact train forward readback runtime is not initialized")
 	}
 	statusBytes, pooledBytes, activeBytes, err := validateCompactTrainForwardReadback(status, pooled, active, statusSrc, pooledSrc, activeSrc)
 	if err != nil {
+		progress.FailureStage = "validation"
 		return progress, err
 	}
 	var cProgress C.EosCudaCompactTrainForwardReadbackProgress
@@ -3769,13 +4404,29 @@ func (rt *deviceRuntime) downloadCompactTrainForwardReadback(status []int32, poo
 		unsafe.Pointer(&active[0]), activeSrc, activeBytes,
 		&cProgress, &errStr,
 	)
+	attemptedCopies := int(cProgress.attempted_copies)
+	completedCopies := int(cProgress.completed_copies)
+	deviceCopies := int(cProgress.device_copies)
+	contextAttempted := cProgress.context_attempted != 0
+	contextSucceeded := cProgress.context_succeeded != 0
+	if attemptedCopies < 0 || attemptedCopies > 3 || completedCopies < 0 || completedCopies > 3 || completedCopies > attemptedCopies || deviceCopies != completedCopies || deviceCopies < 0 || deviceCopies > 3 {
+		return progress, fmt.Errorf("cuda compact train forward readback returned invalid copy progress attempted=%d completed=%d device=%d", attemptedCopies, completedCopies, deviceCopies)
+	}
+	if contextSucceeded && !contextAttempted {
+		return progress, fmt.Errorf("cuda compact train forward readback returned context success without attempt")
+	}
 	progress = cudaCompactTrainForwardReadbackProgress{
-		ContextSets:  int(cProgress.context_sets),
-		DeviceCopies: int(cProgress.device_copies),
-		StatusCopied: cProgress.status_copied != 0,
-		PooledCopied: cProgress.pooled_copied != 0,
-		ActiveCopied: cProgress.active_copied != 0,
-		StatusValue:  int32(cProgress.status_value),
+		ContextAttempted: contextAttempted,
+		ContextSucceeded: contextSucceeded,
+		ContextSets:      int(boolInt64(contextSucceeded)),
+		AttemptedCopies:  attemptedCopies,
+		CompletedCopies:  completedCopies,
+		DeviceCopies:     deviceCopies,
+		FailureStage:     compactTrainReadbackFailureStage(cProgress.failure_stage),
+		StatusCopied:     cProgress.status_copied != 0,
+		PooledCopied:     cProgress.pooled_copied != 0,
+		ActiveCopied:     cProgress.active_copied != 0,
+		StatusValue:      int32(cProgress.status_value),
 	}
 	if rc == 0 || rc == 2 {
 		return progress, nil
@@ -5399,24 +6050,63 @@ func validateOptimizerUpdateLaunches(updates []optimizerUpdateLaunch) error {
 }
 
 func (rt *deviceRuntime) launchOptimizerUpdateBatch(kernel *auxKernel, updates []optimizerUpdateLaunch) (int, bool, error) {
-	if kernel == nil || kernel.ptr == nil {
-		return 0, false, fmt.Errorf("cuda optimizer kernel is not initialized")
+	enqueued, attempted, _, err := rt.launchOptimizerUpdateBatchWithCall(kernel, updates)
+	return enqueued, attempted, err
+}
+
+type optimizerUpdateBatchProgress struct {
+	Enqueued            int
+	Attempted           int
+	Called              bool
+	DescriptorAllocated bool
+	FailureStage        string
+	FailIndex           int
+	Err                 error
+}
+
+func optimizerUpdateBatchFailureStage(stage C.int) string {
+	switch int(stage) {
+	case 3:
+		return "context"
+	case 4:
+		return "launch"
+	case 5:
+		return "barrier"
+	case 6:
+		return "drain"
+	default:
+		return ""
+	}
+}
+
+func (rt *deviceRuntime) launchOptimizerUpdateBatchWithProgress(kernel *auxKernel, updates []optimizerUpdateLaunch) optimizerUpdateBatchProgress {
+	progress := optimizerUpdateBatchProgress{FailIndex: -1}
+	if rt == nil || rt.ptr == nil || kernel == nil || kernel.ptr == nil {
+		progress.FailureStage = "preflight"
+		progress.Err = fmt.Errorf("cuda optimizer runtime or kernel is not initialized")
+		return progress
 	}
 	if len(updates) == 0 {
-		return 0, false, nil
+		return progress
 	}
 	descriptorBytes, err := optimizerUpdateBatchDescriptorBytes(uint64(len(updates)))
 	if err != nil {
-		return 0, false, err
+		progress.FailureStage = "preflight"
+		progress.Err = err
+		return progress
 	}
 	if err := validateOptimizerUpdateLaunches(updates); err != nil {
-		return 0, false, err
+		progress.FailureStage = "preflight"
+		progress.Err = err
+		return progress
 	}
-	bytes := descriptorBytes
-	descriptorMem := C.malloc(bytes)
+	descriptorMem := C.malloc(descriptorBytes)
 	if descriptorMem == nil {
-		return 0, false, fmt.Errorf("cuda optimizer batch descriptor allocation failed for %d updates", len(updates))
+		progress.FailureStage = "descriptor_alloc"
+		progress.Err = fmt.Errorf("cuda optimizer batch descriptor allocation failed for %d updates", len(updates))
+		return progress
 	}
+	progress.DescriptorAllocated = true
 	defer C.free(descriptorMem)
 	descriptors := unsafe.Slice((*C.EosCudaOptimizerUpdateDescriptor)(descriptorMem), len(updates))
 	for i, update := range updates {
@@ -5439,7 +6129,10 @@ func (rt *deviceRuntime) launchOptimizerUpdateBatch(kernel *auxKernel, updates [
 	}
 	var enqueued C.int
 	var attempted C.int
+	var failureStage C.int
+	var failureIndex C.int
 	var errStr *C.char
+	progress.Called = true
 	if C.eosCudaLaunchOptimizerUpdateBatch(
 		rt.ptr,
 		kernel.ptr,
@@ -5447,18 +6140,36 @@ func (rt *deviceRuntime) launchOptimizerUpdateBatch(kernel *auxKernel, updates [
 		C.int(len(updates)),
 		&enqueued,
 		&attempted,
+		&failureStage,
+		&failureIndex,
 		&errStr,
 	) != 0 {
-		count := int(enqueued)
-		if count < 0 {
-			count = 0
-		}
-		if count > len(updates) {
-			count = len(updates)
-		}
-		return count, attempted != 0, cStringError(errStr)
+		progress.Err = cStringError(errStr)
+	} else {
+		progress.Err = nil
 	}
-	return len(updates), attempted != 0, nil
+	progress.Enqueued = int(enqueued)
+	if progress.Enqueued < 0 {
+		progress.Enqueued = 0
+	}
+	if progress.Enqueued > len(updates) {
+		progress.Enqueued = len(updates)
+	}
+	progress.Attempted = int(attempted)
+	if progress.Attempted < 0 {
+		progress.Attempted = 0
+	}
+	if progress.Attempted > len(updates) {
+		progress.Attempted = len(updates)
+	}
+	progress.FailureStage = optimizerUpdateBatchFailureStage(failureStage)
+	progress.FailIndex = int(failureIndex)
+	return progress
+}
+
+func (rt *deviceRuntime) launchOptimizerUpdateBatchWithCall(kernel *auxKernel, updates []optimizerUpdateLaunch) (int, bool, bool, error) {
+	progress := rt.launchOptimizerUpdateBatchWithProgress(kernel, updates)
+	return progress.Enqueued, progress.Attempted != 0, progress.Called, progress.Err
 }
 
 func (rt *deviceRuntime) launchAuxSoftmaxBackwardRows(kernel *auxKernel, grid, block uint, gradOut, probs, out0 C.CUdeviceptr, rows, cols int) error {
@@ -5727,6 +6438,11 @@ var eosCudaCompactTrainForwardGraphEnabled = cudaEnvFlagEnabled("EOS_CUDA_COMPAC
 // cold and mixed-zero arenas always retain the scalar allocation/copy path.
 var eosCudaCompactTrainForwardUploadBatchEnabled = cudaEnvFlagEnabled("EOS_CUDA_COMPACT_TRAIN_FORWARD_UPLOAD_BATCH")
 
+// eosCudaCompactProfileEventsEnabled gates the optional compact resident
+// training telemetry. The default path performs no event allocation, record,
+// elapsed query, or synchronization beyond the existing compact boundaries.
+var eosCudaCompactProfileEventsEnabled = cudaEnvFlagEnabled("EOS_CUDA_COMPACT_PROFILE_EVENTS")
+
 // cudaGraph wraps an instantiated, replayable CUDA graph.
 type cudaGraph struct {
 	ptr     *C.EosCudaGraph
@@ -5744,6 +6460,30 @@ func (rt *deviceRuntime) beginCapture() error {
 	return nil
 }
 
+type cudaCaptureBeginProgress struct {
+	ContextSets int
+	DriverCalls int
+	Attempted   bool
+	Completed   bool
+}
+
+func (rt *deviceRuntime) beginCaptureWithProgress() (cudaCaptureBeginProgress, error) {
+	var progress cudaCaptureBeginProgress
+	var contextSet C.int
+	var attempted C.int
+	var succeeded C.int
+	var errStr *C.char
+	rc := C.eosCudaBeginCaptureProgress(rt.ptr, &contextSet, &attempted, &succeeded, &errStr)
+	progress.ContextSets = int(contextSet)
+	progress.DriverCalls = int(attempted)
+	progress.Attempted = attempted != 0
+	progress.Completed = succeeded != 0
+	if rc != 0 {
+		return progress, cStringError(errStr)
+	}
+	return progress, nil
+}
+
 // endCapture ends capture and instantiates the recorded graph.
 func (rt *deviceRuntime) endCapture() (*cudaGraph, error) {
 	var g *C.EosCudaGraph
@@ -5752,6 +6492,37 @@ func (rt *deviceRuntime) endCapture() (*cudaGraph, error) {
 		return nil, cStringError(errStr)
 	}
 	return &cudaGraph{ptr: g, runtime: rt}, nil
+}
+
+type cudaCaptureEndProgress struct {
+	ContextSets          int
+	DriverCalls          int
+	EndAttempted         bool
+	EndCompleted         bool
+	InstantiateAttempted bool
+	InstantiateCompleted bool
+}
+
+func (rt *deviceRuntime) endCaptureWithProgress() (*cudaGraph, cudaCaptureEndProgress, error) {
+	var progress cudaCaptureEndProgress
+	var g *C.EosCudaGraph
+	var contextSet C.int
+	var endAttempted C.int
+	var endSucceeded C.int
+	var instantiateAttempted C.int
+	var instantiateSucceeded C.int
+	var errStr *C.char
+	rc := C.eosCudaEndCaptureProgress(rt.ptr, &g, &contextSet, &endAttempted, &endSucceeded, &instantiateAttempted, &instantiateSucceeded, &errStr)
+	progress.ContextSets = int(contextSet)
+	progress.DriverCalls = int(endAttempted) + int(instantiateAttempted)
+	progress.EndAttempted = endAttempted != 0
+	progress.EndCompleted = endSucceeded != 0
+	progress.InstantiateAttempted = instantiateAttempted != 0
+	progress.InstantiateCompleted = instantiateSucceeded != 0
+	if rc != 0 {
+		return nil, progress, cStringError(errStr)
+	}
+	return &cudaGraph{ptr: g, runtime: rt}, progress, nil
 }
 
 // launchGraph replays a captured graph and synchronizes once.
