@@ -76,6 +76,9 @@ func TestVectorDistillCompactResidentTrainCUDAOneAndTwoStepParity(t *testing.T) 
 	assertResidentGradBatchTelemetry(t, "resident immediate", residentImmediateSummary.DeltaProfile, 2, 2, 30)
 	assertResidentGradBatchTelemetry(t, "resident deferred", residentDeferredSummary.DeltaProfile, 2, 2, 30)
 	assertNoResidentGradBatchTelemetry(t, "host", hostSummary.DeltaProfile)
+	assertCompactForwardReadbackTelemetry(t, "resident immediate", residentImmediateSummary.DeltaProfile, 2, 2, 6)
+	assertCompactForwardReadbackTelemetry(t, "resident deferred", residentDeferredSummary.DeltaProfile, 2, 2, 6)
+	assertCompactForwardReadbackTelemetry(t, "host", hostSummary.DeltaProfile, 0, 0, 0)
 	if residentImmediateSummary.DeltaProfile.Optimizer.UploadedBytes >= hostSummary.DeltaProfile.Optimizer.UploadedBytes {
 		t.Fatalf("resident immediate optimizer uploaded bytes = %d, host = %d", residentImmediateSummary.DeltaProfile.Optimizer.UploadedBytes, hostSummary.DeltaProfile.Optimizer.UploadedBytes)
 	}
@@ -151,6 +154,7 @@ func TestVectorDistillCompactResidentTrainCUDACublasGateOneAndTwoStepParity(t *t
 		if stats.PooledDownloadedBytes == 0 || stats.GradPooledUploadedBytes == 0 {
 			t.Fatalf("%s compact train pooled transfer counters = %+v", label, *stats)
 		}
+		assertCompactForwardReadbackTelemetry(t, "cublas "+label, summary.DeltaProfile, 2, 2, 6)
 	}
 	t.Logf("B cublas resident/immediate compact_train=%+v", *residentImmediateSummary.DeltaProfile.CompactTrain)
 	t.Logf("C cublas resident/deferred compact_train=%+v", *residentDeferredSummary.DeltaProfile.CompactTrain)
@@ -199,6 +203,8 @@ func TestVectorDistillCompactResidentTrainCUDAVaryingTWholeBatchParity(t *testin
 	stats := profile.CompactTrain
 	assertResidentGradBatchTelemetry(t, "varying-T resident", profile, 1, 1, -1)
 	assertNoResidentGradBatchTelemetry(t, "varying-T host", hostProfile)
+	assertCompactForwardReadbackTelemetry(t, "varying-T resident", profile, 3, 3, 9)
+	assertCompactForwardReadbackTelemetry(t, "varying-T host", hostProfile, 0, 0, 0)
 	if stats == nil {
 		t.Fatal("varying-T resident compact train stats are nil")
 	}
@@ -266,6 +272,8 @@ func TestVectorDistillCompactResidentTrainCUDACublasGateVaryingTWholeBatchParity
 	stats := profile.CompactTrain
 	assertResidentGradBatchTelemetry(t, "varying-T cublas resident", profile, 1, 1, -1)
 	assertNoResidentGradBatchTelemetry(t, "varying-T cublas host", hostProfile)
+	assertCompactForwardReadbackTelemetry(t, "varying-T cublas resident", profile, 3, 3, 9)
+	assertCompactForwardReadbackTelemetry(t, "varying-T cublas host", hostProfile, 0, 0, 0)
 	if stats == nil {
 		t.Fatal("varying-T cublas resident compact train stats are nil")
 	}
@@ -306,6 +314,23 @@ func assertResidentGradBatchTelemetry(t *testing.T, label string, profile Embedd
 	}
 	if wantKernelLaunches >= 0 && stats.ResidentGradBatchKernelLaunches != wantKernelLaunches {
 		t.Fatalf("%s resident-gradient batch kernel launches = %d, want %d: %+v", label, stats.ResidentGradBatchKernelLaunches, wantKernelLaunches, stats)
+	}
+}
+
+func assertCompactForwardReadbackTelemetry(t *testing.T, label string, profile EmbeddingTrainProfile, wantEntries, wantContexts, wantCopies int64) {
+	t.Helper()
+	stats := profile.CompactTrain
+	if wantEntries == 0 && wantContexts == 0 && wantCopies == 0 {
+		if stats != nil && (stats.ForwardReadbackBatchEntries != 0 || stats.ForwardReadbackContextSets != 0 || stats.ForwardReadbackDeviceCopies != 0) {
+			t.Fatalf("%s compact-forward readback telemetry = %d/%d/%d, want 0/0/0", label, stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies)
+		}
+		return
+	}
+	if stats == nil {
+		t.Fatalf("%s compact-forward stats are nil, want readback telemetry %d/%d/%d", label, wantEntries, wantContexts, wantCopies)
+	}
+	if stats.ForwardReadbackBatchEntries != wantEntries || stats.ForwardReadbackContextSets != wantContexts || stats.ForwardReadbackDeviceCopies != wantCopies {
+		t.Fatalf("%s compact-forward readback telemetry = %d/%d/%d, want %d/%d/%d", label, stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies, wantEntries, wantContexts, wantCopies)
 	}
 }
 

@@ -337,6 +337,9 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		out.PooledDownloadedBytes -= start.PooledDownloadedBytes
 		out.GradPooledUploadedBytes -= start.GradPooledUploadedBytes
 		out.StatusDownloadedBytes -= start.StatusDownloadedBytes
+		out.ForwardReadbackBatchEntries -= start.ForwardReadbackBatchEntries
+		out.ForwardReadbackContextSets -= start.ForwardReadbackContextSets
+		out.ForwardReadbackDeviceCopies -= start.ForwardReadbackDeviceCopies
 		out.PackedBytesAvoided -= start.PackedBytesAvoided
 		out.HostGradUploadBytesAvoided -= start.HostGradUploadBytesAvoided
 		out.KernelLaunches -= start.KernelLaunches
@@ -379,6 +382,9 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.PooledDownloadedBytes += right.PooledDownloadedBytes
 		out.GradPooledUploadedBytes += right.GradPooledUploadedBytes
 		out.StatusDownloadedBytes += right.StatusDownloadedBytes
+		out.ForwardReadbackBatchEntries += right.ForwardReadbackBatchEntries
+		out.ForwardReadbackContextSets += right.ForwardReadbackContextSets
+		out.ForwardReadbackDeviceCopies += right.ForwardReadbackDeviceCopies
 		out.PackedBytesAvoided += right.PackedBytesAvoided
 		out.HostGradUploadBytesAvoided += right.HostGradUploadBytesAvoided
 		out.KernelLaunches += right.KernelLaunches

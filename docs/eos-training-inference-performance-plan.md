@@ -236,6 +236,46 @@ wrapper. The longer-term architecture is machine-generated typed wrappers and
 direct driver ownership, with every reduction validated against scalar parity,
 fallback accounting, and failure poisoning.
 
+## Current Preparation Checkpoint: K6 (2026-08-15)
+
+K6 completes the compact-forward readback slice with a typed
+status-to-pooled-to-active bridge. The wrapper validates its typed destinations
+and sources, sets the CUDA context once, performs synchronous copies in that
+order, and retains no Go pointer after return. The successful readback ledger
+is:
+
+| readback metric | before | after |
+| --- | ---: | ---: |
+| Go/C readback entries | 3 | 1 |
+| CUDA context sets | 3 | 1 |
+| device copies | 3 | 3 |
+| readback bytes | unchanged | unchanged |
+| extra stream synchronizations | 0 | 0 |
+
+No kernel, optimizer, graph, H2D, compact-byte, compact-sync, or fallback
+behavior changed. If the device status is nonzero, the bridge copies status
+only, stops before pooled/active, returns the exact existing status error,
+publishes no handle, and does not count a successful readback batch. Successful
+stage progress remains available for partial-byte accounting and cleanup.
+
+Live compact-forward telemetry is batch entries / context sets / device copies:
+
+| profile | readback entries | context sets | device copies | result |
+| --- | ---: | ---: | ---: | --- |
+| canonical one-step | 1 | 1 | 3 | K5 batch `1/15/1`, compact `68/2`, fallback `0` |
+| two-step parity | 2 | 2 | 6 | K5 batch `2/30/2`, parity and handles clean |
+| varying `T=2,3,4` | 3 | 3 | 9 | K5 batch one call/barrier, compact `204/6`, fallback `0` |
+| next one-step | 1 | 1 | 3 | K5 batch `1/14/1`, compact `65/2`, fallback `0` |
+| host/scalar baseline | 0 | 0 | 0 | host batch telemetry remains zero |
+
+The latest warm samples are `4.537 ms` canonical and `678.554 ms` next,
+measured on a shared host with one warm-up excluded. They are deterministic
+counter-gate diagnostics only, not throughput or production-latency claims.
+The K6 code review approved the slice with no P0/P1 finding. A deterministic
+CUDA D2H fault injector is still a residual coverage gap for pooled- and
+active-copy failures; status-first early-stop, validation, stage-progress
+cleanup, and zero-successful-batch behavior are covered by tests and review.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -282,7 +322,11 @@ Durable implementation lessons:
   historical rewrite: K3 per-ref counters remain in the ledger, while K4
   physical slab counters report one cold allocation and warm reuse (the
   measured warm-gate delta is `0/1`).
-- Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons.md`; `.tiller/scratch/codex/eos-k4-gradient-slab-review.md`; `.tiller/scratch/codex/eos-k4-ffi-hotspot-analysis.md`; `.tiller/scratch/codex/eos-k5-live-gate.md`.
+- K6 makes packed readback equally explicit: three Go/C/context boundaries
+  become one, but three device copies and all readback bytes remain. Status is
+  copied first and a nonzero status publishes no handle; deterministic D2H
+  fault injection for pooled/active copies remains a coverage gap.
+- Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons.md`; `.tiller/scratch/codex/eos-k4-gradient-slab-review.md`; `.tiller/scratch/codex/eos-k4-ffi-hotspot-analysis.md`; `.tiller/scratch/codex/eos-k5-live-gate.md`; `.tiller/scratch/codex/eos-k6-forward-readback-report.md`; `.tiller/scratch/codex/eos-k6-live-gate.md`.
 
 External current-docs facts:
 
@@ -392,14 +436,17 @@ Phase 0, weeks 1-2, close safety and observability:
 - K5 preparation slice: add the optional typed resident-optimizer batch, prove
   the canonical `15 -> 1` Go/C/context/barrier reduction while retaining `15`
   kernel launches, and keep scalar host fallback/parity clean.
+- K6 preparation slice: complete the typed compact-forward status/pooled/active
+  readback bridge, reducing Go/C and context boundaries `3 -> 1` while keeping
+  device copies, bytes, synchronizations, and fallback semantics unchanged.
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 
-- Critical path: packed forward readback (three D2H cgo entries to one context/
-  entry without claiming fewer device copies), resident-step coordination,
-  duplicate-ref-safe download elision, host/device/fallback accounting, and
-  S3e full-step gradients. Launch-array or graph work waits for stable pointers
-  and exact-shape allocation/readback behavior.
+- Critical path: investigate fixed-bucket compact CUDA Graph or typed launch-
+  array execution after K6 readback completion, first confirming exact device-
+  pointer stability and excluding H2D/readback from the candidate slice;
+  resident-step coordination, duplicate-ref-safe download elision,
+  host/device/fallback accounting, and S3e full-step gradients remain in scope.
 - Exit gate: deterministic counters prove fewer calls/syncs, quiet-host mini smoke is non-regressing, and fallback reasons are exhaustive.
 
 Phase 2, weeks 4-7, CUDA performance reference:
@@ -579,40 +626,46 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 ### CUDA-GRAPH / Fixed-Bucket CUDA Graph Replay
 
+- status: next bounded investigation only; no implementation claim.
 - role/profile: `tiller-worker`.
 - objective: capture and replay fixed-shape resident training/inference buckets after allocations and stream work are stable.
 - context paths: `runtime/backends/cuda/matmul_accel.go`; resident train stats; backend graph counters.
-- constraints: no graph capture before shape/allocation stability; disable flag; normal dispatch fallback.
+- constraints: first confirm exact device-pointer stability and exclude H2D and
+  compact readback from the candidate slice; keep capture/replay default-off,
+  preserve normal dispatch fallback, and compare a typed launch-array option
+  separately rather than claiming either path is implemented.
 - expected outputs: capture cache, replay counters, fixed-bucket tests, A/B report.
 - verification target: graph capture/replay counters and >=`10%` representative end-to-end replay win without parity drift; `5%` is diagnostic signal only.
 - budget tier/model ceiling: medium.
 - sandbox/permission needs: CUDA.
-- dependencies/blockers: S3E-STEP; OBS-EXEC; stable pointers and the packed
-  forward-readback gate.
+- dependencies/blockers: S3E-STEP; OBS-EXEC; K6 readback completion; stable
+  device pointers.
 - checkpoint criteria: fixed-bucket replay is optional and measured.
 - report contract: Outcome; capture shapes; counters; tests; caveats; next action.
 
 ### PACKED-FORWARD-READBACK / Narrow cgo Readback Fan-Out
 
+- status: complete/historical (K6, 2026-08-15).
 - role/profile: `tiller-worker` with CUDA runtime review.
 - objective: combine compact-forward status, pooled, and active readbacks under
   one context/entry while preserving ordering and the three underlying device
-  copies.
+  copies. **Completed by K6.**
 - context paths: `runtime/backends/cuda/compact_train_accel_linux.go`;
   `runtime/backends/cuda/native_linux.go`; compact resident profile counters.
 - constraints: reduce three D2H cgo entries to one context/entry; do not claim
   fewer device copies or fewer bytes; status must be checked before pooled
   results are returned; keep scalar/fallback behavior unchanged.
-- expected outputs: optional narrow wrapper, counter evidence, and parity/error
+- expected outputs: typed narrow wrapper, counter evidence, and parity/error
   tests. Launch-array and graph capture remain separate follow-up slices.
-- verification target: exact compact launch/sync/byte/fallback parity, one
-  packed readback context/entry, and no stale active/pooled bucket state.
+- verification target: **met** — exact compact launch/sync/byte/fallback parity,
+  one packed readback context/entry, and no stale active/pooled bucket state.
 - budget tier/model ceiling: medium, `gpt-5.5 medium`.
 - sandbox/permission needs: CUDA build/test; no commit.
 - dependencies/blockers: K4 slab lifecycle; K5 optimizer batch; stable exact
   shape and pointer ownership.
-- checkpoint criteria: deterministic cgo/context reduction is verified without
-  changing device-copy counts, and graph/launch-array work remains unstarted.
+- checkpoint criteria: **met** — deterministic cgo/context reduction is
+  verified without changing device-copy counts, and graph/launch-array work
+  remains unstarted.
 - report contract: Outcome; before/after entries and copies; parity/tests;
   caveats; checkpoint candidate; Arbiter next action.
 
@@ -793,6 +846,9 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 ## Risks And Open Decisions
 
 - Wall-clock noise on shared host: use deterministic counters first; require quiet-host timing and loadavg for 5-10% claims.
+- K6 D2H fault injection: status-first early stop and stage-progress cleanup are
+  covered, but deterministic injected failures at pooled/active copy points
+  remain residual test-hardening work.
 - S3d residual validation risks: explicit skip counts, flush counts, resident-gradient attribution, and exact corpus provenance must be surfaced before the next resident-step coordinator claim.
 - Backend name overclaims device execution: CAP-V2 and OBS-EXEC make device/fallback truth inspectable.
 - Apple framework temptation: Direct Metal remains core; MPSGraph selective; MLX/Core ML/BNNS adapters do not own `.mll`.
@@ -807,13 +863,14 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 ## Immediate Next Action
 
-The old K1-first action is historical; K4 and K5 are now verified checkpoints.
-The next bounded performance slice is packed compact-forward readback: reduce
-the three D2H cgo entries for status, pooled, and active to one context/entry
-while preserving all three device copies, ordering, bytes, and fallback
-semantics. Launch-array or CUDA Graph work may follow only after exact-shape
-pointers, allocations, and readback ownership are stable; it remains optional,
-default-off, and measurement-gated.
+The old K1-first action and packed-forward readback are historical; K4, K5,
+and K6 are now verified checkpoints. The next bounded performance step is an
+investigation, not an implementation claim: compare fixed-bucket compact CUDA
+Graph replay with a typed launch-array path only after confirming exact device-
+pointer stability and explicitly excluding H2D and compact readback from the
+candidate slice. Keep either path default-off, expose capture/replay or launch
+telemetry, require hard parity, and require a representative end-to-end win of
+at least `10%` before promotion (`5%` is diagnostic only).
 
 The next controlled encoder-v2.1 training run remains blocked by the selected-
 package BGE FiQA export and related pretrained/export jobs. Hold it and do not

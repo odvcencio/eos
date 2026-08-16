@@ -209,24 +209,32 @@ type CompactForwardAcceleratorStats struct {
 // activity. A nil stats provider means unavailable; a zero-valued available
 // stats struct means the implementation exists but has not run.
 type CompactTrainAcceleratorStats struct {
-	ForwardCalls                int64
-	BackwardCalls               int64
-	HandlesCreated              int64
-	HandlesReleased             int64
-	LiveHandles                 int64
-	ArenaReuseHits              int64
-	ArenaAllocations            int64
-	GradientReuseHits           int64
-	GradientAllocations         int64
-	GradientZeroCalls           int64
-	ResidentGradBytes           int64
-	ActivationArenaBytes        int64
-	WorkspaceArenaBytes         int64
-	UploadedBytes               int64
-	DownloadedBytes             int64
-	PooledDownloadedBytes       int64
-	GradPooledUploadedBytes     int64
-	StatusDownloadedBytes       int64
+	ForwardCalls            int64
+	BackwardCalls           int64
+	HandlesCreated          int64
+	HandlesReleased         int64
+	LiveHandles             int64
+	ArenaReuseHits          int64
+	ArenaAllocations        int64
+	GradientReuseHits       int64
+	GradientAllocations     int64
+	GradientZeroCalls       int64
+	ResidentGradBytes       int64
+	ActivationArenaBytes    int64
+	WorkspaceArenaBytes     int64
+	UploadedBytes           int64
+	DownloadedBytes         int64
+	PooledDownloadedBytes   int64
+	GradPooledUploadedBytes int64
+	StatusDownloadedBytes   int64
+	// ForwardReadbackBatchEntries, ForwardReadbackContextSets, and
+	// ForwardReadbackDeviceCopies count fully successful compact-forward
+	// status/pooled/active readback batches. They deliberately describe the
+	// typed readback wrapper's call/context/copy work; they do not replace the
+	// byte counters above, which retain partial-copy failure accounting.
+	ForwardReadbackBatchEntries int64
+	ForwardReadbackContextSets  int64
+	ForwardReadbackDeviceCopies int64
 	PackedBytesAvoided          int64
 	HostGradUploadBytesAvoided  int64
 	KernelLaunches              int64

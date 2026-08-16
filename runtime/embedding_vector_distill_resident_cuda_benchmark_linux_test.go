@@ -138,6 +138,9 @@ func BenchmarkVectorDistillCompactResidentTrainCUDAWarm(b *testing.B) {
 	if stats.FallbackOrUnhandled != 0 {
 		b.Fatalf("compact resident CUDA measured step reported compact-train fallback/unhandled=%d", stats.FallbackOrUnhandled)
 	}
+	if stats.ForwardReadbackBatchEntries != 1 || stats.ForwardReadbackContextSets != 1 || stats.ForwardReadbackDeviceCopies != 3 {
+		b.Fatalf("compact resident CUDA measured readback telemetry = %d/%d/%d; want 1/1/3", stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies)
+	}
 	optimizerStats := measuredDelta.Optimizer
 	if optimizerStats.ResidentGradBatchCalls != 1 ||
 		optimizerStats.ResidentGradBatchKernelSyncs != 1 ||
@@ -164,6 +167,9 @@ func BenchmarkVectorDistillCompactResidentTrainCUDAWarm(b *testing.B) {
 	b.ReportMetric(perStep(stats.UploadedBytes), "compact_upload_B/step")
 	b.ReportMetric(perStep(stats.DownloadedBytes), "compact_download_B/step")
 	b.ReportMetric(perStep(stats.PooledDownloadedBytes), "pooled_download_B/step")
+	b.ReportMetric(perStep(stats.ForwardReadbackBatchEntries), "compact_forward_readback_batch_entries/step")
+	b.ReportMetric(perStep(stats.ForwardReadbackContextSets), "compact_forward_readback_context_sets/step")
+	b.ReportMetric(perStep(stats.ForwardReadbackDeviceCopies), "compact_forward_readback_device_copies/step")
 	b.ReportMetric(perStep(stats.GradPooledUploadedBytes), "grad_pooled_upload_B/step")
 	b.ReportMetric(perStep(stats.FallbackOrUnhandled), "compact_train_fallback_or_unhandled/step")
 	b.ReportMetric(perStep(stats.GraphCaptures), "graph_captures/step")

@@ -2289,23 +2289,30 @@ func (a *CompactTrainAccelerator) runCompactTrainForwardLocked(req backend.Compa
 		return backend.CompactTrainForwardResult{}, err
 	}
 	status := []int32{0}
-	if err := a.device.downloadInt32(status, arena.status); err != nil {
-		return backend.CompactTrainForwardResult{}, err
+	pooled := make([]float32, B*O)
+	activeCounts := make([]int32, B)
+	readback, readbackErr := a.device.downloadCompactTrainForwardReadback(status, pooled, activeCounts, arena.status, arena.finalPooled, arena.active)
+	if readback.StatusCopied {
+		statusBytes = int64(len(status) * 4)
 	}
-	statusBytes = int64(4)
+	if readback.PooledCopied {
+		pooledBytes = int64(len(pooled) * 4)
+	}
+	if readback.ActiveCopied {
+		activeBytes = int64(len(activeCounts) * 4)
+	}
+	if readbackErr != nil {
+		return backend.CompactTrainForwardResult{}, readbackErr
+	}
 	if status[0] != 0 {
 		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train gather status %d", status[0])
 	}
-	pooled := make([]float32, B*O)
-	if err := a.device.downloadFloat32(pooled, arena.finalPooled); err != nil {
-		return backend.CompactTrainForwardResult{}, err
+	if readback.ContextSets != 1 || readback.DeviceCopies != 3 || !readback.StatusCopied || !readback.PooledCopied || !readback.ActiveCopied {
+		return backend.CompactTrainForwardResult{}, fmt.Errorf("cuda compact train forward readback incomplete: context_sets=%d device_copies=%d status=%t pooled=%t active=%t", readback.ContextSets, readback.DeviceCopies, readback.StatusCopied, readback.PooledCopied, readback.ActiveCopied)
 	}
-	pooledBytes = int64(len(pooled) * 4)
-	activeCounts := make([]int32, B)
-	if err := a.device.downloadInt32(activeCounts, arena.active); err != nil {
-		return backend.CompactTrainForwardResult{}, err
-	}
-	activeBytes = int64(len(activeCounts) * 4)
+	a.stats.ForwardReadbackBatchEntries++
+	a.stats.ForwardReadbackContextSets += int64(readback.ContextSets)
+	a.stats.ForwardReadbackDeviceCopies += int64(readback.DeviceCopies)
 	token := &compactTrainHandleToken{owner: a, backend: eosartifact.BackendCUDA, generation: arena.generation, stepID: a.stepID, id: arena.id}
 	token.alive.Store(true)
 	arena.token = token

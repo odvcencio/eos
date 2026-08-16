@@ -60,6 +60,20 @@ typedef struct {
 	float scale;
 } EosCudaOptimizerUpdateDescriptor;
 
+// EosCudaCompactTrainForwardReadbackProgress is written by the synchronous
+// compact-forward readback bridge before it returns. The bridge never retains
+// any host pointer supplied by Go; the fields only report completed work so
+// the Go owner can account for a partial-copy failure without inventing a
+// successful batch.
+typedef struct {
+	int context_sets;
+	int status_copied;
+	int pooled_copied;
+	int active_copied;
+	int device_copies;
+	int status_value;
+} EosCudaCompactTrainForwardReadbackProgress;
+
 static char* manta_dup_cstr(const char* s) {
 	if (s == NULL) {
 		return NULL;
@@ -466,6 +480,71 @@ static int eosCudaMemcpyDtoH(EosCudaRuntime* rt, void* dst, CUdeviceptr src, siz
 		*err = manta_dup_cu_error("cuMemcpyDtoH", cuRes);
 		return 1;
 	}
+	return 0;
+}
+
+// eosCudaMemcpyCompactTrainForwardReadback performs the three compact-forward
+// readbacks in their existing semantic order. It sets the CUDA context once,
+// copies status first, and stops before pooled/active when status is nonzero.
+// The copies are synchronous cuMemcpyDtoH calls, so no additional stream
+// synchronization is introduced and Go pointers are not retained after return.
+// Return values are 0 for all three copies, 1 for the first CUDA/argument
+// failure, and 2 for a successfully copied nonzero device status.
+static int eosCudaMemcpyCompactTrainForwardReadback(
+	EosCudaRuntime* rt,
+	void* status_dst,
+	CUdeviceptr status_src,
+	size_t status_bytes,
+	void* pooled_dst,
+	CUdeviceptr pooled_src,
+	size_t pooled_bytes,
+	void* active_dst,
+	CUdeviceptr active_src,
+	size_t active_bytes,
+	EosCudaCompactTrainForwardReadbackProgress* progress,
+	char** err) {
+	if (progress == NULL) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardReadback", "missing progress output");
+		return 1;
+	}
+	memset(progress, 0, sizeof(*progress));
+	if (rt == NULL || status_dst == NULL || status_src == 0 || status_bytes != sizeof(int32_t) ||
+		pooled_dst == NULL || pooled_src == 0 || pooled_bytes == 0 ||
+		active_dst == NULL || active_src == 0 || active_bytes == 0) {
+		*err = manta_dup_format("eosCudaMemcpyCompactTrainForwardReadback", "invalid readback arguments");
+		return 1;
+	}
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	progress->context_sets = 1;
+	cuRes = cuMemcpyDtoH(status_dst, status_src, status_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyDtoH(status)", cuRes);
+		return 1;
+	}
+	progress->status_copied = 1;
+	progress->device_copies = 1;
+	progress->status_value = (int)*(const int32_t*)status_dst;
+	if (progress->status_value != 0) {
+		return 2;
+	}
+	cuRes = cuMemcpyDtoH(pooled_dst, pooled_src, pooled_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyDtoH(pooled)", cuRes);
+		return 1;
+	}
+	progress->pooled_copied = 1;
+	progress->device_copies = 2;
+	cuRes = cuMemcpyDtoH(active_dst, active_src, active_bytes);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuMemcpyDtoH(active)", cuRes);
+		return 1;
+	}
+	progress->active_copied = 1;
+	progress->device_copies = 3;
 	return 0;
 }
 
@@ -3274,6 +3353,97 @@ func (rt *deviceRuntime) downloadFloat32(dst []float32, src C.CUdeviceptr) error
 		return cStringError(errStr)
 	}
 	return nil
+}
+
+type cudaCompactTrainForwardReadbackProgress struct {
+	ContextSets  int
+	DeviceCopies int
+	StatusCopied bool
+	PooledCopied bool
+	ActiveCopied bool
+	StatusValue  int32
+}
+
+func checkedCompactTrainForwardReadbackBytes(label string, elements int) (C.size_t, error) {
+	bytes, err := checkedCUDABytes(label, elements, 4)
+	if err != nil {
+		return 0, err
+	}
+	if uint64(bytes) > maxCSizeTValue() {
+		return 0, fmt.Errorf("%s byte size %d overflows C.size_t", label, uint64(bytes))
+	}
+	return bytes, nil
+}
+
+func validateCompactTrainForwardReadback(status []int32, pooled []float32, active []int32, statusSrc, pooledSrc, activeSrc C.CUdeviceptr) (C.size_t, C.size_t, C.size_t, error) {
+	if len(status) != 1 {
+		return 0, 0, 0, fmt.Errorf("cuda compact train forward readback status length %d, want 1", len(status))
+	}
+	if len(pooled) == 0 {
+		return 0, 0, 0, fmt.Errorf("cuda compact train forward readback pooled output must be non-empty")
+	}
+	if len(active) == 0 {
+		return 0, 0, 0, fmt.Errorf("cuda compact train forward readback active output must be non-empty")
+	}
+	statusBytes, err := checkedCompactTrainForwardReadbackBytes("cuda compact train forward status readback", len(status))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	pooledBytes, err := checkedCompactTrainForwardReadbackBytes("cuda compact train forward pooled readback", len(pooled))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	activeBytes, err := checkedCompactTrainForwardReadbackBytes("cuda compact train forward active readback", len(active))
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	if statusSrc == 0 {
+		return 0, 0, 0, fmt.Errorf("cuda compact train forward status readback source pointer is nil")
+	}
+	if pooledSrc == 0 {
+		return 0, 0, 0, fmt.Errorf("cuda compact train forward pooled readback source pointer is nil")
+	}
+	if activeSrc == 0 {
+		return 0, 0, 0, fmt.Errorf("cuda compact train forward active readback source pointer is nil")
+	}
+	return statusBytes, pooledBytes, activeBytes, nil
+}
+
+// downloadCompactTrainForwardReadback is the typed, synchronous compact
+// forward status/pooled/active readback bridge. All validation happens before
+// cgo; the C wrapper uses the Go slices only during this call and retains no Go
+// pointer. A return with StatusValue != 0 has copied status only and leaves the
+// pooled/active slices untouched, matching the previous status-first path.
+func (rt *deviceRuntime) downloadCompactTrainForwardReadback(status []int32, pooled []float32, active []int32, statusSrc, pooledSrc, activeSrc C.CUdeviceptr) (cudaCompactTrainForwardReadbackProgress, error) {
+	var progress cudaCompactTrainForwardReadbackProgress
+	if rt == nil || rt.ptr == nil {
+		return progress, fmt.Errorf("cuda compact train forward readback runtime is not initialized")
+	}
+	statusBytes, pooledBytes, activeBytes, err := validateCompactTrainForwardReadback(status, pooled, active, statusSrc, pooledSrc, activeSrc)
+	if err != nil {
+		return progress, err
+	}
+	var cProgress C.EosCudaCompactTrainForwardReadbackProgress
+	var errStr *C.char
+	rc := C.eosCudaMemcpyCompactTrainForwardReadback(
+		rt.ptr,
+		unsafe.Pointer(&status[0]), statusSrc, statusBytes,
+		unsafe.Pointer(&pooled[0]), pooledSrc, pooledBytes,
+		unsafe.Pointer(&active[0]), activeSrc, activeBytes,
+		&cProgress, &errStr,
+	)
+	progress = cudaCompactTrainForwardReadbackProgress{
+		ContextSets:  int(cProgress.context_sets),
+		DeviceCopies: int(cProgress.device_copies),
+		StatusCopied: cProgress.status_copied != 0,
+		PooledCopied: cProgress.pooled_copied != 0,
+		ActiveCopied: cProgress.active_copied != 0,
+		StatusValue:  int32(cProgress.status_value),
+	}
+	if rc == 0 || rc == 2 {
+		return progress, nil
+	}
+	return progress, cStringError(errStr)
 }
 
 func (rt *deviceRuntime) downloadInt32(dst []int32, src C.CUdeviceptr) error {

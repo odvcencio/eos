@@ -460,6 +460,23 @@ func TestTrainProfileOptimizerCounterActivity(t *testing.T) {
 	}
 }
 
+func TestTrainProfileCompactForwardReadbackCounterActivity(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stats backend.CompactTrainAcceleratorStats
+	}{
+		{name: "batch entries", stats: backend.CompactTrainAcceleratorStats{ForwardReadbackBatchEntries: 1}},
+		{name: "context sets", stats: backend.CompactTrainAcceleratorStats{ForwardReadbackContextSets: 1}},
+		{name: "device copies", stats: backend.CompactTrainAcceleratorStats{ForwardReadbackDeviceCopies: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if !hasTrainProfileActivity(EmbeddingTrainProfile{CompactTrain: &tc.stats}) {
+				t.Fatal("expected compact-forward readback counter activity")
+			}
+		})
+	}
+}
+
 func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *testing.T) {
 	start := &backend.CompactTrainAcceleratorStats{
 		ArenaAllocations:            1,
@@ -469,6 +486,9 @@ func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *tes
 		LiveHandles:                 2,
 		ActivationArenaBytes:        4096,
 		WorkspaceArenaBytes:         2048,
+		ForwardReadbackBatchEntries: 4,
+		ForwardReadbackContextSets:  5,
+		ForwardReadbackDeviceCopies: 12,
 		LastShape:                   backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8},
 		LastForwardLaunches:         3,
 		LastBackwardLaunches:        4,
@@ -485,6 +505,9 @@ func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *tes
 		LiveHandles:                 1,
 		ActivationArenaBytes:        8192,
 		WorkspaceArenaBytes:         4096,
+		ForwardReadbackBatchEntries: 6,
+		ForwardReadbackContextSets:  7,
+		ForwardReadbackDeviceCopies: 18,
 		LastShape:                   backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8, FFNDim: 16},
 		LastForwardLaunches:         5,
 		LastBackwardLaunches:        6,
@@ -504,6 +527,9 @@ func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *tes
 	if got.ArenaReuseHits != 1 || got.GradientReuseHits != 1 {
 		t.Fatalf("measured reuse = arena %d, gradient %d; want both one", got.ArenaReuseHits, got.GradientReuseHits)
 	}
+	if got.ForwardReadbackBatchEntries != 2 || got.ForwardReadbackContextSets != 2 || got.ForwardReadbackDeviceCopies != 6 {
+		t.Fatalf("forward readback counters = %d/%d/%d, want 2/2/6", got.ForwardReadbackBatchEntries, got.ForwardReadbackContextSets, got.ForwardReadbackDeviceCopies)
+	}
 	if got.LiveHandles != end.LiveHandles {
 		t.Fatalf("live handles = %d, want end snapshot %d", got.LiveHandles, end.LiveHandles)
 	}
@@ -519,53 +545,65 @@ func TestCompactTrainProfileRestoreMergePreservesPoolDeltasAndSnapshots(t *testi
 	start := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:          2,
-			ArenaReuseHits:       1,
-			ArenaAllocations:     1,
-			GradientReuseHits:    1,
-			GradientAllocations:  1,
-			ResidentGradBytes:    100,
-			ActivationArenaBytes: 1000,
-			WorkspaceArenaBytes:  2000,
+			LiveHandles:                 2,
+			ArenaReuseHits:              1,
+			ArenaAllocations:            1,
+			GradientReuseHits:           1,
+			GradientAllocations:         1,
+			ResidentGradBytes:           100,
+			ActivationArenaBytes:        1000,
+			WorkspaceArenaBytes:         2000,
+			ForwardReadbackBatchEntries: 1,
+			ForwardReadbackContextSets:  1,
+			ForwardReadbackDeviceCopies: 3,
 		},
 	}
 	preRestoreEnd := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:          1,
-			ArenaReuseHits:       3,
-			ArenaAllocations:     2,
-			GradientReuseHits:    4,
-			GradientAllocations:  2,
-			ResidentGradBytes:    150,
-			ActivationArenaBytes: 1100,
-			WorkspaceArenaBytes:  2200,
+			LiveHandles:                 1,
+			ArenaReuseHits:              3,
+			ArenaAllocations:            2,
+			GradientReuseHits:           4,
+			GradientAllocations:         2,
+			ResidentGradBytes:           150,
+			ActivationArenaBytes:        1100,
+			WorkspaceArenaBytes:         2200,
+			ForwardReadbackBatchEntries: 3,
+			ForwardReadbackContextSets:  3,
+			ForwardReadbackDeviceCopies: 9,
 		},
 	}
 	restoreStart := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:          4,
-			ArenaReuseHits:       10,
-			ArenaAllocations:     5,
-			GradientReuseHits:    11,
-			GradientAllocations:  5,
-			ResidentGradBytes:    200,
-			ActivationArenaBytes: 3000,
-			WorkspaceArenaBytes:  6000,
+			LiveHandles:                 4,
+			ArenaReuseHits:              10,
+			ArenaAllocations:            5,
+			GradientReuseHits:           11,
+			GradientAllocations:         5,
+			ResidentGradBytes:           200,
+			ActivationArenaBytes:        3000,
+			WorkspaceArenaBytes:         6000,
+			ForwardReadbackBatchEntries: 4,
+			ForwardReadbackContextSets:  4,
+			ForwardReadbackDeviceCopies: 12,
 		},
 	}
 	final := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		CompactTrain: &backend.CompactTrainAcceleratorStats{
-			LiveHandles:          3,
-			ArenaReuseHits:       12,
-			ArenaAllocations:     6,
-			GradientReuseHits:    13,
-			GradientAllocations:  6,
-			ResidentGradBytes:    230,
-			ActivationArenaBytes: 3300,
-			WorkspaceArenaBytes:  6600,
+			LiveHandles:                 3,
+			ArenaReuseHits:              12,
+			ArenaAllocations:            6,
+			GradientReuseHits:           13,
+			GradientAllocations:         6,
+			ResidentGradBytes:           230,
+			ActivationArenaBytes:        3300,
+			WorkspaceArenaBytes:         6600,
+			ForwardReadbackBatchEntries: 6,
+			ForwardReadbackContextSets:  6,
+			ForwardReadbackDeviceCopies: 18,
 		},
 	}
 
@@ -575,24 +613,30 @@ func TestCompactTrainProfileRestoreMergePreservesPoolDeltasAndSnapshots(t *testi
 	endProfile := applyTrainProfileDelta(preRestoreEnd, postRestoreDelta)
 
 	assertCompactTrainProfileStats(t, mergedDelta.CompactTrain, &backend.CompactTrainAcceleratorStats{
-		LiveHandles:          3,
-		ArenaReuseHits:       4,
-		ArenaAllocations:     2,
-		GradientReuseHits:    5,
-		GradientAllocations:  2,
-		ResidentGradBytes:    80,
-		ActivationArenaBytes: 3300,
-		WorkspaceArenaBytes:  6600,
+		LiveHandles:                 3,
+		ArenaReuseHits:              4,
+		ArenaAllocations:            2,
+		GradientReuseHits:           5,
+		GradientAllocations:         2,
+		ResidentGradBytes:           80,
+		ActivationArenaBytes:        3300,
+		WorkspaceArenaBytes:         6600,
+		ForwardReadbackBatchEntries: 4,
+		ForwardReadbackContextSets:  4,
+		ForwardReadbackDeviceCopies: 12,
 	})
 	assertCompactTrainProfileStats(t, endProfile.CompactTrain, &backend.CompactTrainAcceleratorStats{
-		LiveHandles:          3,
-		ArenaReuseHits:       5,
-		ArenaAllocations:     3,
-		GradientReuseHits:    6,
-		GradientAllocations:  3,
-		ResidentGradBytes:    180,
-		ActivationArenaBytes: 3300,
-		WorkspaceArenaBytes:  6600,
+		LiveHandles:                 3,
+		ArenaReuseHits:              5,
+		ArenaAllocations:            3,
+		GradientReuseHits:           6,
+		GradientAllocations:         3,
+		ResidentGradBytes:           180,
+		ActivationArenaBytes:        3300,
+		WorkspaceArenaBytes:         6600,
+		ForwardReadbackBatchEntries: 5,
+		ForwardReadbackContextSets:  5,
+		ForwardReadbackDeviceCopies: 15,
 	})
 }
 
@@ -601,7 +645,7 @@ func assertCompactTrainProfileStats(t *testing.T, got, want *backend.CompactTrai
 	if got == nil {
 		t.Fatalf("compact train stats = nil, want %+v", want)
 	}
-	if got.LiveHandles != want.LiveHandles || got.ArenaReuseHits != want.ArenaReuseHits || got.ArenaAllocations != want.ArenaAllocations || got.GradientReuseHits != want.GradientReuseHits || got.GradientAllocations != want.GradientAllocations || got.ResidentGradBytes != want.ResidentGradBytes || got.ActivationArenaBytes != want.ActivationArenaBytes || got.WorkspaceArenaBytes != want.WorkspaceArenaBytes {
+	if got.LiveHandles != want.LiveHandles || got.ArenaReuseHits != want.ArenaReuseHits || got.ArenaAllocations != want.ArenaAllocations || got.GradientReuseHits != want.GradientReuseHits || got.GradientAllocations != want.GradientAllocations || got.ResidentGradBytes != want.ResidentGradBytes || got.ActivationArenaBytes != want.ActivationArenaBytes || got.WorkspaceArenaBytes != want.WorkspaceArenaBytes || got.ForwardReadbackBatchEntries != want.ForwardReadbackBatchEntries || got.ForwardReadbackContextSets != want.ForwardReadbackContextSets || got.ForwardReadbackDeviceCopies != want.ForwardReadbackDeviceCopies {
 		t.Fatalf("compact train stats = %+v, want selected counters/snapshots %+v", *got, *want)
 	}
 }

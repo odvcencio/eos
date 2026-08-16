@@ -11,6 +11,24 @@ import (
 	"m31labs.dev/eos/runtime/backend"
 )
 
+func TestCompactTrainForwardReadbackValidation(t *testing.T) {
+	if _, _, _, err := validateCompactTrainForwardReadback(nil, []float32{0}, []int32{0}, 1, 1, 1); err == nil || !strings.Contains(err.Error(), "status length") {
+		t.Fatalf("status length validation = %v, want status length error", err)
+	}
+	if _, _, _, err := validateCompactTrainForwardReadback([]int32{0}, nil, []int32{0}, 1, 1, 1); err == nil || !strings.Contains(err.Error(), "pooled output") {
+		t.Fatalf("pooled length validation = %v, want pooled output error", err)
+	}
+	if _, _, _, err := validateCompactTrainForwardReadback([]int32{0}, []float32{0}, nil, 1, 1, 1); err == nil || !strings.Contains(err.Error(), "active output") {
+		t.Fatalf("active length validation = %v, want active output error", err)
+	}
+	if _, _, _, err := validateCompactTrainForwardReadback([]int32{0}, []float32{0}, []int32{0}, 0, 1, 1); err == nil || !strings.Contains(err.Error(), "status readback source pointer") {
+		t.Fatalf("status pointer validation = %v, want status pointer error", err)
+	}
+	if _, err := checkedCompactTrainForwardReadbackBytes("test", -1); err == nil {
+		t.Fatal("negative readback length unexpectedly accepted")
+	}
+}
+
 func TestCompactTrainCublasRowMajorMatMulNoSyncParity(t *testing.T) {
 	rt, err := newDeviceRuntime()
 	if err != nil {
@@ -176,6 +194,9 @@ func TestCompactTrainForwardPooledParityAndAccounting(t *testing.T) {
 			if stats.StatusDownloadedBytes != int64(4+shape.Batch*4) {
 				t.Fatalf("status/active bytes = %d, want %d", stats.StatusDownloadedBytes, 4+shape.Batch*4)
 			}
+			if stats.ForwardReadbackBatchEntries != 1 || stats.ForwardReadbackContextSets != 1 || stats.ForwardReadbackDeviceCopies != 3 {
+				t.Fatalf("forward readback telemetry = %d/%d/%d, want 1/1/3", stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies)
+			}
 			arena := compactTrainArenaForHandle(t, accel, got.Handle)
 			if tc.projection {
 				if arena.preProjectionPooled == 0 {
@@ -242,6 +263,9 @@ func TestCompactTrainForwardDeviceStatusFailuresPublishCountersAndReleaseArena(t
 			}
 			if stats.UploadedBytes != wantUpload || stats.DownloadedBytes != 4 || stats.StatusDownloadedBytes != 4 || stats.PooledDownloadedBytes != 0 {
 				t.Fatalf("status failure transfer stats = %+v, want upload %d status-only D2H", stats, wantUpload)
+			}
+			if stats.ForwardReadbackBatchEntries != 0 || stats.ForwardReadbackContextSets != 0 || stats.ForwardReadbackDeviceCopies != 0 {
+				t.Fatalf("status failure readback telemetry = %d/%d/%d, want 0/0/0", stats.ForwardReadbackBatchEntries, stats.ForwardReadbackContextSets, stats.ForwardReadbackDeviceCopies)
 			}
 			if stats.ActivationArenaBytes != 0 || len(accel.arenas) != 0 {
 				t.Fatalf("status failure retained arena bytes=%d arenas=%d", stats.ActivationArenaBytes, len(accel.arenas))
