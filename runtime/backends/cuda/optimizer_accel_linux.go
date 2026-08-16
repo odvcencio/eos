@@ -859,7 +859,8 @@ func (a *optimizerAccelerator) ApplyUpdateWithResidentGradBatch(updates []backen
 		// The native batch wrapper records the end marker immediately before
 		// its existing barrier. Never add a Go-side end record after the
 		// wrapper has returned: that would not bracket the queued work.
-		k5EndRecorded, endProgress := a.device.profileEventK5EndProgress()
+		var endProgress profileEventProgress
+		k5EndRecorded, endProgress = a.device.profileEventK5EndProgress()
 		k5EventProgress = addProfileEventProgress(k5EventProgress, endProgress)
 		k5TelemetryGoCalls++ // cgo getter; no context/driver operation.
 		if k5EndRecorded {

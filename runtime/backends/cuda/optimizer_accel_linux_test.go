@@ -437,6 +437,144 @@ func TestCUDAOptimizerApplyUpdateWithResidentGradParityAndFailures(t *testing.T)
 	}
 }
 
+func TestCUDAOptimizerApplyUpdateWithResidentGradBatchWarmK5EventQuery(t *testing.T) {
+	previousEvents := eosCudaCompactProfileEventsEnabled
+	eosCudaCompactProfileEventsEnabled = true
+	defer func() { eosCudaCompactProfileEventsEnabled = previousEvents }()
+	previousGraph := eosCudaCompactTrainForwardGraphEnabled
+	eosCudaCompactTrainForwardGraphEnabled = false
+	defer func() { eosCudaCompactTrainForwardGraphEnabled = previousGraph }()
+	t.Setenv("EOS_CUDA_COMPACT_TRAIN_CUBLAS", "0")
+
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	weights := compactForwardTestWeights(false)
+	trainOptAny, err := NewOptimizerAccelerator()
+	if err != nil {
+		t.Fatalf("new train optimizer accelerator: %v", err)
+	}
+	if trainOptAny == nil {
+		t.Skip("no cuda optimizer accelerator available")
+	}
+	trainOpt := trainOptAny.(*optimizerAccelerator)
+	trainAccel, err := NewCompactTrainAccelerator()
+	if err != nil {
+		trainOpt.Close()
+		t.Fatalf("new compact train accelerator: %v", err)
+	}
+	defer trainAccel.Close()
+	defer trainOpt.Close()
+	layers := make([]CompactForwardLayerNames, shape.Layers)
+	for layer := range layers {
+		prefix := "layer" + string(rune('0'+layer)) + "_"
+		layers[layer] = CompactForwardLayerNames{
+			AttentionQ: prefix + "attn_q",
+			AttentionK: prefix + "attn_k",
+			AttentionV: prefix + "attn_v",
+			AttentionO: prefix + "attn_o",
+			FFNUp:      prefix + "ffn_up",
+			FFNDown:    prefix + "ffn_down",
+		}
+	}
+	trainAccel.Configure(layers, "token_embedding", "role_embedding", "", true)
+	target := "layer1_ffn_up"
+	param := weights[target].Clone()
+	mom1 := backend.NewTensorF32(param.Shape, seqData(len(param.F32), 0.0002, -0.003))
+	mom2 := backend.NewTensorF32(param.Shape, seqData(len(param.F32), 0.0001, 0.004))
+	for name, tensor := range weights {
+		seedTensor := tensor.Clone()
+		seedMom1 := backend.NewTensorF32(tensor.Shape, make([]float32, len(tensor.F32)))
+		seedMom2 := backend.NewTensorF32(tensor.Shape, make([]float32, len(tensor.F32)))
+		if name == target {
+			seedTensor = param
+			seedMom1 = mom1
+			seedMom2 = mom2
+		}
+		if err := trainOpt.EnsureResidentParameter(name, seedTensor, seedMom1, seedMom2); err != nil {
+			t.Fatalf("seed resident %s: %v", name, err)
+		}
+		ref, ok := trainOpt.ResidentParameter(name)
+		if !ok {
+			t.Fatalf("resident %s missing", name)
+		}
+		if err := trainAccel.BindCompactTrainResident(name, tensor, ref); err != nil {
+			t.Fatalf("bind resident %s: %v", name, err)
+		}
+	}
+	refs := compactTrainResidentRefsForTest(t, trainAccel, shape)
+	if err := trainAccel.BeginCompactTrainStep(201, refs); err != nil {
+		t.Fatalf("begin compact train step: %v", err)
+	}
+	forward, err := trainAccel.RunCompactTrainForward(backend.CompactTrainForwardRequest{
+		Shape:        shape,
+		Tokens:       [][]int32{{2, 1}},
+		Masks:        [][]int32{{1, 1}},
+		Roles:        []int32{0},
+		ResidentRefs: refs,
+		GELUMode:     backend.CompactForwardGELUExact,
+		StepID:       201,
+	})
+	if err != nil {
+		t.Fatalf("compact train forward: %v", err)
+	}
+	backward, err := trainAccel.RunCompactTrainBackward(backend.CompactTrainBackwardRequest{
+		Handle:     forward.Handle,
+		GradPooled: backend.NewTensorF32([]int{shape.Batch, shape.OutputDim}, seqData(shape.Batch*shape.OutputDim, 0.031, -0.047)),
+	})
+	if err != nil {
+		t.Fatalf("compact train backward: %v", err)
+	}
+	gradRef := residentGradRefByName(t, backward.ResidentGradRefs, target)
+	if err := trainAccel.EndCompactTrainStep(201); err != nil {
+		t.Fatalf("end compact train step: %v", err)
+	}
+
+	// Prime the reusable pair so this assertion targets the measured/warm
+	// identity. The production K5 end marker remains in the native batch bridge
+	// immediately before its existing barrier.
+	if _, err := trainOpt.device.profileEventRecordStats(string(backend.CompactTrainPhaseK5Batch), false); err != nil {
+		t.Fatalf("prime K5 start event: %v", err)
+	}
+	if _, err := trainOpt.device.profileEventRecordStats(string(backend.CompactTrainPhaseK5Batch), true); err != nil {
+		t.Fatalf("prime K5 end event: %v", err)
+	}
+	cfg := backend.OptimizerUpdateConfig{
+		Optimizer:    "adamw",
+		Step:         1,
+		LearningRate: 0.01,
+		WeightDecay:  0.001,
+		Beta1:        0.9,
+		Beta2:        0.999,
+		Epsilon:      1e-8,
+		Scale:        0.25,
+	}
+	if err := trainOpt.ApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{{
+		Name: target, Config: cfg, Tensor: param, Mom1: mom1, Mom2: mom2, Grad: gradRef,
+	}}); err != nil {
+		t.Fatalf("resident grad batch update: %v", err)
+	}
+
+	optimizerTelemetry := trainOpt.Stats().CompactTrainTelemetry
+	if optimizerTelemetry == nil {
+		t.Fatal("resident K5 batch did not publish optimizer telemetry")
+	}
+	optimizerK5 := optimizerTelemetry.Phase(backend.CompactTrainPhaseK5Batch)
+	wantK5 := backend.CompactTrainPhaseTelemetry{
+		GoCalls: 6, ContextSets: 4, DriverCalls: 5, KernelLaunches: 1,
+		HostDescriptorAllocs: 1, StreamSynchronizes: 1,
+		EventRecords: 2, EventQueries: 1, Attempted: 1, Enqueued: 1, Completed: 1,
+	}
+	if optimizerK5.GoCalls != wantK5.GoCalls || optimizerK5.ContextSets != wantK5.ContextSets || optimizerK5.DriverCalls != wantK5.DriverCalls || optimizerK5.KernelLaunches != wantK5.KernelLaunches || optimizerK5.HostDescriptorAllocs != wantK5.HostDescriptorAllocs || optimizerK5.StreamSynchronizes != wantK5.StreamSynchronizes || optimizerK5.EventRecords != wantK5.EventRecords || optimizerK5.EventQueries != wantK5.EventQueries || optimizerK5.Attempted != wantK5.Attempted || optimizerK5.Enqueued != wantK5.Enqueued || optimizerK5.Completed != wantK5.Completed || optimizerK5.Failures != 0 || optimizerK5.EventControlFailures != 0 || optimizerK5.DeviceElapsedNanos <= 0 {
+		t.Fatalf("warm L=2 K5 telemetry = %+v, want identity %+v with positive device elapsed", optimizerK5, wantK5)
+	}
+	ownerTelemetry := trainAccel.CompactTrainStats().Telemetry
+	if ownerTelemetry == nil {
+		t.Fatal("resident K5 batch did not publish compact-train owner telemetry")
+	}
+	if ownerK5 := ownerTelemetry.Phase(backend.CompactTrainPhaseK5Batch); ownerK5 != optimizerK5 {
+		t.Fatalf("owner K5 telemetry = %+v, optimizer K5 telemetry = %+v, want identical views", ownerK5, optimizerK5)
+	}
+}
+
 func TestCUDAOptimizerResidentGradBatchPreflightRejectsInvalidSets(t *testing.T) {
 	// This test deliberately uses backend-owned placeholder runtimes: batch
 	// preflight must reject every invalid set before it can reach the native
