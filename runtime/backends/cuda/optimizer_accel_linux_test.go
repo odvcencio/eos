@@ -3,6 +3,7 @@
 package cuda
 
 import (
+	"errors"
 	"math"
 	"strings"
 	"testing"
@@ -432,6 +433,243 @@ func TestCUDAOptimizerApplyUpdateWithResidentGradParityAndFailures(t *testing.T)
 	wrongName.Name = "layer0_ffn_up"
 	if err := trainOpt.ApplyUpdateWithResidentGrad("layer1_ffn_up", cfg, paramB, mom1B, mom2B, wrongName); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("wrong name resident grad update err = %v, want name mismatch", err)
+	}
+}
+
+func TestCUDAOptimizerResidentGradBatchPreflightRejectsInvalidSets(t *testing.T) {
+	// This test deliberately uses backend-owned placeholder runtimes: batch
+	// preflight must reject every invalid set before it can reach the native
+	// launch wrapper, so no CUDA device is required to prove the zero-work
+	// contract.
+	opt := &optimizerAccelerator{
+		device:   &deviceRuntime{},
+		kernel:   &auxKernel{},
+		resident: map[string]residentOptimizerState{},
+	}
+	ownerA := &CompactTrainAccelerator{
+		CompactForwardAccelerator: &CompactForwardAccelerator{device: &deviceRuntime{}},
+		grads:                     map[string]*compactTrainGradient{},
+		stepID:                    17,
+		stepSealed:                true,
+	}
+	stateA := residentOptimizerState{param: 1, mom1: 2, mom2: 3, elements: 2, hasMoments: true, generation: 4}
+	stateA.token = &optimizerResidentParameterToken{owner: opt, name: "a", generation: stateA.generation}
+	opt.resident["a"] = stateA
+	tokenA := &compactTrainGradientToken{owner: ownerA, name: "a", generation: 9, stepID: ownerA.stepID, elements: 2}
+	ownerA.grads["a"] = &compactTrainGradient{
+		ptr:                 11,
+		elements:            2,
+		generation:          tokenA.generation,
+		stepID:              tokenA.stepID,
+		token:               tokenA,
+		optimizerOwner:      opt,
+		optimizerToken:      stateA.token,
+		optimizerGeneration: stateA.generation,
+		optimizerParam:      stateA.param,
+	}
+	tensorA := backend.NewTensorF32([]int{2}, []float32{0.25, -0.5})
+	mom1A := backend.NewTensorF32([]int{2}, []float32{0, 0})
+	mom2A := backend.NewTensorF32([]int{2}, []float32{0, 0})
+	cfg := backend.OptimizerUpdateConfig{Optimizer: "adamw", Step: 1, LearningRate: 0.01, Beta1: 0.9, Beta2: 0.999, Epsilon: 1e-8, Scale: 1}
+	updateA := backend.ResidentGradientOptimizerBatchUpdate{
+		Name: "a", Config: cfg, Tensor: tensorA, Mom1: mom1A, Mom2: mom2A,
+		Grad: backend.ResidentGradientRef{Name: "a", Backend: eosartifact.BackendCUDA, Elements: 2, StepID: ownerA.stepID, Generation: tokenA.generation, Token: tokenA},
+	}
+	before := opt.Stats()
+	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{updateA}); err != nil {
+		t.Fatalf("valid batch preflight: %v", err)
+	}
+	if after := opt.Stats(); after != before {
+		t.Fatalf("valid batch preflight changed optimizer stats: before=%+v after=%+v", before, after)
+	}
+
+	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{updateA, updateA}); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate batch preflight err = %v, want duplicate", err)
+	}
+	stale := updateA
+	stale.Grad.Generation++
+	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{stale}); err == nil || !strings.Contains(err.Error(), "metadata mismatch") {
+		t.Fatalf("stale batch preflight err = %v, want metadata mismatch", err)
+	}
+	ownerA.grads["a"].optimizerUsed = true
+	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{updateA}); err == nil || !strings.Contains(err.Error(), "already used") {
+		t.Fatalf("used batch preflight err = %v, want already used", err)
+	}
+	ownerA.grads["a"].optimizerUsed = false
+
+	ownerB := &CompactTrainAccelerator{
+		CompactForwardAccelerator: &CompactForwardAccelerator{device: &deviceRuntime{}},
+		grads:                     map[string]*compactTrainGradient{},
+		stepID:                    ownerA.stepID,
+		stepSealed:                true,
+	}
+	stateB := residentOptimizerState{param: 4, mom1: 5, mom2: 6, elements: 2, hasMoments: true, generation: 7}
+	stateB.token = &optimizerResidentParameterToken{owner: opt, name: "b", generation: stateB.generation}
+	opt.resident["b"] = stateB
+	tokenB := &compactTrainGradientToken{owner: ownerB, name: "b", generation: 10, stepID: ownerB.stepID, elements: 2}
+	ownerB.grads["b"] = &compactTrainGradient{
+		ptr:                 12,
+		elements:            2,
+		generation:          tokenB.generation,
+		stepID:              tokenB.stepID,
+		token:               tokenB,
+		optimizerOwner:      opt,
+		optimizerToken:      stateB.token,
+		optimizerGeneration: stateB.generation,
+		optimizerParam:      stateB.param,
+	}
+	beforeMixed := opt.Stats()
+	updateB := updateA
+	updateB.Name = "b"
+	updateB.Grad = backend.ResidentGradientRef{Name: "b", Backend: eosartifact.BackendCUDA, Elements: 2, StepID: ownerB.stepID, Generation: tokenB.generation, Token: tokenB}
+	if err := opt.PreflightApplyUpdateWithResidentGradBatch([]backend.ResidentGradientOptimizerBatchUpdate{updateA, updateB}); err == nil || !strings.Contains(err.Error(), "mixes gradient owners") {
+		t.Fatalf("mixed-owner batch preflight err = %v, want mixed owners", err)
+	}
+	if after := opt.Stats(); after != beforeMixed {
+		t.Fatalf("rejected mixed-owner batch preflight changed optimizer stats: before=%+v after=%+v", beforeMixed, after)
+	}
+}
+
+func TestCUDAOptimizerResidentGradBatchDescriptorBounds(t *testing.T) {
+	if _, err := optimizerUpdateBatchDescriptorBytes(maxCIntValue() + 1); err == nil || !strings.Contains(err.Error(), "C.int max") {
+		t.Fatalf("oversized descriptor count err = %v, want C.int bound rejection", err)
+	}
+	if _, err := checkedCSizeMultiply(maxCSizeTValue(), 2); err == nil || !strings.Contains(err.Error(), "C.size_t") {
+		t.Fatalf("descriptor size overflow err = %v, want C.size_t rejection", err)
+	}
+	if bytes, err := optimizerUpdateBatchDescriptorBytes(1); err != nil || bytes == 0 {
+		t.Fatalf("one descriptor size = %d, err = %v; want positive size", bytes, err)
+	}
+
+	valid := optimizerUpdateLaunch{grid: 1, block: 128, elements: 1, mode: 0}
+	if err := validateOptimizerUpdateLaunch(valid); err != nil {
+		t.Fatalf("valid descriptor fields rejected: %v", err)
+	}
+	if err := validateOptimizerUpdateLaunches([]optimizerUpdateLaunch{valid}); err != nil {
+		t.Fatalf("valid descriptor batch rejected: %v", err)
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*optimizerUpdateLaunch)
+		want   string
+	}{
+		{name: "nonpositive elements", mutate: func(update *optimizerUpdateLaunch) { update.elements = 0 }, want: "elements"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			update := valid
+			tc.mutate(&update)
+			if err := validateOptimizerUpdateLaunch(update); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("descriptor validation err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+	if maxCUintValue() < ^uint64(0) {
+		for _, tc := range []struct {
+			name   string
+			mutate func(*optimizerUpdateLaunch)
+			want   string
+		}{
+			{name: "grid overflow", mutate: func(update *optimizerUpdateLaunch) { update.grid = uint(maxCUintValue() + 1) }, want: "grid"},
+			{name: "block overflow", mutate: func(update *optimizerUpdateLaunch) { update.block = uint(maxCUintValue() + 1) }, want: "block"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				update := valid
+				tc.mutate(&update)
+				if err := validateOptimizerUpdateLaunch(update); err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("descriptor validation err = %v, want %q", err, tc.want)
+				}
+			})
+		}
+	}
+	if maxCIntValue() < uint64(^uint(0)>>1) {
+		update := valid
+		update.elements = int(maxCIntValue() + 1)
+		if err := validateOptimizerUpdateLaunch(update); err == nil || !strings.Contains(err.Error(), "elements") {
+			t.Fatalf("elements overflow validation err = %v, want elements bound rejection", err)
+		}
+		update = valid
+		update.mode = int(maxCIntValue() + 1)
+		if err := validateOptimizerUpdateLaunch(update); err == nil || !strings.Contains(err.Error(), "mode") {
+			t.Fatalf("mode overflow validation err = %v, want mode bound rejection", err)
+		}
+	}
+}
+
+func TestCUDAOptimizerResidentGradBatchDeviceAccountingCommitsBeforeReadback(t *testing.T) {
+	owner := &CompactTrainAccelerator{}
+	gradA := &compactTrainGradient{}
+	gradB := &compactTrainGradient{}
+	accel := &optimizerAccelerator{
+		resident: map[string]residentOptimizerState{"a": {}, "b": {}},
+	}
+	updates := []backend.ResidentGradientOptimizerBatchUpdate{
+		{Name: "a", Tensor: backend.NewTensorF32([]int{2}, []float32{1, 2}), Config: backend.OptimizerUpdateConfig{Step: 7}},
+		{Name: "b", Tensor: backend.NewTensorF32([]int{3}, []float32{3, 4, 5}), Config: backend.OptimizerUpdateConfig{Step: 7, DeferSync: true}},
+	}
+	validated := []*residentGradientUpdateValidation{
+		{elements: 2, residentGrad: gradA},
+		{elements: 3, residentGrad: gradB},
+	}
+	const elapsed = int64(1234)
+	accel.commitResidentGradientBatchDeviceWork(updates, validated, owner, len(validated), elapsed)
+
+	if !gradA.optimizerUsed || !gradB.optimizerUsed {
+		t.Fatalf("optimizer-used marks = %t/%t, want both true", gradA.optimizerUsed, gradB.optimizerUsed)
+	}
+	stats := accel.stats
+	if stats.UpdateCalls != 2 || stats.TensorUpdateCalls != 2 || stats.ResidentGradUpdateCalls != 2 || stats.LogicalSteps != 1 || stats.DeferredSyncUpdates != 1 {
+		t.Fatalf("device-work counters = %+v, want two updates/one step/one deferred", stats)
+	}
+	if stats.ResidentGradUploadBytesAvoided != 20 || owner.stats.HostGradUploadBytesAvoided != 20 {
+		t.Fatalf("avoided upload bytes = optimizer %d owner %d, want 20/20", stats.ResidentGradUploadBytesAvoided, owner.stats.HostGradUploadBytesAvoided)
+	}
+	if stats.ResidentGradBatchCalls != 1 || stats.ResidentGradBatchKernelLaunches != 2 || stats.ResidentGradBatchKernelSyncs != 1 {
+		t.Fatalf("batch counters = %d/%d/%d, want 1/2/1", stats.ResidentGradBatchCalls, stats.ResidentGradBatchKernelLaunches, stats.ResidentGradBatchKernelSyncs)
+	}
+	if stats.UpdateNanos != elapsed || stats.ResidentGradUpdateNanos != elapsed || owner.stats.OptimizerResidentGradNanos != elapsed {
+		t.Fatalf("device timing = optimizer update %d resident %d owner %d, want %d", stats.UpdateNanos, stats.ResidentGradUpdateNanos, owner.stats.OptimizerResidentGradNanos, elapsed)
+	}
+	if stats.DownloadedBytes != 0 {
+		t.Fatalf("readback bytes = %d, want zero before host copies", stats.DownloadedBytes)
+	}
+}
+
+func TestCUDAOptimizerResidentGradBatchReadbackFailureKeepsDeviceAccounting(t *testing.T) {
+	owner := &CompactTrainAccelerator{}
+	gradA := &compactTrainGradient{}
+	gradB := &compactTrainGradient{}
+	accel := &optimizerAccelerator{resident: map[string]residentOptimizerState{"a": {}, "b": {}}}
+	updates := []backend.ResidentGradientOptimizerBatchUpdate{
+		{Name: "a", Tensor: backend.NewTensorF32([]int{2}, []float32{1, 2}), Config: backend.OptimizerUpdateConfig{Step: 9}},
+		{Name: "b", Tensor: backend.NewTensorF32([]int{3}, []float32{3, 4, 5}), Config: backend.OptimizerUpdateConfig{Step: 9}},
+	}
+	validated := []*residentGradientUpdateValidation{
+		{elements: 2, residentGrad: gradA},
+		{elements: 3, residentGrad: gradB},
+	}
+	accel.commitResidentGradientBatchDeviceWork(updates, validated, owner, 2, 4321)
+	calls := 0
+	err := accel.readbackResidentGradientBatch(updates, validated, func(dst []float32, _ uint64) error {
+		calls++
+		if calls == 2 {
+			return errors.New("injected D2H failure")
+		}
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "injected D2H failure") {
+		t.Fatalf("readback error = %v, want injected failure", err)
+	}
+	if accel.stats.UpdateCalls != 2 || accel.stats.ResidentGradUpdateCalls != 2 || accel.stats.ResidentGradBatchCalls != 1 || accel.stats.ResidentGradBatchKernelLaunches != 2 || accel.stats.ResidentGradBatchKernelSyncs != 1 {
+		t.Fatalf("device-work counters after readback failure = %+v, want complete batch accounting", accel.stats)
+	}
+	if !gradA.optimizerUsed || !gradB.optimizerUsed {
+		t.Fatalf("optimizer-used marks after readback failure = %t/%t, want both true", gradA.optimizerUsed, gradB.optimizerUsed)
+	}
+	if accel.stats.UpdateNanos != 4321 || accel.stats.ResidentGradUpdateNanos != 4321 || owner.stats.OptimizerResidentGradNanos != 4321 {
+		t.Fatalf("device timing after readback failure = %d/%d/%d, want 4321", accel.stats.UpdateNanos, accel.stats.ResidentGradUpdateNanos, owner.stats.OptimizerResidentGradNanos)
+	}
+	if accel.stats.DownloadedBytes != int64(len(updates[0].Tensor.F32)*4) {
+		t.Fatalf("downloaded bytes after readback failure = %d, want first successful copy only", accel.stats.DownloadedBytes)
 	}
 }
 

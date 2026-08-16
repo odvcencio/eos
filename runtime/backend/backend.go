@@ -113,23 +113,26 @@ type MatMulAcceleratorStats struct {
 
 // OptimizerAcceleratorStats summarizes backend-owned optimizer update activity.
 type OptimizerAcceleratorStats struct {
-	LogicalSteps                   int64
-	TensorUpdateCalls              int64
-	UpdateCalls                    int64
-	ResidentGradUpdateCalls        int64
-	DeferredSyncUpdates            int64
-	SyncCalls                      int64
-	ForcedSyncCalls                int64
-	LastForcedSyncReason           string
-	UploadedBytes                  int64
-	ResidentGradUploadBytesAvoided int64
-	DownloadedBytes                int64
-	UploadedBytesPerStep           float64
-	DownloadedBytesPerStep         float64
-	UpdateNanos                    int64
-	ResidentGradUpdateNanos        int64
-	SyncNanos                      int64
-	ResidentParams                 int64
+	LogicalSteps                    int64
+	TensorUpdateCalls               int64
+	UpdateCalls                     int64
+	ResidentGradUpdateCalls         int64
+	ResidentGradBatchCalls          int64
+	ResidentGradBatchKernelLaunches int64
+	ResidentGradBatchKernelSyncs    int64
+	DeferredSyncUpdates             int64
+	SyncCalls                       int64
+	ForcedSyncCalls                 int64
+	LastForcedSyncReason            string
+	UploadedBytes                   int64
+	ResidentGradUploadBytesAvoided  int64
+	DownloadedBytes                 int64
+	UploadedBytesPerStep            float64
+	DownloadedBytesPerStep          float64
+	UpdateNanos                     int64
+	ResidentGradUpdateNanos         int64
+	SyncNanos                       int64
+	ResidentParams                  int64
 }
 
 // OptimizerResidentParameter is a backend-owned device parameter reference.
@@ -866,6 +869,28 @@ type OptimizerPreflightAccelerator interface {
 
 type ResidentGradientOptimizerAccelerator interface {
 	ApplyUpdateWithResidentGrad(name string, cfg OptimizerUpdateConfig, tensor, mom1, mom2 *Tensor, grad ResidentGradientRef) error
+}
+
+// ResidentGradientOptimizerBatchUpdate describes one already-preflightable
+// resident-gradient optimizer update. It is intentionally backend-neutral;
+// CUDA implementations translate the device-owned references into a
+// backend-owned descriptor array without retaining Go pointers across cgo.
+type ResidentGradientOptimizerBatchUpdate struct {
+	Name   string
+	Config OptimizerUpdateConfig
+	Tensor *Tensor
+	Mom1   *Tensor
+	Mom2   *Tensor
+	Grad   ResidentGradientRef
+}
+
+// ResidentGradientOptimizerBatchAccelerator optionally batches a complete,
+// preflighted resident-gradient update set. Implementations must perform the
+// batch preflight before any driver work, then hold the gradient owner lock
+// through all kernel enqueues and the single completion barrier.
+type ResidentGradientOptimizerBatchAccelerator interface {
+	PreflightApplyUpdateWithResidentGradBatch(updates []ResidentGradientOptimizerBatchUpdate) error
+	ApplyUpdateWithResidentGradBatch(updates []ResidentGradientOptimizerBatchUpdate) error
 }
 
 // ResidentGradientOptimizerPreflightAccelerator validates a resident-gradient

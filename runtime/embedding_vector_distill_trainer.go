@@ -985,6 +985,19 @@ func (t *EmbeddingTrainer) preflightCompactOptimizerUpdatesWithResidentGrads(res
 			return nil, fmt.Errorf("compact resident optimizer preflight %q: %w", update.item.Name, err)
 		}
 	}
+	if batcher, ok := residentOpt.(backend.ResidentGradientOptimizerBatchAccelerator); ok {
+		batchUpdates := make([]backend.ResidentGradientOptimizerBatchUpdate, len(pending))
+		for i, update := range pending {
+			batchUpdates[i] = backend.ResidentGradientOptimizerBatchUpdate{
+				Name: update.item.Name, Config: update.cfg,
+				Tensor: update.item.Tensor, Mom1: update.mom1, Mom2: update.mom2,
+				Grad: update.ref,
+			}
+		}
+		if err := batcher.PreflightApplyUpdateWithResidentGradBatch(batchUpdates); err != nil {
+			return nil, fmt.Errorf("compact resident optimizer batch preflight: %w", err)
+		}
+	}
 	return pending, nil
 }
 
@@ -1000,9 +1013,23 @@ func (t *EmbeddingTrainer) applyPreflightedCompactOptimizerUpdatesWithResidentGr
 			update.item.Moment2 = update.mom2
 		}
 	}
-	for _, update := range pending {
-		if err := residentOpt.ApplyUpdateWithResidentGrad(update.item.Name, update.cfg, update.item.Tensor, update.mom1, update.mom2, update.ref); err != nil {
-			return fmt.Errorf("compact resident optimizer update %q: %w", update.item.Name, err)
+	if batcher, ok := residentOpt.(backend.ResidentGradientOptimizerBatchAccelerator); ok {
+		batchUpdates := make([]backend.ResidentGradientOptimizerBatchUpdate, len(pending))
+		for i, update := range pending {
+			batchUpdates[i] = backend.ResidentGradientOptimizerBatchUpdate{
+				Name: update.item.Name, Config: update.cfg,
+				Tensor: update.item.Tensor, Mom1: update.mom1, Mom2: update.mom2,
+				Grad: update.ref,
+			}
+		}
+		if err := batcher.ApplyUpdateWithResidentGradBatch(batchUpdates); err != nil {
+			return fmt.Errorf("compact resident optimizer batch update: %w", err)
+		}
+	} else {
+		for _, update := range pending {
+			if err := residentOpt.ApplyUpdateWithResidentGrad(update.item.Name, update.cfg, update.item.Tensor, update.mom1, update.mom2, update.ref); err != nil {
+				return fmt.Errorf("compact resident optimizer update %q: %w", update.item.Name, err)
+			}
 		}
 	}
 	t.momentsDirty = true

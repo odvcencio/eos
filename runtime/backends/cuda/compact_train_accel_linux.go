@@ -134,6 +134,7 @@ import "C"
 
 import (
 	"fmt"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -148,7 +149,8 @@ type CompactTrainAccelerator struct {
 	arenaPool          map[backend.CompactForwardShape][]*compactTrainArena
 	trainKernels       compactTrainKernels
 	grads              map[string]*compactTrainGradient
-	gradientPool       map[int][]C.CUdeviceptr
+	gradientSlab       *compactTrainGradientSlab
+	gradientSlabPool   map[string][]*compactTrainGradientSlab
 	hostTokens         []int32
 	hostMasks          []int32
 	gradGen            uint64
@@ -191,10 +193,22 @@ type compactTrainGradient struct {
 	optimizerUsed       bool
 }
 
-type compactTrainGradientBuffer struct {
-	ptr      C.CUdeviceptr
+type compactTrainGradientLayoutEntry struct {
+	name     string
 	elements int
-	reused   bool
+	offset   int
+}
+
+type compactTrainGradientLayout struct {
+	key      string
+	elements int
+	entries  []compactTrainGradientLayoutEntry
+}
+
+type compactTrainGradientSlab struct {
+	ptr       C.CUdeviceptr
+	elements  int
+	layoutKey string
 }
 
 type compactTrainResidentRefSnapshot struct {
@@ -772,7 +786,7 @@ func NewCompactTrainAccelerator() (*CompactTrainAccelerator, error) {
 		},
 		compactTrainCublas: cudaEnvFlagEnabled("EOS_CUDA_COMPACT_TRAIN_CUBLAS"),
 		grads:              map[string]*compactTrainGradient{},
-		gradientPool:       map[int][]C.CUdeviceptr{},
+		gradientSlabPool:   map[string][]*compactTrainGradientSlab{},
 		arenas:             map[*compactTrainHandleToken]*compactTrainArena{},
 		arenaPool:          map[backend.CompactForwardShape][]*compactTrainArena{},
 	}, nil
@@ -914,33 +928,31 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 		return err
 	}
 	nextGradGen := a.gradGen + 1
-	pending := make(map[string]*compactTrainGradient, len(snapshots))
-	taken := make([]compactTrainGradientBuffer, 0, len(snapshots))
-	freePending := func() {
-		for _, buffer := range taken {
-			if buffer.ptr == 0 {
-				continue
-			}
-			if buffer.reused {
-				a.returnGradientBufferLocked(buffer.elements, buffer.ptr)
-				continue
-			}
-			_ = a.device.freeBuffer(buffer.ptr)
-		}
+	layout, err := compactTrainGradientLayoutForSnapshots(snapshots)
+	if err != nil {
+		return err
 	}
+	slab, reused, err := a.takeGradientSlabLocked(layout)
+	if err != nil {
+		return err
+	}
+	freePending := func() {
+		if reused {
+			a.returnGradientSlabLocked(slab)
+			return
+		}
+		_ = a.device.freeBuffer(slab.ptr)
+	}
+	if err := a.device.memsetFloat32Zero(slab.ptr, slab.elements); err != nil {
+		freePending()
+		return err
+	}
+	pending := make(map[string]*compactTrainGradient, len(layout.entries))
 	var bytes int64
-	for _, snapshot := range snapshots {
+	for _, entry := range layout.entries {
+		snapshot := snapshots[entry.name]
 		ref := snapshot.ref
-		ptr, reused, err := a.takeGradientBufferLocked(ref.Elements)
-		if err != nil {
-			freePending()
-			return err
-		}
-		taken = append(taken, compactTrainGradientBuffer{ptr: ptr, elements: ref.Elements, reused: reused})
-		if err := a.device.memsetFloat32Zero(ptr, ref.Elements); err != nil {
-			freePending()
-			return err
-		}
+		ptr := compactTrainGradientOffsetPtr(slab.ptr, entry.offset)
 		gradToken := &compactTrainGradientToken{owner: a, name: ref.Name, generation: nextGradGen, stepID: stepID, elements: ref.Elements}
 		pending[ref.Name] = &compactTrainGradient{
 			ptr:                 ptr,
@@ -953,7 +965,7 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 			optimizerGeneration: snapshot.generation,
 			optimizerParam:      snapshot.param,
 		}
-		bytes += int64(ref.Elements * 4)
+		bytes += int64(ref.Elements) * 4
 	}
 	a.recycleGradientsLocked()
 	a.releaseArenasLocked()
@@ -963,14 +975,13 @@ func (a *CompactTrainAccelerator) BeginCompactTrainStep(stepID uint64, refs []ba
 	a.stepSealed = false
 	a.stepPoisoned = false
 	a.grads = pending
+	a.gradientSlab = slab
 	a.stats.GradientZeroCalls++
 	a.stats.ResidentGradBytes = bytes
-	for _, buffer := range taken {
-		if buffer.reused {
-			a.stats.GradientReuseHits++
-		} else {
-			a.stats.GradientAllocations++
-		}
+	if reused {
+		a.stats.GradientReuseHits++
+	} else {
+		a.stats.GradientAllocations++
 	}
 	return nil
 }
@@ -1886,6 +1897,7 @@ func (a *CompactTrainAccelerator) requiredResidentNamesForCurrentStepLocked() []
 	for name := range a.grads {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }
 
@@ -2515,45 +2527,82 @@ func (a *CompactTrainAccelerator) refreshArenaStatsLocked() {
 	a.stats.WorkspaceArenaBytes = workspaceBytes
 }
 
-func (a *CompactTrainAccelerator) takeGradientBufferLocked(elements int) (C.CUdeviceptr, bool, error) {
-	if elements <= 0 {
-		return 0, false, fmt.Errorf("cuda compact train gradient elements %d must be positive", elements)
+func compactTrainGradientLayoutForSnapshots(snapshots map[string]compactTrainResidentRefSnapshot) (compactTrainGradientLayout, error) {
+	names := make([]string, 0, len(snapshots))
+	for name := range snapshots {
+		names = append(names, name)
 	}
-	if a.gradientPool == nil {
-		a.gradientPool = map[int][]C.CUdeviceptr{}
+	sort.Strings(names)
+	entries := make([]compactTrainGradientLayoutEntry, 0, len(names))
+	key := ""
+	total := 0
+	maxInt := int(^uint(0) >> 1)
+	for _, name := range names {
+		snapshot := snapshots[name]
+		if snapshot.elements <= 0 {
+			return compactTrainGradientLayout{}, fmt.Errorf("cuda compact train gradient %q elements %d must be positive", name, snapshot.elements)
+		}
+		if total > maxInt-snapshot.elements {
+			return compactTrainGradientLayout{}, fmt.Errorf("cuda compact train gradient slab elements overflow for %q", name)
+		}
+		key += fmt.Sprintf("%d:%s:%d;", len(name), name, snapshot.elements)
+		entries = append(entries, compactTrainGradientLayoutEntry{name: name, elements: snapshot.elements, offset: total})
+		total += snapshot.elements
 	}
-	if bucket := a.gradientPool[elements]; len(bucket) > 0 {
-		ptr := bucket[len(bucket)-1]
-		a.gradientPool[elements] = bucket[:len(bucket)-1]
-		return ptr, true, nil
+	if total <= 0 {
+		return compactTrainGradientLayout{}, fmt.Errorf("cuda compact train gradient slab is empty")
 	}
-	ptr, err := a.device.allocFloat32(elements)
-	if err != nil {
-		return 0, false, err
-	}
-	return ptr, false, nil
+	return compactTrainGradientLayout{key: key, elements: total, entries: entries}, nil
 }
 
-func (a *CompactTrainAccelerator) returnGradientBufferLocked(elements int, ptr C.CUdeviceptr) {
-	if a == nil || ptr == 0 || elements <= 0 {
+func compactTrainGradientOffsetPtr(base C.CUdeviceptr, offset int) C.CUdeviceptr {
+	return base + C.CUdeviceptr(offset)*C.CUdeviceptr(4)
+}
+
+func (a *CompactTrainAccelerator) takeGradientSlabLocked(layout compactTrainGradientLayout) (*compactTrainGradientSlab, bool, error) {
+	if layout.elements <= 0 || layout.key == "" {
+		return nil, false, fmt.Errorf("cuda compact train gradient slab layout is invalid")
+	}
+	if a.gradientSlabPool == nil {
+		a.gradientSlabPool = map[string][]*compactTrainGradientSlab{}
+	}
+	if bucket := a.gradientSlabPool[layout.key]; len(bucket) > 0 {
+		slab := bucket[len(bucket)-1]
+		a.gradientSlabPool[layout.key] = bucket[:len(bucket)-1]
+		if slab != nil && slab.ptr != 0 && slab.elements == layout.elements && slab.layoutKey == layout.key {
+			return slab, true, nil
+		}
+		if slab != nil && slab.ptr != 0 {
+			_ = a.device.freeBuffer(slab.ptr)
+		}
+	}
+	ptr, err := a.device.allocFloat32(layout.elements)
+	if err != nil {
+		return nil, false, err
+	}
+	return &compactTrainGradientSlab{ptr: ptr, elements: layout.elements, layoutKey: layout.key}, false, nil
+}
+
+func (a *CompactTrainAccelerator) returnGradientSlabLocked(slab *compactTrainGradientSlab) {
+	if a == nil || slab == nil || slab.ptr == 0 || slab.elements <= 0 || slab.layoutKey == "" {
 		return
 	}
-	if a.gradientPool == nil {
-		a.gradientPool = map[int][]C.CUdeviceptr{}
+	if a.gradientSlabPool == nil {
+		a.gradientSlabPool = map[string][]*compactTrainGradientSlab{}
 	}
-	a.gradientPool[elements] = append(a.gradientPool[elements], ptr)
+	a.gradientSlabPool[slab.layoutKey] = append(a.gradientSlabPool[slab.layoutKey], slab)
 }
 
 func (a *CompactTrainAccelerator) recycleGradientsLocked() {
 	if a == nil {
 		return
 	}
-	if a.gradientPool == nil {
-		a.gradientPool = map[int][]C.CUdeviceptr{}
+	if a.gradientSlab != nil {
+		a.returnGradientSlabLocked(a.gradientSlab)
+		a.gradientSlab = nil
 	}
 	for name, grad := range a.grads {
-		if grad != nil && grad.ptr != 0 {
-			a.returnGradientBufferLocked(grad.elements, grad.ptr)
+		if grad != nil {
 			grad.ptr = 0
 		}
 		delete(a.grads, name)
@@ -2565,21 +2614,24 @@ func (a *CompactTrainAccelerator) releaseGradientsLocked() {
 	if a == nil || a.device == nil {
 		return
 	}
-	for _, grad := range a.grads {
-		if grad == nil {
-			continue
-		}
-		if grad.ptr != 0 {
-			_ = a.device.freeBuffer(grad.ptr)
+	for name, grad := range a.grads {
+		if grad != nil {
 			grad.ptr = 0
 		}
+		delete(a.grads, name)
 	}
 	a.grads = map[string]*compactTrainGradient{}
-	for elements, bucket := range a.gradientPool {
-		for _, ptr := range bucket {
-			_ = a.device.freeBuffer(ptr)
+	if a.gradientSlab != nil {
+		_ = a.device.freeBuffer(a.gradientSlab.ptr)
+		a.gradientSlab = nil
+	}
+	for key, bucket := range a.gradientSlabPool {
+		for _, slab := range bucket {
+			if slab != nil && slab.ptr != 0 {
+				_ = a.device.freeBuffer(slab.ptr)
+			}
 		}
-		delete(a.gradientPool, elements)
+		delete(a.gradientSlabPool, key)
 	}
 	a.stats.ResidentGradBytes = 0
 }

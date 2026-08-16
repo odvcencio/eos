@@ -326,10 +326,12 @@ func diffCompactTrainStats(start, end *backend.CompactTrainAcceleratorStats) *ba
 		out.BackwardCalls -= start.BackwardCalls
 		out.HandlesCreated -= start.HandlesCreated
 		out.HandlesReleased -= start.HandlesReleased
+		out.ArenaReuseHits -= start.ArenaReuseHits
+		out.ArenaAllocations -= start.ArenaAllocations
+		out.GradientReuseHits -= start.GradientReuseHits
+		out.GradientAllocations -= start.GradientAllocations
 		out.GradientZeroCalls -= start.GradientZeroCalls
 		out.ResidentGradBytes -= start.ResidentGradBytes
-		out.ActivationArenaBytes -= start.ActivationArenaBytes
-		out.WorkspaceArenaBytes -= start.WorkspaceArenaBytes
 		out.UploadedBytes -= start.UploadedBytes
 		out.DownloadedBytes -= start.DownloadedBytes
 		out.PooledDownloadedBytes -= start.PooledDownloadedBytes
@@ -364,10 +366,14 @@ func addCompactTrainStats(left, right *backend.CompactTrainAcceleratorStats) *ba
 		out.HandlesCreated += right.HandlesCreated
 		out.HandlesReleased += right.HandlesReleased
 		out.LiveHandles = right.LiveHandles
+		out.ArenaReuseHits += right.ArenaReuseHits
+		out.ArenaAllocations += right.ArenaAllocations
+		out.GradientReuseHits += right.GradientReuseHits
+		out.GradientAllocations += right.GradientAllocations
 		out.GradientZeroCalls += right.GradientZeroCalls
 		out.ResidentGradBytes += right.ResidentGradBytes
-		out.ActivationArenaBytes += right.ActivationArenaBytes
-		out.WorkspaceArenaBytes += right.WorkspaceArenaBytes
+		out.ActivationArenaBytes = right.ActivationArenaBytes
+		out.WorkspaceArenaBytes = right.WorkspaceArenaBytes
 		out.UploadedBytes += right.UploadedBytes
 		out.DownloadedBytes += right.DownloadedBytes
 		out.PooledDownloadedBytes += right.PooledDownloadedBytes
@@ -439,6 +445,9 @@ func hasTrainProfileActivity(profile EmbeddingTrainProfile) bool {
 		profile.Optimizer.LogicalSteps != 0 ||
 		profile.Optimizer.TensorUpdateCalls != 0 ||
 		profile.Optimizer.UpdateCalls != 0 ||
+		profile.Optimizer.ResidentGradBatchCalls != 0 ||
+		profile.Optimizer.ResidentGradBatchKernelLaunches != 0 ||
+		profile.Optimizer.ResidentGradBatchKernelSyncs != 0 ||
 		profile.Optimizer.DeferredSyncUpdates != 0 ||
 		profile.Optimizer.SyncCalls != 0 ||
 		profile.Optimizer.ForcedSyncCalls != 0 ||
@@ -509,20 +518,23 @@ func addTrainProfileDelta(left, right EmbeddingTrainProfile) EmbeddingTrainProfi
 			OptimizerCalls:      left.VectorDistillPhases.OptimizerCalls + right.VectorDistillPhases.OptimizerCalls,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:                   left.Optimizer.LogicalSteps + right.Optimizer.LogicalSteps,
-			TensorUpdateCalls:              left.Optimizer.TensorUpdateCalls + right.Optimizer.TensorUpdateCalls,
-			UpdateCalls:                    left.Optimizer.UpdateCalls + right.Optimizer.UpdateCalls,
-			ResidentGradUpdateCalls:        left.Optimizer.ResidentGradUpdateCalls + right.Optimizer.ResidentGradUpdateCalls,
-			DeferredSyncUpdates:            left.Optimizer.DeferredSyncUpdates + right.Optimizer.DeferredSyncUpdates,
-			SyncCalls:                      left.Optimizer.SyncCalls + right.Optimizer.SyncCalls,
-			ForcedSyncCalls:                left.Optimizer.ForcedSyncCalls + right.Optimizer.ForcedSyncCalls,
-			UploadedBytes:                  left.Optimizer.UploadedBytes + right.Optimizer.UploadedBytes,
-			ResidentGradUploadBytesAvoided: left.Optimizer.ResidentGradUploadBytesAvoided + right.Optimizer.ResidentGradUploadBytesAvoided,
-			DownloadedBytes:                left.Optimizer.DownloadedBytes + right.Optimizer.DownloadedBytes,
-			UpdateNanos:                    left.Optimizer.UpdateNanos + right.Optimizer.UpdateNanos,
-			ResidentGradUpdateNanos:        left.Optimizer.ResidentGradUpdateNanos + right.Optimizer.ResidentGradUpdateNanos,
-			SyncNanos:                      left.Optimizer.SyncNanos + right.Optimizer.SyncNanos,
-			ResidentParams:                 left.Optimizer.ResidentParams,
+			LogicalSteps:                    left.Optimizer.LogicalSteps + right.Optimizer.LogicalSteps,
+			TensorUpdateCalls:               left.Optimizer.TensorUpdateCalls + right.Optimizer.TensorUpdateCalls,
+			UpdateCalls:                     left.Optimizer.UpdateCalls + right.Optimizer.UpdateCalls,
+			ResidentGradUpdateCalls:         left.Optimizer.ResidentGradUpdateCalls + right.Optimizer.ResidentGradUpdateCalls,
+			ResidentGradBatchCalls:          left.Optimizer.ResidentGradBatchCalls + right.Optimizer.ResidentGradBatchCalls,
+			ResidentGradBatchKernelLaunches: left.Optimizer.ResidentGradBatchKernelLaunches + right.Optimizer.ResidentGradBatchKernelLaunches,
+			ResidentGradBatchKernelSyncs:    left.Optimizer.ResidentGradBatchKernelSyncs + right.Optimizer.ResidentGradBatchKernelSyncs,
+			DeferredSyncUpdates:             left.Optimizer.DeferredSyncUpdates + right.Optimizer.DeferredSyncUpdates,
+			SyncCalls:                       left.Optimizer.SyncCalls + right.Optimizer.SyncCalls,
+			ForcedSyncCalls:                 left.Optimizer.ForcedSyncCalls + right.Optimizer.ForcedSyncCalls,
+			UploadedBytes:                   left.Optimizer.UploadedBytes + right.Optimizer.UploadedBytes,
+			ResidentGradUploadBytesAvoided:  left.Optimizer.ResidentGradUploadBytesAvoided + right.Optimizer.ResidentGradUploadBytesAvoided,
+			DownloadedBytes:                 left.Optimizer.DownloadedBytes + right.Optimizer.DownloadedBytes,
+			UpdateNanos:                     left.Optimizer.UpdateNanos + right.Optimizer.UpdateNanos,
+			ResidentGradUpdateNanos:         left.Optimizer.ResidentGradUpdateNanos + right.Optimizer.ResidentGradUpdateNanos,
+			SyncNanos:                       left.Optimizer.SyncNanos + right.Optimizer.SyncNanos,
+			ResidentParams:                  left.Optimizer.ResidentParams,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              left.Activation.BindCalls + right.Activation.BindCalls,
@@ -623,20 +635,23 @@ func applyTrainProfileDelta(base, delta EmbeddingTrainProfile) EmbeddingTrainPro
 			OptimizerCalls:      base.VectorDistillPhases.OptimizerCalls + delta.VectorDistillPhases.OptimizerCalls,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:                   base.Optimizer.LogicalSteps + delta.Optimizer.LogicalSteps,
-			TensorUpdateCalls:              base.Optimizer.TensorUpdateCalls + delta.Optimizer.TensorUpdateCalls,
-			UpdateCalls:                    base.Optimizer.UpdateCalls + delta.Optimizer.UpdateCalls,
-			ResidentGradUpdateCalls:        base.Optimizer.ResidentGradUpdateCalls + delta.Optimizer.ResidentGradUpdateCalls,
-			DeferredSyncUpdates:            base.Optimizer.DeferredSyncUpdates + delta.Optimizer.DeferredSyncUpdates,
-			SyncCalls:                      base.Optimizer.SyncCalls + delta.Optimizer.SyncCalls,
-			ForcedSyncCalls:                base.Optimizer.ForcedSyncCalls + delta.Optimizer.ForcedSyncCalls,
-			UploadedBytes:                  base.Optimizer.UploadedBytes + delta.Optimizer.UploadedBytes,
-			ResidentGradUploadBytesAvoided: base.Optimizer.ResidentGradUploadBytesAvoided + delta.Optimizer.ResidentGradUploadBytesAvoided,
-			DownloadedBytes:                base.Optimizer.DownloadedBytes + delta.Optimizer.DownloadedBytes,
-			UpdateNanos:                    base.Optimizer.UpdateNanos + delta.Optimizer.UpdateNanos,
-			ResidentGradUpdateNanos:        base.Optimizer.ResidentGradUpdateNanos + delta.Optimizer.ResidentGradUpdateNanos,
-			SyncNanos:                      base.Optimizer.SyncNanos + delta.Optimizer.SyncNanos,
-			ResidentParams:                 base.Optimizer.ResidentParams,
+			LogicalSteps:                    base.Optimizer.LogicalSteps + delta.Optimizer.LogicalSteps,
+			TensorUpdateCalls:               base.Optimizer.TensorUpdateCalls + delta.Optimizer.TensorUpdateCalls,
+			UpdateCalls:                     base.Optimizer.UpdateCalls + delta.Optimizer.UpdateCalls,
+			ResidentGradUpdateCalls:         base.Optimizer.ResidentGradUpdateCalls + delta.Optimizer.ResidentGradUpdateCalls,
+			ResidentGradBatchCalls:          base.Optimizer.ResidentGradBatchCalls + delta.Optimizer.ResidentGradBatchCalls,
+			ResidentGradBatchKernelLaunches: base.Optimizer.ResidentGradBatchKernelLaunches + delta.Optimizer.ResidentGradBatchKernelLaunches,
+			ResidentGradBatchKernelSyncs:    base.Optimizer.ResidentGradBatchKernelSyncs + delta.Optimizer.ResidentGradBatchKernelSyncs,
+			DeferredSyncUpdates:             base.Optimizer.DeferredSyncUpdates + delta.Optimizer.DeferredSyncUpdates,
+			SyncCalls:                       base.Optimizer.SyncCalls + delta.Optimizer.SyncCalls,
+			ForcedSyncCalls:                 base.Optimizer.ForcedSyncCalls + delta.Optimizer.ForcedSyncCalls,
+			UploadedBytes:                   base.Optimizer.UploadedBytes + delta.Optimizer.UploadedBytes,
+			ResidentGradUploadBytesAvoided:  base.Optimizer.ResidentGradUploadBytesAvoided + delta.Optimizer.ResidentGradUploadBytesAvoided,
+			DownloadedBytes:                 base.Optimizer.DownloadedBytes + delta.Optimizer.DownloadedBytes,
+			UpdateNanos:                     base.Optimizer.UpdateNanos + delta.Optimizer.UpdateNanos,
+			ResidentGradUpdateNanos:         base.Optimizer.ResidentGradUpdateNanos + delta.Optimizer.ResidentGradUpdateNanos,
+			SyncNanos:                       base.Optimizer.SyncNanos + delta.Optimizer.SyncNanos,
+			ResidentParams:                  base.Optimizer.ResidentParams,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              base.Activation.BindCalls + delta.Activation.BindCalls,
@@ -705,21 +720,24 @@ func diffTrainProfile(start, end EmbeddingTrainProfile) EmbeddingTrainProfile {
 		CompactTrain:          diffCompactTrainStats(start.CompactTrain, end.CompactTrain),
 		VectorDistillPhases:   diffVectorDistillPhaseTimers(start.VectorDistillPhases, end.VectorDistillPhases),
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:                   end.Optimizer.LogicalSteps - start.Optimizer.LogicalSteps,
-			TensorUpdateCalls:              end.Optimizer.TensorUpdateCalls - start.Optimizer.TensorUpdateCalls,
-			UpdateCalls:                    end.Optimizer.UpdateCalls - start.Optimizer.UpdateCalls,
-			ResidentGradUpdateCalls:        end.Optimizer.ResidentGradUpdateCalls - start.Optimizer.ResidentGradUpdateCalls,
-			DeferredSyncUpdates:            end.Optimizer.DeferredSyncUpdates - start.Optimizer.DeferredSyncUpdates,
-			SyncCalls:                      end.Optimizer.SyncCalls - start.Optimizer.SyncCalls,
-			ForcedSyncCalls:                end.Optimizer.ForcedSyncCalls - start.Optimizer.ForcedSyncCalls,
-			LastForcedSyncReason:           end.Optimizer.LastForcedSyncReason,
-			UploadedBytes:                  end.Optimizer.UploadedBytes - start.Optimizer.UploadedBytes,
-			ResidentGradUploadBytesAvoided: end.Optimizer.ResidentGradUploadBytesAvoided - start.Optimizer.ResidentGradUploadBytesAvoided,
-			DownloadedBytes:                end.Optimizer.DownloadedBytes - start.Optimizer.DownloadedBytes,
-			UpdateNanos:                    end.Optimizer.UpdateNanos - start.Optimizer.UpdateNanos,
-			ResidentGradUpdateNanos:        end.Optimizer.ResidentGradUpdateNanos - start.Optimizer.ResidentGradUpdateNanos,
-			SyncNanos:                      end.Optimizer.SyncNanos - start.Optimizer.SyncNanos,
-			ResidentParams:                 end.Optimizer.ResidentParams,
+			LogicalSteps:                    end.Optimizer.LogicalSteps - start.Optimizer.LogicalSteps,
+			TensorUpdateCalls:               end.Optimizer.TensorUpdateCalls - start.Optimizer.TensorUpdateCalls,
+			UpdateCalls:                     end.Optimizer.UpdateCalls - start.Optimizer.UpdateCalls,
+			ResidentGradUpdateCalls:         end.Optimizer.ResidentGradUpdateCalls - start.Optimizer.ResidentGradUpdateCalls,
+			ResidentGradBatchCalls:          end.Optimizer.ResidentGradBatchCalls - start.Optimizer.ResidentGradBatchCalls,
+			ResidentGradBatchKernelLaunches: end.Optimizer.ResidentGradBatchKernelLaunches - start.Optimizer.ResidentGradBatchKernelLaunches,
+			ResidentGradBatchKernelSyncs:    end.Optimizer.ResidentGradBatchKernelSyncs - start.Optimizer.ResidentGradBatchKernelSyncs,
+			DeferredSyncUpdates:             end.Optimizer.DeferredSyncUpdates - start.Optimizer.DeferredSyncUpdates,
+			SyncCalls:                       end.Optimizer.SyncCalls - start.Optimizer.SyncCalls,
+			ForcedSyncCalls:                 end.Optimizer.ForcedSyncCalls - start.Optimizer.ForcedSyncCalls,
+			LastForcedSyncReason:            end.Optimizer.LastForcedSyncReason,
+			UploadedBytes:                   end.Optimizer.UploadedBytes - start.Optimizer.UploadedBytes,
+			ResidentGradUploadBytesAvoided:  end.Optimizer.ResidentGradUploadBytesAvoided - start.Optimizer.ResidentGradUploadBytesAvoided,
+			DownloadedBytes:                 end.Optimizer.DownloadedBytes - start.Optimizer.DownloadedBytes,
+			UpdateNanos:                     end.Optimizer.UpdateNanos - start.Optimizer.UpdateNanos,
+			ResidentGradUpdateNanos:         end.Optimizer.ResidentGradUpdateNanos - start.Optimizer.ResidentGradUpdateNanos,
+			SyncNanos:                       end.Optimizer.SyncNanos - start.Optimizer.SyncNanos,
+			ResidentParams:                  end.Optimizer.ResidentParams,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              end.Activation.BindCalls - start.Activation.BindCalls,

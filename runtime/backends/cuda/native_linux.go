@@ -38,6 +38,28 @@ typedef struct {
 	int value;
 } EosCudaTypedLaunchArg;
 
+// EosCudaOptimizerUpdateDescriptor is allocated and populated in C-owned
+// memory by the Go bridge. No Go pointer is retained by this descriptor or
+// passed to cuLaunchKernel.
+typedef struct {
+	CUdeviceptr param;
+	CUdeviceptr mom1;
+	CUdeviceptr mom2;
+	CUdeviceptr grad;
+	unsigned int grid;
+	unsigned int block;
+	int elements;
+	int mode;
+	float learning_rate;
+	float weight_decay;
+	float beta1;
+	float beta2;
+	float corr1;
+	float corr2;
+	float epsilon;
+	float scale;
+} EosCudaOptimizerUpdateDescriptor;
+
 static char* manta_dup_cstr(const char* s) {
 	if (s == NULL) {
 		return NULL;
@@ -560,6 +582,72 @@ static int eosCudaLaunchScore(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigne
 static int eosCudaLaunchOptimizerUpdate(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr param, CUdeviceptr mom1, CUdeviceptr mom2, CUdeviceptr grad, int elements, int mode, float learningRate, float weightDecay, float beta1, float beta2, float corr1, float corr2, float epsilon, float scale, char** err) {
 	void* args[] = {&param, &mom1, &mom2, &grad, &elements, &mode, &learningRate, &weightDecay, &beta1, &beta2, &corr1, &corr2, &epsilon, &scale};
 	return eosCudaLaunch1D(rt, kernel, grid, block, args, err);
+}
+
+// eosCudaLaunchOptimizerUpdateBatch sets the context once, enqueues each
+// existing optimizer kernel on the runtime stream, and synchronizes once.
+// enqueued reports the number of successfully submitted kernels even when a
+// later launch or the completion barrier fails, allowing the Go owner to
+// poison the step conservatively.
+static int eosCudaLaunchOptimizerUpdateBatch(EosCudaRuntime* rt, EosCudaKernel* kernel, EosCudaOptimizerUpdateDescriptor* descriptors, int count, int* enqueued, int* attempted, char** err) {
+	if (enqueued == NULL || attempted == NULL) {
+		*err = manta_dup_format("eosCudaLaunchOptimizerUpdateBatch", "missing progress output");
+		return 1;
+	}
+	*enqueued = 0;
+	*attempted = 0;
+	if (rt == NULL || kernel == NULL || descriptors == NULL || count <= 0) {
+		*err = manta_dup_format("eosCudaLaunchOptimizerUpdateBatch", "invalid batch arguments");
+		return 1;
+	}
+	CUresult cuRes = cuCtxSetCurrent(rt->ctx);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuCtxSetCurrent", cuRes);
+		return 1;
+	}
+	CUresult launchError = CUDA_SUCCESS;
+	for (int i = 0; i < count; i++) {
+		EosCudaOptimizerUpdateDescriptor* d = &descriptors[i];
+		void* args[] = {&d->param, &d->mom1, &d->mom2, &d->grad, &d->elements, &d->mode, &d->learning_rate, &d->weight_decay, &d->beta1, &d->beta2, &d->corr1, &d->corr2, &d->epsilon, &d->scale};
+		*attempted = 1;
+		cuRes = cuLaunchKernel(kernel->function, d->grid, 1, 1, d->block, 1, 1, 0, rt->stream, args, NULL);
+		if (cuRes != CUDA_SUCCESS) {
+			launchError = cuRes;
+			break;
+		}
+		*enqueued = i + 1;
+	}
+	if (launchError != CUDA_SUCCESS) {
+		char* primary = manta_dup_cu_error("cuLaunchKernel", launchError);
+		CUresult drainRes = cuStreamSynchronize(rt->stream);
+		if (drainRes != CUDA_SUCCESS) {
+			char* drain = manta_dup_cu_error("cuStreamSynchronize(drain)", drainRes);
+			if (primary != NULL && drain != NULL) {
+				size_t n = strlen(primary) + strlen(drain) + 3;
+				char* combined = (char*)malloc(n);
+				if (combined != NULL) {
+					snprintf(combined, n, "%s; %s", primary, drain);
+					free(primary);
+					free(drain);
+					*err = combined;
+					return 1;
+				}
+			}
+			if (primary == NULL) {
+				*err = drain;
+				return 1;
+			}
+			free(drain);
+		}
+		*err = primary;
+		return 1;
+	}
+	cuRes = cuStreamSynchronize(rt->stream);
+	if (cuRes != CUDA_SUCCESS) {
+		*err = manta_dup_cu_error("cuStreamSynchronize", cuRes);
+		return 1;
+	}
+	return 0;
 }
 
 static int eosCudaLaunchSoftmaxBackwardRows(EosCudaRuntime* rt, EosCudaKernel* kernel, unsigned int grid, unsigned int block, CUdeviceptr gradOut, CUdeviceptr probs, CUdeviceptr out0, int rows, int cols, char** err) {
@@ -4703,6 +4791,167 @@ func (rt *deviceRuntime) launchOptimizerUpdate(kernel *auxKernel, grid, block ui
 		return cStringError(errStr)
 	}
 	return nil
+}
+
+// optimizerUpdateLaunch is the Go-side value-only representation of one
+// resident optimizer launch. launchOptimizerUpdateBatch copies these values
+// into C-owned descriptors before crossing cgo.
+type optimizerUpdateLaunch struct {
+	grid, block  uint
+	param        uint64
+	Mom1         uint64
+	Mom2         uint64
+	grad         uint64
+	elements     int
+	mode         int
+	learningRate float32
+	weightDecay  float32
+	beta1        float32
+	beta2        float32
+	corr1        float32
+	corr2        float32
+	epsilon      float32
+	scale        float32
+}
+
+const maxInt64Value = int64(1<<63 - 1)
+
+func maxUnsignedCValue(size uintptr) uint64 {
+	bits := uint(size * 8)
+	if bits >= 64 {
+		return ^uint64(0)
+	}
+	return (uint64(1) << bits) - 1
+}
+
+func cIntBounds() (int64, int64) {
+	bits := uint(unsafe.Sizeof(C.int(0)) * 8)
+	if bits >= 64 {
+		return -maxInt64Value - 1, maxInt64Value
+	}
+	max := int64((uint64(1) << (bits - 1)) - 1)
+	return -max - 1, max
+}
+
+func maxCIntValue() uint64 {
+	_, max := cIntBounds()
+	return uint64(max)
+}
+
+func maxCUintValue() uint64 {
+	return maxUnsignedCValue(unsafe.Sizeof(C.uint(0)))
+}
+
+func maxCSizeTValue() uint64 {
+	return maxUnsignedCValue(unsafe.Sizeof(C.size_t(0)))
+}
+
+func checkedCSizeMultiply(left, right uint64) (uint64, error) {
+	max := maxCSizeTValue()
+	if left != 0 && right > max/left {
+		return 0, fmt.Errorf("cuda optimizer batch descriptor size overflows C.size_t")
+	}
+	return left * right, nil
+}
+
+func optimizerUpdateBatchDescriptorBytes(count uint64) (C.size_t, error) {
+	if count > maxCIntValue() {
+		return 0, fmt.Errorf("cuda optimizer batch descriptor count %d exceeds C.int max %d", count, maxCIntValue())
+	}
+	bytes, err := checkedCSizeMultiply(count, uint64(C.sizeof_EosCudaOptimizerUpdateDescriptor))
+	if err != nil {
+		return 0, err
+	}
+	return C.size_t(bytes), nil
+}
+
+func validateOptimizerUpdateLaunch(update optimizerUpdateLaunch) error {
+	if uint64(update.grid) > maxCUintValue() {
+		return fmt.Errorf("cuda optimizer batch grid %d exceeds C.uint max %d", update.grid, maxCUintValue())
+	}
+	if uint64(update.block) > maxCUintValue() {
+		return fmt.Errorf("cuda optimizer batch block %d exceeds C.uint max %d", update.block, maxCUintValue())
+	}
+	minCInt, maxCInt := cIntBounds()
+	if update.elements <= 0 || int64(update.elements) < minCInt || int64(update.elements) > maxCInt {
+		return fmt.Errorf("cuda optimizer batch elements %d must be positive and fit C.int [%d,%d]", update.elements, minCInt, maxCInt)
+	}
+	if int64(update.mode) < minCInt || int64(update.mode) > maxCInt {
+		return fmt.Errorf("cuda optimizer batch mode %d exceeds C.int range [%d,%d]", update.mode, minCInt, maxCInt)
+	}
+	return nil
+}
+
+func validateOptimizerUpdateLaunches(updates []optimizerUpdateLaunch) error {
+	for i, update := range updates {
+		if err := validateOptimizerUpdateLaunch(update); err != nil {
+			return fmt.Errorf("cuda optimizer batch descriptor %d: %w", i, err)
+		}
+	}
+	return nil
+}
+
+func (rt *deviceRuntime) launchOptimizerUpdateBatch(kernel *auxKernel, updates []optimizerUpdateLaunch) (int, bool, error) {
+	if kernel == nil || kernel.ptr == nil {
+		return 0, false, fmt.Errorf("cuda optimizer kernel is not initialized")
+	}
+	if len(updates) == 0 {
+		return 0, false, nil
+	}
+	descriptorBytes, err := optimizerUpdateBatchDescriptorBytes(uint64(len(updates)))
+	if err != nil {
+		return 0, false, err
+	}
+	if err := validateOptimizerUpdateLaunches(updates); err != nil {
+		return 0, false, err
+	}
+	bytes := descriptorBytes
+	descriptorMem := C.malloc(bytes)
+	if descriptorMem == nil {
+		return 0, false, fmt.Errorf("cuda optimizer batch descriptor allocation failed for %d updates", len(updates))
+	}
+	defer C.free(descriptorMem)
+	descriptors := unsafe.Slice((*C.EosCudaOptimizerUpdateDescriptor)(descriptorMem), len(updates))
+	for i, update := range updates {
+		descriptors[i].param = C.CUdeviceptr(update.param)
+		descriptors[i].mom1 = C.CUdeviceptr(update.Mom1)
+		descriptors[i].mom2 = C.CUdeviceptr(update.Mom2)
+		descriptors[i].grad = C.CUdeviceptr(update.grad)
+		descriptors[i].grid = C.uint(update.grid)
+		descriptors[i].block = C.uint(update.block)
+		descriptors[i].elements = C.int(update.elements)
+		descriptors[i].mode = C.int(update.mode)
+		descriptors[i].learning_rate = C.float(update.learningRate)
+		descriptors[i].weight_decay = C.float(update.weightDecay)
+		descriptors[i].beta1 = C.float(update.beta1)
+		descriptors[i].beta2 = C.float(update.beta2)
+		descriptors[i].corr1 = C.float(update.corr1)
+		descriptors[i].corr2 = C.float(update.corr2)
+		descriptors[i].epsilon = C.float(update.epsilon)
+		descriptors[i].scale = C.float(update.scale)
+	}
+	var enqueued C.int
+	var attempted C.int
+	var errStr *C.char
+	if C.eosCudaLaunchOptimizerUpdateBatch(
+		rt.ptr,
+		kernel.ptr,
+		(*C.EosCudaOptimizerUpdateDescriptor)(descriptorMem),
+		C.int(len(updates)),
+		&enqueued,
+		&attempted,
+		&errStr,
+	) != 0 {
+		count := int(enqueued)
+		if count < 0 {
+			count = 0
+		}
+		if count > len(updates) {
+			count = len(updates)
+		}
+		return count, attempted != 0, cStringError(errStr)
+	}
+	return len(updates), attempted != 0, nil
 }
 
 func (rt *deviceRuntime) launchAuxSoftmaxBackwardRows(kernel *auxKernel, grid, block uint, gradOut, probs, out0 C.CUdeviceptr, rows, cols int) error {

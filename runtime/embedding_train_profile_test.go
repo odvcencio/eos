@@ -51,18 +51,21 @@ func TestEmbeddingTrainProfileRoundTrip(t *testing.T) {
 			OptimizerCalls:      1,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         4,
-			TensorUpdateCalls:    13,
-			UpdateCalls:          4,
-			DeferredSyncUpdates:  9,
-			SyncCalls:            2,
-			ForcedSyncCalls:      1,
-			LastForcedSyncReason: "restore-best-test",
-			UploadedBytes:        1024,
-			DownloadedBytes:      512,
-			UpdateNanos:          100,
-			SyncNanos:            40,
-			ResidentParams:       3,
+			LogicalSteps:                    4,
+			TensorUpdateCalls:               13,
+			UpdateCalls:                     4,
+			ResidentGradBatchCalls:          2,
+			ResidentGradBatchKernelLaunches: 20,
+			ResidentGradBatchKernelSyncs:    2,
+			DeferredSyncUpdates:             9,
+			SyncCalls:                       2,
+			ForcedSyncCalls:                 1,
+			LastForcedSyncReason:            "restore-best-test",
+			UploadedBytes:                   1024,
+			DownloadedBytes:                 512,
+			UpdateNanos:                     100,
+			SyncNanos:                       40,
+			ResidentParams:                  3,
 		},
 		Activation: backend.ActivationAcceleratorStats{
 			BindCalls:              4,
@@ -113,6 +116,15 @@ func TestEmbeddingTrainProfileRoundTrip(t *testing.T) {
 	}
 	if got.Optimizer.TensorUpdateCalls != want.Optimizer.TensorUpdateCalls {
 		t.Fatalf("optimizer tensor update calls = %d, want %d", got.Optimizer.TensorUpdateCalls, want.Optimizer.TensorUpdateCalls)
+	}
+	if got.Optimizer.ResidentGradBatchCalls != want.Optimizer.ResidentGradBatchCalls {
+		t.Fatalf("optimizer resident-gradient batch calls = %d, want %d", got.Optimizer.ResidentGradBatchCalls, want.Optimizer.ResidentGradBatchCalls)
+	}
+	if got.Optimizer.ResidentGradBatchKernelLaunches != want.Optimizer.ResidentGradBatchKernelLaunches {
+		t.Fatalf("optimizer resident-gradient batch kernel launches = %d, want %d", got.Optimizer.ResidentGradBatchKernelLaunches, want.Optimizer.ResidentGradBatchKernelLaunches)
+	}
+	if got.Optimizer.ResidentGradBatchKernelSyncs != want.Optimizer.ResidentGradBatchKernelSyncs {
+		t.Fatalf("optimizer resident-gradient batch kernel synchronizations = %d, want %d", got.Optimizer.ResidentGradBatchKernelSyncs, want.Optimizer.ResidentGradBatchKernelSyncs)
 	}
 	if got.Optimizer.DeferredSyncUpdates != want.Optimizer.DeferredSyncUpdates {
 		t.Fatalf("optimizer deferred sync updates = %d, want %d", got.Optimizer.DeferredSyncUpdates, want.Optimizer.DeferredSyncUpdates)
@@ -203,14 +215,17 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 			OptimizerCalls:      1,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         2,
-			TensorUpdateCalls:    9,
-			UpdateCalls:          2,
-			DeferredSyncUpdates:  7,
-			SyncCalls:            1,
-			ForcedSyncCalls:      1,
-			LastForcedSyncReason: "left-pressure",
-			ResidentParams:       3,
+			LogicalSteps:                    2,
+			TensorUpdateCalls:               9,
+			UpdateCalls:                     2,
+			ResidentGradBatchCalls:          2,
+			ResidentGradBatchKernelLaunches: 30,
+			ResidentGradBatchKernelSyncs:    2,
+			DeferredSyncUpdates:             7,
+			SyncCalls:                       1,
+			ForcedSyncCalls:                 1,
+			LastForcedSyncReason:            "left-pressure",
+			ResidentParams:                  3,
 		},
 	}
 	right := EmbeddingTrainProfile{
@@ -227,27 +242,33 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 			OptimizerCalls:      3,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         3,
-			TensorUpdateCalls:    11,
-			UpdateCalls:          3,
-			DeferredSyncUpdates:  5,
-			SyncCalls:            2,
-			ForcedSyncCalls:      2,
-			LastForcedSyncReason: "right-capacity",
-			ResidentParams:       4,
+			LogicalSteps:                    3,
+			TensorUpdateCalls:               11,
+			UpdateCalls:                     3,
+			ResidentGradBatchCalls:          3,
+			ResidentGradBatchKernelLaunches: 45,
+			ResidentGradBatchKernelSyncs:    3,
+			DeferredSyncUpdates:             5,
+			SyncCalls:                       2,
+			ForcedSyncCalls:                 2,
+			LastForcedSyncReason:            "right-capacity",
+			ResidentParams:                  4,
 		},
 	}
 
 	merged := addTrainProfileDelta(left, right)
 	assertOptimizerProfileCounters(t, merged.Optimizer, backend.OptimizerAcceleratorStats{
-		LogicalSteps:         5,
-		TensorUpdateCalls:    20,
-		UpdateCalls:          5,
-		DeferredSyncUpdates:  12,
-		SyncCalls:            3,
-		ForcedSyncCalls:      3,
-		LastForcedSyncReason: "right-capacity",
-		ResidentParams:       4,
+		LogicalSteps:                    5,
+		TensorUpdateCalls:               20,
+		UpdateCalls:                     5,
+		ResidentGradBatchCalls:          5,
+		ResidentGradBatchKernelLaunches: 75,
+		ResidentGradBatchKernelSyncs:    5,
+		DeferredSyncUpdates:             12,
+		SyncCalls:                       3,
+		ForcedSyncCalls:                 3,
+		LastForcedSyncReason:            "right-capacity",
+		ResidentParams:                  4,
 	})
 	assertVectorDistillProfilePhases(t, merged.VectorDistillPhases, EmbeddingVectorDistillPhaseTimers{
 		EncodeNanos:         110,
@@ -274,26 +295,32 @@ func TestTrainProfileOptimizerCounterDeltaMergeAndApply(t *testing.T) {
 			OptimizerCalls:      10,
 		},
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         10,
-			TensorUpdateCalls:    100,
-			UpdateCalls:          10,
-			DeferredSyncUpdates:  50,
-			SyncCalls:            10,
-			ForcedSyncCalls:      4,
-			LastForcedSyncReason: "base-sync",
-			ResidentParams:       8,
+			LogicalSteps:                    10,
+			TensorUpdateCalls:               100,
+			UpdateCalls:                     10,
+			ResidentGradBatchCalls:          10,
+			ResidentGradBatchKernelLaunches: 150,
+			ResidentGradBatchKernelSyncs:    10,
+			DeferredSyncUpdates:             50,
+			SyncCalls:                       10,
+			ForcedSyncCalls:                 4,
+			LastForcedSyncReason:            "base-sync",
+			ResidentParams:                  8,
 		},
 	}
 	applied := applyTrainProfileDelta(base, right)
 	assertOptimizerProfileCounters(t, applied.Optimizer, backend.OptimizerAcceleratorStats{
-		LogicalSteps:         13,
-		TensorUpdateCalls:    111,
-		UpdateCalls:          13,
-		DeferredSyncUpdates:  55,
-		SyncCalls:            12,
-		ForcedSyncCalls:      6,
-		LastForcedSyncReason: "right-capacity",
-		ResidentParams:       4,
+		LogicalSteps:                    13,
+		TensorUpdateCalls:               111,
+		UpdateCalls:                     13,
+		ResidentGradBatchCalls:          13,
+		ResidentGradBatchKernelLaunches: 195,
+		ResidentGradBatchKernelSyncs:    13,
+		DeferredSyncUpdates:             55,
+		SyncCalls:                       12,
+		ForcedSyncCalls:                 6,
+		LastForcedSyncReason:            "right-capacity",
+		ResidentParams:                  4,
 	})
 	assertVectorDistillProfilePhases(t, applied.VectorDistillPhases, EmbeddingVectorDistillPhaseTimers{
 		EncodeNanos:         1100,
@@ -312,56 +339,68 @@ func TestTrainProfileRestoreBestMergePreservesOptimizerCounters(t *testing.T) {
 		Version: EmbeddingTrainProfileVersion,
 		Step:    10,
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         10,
-			TensorUpdateCalls:    100,
-			UpdateCalls:          10,
-			DeferredSyncUpdates:  80,
-			SyncCalls:            2,
-			ForcedSyncCalls:      1,
-			LastForcedSyncReason: "startup",
-			ResidentParams:       2,
+			LogicalSteps:                    10,
+			TensorUpdateCalls:               100,
+			UpdateCalls:                     10,
+			ResidentGradBatchCalls:          10,
+			ResidentGradBatchKernelLaunches: 150,
+			ResidentGradBatchKernelSyncs:    10,
+			DeferredSyncUpdates:             80,
+			SyncCalls:                       2,
+			ForcedSyncCalls:                 1,
+			LastForcedSyncReason:            "startup",
+			ResidentParams:                  2,
 		},
 	}
 	preRestoreEnd := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		Step:    14,
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         14,
-			TensorUpdateCalls:    140,
-			UpdateCalls:          14,
-			DeferredSyncUpdates:  120,
-			SyncCalls:            5,
-			ForcedSyncCalls:      2,
-			LastForcedSyncReason: "pre-restore-pressure",
-			ResidentParams:       4,
+			LogicalSteps:                    14,
+			TensorUpdateCalls:               140,
+			UpdateCalls:                     14,
+			ResidentGradBatchCalls:          14,
+			ResidentGradBatchKernelLaunches: 210,
+			ResidentGradBatchKernelSyncs:    14,
+			DeferredSyncUpdates:             120,
+			SyncCalls:                       5,
+			ForcedSyncCalls:                 2,
+			LastForcedSyncReason:            "pre-restore-pressure",
+			ResidentParams:                  4,
 		},
 	}
 	restoreStart := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		Step:    12,
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         12,
-			TensorUpdateCalls:    120,
-			UpdateCalls:          12,
-			DeferredSyncUpdates:  96,
-			SyncCalls:            3,
-			ForcedSyncCalls:      1,
-			LastForcedSyncReason: "startup",
-			ResidentParams:       3,
+			LogicalSteps:                    12,
+			TensorUpdateCalls:               120,
+			UpdateCalls:                     12,
+			ResidentGradBatchCalls:          12,
+			ResidentGradBatchKernelLaunches: 180,
+			ResidentGradBatchKernelSyncs:    12,
+			DeferredSyncUpdates:             96,
+			SyncCalls:                       3,
+			ForcedSyncCalls:                 1,
+			LastForcedSyncReason:            "startup",
+			ResidentParams:                  3,
 		},
 	}
 	final := EmbeddingTrainProfile{
 		Version: EmbeddingTrainProfileVersion,
 		Step:    13,
 		Optimizer: backend.OptimizerAcceleratorStats{
-			LogicalSteps:         13,
-			TensorUpdateCalls:    133,
-			UpdateCalls:          13,
-			DeferredSyncUpdates:  108,
-			SyncCalls:            4,
-			ForcedSyncCalls:      2,
-			LastForcedSyncReason: "final-eval-sync",
-			ResidentParams:       5,
+			LogicalSteps:                    13,
+			TensorUpdateCalls:               133,
+			UpdateCalls:                     13,
+			ResidentGradBatchCalls:          13,
+			ResidentGradBatchKernelLaunches: 195,
+			ResidentGradBatchKernelSyncs:    13,
+			DeferredSyncUpdates:             108,
+			SyncCalls:                       4,
+			ForcedSyncCalls:                 2,
+			LastForcedSyncReason:            "final-eval-sync",
+			ResidentParams:                  5,
 		},
 	}
 
@@ -371,24 +410,30 @@ func TestTrainProfileRestoreBestMergePreservesOptimizerCounters(t *testing.T) {
 	endProfile := applyTrainProfileDelta(preRestoreEnd, postRestoreDelta)
 
 	assertOptimizerProfileCounters(t, mergedDelta.Optimizer, backend.OptimizerAcceleratorStats{
-		LogicalSteps:         5,
-		TensorUpdateCalls:    53,
-		UpdateCalls:          5,
-		DeferredSyncUpdates:  52,
-		SyncCalls:            4,
-		ForcedSyncCalls:      2,
-		LastForcedSyncReason: "final-eval-sync",
-		ResidentParams:       5,
+		LogicalSteps:                    5,
+		TensorUpdateCalls:               53,
+		UpdateCalls:                     5,
+		ResidentGradBatchCalls:          5,
+		ResidentGradBatchKernelLaunches: 75,
+		ResidentGradBatchKernelSyncs:    5,
+		DeferredSyncUpdates:             52,
+		SyncCalls:                       4,
+		ForcedSyncCalls:                 2,
+		LastForcedSyncReason:            "final-eval-sync",
+		ResidentParams:                  5,
 	})
 	assertOptimizerProfileCounters(t, endProfile.Optimizer, backend.OptimizerAcceleratorStats{
-		LogicalSteps:         15,
-		TensorUpdateCalls:    153,
-		UpdateCalls:          15,
-		DeferredSyncUpdates:  132,
-		SyncCalls:            6,
-		ForcedSyncCalls:      3,
-		LastForcedSyncReason: "final-eval-sync",
-		ResidentParams:       5,
+		LogicalSteps:                    15,
+		TensorUpdateCalls:               153,
+		UpdateCalls:                     15,
+		ResidentGradBatchCalls:          15,
+		ResidentGradBatchKernelLaunches: 225,
+		ResidentGradBatchKernelSyncs:    15,
+		DeferredSyncUpdates:             132,
+		SyncCalls:                       6,
+		ForcedSyncCalls:                 3,
+		LastForcedSyncReason:            "final-eval-sync",
+		ResidentParams:                  5,
 	})
 }
 
@@ -399,6 +444,9 @@ func TestTrainProfileOptimizerCounterActivity(t *testing.T) {
 	}{
 		{name: "logical steps", stats: backend.OptimizerAcceleratorStats{LogicalSteps: 1}},
 		{name: "tensor update calls", stats: backend.OptimizerAcceleratorStats{TensorUpdateCalls: 1}},
+		{name: "resident-gradient batch calls", stats: backend.OptimizerAcceleratorStats{ResidentGradBatchCalls: 1}},
+		{name: "resident-gradient batch kernel launches", stats: backend.OptimizerAcceleratorStats{ResidentGradBatchKernelLaunches: 1}},
+		{name: "resident-gradient batch kernel synchronizations", stats: backend.OptimizerAcceleratorStats{ResidentGradBatchKernelSyncs: 1}},
 		{name: "deferred sync updates", stats: backend.OptimizerAcceleratorStats{DeferredSyncUpdates: 1}},
 		{name: "forced sync calls", stats: backend.OptimizerAcceleratorStats{ForcedSyncCalls: 1}},
 		{name: "last forced sync reason", stats: backend.OptimizerAcceleratorStats{LastForcedSyncReason: "memory-pressure"}},
@@ -412,6 +460,152 @@ func TestTrainProfileOptimizerCounterActivity(t *testing.T) {
 	}
 }
 
+func TestDiffCompactTrainStatsExcludesWarmupAllocationsKeepsMeasuredReuse(t *testing.T) {
+	start := &backend.CompactTrainAcceleratorStats{
+		ArenaAllocations:            1,
+		ArenaReuseHits:              1,
+		GradientAllocations:         1,
+		GradientReuseHits:           1,
+		LiveHandles:                 2,
+		ActivationArenaBytes:        4096,
+		WorkspaceArenaBytes:         2048,
+		LastShape:                   backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8},
+		LastForwardLaunches:         3,
+		LastBackwardLaunches:        4,
+		LastForwardCublasGemmCalls:  1,
+		LastBackwardCublasGemmCalls: 2,
+		LastForwardSyncs:            1,
+		LastBackwardSyncs:           1,
+	}
+	end := &backend.CompactTrainAcceleratorStats{
+		ArenaAllocations:            1,
+		ArenaReuseHits:              2,
+		GradientAllocations:         1,
+		GradientReuseHits:           2,
+		LiveHandles:                 1,
+		ActivationArenaBytes:        8192,
+		WorkspaceArenaBytes:         4096,
+		LastShape:                   backend.CompactForwardShape{Batch: 1, Tokens: 4, ModelDim: 8, FFNDim: 16},
+		LastForwardLaunches:         5,
+		LastBackwardLaunches:        6,
+		LastForwardCublasGemmCalls:  3,
+		LastBackwardCublasGemmCalls: 4,
+		LastForwardSyncs:            2,
+		LastBackwardSyncs:           2,
+	}
+
+	got := diffCompactTrainStats(start, end)
+	if got == nil {
+		t.Fatal("compact train diff = nil, want stats")
+	}
+	if got.ArenaAllocations != 0 || got.GradientAllocations != 0 {
+		t.Fatalf("warm-up allocations = arena %d, gradient %d; want both zero", got.ArenaAllocations, got.GradientAllocations)
+	}
+	if got.ArenaReuseHits != 1 || got.GradientReuseHits != 1 {
+		t.Fatalf("measured reuse = arena %d, gradient %d; want both one", got.ArenaReuseHits, got.GradientReuseHits)
+	}
+	if got.LiveHandles != end.LiveHandles {
+		t.Fatalf("live handles = %d, want end snapshot %d", got.LiveHandles, end.LiveHandles)
+	}
+	if got.ActivationArenaBytes != end.ActivationArenaBytes || got.WorkspaceArenaBytes != end.WorkspaceArenaBytes {
+		t.Fatalf("arena bytes = activation %d/workspace %d, want end snapshot %d/%d", got.ActivationArenaBytes, got.WorkspaceArenaBytes, end.ActivationArenaBytes, end.WorkspaceArenaBytes)
+	}
+	if got.LastShape != end.LastShape || got.LastForwardLaunches != end.LastForwardLaunches || got.LastBackwardLaunches != end.LastBackwardLaunches || got.LastForwardCublasGemmCalls != end.LastForwardCublasGemmCalls || got.LastBackwardCublasGemmCalls != end.LastBackwardCublasGemmCalls || got.LastForwardSyncs != end.LastForwardSyncs || got.LastBackwardSyncs != end.LastBackwardSyncs {
+		t.Fatalf("last compact train snapshots = %+v, want end snapshots %+v", got, end)
+	}
+}
+
+func TestCompactTrainProfileRestoreMergePreservesPoolDeltasAndSnapshots(t *testing.T) {
+	start := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		CompactTrain: &backend.CompactTrainAcceleratorStats{
+			LiveHandles:          2,
+			ArenaReuseHits:       1,
+			ArenaAllocations:     1,
+			GradientReuseHits:    1,
+			GradientAllocations:  1,
+			ResidentGradBytes:    100,
+			ActivationArenaBytes: 1000,
+			WorkspaceArenaBytes:  2000,
+		},
+	}
+	preRestoreEnd := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		CompactTrain: &backend.CompactTrainAcceleratorStats{
+			LiveHandles:          1,
+			ArenaReuseHits:       3,
+			ArenaAllocations:     2,
+			GradientReuseHits:    4,
+			GradientAllocations:  2,
+			ResidentGradBytes:    150,
+			ActivationArenaBytes: 1100,
+			WorkspaceArenaBytes:  2200,
+		},
+	}
+	restoreStart := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		CompactTrain: &backend.CompactTrainAcceleratorStats{
+			LiveHandles:          4,
+			ArenaReuseHits:       10,
+			ArenaAllocations:     5,
+			GradientReuseHits:    11,
+			GradientAllocations:  5,
+			ResidentGradBytes:    200,
+			ActivationArenaBytes: 3000,
+			WorkspaceArenaBytes:  6000,
+		},
+	}
+	final := EmbeddingTrainProfile{
+		Version: EmbeddingTrainProfileVersion,
+		CompactTrain: &backend.CompactTrainAcceleratorStats{
+			LiveHandles:          3,
+			ArenaReuseHits:       12,
+			ArenaAllocations:     6,
+			GradientReuseHits:    13,
+			GradientAllocations:  6,
+			ResidentGradBytes:    230,
+			ActivationArenaBytes: 3300,
+			WorkspaceArenaBytes:  6600,
+		},
+	}
+
+	preRestoreDelta := diffTrainProfile(start, preRestoreEnd)
+	postRestoreDelta := diffTrainProfile(restoreStart, final)
+	mergedDelta := addTrainProfileDelta(preRestoreDelta, postRestoreDelta)
+	endProfile := applyTrainProfileDelta(preRestoreEnd, postRestoreDelta)
+
+	assertCompactTrainProfileStats(t, mergedDelta.CompactTrain, &backend.CompactTrainAcceleratorStats{
+		LiveHandles:          3,
+		ArenaReuseHits:       4,
+		ArenaAllocations:     2,
+		GradientReuseHits:    5,
+		GradientAllocations:  2,
+		ResidentGradBytes:    80,
+		ActivationArenaBytes: 3300,
+		WorkspaceArenaBytes:  6600,
+	})
+	assertCompactTrainProfileStats(t, endProfile.CompactTrain, &backend.CompactTrainAcceleratorStats{
+		LiveHandles:          3,
+		ArenaReuseHits:       5,
+		ArenaAllocations:     3,
+		GradientReuseHits:    6,
+		GradientAllocations:  3,
+		ResidentGradBytes:    180,
+		ActivationArenaBytes: 3300,
+		WorkspaceArenaBytes:  6600,
+	})
+}
+
+func assertCompactTrainProfileStats(t *testing.T, got, want *backend.CompactTrainAcceleratorStats) {
+	t.Helper()
+	if got == nil {
+		t.Fatalf("compact train stats = nil, want %+v", want)
+	}
+	if got.LiveHandles != want.LiveHandles || got.ArenaReuseHits != want.ArenaReuseHits || got.ArenaAllocations != want.ArenaAllocations || got.GradientReuseHits != want.GradientReuseHits || got.GradientAllocations != want.GradientAllocations || got.ResidentGradBytes != want.ResidentGradBytes || got.ActivationArenaBytes != want.ActivationArenaBytes || got.WorkspaceArenaBytes != want.WorkspaceArenaBytes {
+		t.Fatalf("compact train stats = %+v, want selected counters/snapshots %+v", *got, *want)
+	}
+}
+
 func assertOptimizerProfileCounters(t *testing.T, got, want backend.OptimizerAcceleratorStats) {
 	t.Helper()
 	if got.LogicalSteps != want.LogicalSteps {
@@ -422,6 +616,15 @@ func assertOptimizerProfileCounters(t *testing.T, got, want backend.OptimizerAcc
 	}
 	if got.UpdateCalls != want.UpdateCalls {
 		t.Fatalf("update calls = %d, want %d", got.UpdateCalls, want.UpdateCalls)
+	}
+	if got.ResidentGradBatchCalls != want.ResidentGradBatchCalls {
+		t.Fatalf("resident-gradient batch calls = %d, want %d", got.ResidentGradBatchCalls, want.ResidentGradBatchCalls)
+	}
+	if got.ResidentGradBatchKernelLaunches != want.ResidentGradBatchKernelLaunches {
+		t.Fatalf("resident-gradient batch kernel launches = %d, want %d", got.ResidentGradBatchKernelLaunches, want.ResidentGradBatchKernelLaunches)
+	}
+	if got.ResidentGradBatchKernelSyncs != want.ResidentGradBatchKernelSyncs {
+		t.Fatalf("resident-gradient batch kernel synchronizations = %d, want %d", got.ResidentGradBatchKernelSyncs, want.ResidentGradBatchKernelSyncs)
 	}
 	if got.DeferredSyncUpdates != want.DeferredSyncUpdates {
 		t.Fatalf("deferred sync updates = %d, want %d", got.DeferredSyncUpdates, want.DeferredSyncUpdates)

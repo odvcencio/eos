@@ -1,23 +1,23 @@
 ---
 mdpp: "0.1"
 title: "EOS Training And Inference Performance Plan"
-date: 2026-08-13
+date: 2026-08-15
 status: draft
 scope: "10-14 week implementation specification for EOS training quality, training efficiency, inference performance, Apple acceleration, and Go SIMD experiments"
 ---
 
 # EOS Training And Inference Performance Plan
 
-This is an implementation specification, not a result announcement. It reconciles current EOS repository evidence, Hyphae memory, and current official Go and Apple documentation available on 2026-08-13. Measurements are labeled as measured. Everything else is proposed work, a dependency, or a gate.
+This is an implementation specification, not a result announcement. It reconciles current EOS repository evidence, Hyphae memory, and current official Go and Apple documentation available on 2026-08-15. Measurements are labeled as measured. Everything else is proposed work, a dependency, or a gate.
 
 ## Executive Decision Summary
 
-1. EOS keeps Go-native compiler/runtime ownership. The `.mll` artifact remains backend-neutral and EOS-owned. External frameworks are optional adapters, parity oracles, import/export bridges, or product deployment surfaces. They fail closed and do not define default runtime semantics.
-2. CUDA remains the performance reference. Finish S3d safely, then move to resident-step coordination, S3e full-step gradients, cuBLASLt heuristics/epilogues, and CUDA Graph replay for fixed buckets. Optimize call count and synchronization count before byte count.
+1. EOS keeps Go-native compiler/runtime ownership. Core Go owns orchestration, ABI and artifact schemas, and generated kernels. The `.mll` artifact remains backend-neutral and EOS-owned. External frameworks are optional adapters, parity oracles, import/export bridges, or product deployment surfaces. They fail closed and do not define default runtime semantics.
+2. CUDA remains the performance reference. K4 closes the contiguous resident-gradient slab; K5 reduces the resident optimizer Go/C boundary behind an optional typed batch contract. The current CUDA driver boundary is still a narrow cgo wrapper, not zero FFI; the roadmap is machine-generated typed wrappers and direct driver ownership. Optimize call count and synchronization count before byte count.
 3. Apple core is Direct Metal first. MLX/MLX-C is not a core backend. The Apple path is persistent `MTLBuffer` residency and command batching, followed by selective cached MPSGraph dense islands. MLX-C comes last as an optional parity/import/teacher oracle outside default builds and default runtime.
 4. Backend truth precedes kernel breadth. Add a versioned backend feature/requirement contract and per-run accounting for host/device/fallback steps, fallback reasons, upload/download bytes, syncs, residency hits/misses, and `full_device_execution`. Artifact device-residency requirements fail closed.
 5. Inference work moves data structures onto the device. Build persistent/fused embedding inference, device-resident TurboQuant prepared index plus top-k and q5+q8 rerank, compressed KV/TurboSparse decode, stronger Metal paths, and WebGPU only after persistent buffers and delayed readback are real.
-6. Keep `go.mod` on Go 1.26. Official Go downloads list stable Go 1.26.6 and unstable Go 1.27rc3 as of 2026-08-13. Go 1.27 release notes are still draft and say Go 1.27 is not released. `simd` and `simd/archsimd` remain `GOEXPERIMENT=simd`; no public EOS APIs should expose SIMD types.
+6. Keep `go.mod` on Go 1.26. As of 2026-08-15, Go 1.27 release notes are still draft and explicitly say Go 1.27 is not released. `GOEXPERIMENT=simd` adds portable, vector-size-agnostic `simd`, revises amd64 `simd/archsimd`, and adds arm64 NEON and WebAssembly 128-bit SIMD; the API remains unstable. Go 1.26 scalar/default is the release baseline. SIMD is limited to build-tagged microbench lanes with scalar parity/fallback and no production dependency until release/API stability and representative wins.
 7. Teacher and data signal come before bigger models. Complete provenance-safe Qwen3/mxbai teacher-cache scoring, agreement, margin, and leak filtering before one bounded dense pilot. Scale only after macro nDCG moves by at least `+0.001` with floors intact; promotion target is `+0.010`.
 8. Compact serving promotion is parallel, not dense-quality evidence. q5+q8 at `432 B/vector` passed 6/6 quality gates as a candidate replacement for q4+fp16 at `648 B/vector`, but needs repeated p95 timing. That does not prove dense model quality.
 
@@ -148,6 +148,94 @@ after the trainer releases sealed gradients; hard parity, `136` launches, and
 `4` synchronizations remain unchanged. This is a warm-path readiness signal,
 not a release-shape throughput result.
 
+The `15/15` K3 values are retained as historical K3 evidence, but they are
+not the current physical-allocation model. K3 counted one event per logical
+resident gradient view. K4 changes the accounting and implementation to one
+layout-keyed contiguous slab containing those logical views: a cold exact-shape
+step has one physical slab allocation, a warm step has one slab reuse, and one
+`cuMemsetD32` zeroes the acquired slab per step. `ResidentGradBytes` remains
+the logical sum of the per-ref byte lengths. The K4 warm benchmark reports the
+measured-step delta after its excluded warm-up as `GradientAllocations=0` and
+`GradientReuseHits=1`; it does not rewrite the K3 history.
+
+## Current Preparation Checkpoint: K4 (2026-08-15)
+
+K4 closes the resident-gradient preparation and warm-gate slice:
+
+- One layout-keyed contiguous CUDA gradient slab owns the logical resident
+  gradient refs for an exact shape. The layout key is deterministic and
+  independent of ref ordering; lifecycle transitions invalidate stale tokens,
+  recycle the active slab safely, and flush active and pooled slabs on close or
+  reconfiguration.
+- `BeginCompactTrainStep` acquires and zeroes exactly one slab with one
+  `cuMemsetD32` call per step, then publishes gradient refs only after fallible
+  device work succeeds. `GradientAllocations`, `GradientReuseHits`, and
+  `GradientZeroCalls` are physical slab-level counters; they no longer imply
+  one device allocation or memset per logical gradient ref.
+- The approved K4 lifecycle review found no P0/P1 issue in contiguous layout,
+  pooling, stale-token invalidation, Begin/Release/Abort/Configure/Close
+  transitions, lock ownership, or gradient-pointer consumers. This is a
+  lifecycle/counter checkpoint, not a throughput claim.
+
+The repaired CUDA warm gate is opt-in and exact-profile only. It accepts the
+canonical synthetic fixture or the `next`/`descriptor` profile; arbitrary
+shape overrides and the incomplete checkpoint-only estimator are not accepted.
+Each run is exactly one excluded warm-up plus one measured `b.N=1` step and
+must use `-benchtime=1x`. The gate fails closed before CUDA setup when
+`b.N != 1`; an unset opt-in gate intentionally skips. Factory/setup errors,
+nil or non-CUDA backends, and any nonzero compact-train fallback/unhandled
+counter are fatal. The measured allocation/reuse delta is `0/1` for both
+accepted profiles because the warm-up owns the cold allocation.
+
+The latest qualified K4 target-shape diagnostic is
+`B=1,T=256,D=128,H=256,L=2,O=128,heads=4`: `629.733 ms` host wall time,
+`65` compact kernel launches, `2` compact synchronizations, `0` compact
+fallback/unhandled, `0` graph captures/replays, and gradient allocation/reuse
+`0/1`. The canonical profile measured `3.917 ms`, `68` launches, `2`
+synchronizations, and the same clean fallback/graph and `0/1` allocation/reuse
+delta. These are local, synthetic, one-step, shared-host diagnostics only;
+neither value is a release-throughput, production latency, or graph-support
+claim.
+
+## Current Preparation Checkpoint: K5 (2026-08-15)
+
+K5 adds the optional typed `ResidentGradientOptimizerBatchAccelerator` batch
+contract while retaining the scalar path for unsupported backends and callers.
+Complete preflight still rejects
+duplicate, stale, mixed-owner, metadata-mismatched, or already-used gradient
+refs before launch. The CUDA batch wrapper submits the existing optimizer
+kernel once per descriptor and performs one mandatory completion barrier;
+`DeferSync` suppresses only immediate host parameter copies. Partial enqueue or
+barrier failures drain and poison the step rather than publishing it.
+
+For the canonical `N=15` resident optimizer updates, source and counter
+evidence is deterministic: Go/C entries change `15 -> 1`, context sets change
+`15 -> 1`, and completion barriers change `15 -> 1`, while CUDA kernel launches
+remain `15`. This is a call and barrier reduction, not a kernel-count or
+throughput claim. Live telemetry reports batch calls / resident kernel
+launches / batch kernel synchronizations as follows:
+
+| profile | batch calls | resident launches | batch syncs | result |
+| --- | ---: | ---: | ---: | --- |
+| canonical one-step | 1 | 15 | 1 | CUDA batch path; compact fallback `0` |
+| next one-step | 1 | 14 | 1 | CUDA batch path; compact fallback `0` |
+| two-step parity | 2 | 30 | 2 | immediate and deferred parity pass |
+| host/scalar baseline | 0 | 0 | 0 | scalar fallback remains intact |
+
+The resident parity gates also report clean handles and no compact fallback or
+unhandled work. The latest single-sample K5 timings vary with shared-host load,
+approximately `4.5-5.5 ms` for canonical and `651 ms` for next, so K5 makes no
+speedup claim. The durable win is the measured deterministic reduction in
+Go/C entries, context sets, and barriers; repeat quiet-host timing is required
+before any wall-clock claim.
+
+K5 reduces one narrow cgo boundary; it does not make CUDA FFI zero. Core Go
+continues to own orchestration, typed ABI contracts, artifact schemas, and
+generated kernels. The current CUDA driver boundary remains a narrow cgo
+wrapper. The longer-term architecture is machine-generated typed wrappers and
+direct driver ownership, with every reduction validated against scalar parity,
+fallback accounting, and failure poisoning.
+
 ## Reconciled Progress And Evidence Ledger
 
 Historical pre-S3 documented CUDA baseline:
@@ -182,18 +270,33 @@ Measured compact retrieval anchors:
 Durable implementation lessons:
 
 - cgo call count dominates current GPU-offload cost on the measured host. This is a durable design lesson, not a universal hardware law.
+- K4 and K5 make that lesson measurable without overstating ownership: Go
+  still owns orchestration, ABI/artifacts, and generated kernels; the current
+  CUDA driver boundary is a narrow cgo wrapper. K5 removes 14 of 15 resident
+  optimizer Go/C entries and barriers in the canonical batch contract, but FFI
+  is not yet zero. Machine-generated typed wrappers and direct driver ownership
+  remain the roadmap.
 - Duplicate resident refs are about `18-20%`; only `refcount==1` can skip downloads until upstream duplicate gradients are coalesced.
 - Wall-clock A/B under shared load is noisy; deterministic counters are the first gate.
-- Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons.md`.
+- K4's `15/15`-to-slab correction is a counter-definition change, not a
+  historical rewrite: K3 per-ref counters remain in the ledger, while K4
+  physical slab counters report one cold allocation and warm reuse (the
+  measured warm-gate delta is `0/1`).
+- Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons.md`; `.tiller/scratch/codex/eos-k4-gradient-slab-review.md`; `.tiller/scratch/codex/eos-k4-ffi-hotspot-analysis.md`; `.tiller/scratch/codex/eos-k5-live-gate.md`.
 
 External current-docs facts:
 
-- Go status: stable Go 1.26.6; Go 1.27rc3 unstable; Go 1.27 release notes draft. Verified from [Go downloads](https://go.dev/dl/), [Go 1.27 release notes](https://go.dev/doc/go1.27), and [Go devel release policy](https://go.dev/doc/devel/release).
+- Go status as of 2026-08-15: Go 1.27 release notes remain draft and
+  explicitly say Go 1.27 is not released. Under `GOEXPERIMENT=simd`, the
+  draft describes portable size-agnostic `simd`, a revised amd64
+  `simd/archsimd`, arm64 NEON, and WebAssembly 128-bit SIMD; the API is
+  unstable. Go 1.26 scalar/default remains the release baseline. Verified from
+  the [Go 1.27 draft release notes](https://go.dev/doc/go1.27), [architecture-specific SIMD proposal #73787](https://github.com/golang/go/issues/73787), and [portable SIMD proposal #78902](https://github.com/golang/go/issues/78902).
 - Apple Accelerate is documented as CPU vector/BLAS/vDSP/BNNS computation, and Core ML is documented as app integration that can let the OS select CPU/GPU/Neural Engine. Verified from [Apple Accelerate](https://developer.apple.com/documentation/accelerate), [Apple Core ML](https://developer.apple.com/documentation/coreml), and [MLComputeUnits](https://developer.apple.com/documentation/coreml/mlcomputeunits).
 
 ### External Primary References
 
-- Go 1.27 / SIMD: [Go 1.27 draft release notes](https://go.dev/doc/go1.27), [generic SIMD proposal #78902](https://github.com/golang/go/issues/78902), and [arch-specific SIMD proposal #73787](https://github.com/golang/go/issues/73787).
+- Go 1.27 / SIMD (status checked 2026-08-15): [Go 1.27 draft release notes](https://go.dev/doc/go1.27), [generic SIMD proposal #78902](https://github.com/golang/go/issues/78902), and [arch-specific SIMD proposal #73787](https://github.com/golang/go/issues/73787).
 - MLX and MLX-C: [MLX v0.32.0 release](https://github.com/ml-explore/mlx/releases/tag/v0.32.0), [MLX-C overview](https://ml-explore.github.io/mlx-c/build/html/overview.html), and [MLX-C install](https://ml-explore.github.io/mlx-c/build/html/install.html).
 - Apple graph/runtime references: [MPSGraph](https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraph), [MPSGraphExecutable](https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraphexecutable), [Accelerate](https://developer.apple.com/documentation/accelerate), [BNNS](https://developer.apple.com/documentation/accelerate/bnns-library/), [Core ML](https://developer.apple.com/documentation/coreml), and [MLComputeUnits](https://developer.apple.com/documentation/coreml/mlcomputeunits).
 - NVIDIA references: [CUDA Graphs](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html) and [cuBLAS/cuBLASLt documentation](https://docs.nvidia.com/cuda/cublas/index.html).
@@ -252,7 +355,15 @@ Non-goals:
 - Core ML / ANE: P5 export-only deployment adapter and non-goal for core runtime. It lets the OS select CPU/GPU/ANE, which cedes backend/artifact control. Kill any default EOS runtime dependency, promotion gate dependency, or loss of `.mll` backend-neutral ownership.
 - WebGPU: P3 portable browser/device surface after persistent buffers and delayed readback. Kill if readback-per-step or host fallback dominates.
 - Vulkan / DirectML: P4 portability surfaces until measured device paths exist. Kill performance/readiness claims without device counters.
-- Go `simd` / `simd/archsimd`: P3 private CPU POC only with build tags and scalar fallback. First target TurboQuant prepared scoring, rotations, quant-dequant, and dots; then private EOS row dot/norm/layernorm helpers. Kill on less than `1.2x` representative EOS CPU path, less than `1.15x` over existing TurboQuant assembly where relevant, allocations, ranking drift, or default-build regression.
+- Go `simd` / `simd/archsimd`: P3 private CPU POC only with build tags and
+  scalar fallback. The Go 1.27 APIs remain draft/unstable as of 2026-08-15,
+  so Go 1.26 scalar/default is the release baseline and production must not
+  depend on SIMD until release/API stability and representative wins. First
+  target TurboQuant prepared scoring, rotations, quant-dequant, and dots; then
+  private EOS row dot/norm/layernorm helpers. Kill on less than `1.2x`
+  representative EOS CPU path, less than `1.15x` over existing TurboQuant
+  assembly where relevant, allocations, ranking drift, or default-build
+  regression.
 
 ## Phased Roadmap
 
@@ -275,10 +386,20 @@ Phase 0, weeks 1-2, close safety and observability:
 - K3 preparation slice: device-zero resident gradients, warm gradient buffers,
   and reuse compact-train host flattening capacity before the target-shape warm
   benchmark.
+- K4 preparation slice: replace per-ref resident-gradient allocation/zeroing
+  with one layout-keyed contiguous slab, expose physical slab allocation and
+  reuse counters, and repair the exact-profile one-step CUDA warm gate.
+- K5 preparation slice: add the optional typed resident-optimizer batch, prove
+  the canonical `15 -> 1` Go/C/context/barrier reduction while retaining `15`
+  kernel launches, and keep scalar host fallback/parity clean.
 
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 
-- Critical path: resident-step coordinator, duplicate-ref-safe download elision, host/device/fallback accounting, and S3e full-step gradients plan.
+- Critical path: packed forward readback (three D2H cgo entries to one context/
+  entry without claiming fewer device copies), resident-step coordination,
+  duplicate-ref-safe download elision, host/device/fallback accounting, and
+  S3e full-step gradients. Launch-array or graph work waits for stable pointers
+  and exact-shape allocation/readback behavior.
 - Exit gate: deterministic counters prove fewer calls/syncs, quiet-host mini smoke is non-regressing, and fallback reasons are exhaustive.
 
 Phase 2, weeks 4-7, CUDA performance reference:
@@ -466,9 +587,34 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - verification target: graph capture/replay counters and >=`10%` representative end-to-end replay win without parity drift; `5%` is diagnostic signal only.
 - budget tier/model ceiling: medium.
 - sandbox/permission needs: CUDA.
-- dependencies/blockers: S3E-STEP; OBS-EXEC.
+- dependencies/blockers: S3E-STEP; OBS-EXEC; stable pointers and the packed
+  forward-readback gate.
 - checkpoint criteria: fixed-bucket replay is optional and measured.
 - report contract: Outcome; capture shapes; counters; tests; caveats; next action.
+
+### PACKED-FORWARD-READBACK / Narrow cgo Readback Fan-Out
+
+- role/profile: `tiller-worker` with CUDA runtime review.
+- objective: combine compact-forward status, pooled, and active readbacks under
+  one context/entry while preserving ordering and the three underlying device
+  copies.
+- context paths: `runtime/backends/cuda/compact_train_accel_linux.go`;
+  `runtime/backends/cuda/native_linux.go`; compact resident profile counters.
+- constraints: reduce three D2H cgo entries to one context/entry; do not claim
+  fewer device copies or fewer bytes; status must be checked before pooled
+  results are returned; keep scalar/fallback behavior unchanged.
+- expected outputs: optional narrow wrapper, counter evidence, and parity/error
+  tests. Launch-array and graph capture remain separate follow-up slices.
+- verification target: exact compact launch/sync/byte/fallback parity, one
+  packed readback context/entry, and no stale active/pooled bucket state.
+- budget tier/model ceiling: medium, `gpt-5.5 medium`.
+- sandbox/permission needs: CUDA build/test; no commit.
+- dependencies/blockers: K4 slab lifecycle; K5 optimizer batch; stable exact
+  shape and pointer ownership.
+- checkpoint criteria: deterministic cgo/context reduction is verified without
+  changing device-copy counts, and graph/launch-array work remains unstarted.
+- report contract: Outcome; before/after entries and copies; parity/tests;
+  caveats; checkpoint candidate; Arbiter next action.
 
 ### METAL-RES / Direct Metal Persistent Buffers
 
@@ -517,11 +663,17 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - role/profile: `tiller-worker`.
 - objective: prototype Go `GOEXPERIMENT=simd` helpers first in TurboQuant for prepared scoring, rotations, quant-dequant, and dots; then consider private EOS helpers.
 - context paths: `go.mod`; TurboQuant repo; EOS retrieval CPU helpers; official Go 1.27 docs.
-- constraints: keep EOS `go.mod` at 1.26; build tags; scalar fallback; no public SIMD types; no default-build regression.
+- constraints: as of 2026-08-15 Go 1.27 and its release notes remain draft/
+  unreleased and the SIMD API is unstable; keep EOS `go.mod` on Go 1.26 as the
+  scalar/default release baseline; use only experimental build-tagged
+  microbench lanes with scalar parity/fallback; no public SIMD types, no
+  production dependency before release/API stability and representative wins,
+  and no default-build regression.
 - expected outputs: benchmarks, build-tagged POC, ranking drift tests, recommendation.
 - verification target: >=`1.2x` representative EOS CPU path or >=`1.15x` over existing TurboQuant assembly; zero allocations and no ranking drift.
 - budget tier/model ceiling: medium.
-- sandbox/permission needs: Go 1.27rc toolchain optional; default Go 1.26 tests.
+- sandbox/permission needs: unreleased Go 1.27 experimental toolchain optional;
+  default Go 1.26 tests.
 - dependencies/blockers: official Go SIMD instability.
 - checkpoint criteria: POC only if gated and isolated.
 - report contract: Outcome; toolchains; perf rows; drift tests; caveats; next action.
@@ -644,7 +796,10 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - S3d residual validation risks: explicit skip counts, flush counts, resident-gradient attribution, and exact corpus provenance must be surfaced before the next resident-step coordinator claim.
 - Backend name overclaims device execution: CAP-V2 and OBS-EXEC make device/fallback truth inspectable.
 - Apple framework temptation: Direct Metal remains core; MPSGraph selective; MLX/Core ML/BNNS adapters do not own `.mll`.
-- Go SIMD instability: keep Go 1.26 default; SIMD only behind experiment tags and scalar fallback.
+- Go SIMD instability: as of 2026-08-15 Go 1.27 is unreleased and its SIMD
+  API is unstable; keep Go 1.26 scalar/default, and allow only build-tagged
+  microbench lanes with scalar parity/fallback until release/API stability and
+  representative wins.
 - Dense-quality false positives: retrieval scoreboards decide; internal AUC/margin/top1 are diagnostics only.
 - Compact serving confusion: q5+q8 is serving evidence, not dense model evidence.
 - MS MARCO licensing: research-only unless acquisition manifest and policy explicitly allow release use.
@@ -652,8 +807,17 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 ## Immediate Next Action
 
-K1 is now the first post-K0 implementation gate. The next sub-gates are the
-generic typed launch bridge (one CUDA family first), device-side byte/sync
-telemetry, then `S3D-CLOSE`/`RES-COORD` and fixed-bucket graph replay. Broad
-optimization claims remain blocked until every benchmark reports exactly what
-executed on device, what fell back, and why.
+The old K1-first action is historical; K4 and K5 are now verified checkpoints.
+The next bounded performance slice is packed compact-forward readback: reduce
+the three D2H cgo entries for status, pooled, and active to one context/entry
+while preserving all three device copies, ordering, bytes, and fallback
+semantics. Launch-array or CUDA Graph work may follow only after exact-shape
+pointers, allocations, and readback ownership are stable; it remains optional,
+default-off, and measurement-gated.
+
+The next controlled encoder-v2.1 training run remains blocked by the selected-
+package BGE FiQA export and related pretrained/export jobs. Hold it and do not
+start it until `.tiller/scratch/codex/encoder-v21-controlled-training-ready-descriptor-v1.md`
+launch conditions are satisfied. Go SIMD work remains
+experimental build-tagged microbench coverage only; the Go 1.26 scalar/default
+baseline stays release-facing.

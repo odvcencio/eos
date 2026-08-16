@@ -3,6 +3,7 @@
 package cuda
 
 import (
+	"sort"
 	"testing"
 
 	"m31labs.dev/eos/runtime/backend"
@@ -73,15 +74,93 @@ func TestCompactTrainGradientBuffersWarmAfterTwoSteps(t *testing.T) {
 		}
 	}
 	stats := accel.CompactTrainStats()
-	wantRefs := int64(len(refs))
-	if stats.GradientAllocations != wantRefs || stats.GradientReuseHits != 2*wantRefs {
-		t.Fatalf("gradient allocations/reuse = %d/%d, want %d/%d: %+v", stats.GradientAllocations, stats.GradientReuseHits, wantRefs, 2*wantRefs, stats)
+	if stats.GradientAllocations != 1 || stats.GradientReuseHits != 2 {
+		t.Fatalf("gradient slab allocations/reuse = %d/%d, want 1/2: %+v", stats.GradientAllocations, stats.GradientReuseHits, stats)
 	}
 	if stats.GradientZeroCalls != 3 {
 		t.Fatalf("gradient zero calls = %d, want 3", stats.GradientZeroCalls)
 	}
 	if err := accel.AbortCompactTrainStep(3); err != nil {
 		t.Fatalf("abort warm gradient step: %v", err)
+	}
+}
+
+func TestCompactTrainGradientSlabOffsetsAndWarmReuse(t *testing.T) {
+	accel, cleanup := newBoundCompactTrainTestAccelerator(t, false, false)
+	defer cleanup()
+	shape := backend.CompactForwardShape{Batch: 1, Tokens: 2, ModelDim: 4, FFNDim: 5, Heads: 2, HeadDim: 2, Layers: 2, OutputDim: 4}
+	refs := compactTrainResidentRefsForTest(t, accel, shape)
+	if err := accel.BeginCompactTrainStep(11, refs); err != nil {
+		t.Fatalf("begin cold slab step: %v", err)
+	}
+	if accel.gradientSlab == nil || accel.gradientSlab.ptr == 0 {
+		t.Fatal("cold begin did not publish a resident gradient slab")
+	}
+	firstSlabPtr := uintptr(accel.gradientSlab.ptr)
+	firstGeneration := accel.gradGen
+	firstRefs := accel.residentGradientRefsLocked()
+	grads := make([]*compactTrainGradient, 0, len(accel.grads))
+	for _, grad := range accel.grads {
+		grads = append(grads, grad)
+	}
+	sort.Slice(grads, func(i, j int) bool { return uintptr(grads[i].ptr) < uintptr(grads[j].ptr) })
+	if len(grads) == 0 {
+		t.Fatal("cold begin published no resident gradient refs")
+	}
+	if uintptr(grads[0].ptr) != firstSlabPtr {
+		t.Fatalf("first resident gradient pointer = %#x, want slab base %#x", uintptr(grads[0].ptr), firstSlabPtr)
+	}
+	for i := 1; i < len(grads); i++ {
+		want := uintptr(grads[i-1].ptr) + uintptr(grads[i-1].elements*4)
+		if got := uintptr(grads[i].ptr); got != want {
+			t.Fatalf("gradient slab offset %d = %#x, want %#x after %d elements", i, got, want, grads[i-1].elements)
+		}
+	}
+	if err := accel.EndCompactTrainStep(11); err != nil {
+		t.Fatalf("end cold slab step: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainGradients(11); err != nil {
+		t.Fatalf("release cold slab step: %v", err)
+	}
+	for _, ref := range firstRefs {
+		if ref.Token.Alive() {
+			t.Fatalf("old resident gradient token %q remained alive after recycle", ref.Name)
+		}
+	}
+	pooled := 0
+	for _, bucket := range accel.gradientSlabPool {
+		pooled += len(bucket)
+	}
+	if pooled != 1 {
+		t.Fatalf("recycled gradient slab count = %d, want 1", pooled)
+	}
+	if err := accel.BeginCompactTrainStep(12, refs); err != nil {
+		t.Fatalf("begin warm slab step: %v", err)
+	}
+	if accel.gradientSlab == nil {
+		t.Fatal("warm begin did not publish a resident gradient slab")
+	}
+	if uintptr(accel.gradientSlab.ptr) != firstSlabPtr {
+		t.Fatalf("warm slab pointer = %#x, want %#x", uintptr(accel.gradientSlab.ptr), firstSlabPtr)
+	}
+	if accel.gradGen == firstGeneration {
+		t.Fatal("warm slab begin did not advance gradient generation")
+	}
+	for _, ref := range firstRefs {
+		grad := accel.grads[ref.Name]
+		if grad == nil || grad.token == ref.Token {
+			t.Fatalf("warm slab reused stale token for %q", ref.Name)
+		}
+	}
+	stats := accel.CompactTrainStats()
+	if stats.GradientAllocations != 1 || stats.GradientReuseHits != 1 || stats.GradientZeroCalls != 2 {
+		t.Fatalf("gradient slab counters = %+v, want allocations/reuse/zero 1/1/2", stats)
+	}
+	if err := accel.EndCompactTrainStep(12); err != nil {
+		t.Fatalf("end warm slab step: %v", err)
+	}
+	if err := accel.ReleaseCompactTrainGradients(12); err != nil {
+		t.Fatalf("release warm slab step: %v", err)
 	}
 }
 

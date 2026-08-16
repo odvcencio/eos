@@ -313,10 +313,28 @@ type residentGradientUpdateValidation struct {
 	gradOwner    *CompactTrainAccelerator
 }
 
+// residentGradientTokenOwner resolves the compact owner without taking its
+// mutex. The token's owner pointer is immutable; all mutable validation is
+// performed after the caller acquires the owner lock in optimizer-mutex order.
+func residentGradientTokenOwner(grad backend.ResidentGradientRef) (*compactTrainGradientToken, *CompactTrainAccelerator, error) {
+	gradToken, ok := grad.Token.(*compactTrainGradientToken)
+	if !ok || gradToken == nil {
+		return nil, nil, fmt.Errorf("cuda optimizer resident gradient %q has invalid cuda token", grad.Name)
+	}
+	if gradToken.Backend() != eosartifact.BackendCUDA {
+		return nil, nil, fmt.Errorf("cuda optimizer resident gradient %q token backend %q, want cuda", grad.Name, gradToken.Backend())
+	}
+	gradOwner := gradToken.owner
+	if gradOwner == nil {
+		return nil, nil, fmt.Errorf("cuda optimizer resident gradient %q owner is nil", grad.Name)
+	}
+	return gradToken, gradOwner, nil
+}
+
 // validateResidentGradientUpdateLocked is the single validation path for
-// preflight and apply. a.mu must be held. On success it also returns with the
-// gradient owner's mutex held so the validated allocation cannot change before
-// apply launches (or preflight returns).
+// scalar preflight and apply. a.mu must be held. On success it also returns
+// with the gradient owner's mutex held so the validated allocation cannot
+// change before apply launches (or preflight returns).
 func (a *optimizerAccelerator) validateResidentGradientUpdateLocked(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) (*residentGradientUpdateValidation, error) {
 	if a.device == nil || a.kernel == nil {
 		return nil, fmt.Errorf("cuda optimizer accelerator is not initialized")
@@ -331,6 +349,23 @@ func (a *optimizerAccelerator) validateResidentGradientUpdateLocked(name string,
 	if elements == 0 {
 		return &residentGradientUpdateValidation{}, nil
 	}
+	gradToken, gradOwner, err := residentGradientTokenOwner(grad)
+	if err != nil {
+		return nil, err
+	}
+	gradOwner.mu.Lock()
+	validated, err := a.validateResidentGradientUpdateWithOwnerLocked(name, cfg, tensor, mom1, mom2, grad, elements, gradToken, gradOwner)
+	if err != nil {
+		gradOwner.mu.Unlock()
+		return nil, err
+	}
+	return validated, nil
+}
+
+// validateResidentGradientUpdateWithOwnerLocked performs the mutable portion
+// of resident-gradient validation. a.mu and gradOwner.mu must both be held;
+// the owner mutex remains held on success.
+func (a *optimizerAccelerator) validateResidentGradientUpdateWithOwnerLocked(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef, elements int, gradToken *compactTrainGradientToken, gradOwner *CompactTrainAccelerator) (*residentGradientUpdateValidation, error) {
 	if grad.Name != name {
 		return nil, fmt.Errorf("cuda optimizer resident gradient name %q does not match parameter %q", grad.Name, name)
 	}
@@ -364,58 +399,42 @@ func (a *optimizerAccelerator) validateResidentGradientUpdateLocked(name string,
 	if state.elements != elements || state.hasMoments != (mode == 1) {
 		return nil, fmt.Errorf("cuda optimizer state %q metadata mismatch", name)
 	}
-	gradToken, ok := grad.Token.(*compactTrainGradientToken)
-	if !ok || gradToken == nil {
-		return nil, fmt.Errorf("cuda optimizer resident gradient %q has invalid cuda token", grad.Name)
-	}
-	if gradToken.Backend() != eosartifact.BackendCUDA {
-		return nil, fmt.Errorf("cuda optimizer resident gradient %q token backend %q, want cuda", grad.Name, gradToken.Backend())
-	}
-	gradOwner := gradToken.owner
-	if gradOwner == nil {
-		return nil, fmt.Errorf("cuda optimizer resident gradient %q owner is nil", grad.Name)
-	}
-	gradOwner.mu.Lock()
-	fail := func(err error) (*residentGradientUpdateValidation, error) {
-		gradOwner.mu.Unlock()
-		return nil, err
-	}
 	if gradOwner.closed || gradOwner.device == nil {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q owner is closed", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q owner is closed", grad.Name)
 	}
 	if !gradOwner.stepSealed || gradOwner.stepActive {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q step %d is not sealed", grad.Name, grad.StepID))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q step %d is not sealed", grad.Name, grad.StepID)
 	}
 	if gradOwner.stepPoisoned {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q step %d is poisoned", grad.Name, grad.StepID))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q step %d is poisoned", grad.Name, grad.StepID)
 	}
 	if gradToken.owner != gradOwner || gradToken.name != grad.Name {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q owner/name mismatch", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q owner/name mismatch", grad.Name)
 	}
 	if gradToken.generation != grad.Generation || gradToken.stepID != grad.StepID || gradToken.elements != grad.Elements {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q token metadata mismatch", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q token metadata mismatch", grad.Name)
 	}
 	residentGrad := gradOwner.grads[grad.Name]
 	if residentGrad == nil || residentGrad.token != gradToken || residentGrad.ptr == 0 {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q is stale", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q is stale", grad.Name)
 	}
 	if residentGrad.generation != grad.Generation || residentGrad.stepID != grad.StepID || residentGrad.elements != grad.Elements {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q generation/elements mismatch", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q generation/elements mismatch", grad.Name)
 	}
 	if residentGrad.optimizerOwner != a {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q belongs to a different optimizer", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q belongs to a different optimizer", grad.Name)
 	}
 	if residentGrad.optimizerToken == nil || residentGrad.optimizerToken != state.token {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q optimizer token is stale", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q optimizer token is stale", grad.Name)
 	}
 	if residentGrad.optimizerGeneration != state.generation {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q optimizer generation %d is stale, current %d", grad.Name, residentGrad.optimizerGeneration, state.generation))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q optimizer generation %d is stale, current %d", grad.Name, residentGrad.optimizerGeneration, state.generation)
 	}
 	if residentGrad.optimizerParam != state.param {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q optimizer parameter pointer is stale", grad.Name))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q optimizer parameter pointer is stale", grad.Name)
 	}
 	if residentGrad.optimizerUsed {
-		return fail(fmt.Errorf("cuda optimizer resident gradient %q was already used for step %d", grad.Name, grad.StepID))
+		return nil, fmt.Errorf("cuda optimizer resident gradient %q was already used for step %d", grad.Name, grad.StepID)
 	}
 	return &residentGradientUpdateValidation{elements: elements, mode: mode, state: state, residentGrad: residentGrad, gradOwner: gradOwner}, nil
 }
@@ -434,6 +453,80 @@ func (a *optimizerAccelerator) PreflightApplyUpdateWithResidentGrad(name string,
 		validated.gradOwner.mu.Unlock()
 	}
 	return nil
+}
+
+// validateResidentGradientBatchLocked validates the complete batch while
+// holding a.mu. It resolves and compares owners before taking any owner lock,
+// then takes exactly one owner lock and leaves it held on success.
+func (a *optimizerAccelerator) validateResidentGradientBatchLocked(updates []backend.ResidentGradientOptimizerBatchUpdate) ([]*residentGradientUpdateValidation, *CompactTrainAccelerator, error) {
+	if a.device == nil || a.kernel == nil {
+		return nil, nil, fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	if len(updates) == 0 {
+		return nil, nil, nil
+	}
+	validated := make([]*residentGradientUpdateValidation, len(updates))
+	tokens := make([]*compactTrainGradientToken, len(updates))
+	owner := (*CompactTrainAccelerator)(nil)
+	seen := make(map[string]struct{}, len(updates))
+	for i, update := range updates {
+		if update.Name == "" {
+			return nil, nil, fmt.Errorf("cuda optimizer resident-gradient batch update %d requires a parameter name", i)
+		}
+		if _, exists := seen[update.Name]; exists {
+			return nil, nil, fmt.Errorf("cuda optimizer resident-gradient batch has duplicate parameter %q", update.Name)
+		}
+		seen[update.Name] = struct{}{}
+		if update.Tensor == nil {
+			return nil, nil, fmt.Errorf("cuda optimizer resident-gradient update %q requires tensor", update.Name)
+		}
+		if len(update.Tensor.F32) == 0 {
+			continue
+		}
+		token, candidate, err := residentGradientTokenOwner(update.Grad)
+		if err != nil {
+			return nil, nil, err
+		}
+		if owner == nil {
+			owner = candidate
+		} else if owner != candidate {
+			return nil, nil, fmt.Errorf("cuda optimizer resident-gradient batch mixes gradient owners")
+		}
+		tokens[i] = token
+	}
+	if owner == nil {
+		for i := range validated {
+			validated[i] = &residentGradientUpdateValidation{}
+		}
+		return validated, nil, nil
+	}
+	owner.mu.Lock()
+	for i, update := range updates {
+		if len(update.Tensor.F32) == 0 {
+			validated[i] = &residentGradientUpdateValidation{}
+			continue
+		}
+		item, err := a.validateResidentGradientUpdateWithOwnerLocked(update.Name, update.Config, update.Tensor, update.Mom1, update.Mom2, update.Grad, len(update.Tensor.F32), tokens[i], owner)
+		if err != nil {
+			owner.mu.Unlock()
+			return nil, nil, err
+		}
+		validated[i] = item
+	}
+	return validated, owner, nil
+}
+
+func (a *optimizerAccelerator) PreflightApplyUpdateWithResidentGradBatch(updates []backend.ResidentGradientOptimizerBatchUpdate) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, owner, err := a.validateResidentGradientBatchLocked(updates)
+	if owner != nil {
+		owner.mu.Unlock()
+	}
+	return err
 }
 
 func (a *optimizerAccelerator) ApplyUpdateWithResidentGrad(name string, cfg backend.OptimizerUpdateConfig, tensor, mom1, mom2 *backend.Tensor, grad backend.ResidentGradientRef) error {
@@ -512,6 +605,160 @@ func (a *optimizerAccelerator) ApplyUpdateWithResidentGrad(name string, cfg back
 	gradOwner.stats.OptimizerResidentGradNanos += elapsed
 	a.stats.ResidentParams = int64(len(a.resident))
 	a.updatePerStepStats()
+	return nil
+}
+
+// poisonResidentGradientBatchLocked drains the optimizer stream best-effort
+// and makes the compact owner unusable until its step is aborted. It is called
+// with a.mu and owner.mu held after batch preflight, so no caller can recycle
+// the gradient slab while the drain is in progress.
+func (a *optimizerAccelerator) poisonResidentGradientBatchLocked(owner *CompactTrainAccelerator, err error) error {
+	if a != nil && a.device != nil {
+		if drainErr := a.device.synchronize(); drainErr != nil && err != nil {
+			err = fmt.Errorf("%w; cuda optimizer batch drain: %v", err, drainErr)
+		}
+	}
+	if owner != nil {
+		owner.stepPoisoned = true
+		// Keep the sealed lifecycle bit set so the trainer's deferred abort can
+		// recycle the slab and invalidate every old token. Release still rejects
+		// the poisoned step, while AbortCompactTrainStep accepts it for cleanup.
+		owner.stepSealed = true
+	}
+	return err
+}
+
+// commitResidentGradientBatchDeviceWork records all work that is known to have
+// completed once the native batch enqueue and barrier succeed. It must run
+// before any immediate host readback: a later D2H failure cannot undo device
+// updates, optimizer-used marks, or their timing/accounting.
+func (a *optimizerAccelerator) commitResidentGradientBatchDeviceWork(updates []backend.ResidentGradientOptimizerBatchUpdate, validated []*residentGradientUpdateValidation, owner *CompactTrainAccelerator, kernelLaunches int, elapsed int64) {
+	for i, update := range updates {
+		item := validated[i]
+		if item == nil || item.elements == 0 {
+			continue
+		}
+		item.residentGrad.optimizerUsed = true
+		a.stats.UpdateCalls++
+		a.stats.TensorUpdateCalls++
+		a.stats.ResidentGradUpdateCalls++
+		avoided := int64(item.elements * 4)
+		a.stats.ResidentGradUploadBytesAvoided += avoided
+		if owner != nil {
+			owner.stats.HostGradUploadBytesAvoided += avoided
+		}
+		if update.Config.Step != 0 && update.Config.Step != a.lastLogicalStep {
+			a.stats.LogicalSteps++
+			a.lastLogicalStep = update.Config.Step
+		}
+		if update.Config.DeferSync && update.Name != "" {
+			a.stats.DeferredSyncUpdates++
+		}
+	}
+	a.stats.ResidentGradBatchCalls++
+	a.stats.ResidentGradBatchKernelLaunches += int64(kernelLaunches)
+	a.stats.ResidentGradBatchKernelSyncs++
+	a.stats.UpdateNanos += elapsed
+	a.stats.ResidentGradUpdateNanos += elapsed
+	if owner != nil {
+		owner.stats.OptimizerResidentGradNanos += elapsed
+	}
+	a.stats.ResidentParams = int64(len(a.resident))
+	a.updatePerStepStats()
+}
+
+func (a *optimizerAccelerator) readbackResidentGradientBatch(updates []backend.ResidentGradientOptimizerBatchUpdate, validated []*residentGradientUpdateValidation, download func([]float32, uint64) error) error {
+	if download == nil {
+		return fmt.Errorf("cuda optimizer resident-gradient batch readback is unavailable")
+	}
+	for i, update := range updates {
+		item := validated[i]
+		if item == nil || item.elements == 0 || (update.Config.DeferSync && update.Name != "") {
+			continue
+		}
+		if err := download(update.Tensor.F32, uint64(item.state.param)); err != nil {
+			return fmt.Errorf("cuda optimizer resident-gradient batch readback %q: %w", update.Name, err)
+		}
+		a.stats.DownloadedBytes += int64(len(update.Tensor.F32) * 4)
+		a.updatePerStepStats()
+	}
+	return nil
+}
+
+func (a *optimizerAccelerator) ApplyUpdateWithResidentGradBatch(updates []backend.ResidentGradientOptimizerBatchUpdate) error {
+	if a == nil {
+		return fmt.Errorf("cuda optimizer accelerator is not initialized")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	validated, owner, err := a.validateResidentGradientBatchLocked(updates)
+	if err != nil {
+		return err
+	}
+	if owner != nil {
+		defer owner.mu.Unlock()
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	launches := make([]optimizerUpdateLaunch, 0, len(updates))
+	for i, update := range updates {
+		item := validated[i]
+		if item == nil || item.elements == 0 {
+			continue
+		}
+		corr1 := float32(1)
+		corr2 := float32(1)
+		if item.mode == 1 {
+			corr1 -= float32(math.Pow(float64(update.Config.Beta1), float64(update.Config.Step)))
+			corr2 -= float32(math.Pow(float64(update.Config.Beta2), float64(update.Config.Step)))
+		}
+		block := uint(128)
+		grid := uint((item.elements-1)/int(block) + 1)
+		launches = append(launches, optimizerUpdateLaunch{
+			grid:         grid,
+			block:        block,
+			param:        uint64(item.state.param),
+			Mom1:         uint64(item.state.mom1),
+			Mom2:         uint64(item.state.mom2),
+			grad:         uint64(item.residentGrad.ptr),
+			elements:     item.elements,
+			mode:         item.mode,
+			learningRate: update.Config.LearningRate,
+			weightDecay:  update.Config.WeightDecay,
+			beta1:        update.Config.Beta1,
+			beta2:        update.Config.Beta2,
+			corr1:        corr1,
+			corr2:        corr2,
+			epsilon:      update.Config.Epsilon,
+			scale:        update.Config.Scale,
+		})
+	}
+	if len(launches) == 0 {
+		return nil
+	}
+	start := time.Now()
+	enqueued, attempted, err := a.device.launchOptimizerUpdateBatch(a.kernel, launches)
+	if err != nil {
+		return a.poisonResidentGradientBatchLocked(owner, fmt.Errorf("cuda optimizer resident-gradient batch launch (attempted=%t, %d/%d enqueued): %w", attempted, enqueued, len(launches), err))
+	}
+	if enqueued != len(launches) {
+		return a.poisonResidentGradientBatchLocked(owner, fmt.Errorf("cuda optimizer resident-gradient batch reported %d/%d enqueued without error", enqueued, len(launches)))
+	}
+	// The native batch call has completed its single stream barrier at this
+	// point. Commit all device-work accounting before any immediate host
+	// readbacks so a later D2H failure still reports the completed batch.
+	elapsed := time.Since(start).Nanoseconds()
+	a.commitResidentGradientBatchDeviceWork(updates, validated, owner, len(launches), elapsed)
+
+	// The one batch barrier above is mandatory even when every item defers its
+	// host copy. Immediate items read back only after that barrier, preserving
+	// the scalar path's host-visible state without adding stream barriers.
+	if err := a.readbackResidentGradientBatch(updates, validated, func(dst []float32, ptr uint64) error {
+		return a.device.downloadFloat32(dst, C.CUdeviceptr(ptr))
+	}); err != nil {
+		return a.poisonResidentGradientBatchLocked(owner, err)
+	}
 	return nil
 }
 

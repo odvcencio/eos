@@ -61,8 +61,8 @@ func TestVectorDistillCompactResidentTrainCUDAOneAndTwoStepParity(t *testing.T) 
 	if residentImmediateSummary.DeltaProfile.CompactTrain.ArenaReuseHits != 1 || residentImmediateSummary.DeltaProfile.CompactTrain.ArenaAllocations != 1 {
 		t.Fatalf("resident immediate arena reuse/allocation = %d/%d, want 1/1: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.ArenaReuseHits, residentImmediateSummary.DeltaProfile.CompactTrain.ArenaAllocations, *residentImmediateSummary.DeltaProfile.CompactTrain)
 	}
-	if residentImmediateSummary.DeltaProfile.CompactTrain.GradientReuseHits == 0 || residentImmediateSummary.DeltaProfile.CompactTrain.GradientReuseHits != residentImmediateSummary.DeltaProfile.CompactTrain.GradientAllocations {
-		t.Fatalf("resident immediate gradient reuse/allocation = %d/%d, want equal nonzero warm counters: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.GradientReuseHits, residentImmediateSummary.DeltaProfile.CompactTrain.GradientAllocations, *residentImmediateSummary.DeltaProfile.CompactTrain)
+	if residentImmediateSummary.DeltaProfile.CompactTrain.GradientAllocations != 1 || residentImmediateSummary.DeltaProfile.CompactTrain.GradientReuseHits != 1 {
+		t.Fatalf("resident immediate gradient slab reuse/allocation = %d/%d, want 1/1: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.GradientReuseHits, residentImmediateSummary.DeltaProfile.CompactTrain.GradientAllocations, *residentImmediateSummary.DeltaProfile.CompactTrain)
 	}
 	if wantLaunches, wantSyncs := int64(136), expectedRuntimeCompactTrainSyncs(136, 4); residentImmediateSummary.DeltaProfile.CompactTrain.KernelLaunches != wantLaunches || residentImmediateSummary.DeltaProfile.CompactTrain.KernelSynchronizations != wantSyncs {
 		t.Fatalf("resident immediate compact train launch/sync = %d/%d, want %d/%d: %+v", residentImmediateSummary.DeltaProfile.CompactTrain.KernelLaunches, residentImmediateSummary.DeltaProfile.CompactTrain.KernelSynchronizations, wantLaunches, wantSyncs, *residentImmediateSummary.DeltaProfile.CompactTrain)
@@ -73,6 +73,9 @@ func TestVectorDistillCompactResidentTrainCUDAOneAndTwoStepParity(t *testing.T) 
 	if residentImmediateSummary.DeltaProfile.Optimizer.ResidentGradUpdateCalls == 0 || residentImmediateSummary.DeltaProfile.Optimizer.ResidentGradUploadBytesAvoided == 0 {
 		t.Fatalf("resident immediate optimizer profile = %+v", residentImmediateSummary.DeltaProfile.Optimizer)
 	}
+	assertResidentGradBatchTelemetry(t, "resident immediate", residentImmediateSummary.DeltaProfile, 2, 2, 30)
+	assertResidentGradBatchTelemetry(t, "resident deferred", residentDeferredSummary.DeltaProfile, 2, 2, 30)
+	assertNoResidentGradBatchTelemetry(t, "host", hostSummary.DeltaProfile)
 	if residentImmediateSummary.DeltaProfile.Optimizer.UploadedBytes >= hostSummary.DeltaProfile.Optimizer.UploadedBytes {
 		t.Fatalf("resident immediate optimizer uploaded bytes = %d, host = %d", residentImmediateSummary.DeltaProfile.Optimizer.UploadedBytes, hostSummary.DeltaProfile.Optimizer.UploadedBytes)
 	}
@@ -137,6 +140,7 @@ func TestVectorDistillCompactResidentTrainCUDACublasGateOneAndTwoStepParity(t *t
 		"immediate": residentImmediateSummary,
 		"deferred":  residentDeferredSummary,
 	} {
+		assertResidentGradBatchTelemetry(t, "cublas "+label, summary.DeltaProfile, 2, 2, 30)
 		stats := summary.DeltaProfile.CompactTrain
 		if stats == nil {
 			t.Fatalf("%s compact train profile is nil", label)
@@ -178,7 +182,7 @@ func TestVectorDistillCompactResidentTrainCUDAVaryingTWholeBatchParity(t *testin
 		}
 		return trainer, proj, diffTrainProfile(start, trainer.TrainProfile())
 	}
-	host, hostProj, _ := run("host", "0")
+	host, hostProj, hostProfile := run("host", "0")
 	defer host.Close()
 	resident, residentProj, profile := run("resident", "1")
 	defer resident.Close()
@@ -193,6 +197,8 @@ func TestVectorDistillCompactResidentTrainCUDAVaryingTWholeBatchParity(t *testin
 	assertTensorMaxAbs(t, "varying_t projection mom1", hostProj.Mom1, residentProj.Mom1, 1e-6, 1e-6)
 	assertTensorMaxAbs(t, "varying_t projection mom2", hostProj.Mom2, residentProj.Mom2, 1e-6, 1e-6)
 	stats := profile.CompactTrain
+	assertResidentGradBatchTelemetry(t, "varying-T resident", profile, 1, 1, -1)
+	assertNoResidentGradBatchTelemetry(t, "varying-T host", hostProfile)
 	if stats == nil {
 		t.Fatal("varying-T resident compact train stats are nil")
 	}
@@ -243,7 +249,7 @@ func TestVectorDistillCompactResidentTrainCUDACublasGateVaryingTWholeBatchParity
 		}
 		return trainer, proj, diffTrainProfile(start, trainer.TrainProfile())
 	}
-	host, hostProj, _ := run("host", "0")
+	host, hostProj, hostProfile := run("host", "0")
 	defer host.Close()
 	resident, residentProj, profile := run("resident_cublas", "1")
 	defer resident.Close()
@@ -258,6 +264,8 @@ func TestVectorDistillCompactResidentTrainCUDACublasGateVaryingTWholeBatchParity
 	assertTensorMaxAbs(t, "varying_t_cublas projection mom1", hostProj.Mom1, residentProj.Mom1, 1e-6, 1e-6)
 	assertTensorMaxAbs(t, "varying_t_cublas projection mom2", hostProj.Mom2, residentProj.Mom2, 1e-6, 1e-6)
 	stats := profile.CompactTrain
+	assertResidentGradBatchTelemetry(t, "varying-T cublas resident", profile, 1, 1, -1)
+	assertNoResidentGradBatchTelemetry(t, "varying-T cublas host", hostProfile)
 	if stats == nil {
 		t.Fatal("varying-T cublas resident compact train stats are nil")
 	}
@@ -282,6 +290,31 @@ func expectedRuntimeCompactTrainSyncs(launches, defaultSyncs int64) int64 {
 		return launches
 	}
 	return defaultSyncs
+}
+
+func assertResidentGradBatchTelemetry(t *testing.T, label string, profile EmbeddingTrainProfile, wantCalls, wantSyncs, wantKernelLaunches int64) {
+	t.Helper()
+	stats := profile.Optimizer
+	if stats.ResidentGradUpdateCalls <= 0 {
+		t.Fatalf("%s resident-gradient updates = %d, want positive", label, stats.ResidentGradUpdateCalls)
+	}
+	if stats.ResidentGradBatchCalls != wantCalls || stats.ResidentGradBatchKernelSyncs != wantSyncs {
+		t.Fatalf("%s resident-gradient batch calls/syncs = %d/%d, want %d/%d: %+v", label, stats.ResidentGradBatchCalls, stats.ResidentGradBatchKernelSyncs, wantCalls, wantSyncs, stats)
+	}
+	if stats.ResidentGradBatchKernelLaunches != stats.ResidentGradUpdateCalls {
+		t.Fatalf("%s resident-gradient batch kernel launches = %d, resident-gradient updates = %d: %+v", label, stats.ResidentGradBatchKernelLaunches, stats.ResidentGradUpdateCalls, stats)
+	}
+	if wantKernelLaunches >= 0 && stats.ResidentGradBatchKernelLaunches != wantKernelLaunches {
+		t.Fatalf("%s resident-gradient batch kernel launches = %d, want %d: %+v", label, stats.ResidentGradBatchKernelLaunches, wantKernelLaunches, stats)
+	}
+}
+
+func assertNoResidentGradBatchTelemetry(t *testing.T, label string, profile EmbeddingTrainProfile) {
+	t.Helper()
+	stats := profile.Optimizer
+	if stats.ResidentGradBatchCalls != 0 || stats.ResidentGradBatchKernelLaunches != 0 || stats.ResidentGradBatchKernelSyncs != 0 {
+		t.Fatalf("%s unexpectedly reported resident-gradient batch telemetry: %+v", label, stats)
+	}
 }
 
 func assertCompactTrainerStateClose(t *testing.T, label string, left, right *EmbeddingTrainer, target, hard float32) {
