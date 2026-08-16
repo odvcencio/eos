@@ -23,15 +23,10 @@ This is an implementation specification, not a result announcement. It reconcile
 
 ## Current Execution Checkpoint: Kernel-First K0 (2026-08-13)
 
-The first implementation slice of the native toolchain is now in the branch,
-behind the existing source-backed behavior:
+The first implementation slice of the native toolchain is now in the branch, behind the existing source-backed behavior:
 
 - The compiler emits a versioned `KernelABI` for generated CUDA and Metal
-  variants. Pure-Go GoTreeSitter parses the generated C++-compatible signature;
-  vendor qualifiers and Metal attributes are masked in a byte-preserving view,
-  while address spaces, access mode, and binding locations are recovered from
-  the original source. The ABI carries the parser mode and a SHA-256 fingerprint
-  of the exact source.
+ variants. Pure-Go GoTreeSitter parses the generated C++-compatible signature; vendor qualifiers and Metal attributes are masked in a byte-preserving view, while address spaces, access mode, and binding locations are recovered from the original source. The ABI carries the parser mode and a SHA-256 fingerprint of the exact source.
 - `KernelVariant.Binary` is an optional, hash-checked offline image descriptor
   (`ptx`, `cubin`, `air`, or `metallib`). `compiler.CompileKernelVariants` and
   `eos compile --offline-backend ...` are the explicit build actions that attach
@@ -56,9 +51,7 @@ The next correctness/performance gate is the K1 dispatch contract slice:
   the minimum information a future generic Go-to-driver argument bridge needs;
   runtime code does not guess from C spellings.
 - The backend derives a launch contract for the currently promoted row-wise,
-  RoPE, elementwise, and score families, validates it against the typed ABI
-  before native compilation, and records a stable contract fingerprint. Metal
-  built-in thread identifiers are excluded from the runtime buffer vector.
+ RoPE, elementwise, and score families, validates it against the typed ABI before native compilation, and records a stable contract fingerprint. Metal built-in thread identifiers are excluded from the runtime buffer vector.
 - Every symbolic run now exposes structured `ExecutionAccounting` plus stable
   metadata for total/kernel/device/host/fallback steps, kernel launches,
   upload/download bytes, synchronizations, graph captures/replays, residency
@@ -70,14 +63,11 @@ The next correctness/performance gate is the K1 dispatch contract slice:
   A mismatch in a present ABI fails before driver compilation, preserving the
   fail-closed behavior instead of silently launching a wrong argument vector.
 
-Measured in this checkpoint: compiler, artifact, backend, CUDA, Metal, and CLI
-tests pass; no CUDA compiler is installed in the current Linux environment, so
-no PTX throughput or device-parity claim is made here.
+Measured in this checkpoint: compiler, artifact, backend, CUDA, Metal, and CLI tests pass; no CUDA compiler is installed in the current Linux environment, so no PTX throughput or device-parity claim is made here.
 
 ## Current Preparation Checkpoint: K2 (2026-08-14)
 
-The next pre-training hardening slice removes avoidable allocation and launch
-plumbing overhead without changing the backend-neutral artifact contract:
+The next pre-training hardening slice removes avoidable allocation and launch plumbing overhead without changing the backend-neutral artifact contract:
 
 - Compact resident training now reuses activation and backward arenas by exact
   `CompactForwardShape`. Consumed handles remain precisely recognizable as
@@ -85,9 +75,7 @@ plumbing overhead without changing the backend-neutral artifact contract:
   bounded by consumed arena concurrency and flushed on reconfiguration or
   close.
 - The trainer memoizes the layer/name/shape/position configuration around its
-  per-batch preparation hook, so unchanged preparation does not call the
-  explicit reconfiguration API (which still flushes safely when invoked by a
-  caller) or flush the warm pool/resident gradients.
+ per-batch preparation hook, so unchanged preparation does not call the explicit reconfiguration API (which still flushes safely when invoked by a caller) or flush the warm pool/resident gradients.
 - Compact train int32 token/mask/role/status staging buffers are copied into
   the reusable arena instead of being freed and reallocated for every
   microbatch. `ArenaReuseHits` and `ArenaAllocations` are explicit counters for
@@ -98,8 +86,7 @@ plumbing overhead without changing the backend-neutral artifact contract:
   provides one common path for the later batched/asynchronous launch bridge;
   existing auxiliary wrappers remain until their contracts are promoted.
 - Metal RoPE emission now carries `seq_len` and resets batched positions by
-  sequence, keeping the cross-backend K1 contract truthful instead of falling
-  through to a four-argument stale variant.
+sequence, keeping the cross-backend K1 contract truthful instead of falling through to a four-argument stale variant.
 
 The K2 verification gate is green for `go test ./...`, `CGO_ENABLED=0 go test
 ./...`, `go vet ./...`, and the exact-shape arena-pool unit tests. These are
@@ -121,26 +108,18 @@ benchmark.
 
 ## Current Preparation Checkpoint: K3 (2026-08-15)
 
-The next compact-train preparation slice removes another warm-step transfer and
-allocation source:
+The next compact-train preparation slice removes another warm-step transfer and allocation source:
 
 - Resident gradient buffers now warm in an exact-element-count pool. A normal
-  step still gets fresh generation/token metadata, while a later step reuses
-  the device allocation after the prior step's resident-gradient consumers have
-  finished. Reconfiguration and close flush the pool; abort recycles it safely.
+ step still gets fresh generation/token metadata, while a later step reuses the device allocation after the prior step's resident-gradient consumers have finished. Reconfiguration and close flush the pool; abort recycles it safely.
 - Gradient initialization uses CUDA `cuMemsetD32` instead of allocating a host
-  zero slice and copying it over the driver boundary for every resident
-  parameter. The old host-side path is no longer on the compact resident-train
-  step boundary.
+ zero slice and copying it over the driver boundary for every resident parameter. The old host-side path is no longer on the compact resident-train step boundary.
 - Compact-forward and compact-train token and mask flattening reuse host
-  staging capacity under their accelerator mutexes, so repeated buckets do not
-  allocate short-lived flattened slices before the device copy.
+ staging capacity under their accelerator mutexes, so repeated buckets do not allocate short-lived flattened slices before the device copy.
 - `GradientReuseHits` and `GradientAllocations` make the warm-up behavior
   observable alongside the K2 arena counters.
 
-K3 verification is limited to lifecycle/allocation correctness and native-only
-build safety. It does not claim a device throughput win until the target-shape
-warm benchmark measures the reduced allocation and transfer path.
+K3 verification is limited to lifecycle/allocation correctness and native-only build safety. It does not claim a device throughput win until the target-shape warm benchmark measures the reduced allocation and transfer path.
 
 The live two-step `B=1,T=2,D=4,H=6,L=2` CUDA parity fixture now records
 `GradientReuseHits=15`, `GradientAllocations=15`, and `GradientZeroCalls=2`
@@ -163,19 +142,14 @@ measured-step delta after its excluded warm-up as `GradientAllocations=0` and
 K4 closes the resident-gradient preparation and warm-gate slice:
 
 - One layout-keyed contiguous CUDA gradient slab owns the logical resident
-  gradient refs for an exact shape. The layout key is deterministic and
-  independent of ref ordering; lifecycle transitions invalidate stale tokens,
-  recycle the active slab safely, and flush active and pooled slabs on close or
-  reconfiguration.
+ gradient refs for an exact shape. The layout key is deterministic and independent of ref ordering; lifecycle transitions invalidate stale tokens, recycle the active slab safely, and flush active and pooled slabs on close or reconfiguration.
 - `BeginCompactTrainStep` acquires and zeroes exactly one slab with one
   `cuMemsetD32` call per step, then publishes gradient refs only after fallible
   device work succeeds. `GradientAllocations`, `GradientReuseHits`, and
   `GradientZeroCalls` are physical slab-level counters; they no longer imply
   one device allocation or memset per logical gradient ref.
 - The approved K4 lifecycle review found no P0/P1 issue in contiguous layout,
-  pooling, stale-token invalidation, Begin/Release/Abort/Configure/Close
-  transitions, lock ownership, or gradient-pointer consumers. This is a
-  lifecycle/counter checkpoint, not a throughput claim.
+pooling, stale-token invalidation, Begin/Release/Abort/Configure/Close transitions, lock ownership, or gradient-pointer consumers. This is a lifecycle/counter checkpoint, not a throughput claim.
 
 The repaired CUDA warm gate is opt-in and exact-profile only. It accepts the
 canonical synthetic fixture or the `next`/`descriptor` profile; arbitrary
@@ -216,7 +190,7 @@ throughput claim. Live telemetry reports batch calls / resident kernel
 launches / batch kernel synchronizations as follows:
 
 | profile | batch calls | resident launches | batch syncs | result |
-| --- | ---: | ---: | ---: | --- |
+|---|---:|---:|---:|---|
 | canonical one-step | 1 | 15 | 1 | CUDA batch path; compact fallback `0` |
 | next one-step | 1 | 14 | 1 | CUDA batch path; compact fallback `0` |
 | two-step parity | 2 | 30 | 2 | immediate and deferred parity pass |
@@ -229,39 +203,26 @@ speedup claim. The durable win is the measured deterministic reduction in
 Go/C entries, context sets, and barriers; repeat quiet-host timing is required
 before any wall-clock claim.
 
-K5 reduces one narrow cgo boundary; it does not make CUDA FFI zero. Core Go
-continues to own orchestration, typed ABI contracts, artifact schemas, and
-generated kernels. The current CUDA driver boundary remains a narrow cgo
-wrapper. The longer-term architecture is machine-generated typed wrappers and
-direct driver ownership, with every reduction validated against scalar parity,
-fallback accounting, and failure poisoning.
+K5 reduces one narrow cgo boundary; it does not make CUDA FFI zero. Core Go continues to own orchestration, typed ABI contracts, artifact schemas, and generated kernels. The current CUDA driver boundary remains a narrow cgo wrapper. The longer-term architecture is machine-generated typed wrappers and direct driver ownership, with every reduction validated against scalar parity, fallback accounting, and failure poisoning.
 
 ## Current Preparation Checkpoint: K6 (2026-08-15)
 
-K6 completes the compact-forward readback slice with a typed
-status-to-pooled-to-active bridge. The wrapper validates its typed destinations
-and sources, sets the CUDA context once, performs synchronous copies in that
-order, and retains no Go pointer after return. The successful readback ledger
-is:
+K6 completes the compact-forward readback slice with a typed status-to-pooled-to-active bridge. The wrapper validates its typed destinations and sources, sets the CUDA context once, performs synchronous copies in that order, and retains no Go pointer after return. The successful readback ledger is:
 
 | readback metric | before | after |
-| --- | ---: | ---: |
+|---|---:|---:|
 | Go/C readback entries | 3 | 1 |
 | CUDA context sets | 3 | 1 |
 | device copies | 3 | 3 |
 | readback bytes | unchanged | unchanged |
 | extra stream synchronizations | 0 | 0 |
 
-No kernel, optimizer, graph, H2D, compact-byte, compact-sync, or fallback
-behavior changed. If the device status is nonzero, the bridge copies status
-only, stops before pooled/active, returns the exact existing status error,
-publishes no handle, and does not count a successful readback batch. Successful
-stage progress remains available for partial-byte accounting and cleanup.
+No kernel, optimizer, graph, H2D, compact-byte, compact-sync, or fallback behavior changed. If the device status is nonzero, the bridge copies status only, stops before pooled/active, returns the exact existing status error, publishes no handle, and does not count a successful readback batch. Successful stage progress remains available for partial-byte accounting and cleanup.
 
 Live compact-forward telemetry is batch entries / context sets / device copies:
 
 | profile | readback entries | context sets | device copies | result |
-| --- | ---: | ---: | ---: | --- |
+|---|---:|---:|---:|---|
 | canonical one-step | 1 | 1 | 3 | K5 batch `1/15/1`, compact `68/2`, fallback `0` |
 | two-step parity | 2 | 2 | 6 | K5 batch `2/30/2`, parity and handles clean |
 | varying `T=2,3,4` | 3 | 3 | 9 | K5 batch one call/barrier, compact `204/6`, fallback `0` |
@@ -282,18 +243,12 @@ K7 completes the `CUDA-GRAPH` investigation as a bounded correctness and
 counter gate for the default-off `EOS_CUDA_COMPACT_TRAIN_FORWARD_GRAPH` flag:
 
 - The graph covers forward compute only. H2D uploads, K6 status/pooled/active
-  readback, backward, and optimizer work remain outside it. The first exact-key
-  call runs direct and then records a non-executing capture; later exact-key
-  calls replay.
+ readback, backward, and optimizer work remain outside it. The first exact-key call runs direct and then records a non-executing capture; later exact-key calls replay.
 - A cache hit requires the exact shape/configuration plus stable bound pointers,
-  allocator/arena/workspace/resident generations, and device, CUDA-context, and
-  stream identities. Pointer equality is mandatory; a near-shape or same-size
-  replacement is not a hit. Compact graph owners now close before
-  optimizer-owned resident weights, including constructor rollback and
-  alias-safe teardown.
+allocator/arena/workspace/resident generations, and device, CUDA-context, and stream identities. Pointer equality is mandatory; a near-shape or same-size replacement is not a hit. Compact graph owners now close before optimizer-owned resident weights, including constructor rollback and alias-safe teardown.
 
 | warm profile | direct forward submissions | whole-step direct submissions | graph executed nodes | total device work |
-| --- | ---: | ---: | ---: | ---: |
+|---|---:|---:|---:|---:|
 | canonical | `24 -> 0` | `68 -> 44` | `24` | `68` |
 | next | `22 -> 0` | `65 -> 43` | `22` | `65` |
 
@@ -320,8 +275,7 @@ K8 completes a bounded, default-off compact-forward input-upload bridge behind
 `EOS_CUDA_COMPACT_TRAIN_FORWARD_UPLOAD_BATCH`:
 
 - The bridge is selected only for warm exact-arena reuse. Cold and mixed-zero
-  destinations retain the scalar allocation/copy path as the correctness
-  oracle.
+ destinations retain the scalar allocation/copy path as the correctness oracle.
 - One typed synchronous Go→C bridge sets the CUDA context once and issues
   synchronous H2D copies in exact `tokens → masks → roles → status` order. It
   retains no Go pointers and adds no stream synchronization. Four Go/C+context
@@ -332,14 +286,9 @@ K8 completes a bounded, default-off compact-forward input-upload bridge behind
   remain `2`. K6 readback remains `1/1/3`, and K5 remains canonical `1/15/1`
   and next `1/14/1` (batch calls / launches / syncs).
 - Normal warm telemetry is `1/1/4/0/0` (calls / context sets / device copies /
-  failures / scalar fallbacks). With the flag off, all five are zero; a cold or
-  mixed-zero flag-on call records scalar fallback. Partial failure reports the
-  truthful completed-copy and completed-byte prefix, publishes no handle, and
-  performs cleanup plus graph invalidation. The graph-boundary status reset
-  remains a separate path and is not counted as a four-stage upload batch.
+ failures / scalar fallbacks). With the flag off, all five are zero; a cold or mixed-zero flag-on call records scalar fallback. Partial failure reports the truthful completed-copy and completed-byte prefix, publishes no handle, and performs cleanup plus graph invalidation. The graph-boundary status reset remains a separate path and is not counted as a four-stage upload batch.
 - The adversarial code review found no P0/P1 issue. Full cgo and no-cgo
-  repository tests and vet are green. This is synthetic/runtime evidence only;
-  no BGE/FiQA training ran, and that training remains blocked.
+ repository tests and vet are green. This is synthetic/runtime evidence only; no BGE/FiQA training ran, and that training remains blocked.
 - The isolated promotion campaign used 56 processes (7 pairs per cell) under
   high, variable host load. Unpaired median changes were canonical graph-off
   `-6.69%` (regression), canonical graph-on `+17.26%` (outlier-sensitive), next
@@ -382,11 +331,7 @@ Durable implementation lessons:
 
 - cgo call count dominates current GPU-offload cost on the measured host. This is a durable design lesson, not a universal hardware law.
 - K4 and K5 make that lesson measurable without overstating ownership: Go
-  still owns orchestration, ABI/artifacts, and generated kernels; the current
-  CUDA driver boundary is a narrow cgo wrapper. K5 removes 14 of 15 resident
-  optimizer Go/C entries and barriers in the canonical batch contract, but FFI
-  is not yet zero. Machine-generated typed wrappers and direct driver ownership
-  remain the roadmap.
+ still owns orchestration, ABI/artifacts, and generated kernels; the current CUDA driver boundary is a narrow cgo wrapper. K5 removes 14 of 15 resident optimizer Go/C entries and barriers in the canonical batch contract, but FFI is not yet zero. Machine-generated typed wrappers and direct driver ownership remain the roadmap.
 - Duplicate resident refs are about `18-20%`; only `refcount==1` can skip downloads until upstream duplicate gradients are coalesced.
 - Wall-clock A/B under shared load is noisy; deterministic counters are the first gate.
 - K4's `15/15`-to-slab correction is a counter-definition change, not a
@@ -394,9 +339,7 @@ Durable implementation lessons:
   physical slab counters report one cold allocation and warm reuse (the
   measured warm-gate delta is `0/1`).
 - K6 makes packed readback equally explicit: three Go/C/context boundaries
-  become one, but three device copies and all readback bytes remain. Status is
-  copied first and a nonzero status publishes no handle; deterministic D2H
-  fault injection for pooled/active copies remains a coverage gap.
+ become one, but three device copies and all readback bytes remain. Status is copied first and a nonzero status publishes no handle; deterministic D2H fault injection for pooled/active copies remains a coverage gap.
 - Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons.md`; `.tiller/scratch/codex/eos-k4-gradient-slab-review.md`; `.tiller/scratch/codex/eos-k4-ffi-hotspot-analysis.md`; `.tiller/scratch/codex/eos-k5-live-gate.md`; `.tiller/scratch/codex/eos-k6-forward-readback-report.md`; `.tiller/scratch/codex/eos-k6-live-gate.md`.
 
 External current-docs facts:
@@ -485,25 +428,18 @@ Non-goals:
 Phase 0, weeks 1-2, close safety and observability:
 
 - Critical path: close S3d safely, land the K1 launch-contract gate, add
-  execution accounting, and add backend feature contract design and first
-  manifest fields.
+ execution accounting, and add backend feature contract design and first manifest fields.
 - Exit gate: S3d default-off gates pass, no host fallback after resident errors, and run manifests expose required counters.
 - Kernel-first K0 slice: emit typed GoTreeSitter-derived ABI metadata and make
-  offline CUDA/Metal images an explicit, hash-checked artifact option. Keep
-  NVRTC/source fallback until device parity is demonstrated.
+ offline CUDA/Metal images an explicit, hash-checked artifact option. Keep NVRTC/source fallback until device parity is demonstrated.
 - Kernel-first K1 slice: validate the typed launch contract before native
-  compilation and expose run-level device/host/fallback accounting. Keep the
-  generic argument bridge and device byte/sync telemetry as the next measured
-  sub-gates rather than claiming they already exist.
+ compilation and expose run-level device/host/fallback accounting. Keep the generic argument bridge and device byte/sync telemetry as the next measured sub-gates rather than claiming they already exist.
 - K2 preparation slice: warm exact-shape compact-train arenas and staging
-  buffers, use the typed CUDA launch bridge for promoted generated families,
-  and repair Metal RoPE ABI parity before the next embedder training run.
+ buffers, use the typed CUDA launch bridge for promoted generated families, and repair Metal RoPE ABI parity before the next embedder training run.
 - K3 preparation slice: device-zero resident gradients, warm gradient buffers,
-  and reuse compact-train host flattening capacity before the target-shape warm
-  benchmark.
+ and reuse compact-train host flattening capacity before the target-shape warm benchmark.
 - K4 preparation slice: replace per-ref resident-gradient allocation/zeroing
-  with one layout-keyed contiguous slab, expose physical slab allocation and
-  reuse counters, and repair the exact-profile one-step CUDA warm gate.
+ with one layout-keyed contiguous slab, expose physical slab allocation and reuse counters, and repair the exact-profile one-step CUDA warm gate.
 - K5 preparation slice: add the optional typed resident-optimizer batch, prove
   the canonical `15 -> 1` Go/C/context/barrier reduction while retaining `15`
   kernel launches, and keep scalar host fallback/parity clean.
@@ -514,11 +450,7 @@ Phase 0, weeks 1-2, close safety and observability:
 Phase 1, weeks 2-4, resident CUDA step skeleton:
 
 - Critical path: K7 fixed-bucket graph replay and K8 warm input-upload bridging
-  are verified as default-off diagnostic slices. K9 starts with a residual
-  launch-boundary/device-time investigation; only stable evidence may select
-  exactly one typed launch-array or kernel-fusion/coalescing slice. Resident-
-  step coordination, duplicate-ref-safe download elision, host/device/fallback
-  accounting, and S3e full-step gradients remain in scope.
+ are verified as default-off diagnostic slices. K9 starts with a residual launch-boundary/device-time investigation; only stable evidence may select exactly one typed launch-array or kernel-fusion/coalescing slice. Resident- step coordination, duplicate-ref-safe download elision, host/device/fallback accounting, and S3e full-step gradients remain in scope.
 - Exit gate: deterministic counters prove fewer calls/syncs, quiet-host mini smoke is non-regressing, and fallback reasons are exhaustive.
 
 Phase 2, weeks 4-7, CUDA performance reference:
@@ -590,14 +522,12 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 - role/profile: `tiller-worker` with compiler/runtime review.
 - objective: derive typed CUDA/Metal launch ABIs with pure-Go GoTreeSitter,
-  compile selected variants offline, and load PTX/cubin/AIR/metallib directly
-  through the minimal driver adapter.
+ compile selected variants offline, and load PTX/cubin/AIR/metallib directly through the minimal driver adapter.
 - context paths: `compiler/kernel_abi.go`; `compiler/kernel_toolchain.go`;
   `artifact/eos/module.go`; `runtime/backend/backend.go`;
   `runtime/backends/cuda/native_linux.go`; `cmd/eos/main.go`.
 - constraints: preserve source-backed artifacts and NVRTC fallback; never make
-  cgo/MLX the compiler or artifact authority; fail closed on ABI/hash mismatch;
-  keep image format/backend semantics explicit.
+ cgo/MLX the compiler or artifact authority; fail closed on ABI/hash mismatch; keep image format/backend semantics explicit.
 - expected outputs: versioned ABI schema, offline compiler command, binary
   validation, direct CUDA module loading, and a future native MLL binary section.
 - verification target: GoTreeSitter signature tests; JSON/MLL round trips;
@@ -617,19 +547,16 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 - role/profile: `tiller-worker` with compiler/runtime review.
 - objective: make K0's typed ABI operational at the native dispatch boundary
-  and expose truthful per-run counters before reducing FFI or adding graph
-  capture.
+ and expose truthful per-run counters before reducing FFI or adding graph capture.
 - context paths: `artifact/eos/module.go`; `compiler/kernel_abi.go`;
   `runtime/backend/native_kernel.go`; `runtime/backend/symbolic.go`;
   `runtime/backend/backend.go`.
 - constraints: validate only generated launch families with a known contract;
-  preserve legacy source-backed artifacts as explicitly unverified; do not
-  infer device execution from backend identity; keep fallback behavior intact.
+ preserve legacy source-backed artifacts as explicitly unverified; do not infer device execution from backend identity; keep fallback behavior intact.
 - expected outputs: ABI pointer/value kind, launch contract fingerprint,
   pre-driver validation, structured execution accounting, and focused tests.
 - verification target: compiler/artifact/backend tests; mismatch rejection;
-  deterministic accounting tests for device, host, and fallback paths; full
-  default test/vet gates; no CUDA throughput claim without a device.
+ deterministic accounting tests for device, host, and fallback paths; full default test/vet gates; no CUDA throughput claim without a device.
 - budget tier/model ceiling: medium, `gpt-5.5 medium`.
 - sandbox/permission needs: local Go tests; no network or external toolchain.
 - dependencies/blockers: K0 artifact schema; CUDA/Metal hardware only for
@@ -703,9 +630,7 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - objective: capture and replay fixed-shape resident training/inference buckets after allocations and stream work are stable. **Completed for forward-only compact-train replay.**
 - context paths: `runtime/backends/cuda/matmul_accel.go`; resident train stats; backend graph counters.
 - constraints: forward only; exclude H2D, compact readback, backward, and
-  optimizer work; require exact pointer/generation/device/context/stream keys;
-  keep capture/replay default-off and preserve drained direct fallback. A
-  typed launch-array option remains a separate next efficiency slice.
+ optimizer work; require exact pointer/generation/device/context/stream keys; keep capture/replay default-off and preserve drained direct fallback. A typed launch-array option remains a separate next efficiency slice.
 - expected outputs: **met** — capture cache, replay counters, fixed-bucket
   tests, exact-profile report, and lifecycle/failure repairs.
 - verification target: **met for bounded canonical/next correctness and
@@ -729,8 +654,7 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - context paths: `runtime/backends/cuda/compact_train_accel_linux.go`;
   `runtime/backends/cuda/native_linux.go`; compact resident profile counters.
 - constraints: reduce three D2H cgo entries to one context/entry; do not claim
-  fewer device copies or fewer bytes; status must be checked before pooled
-  results are returned; keep scalar/fallback behavior unchanged.
+ fewer device copies or fewer bytes; status must be checked before pooled results are returned; keep scalar/fallback behavior unchanged.
 - expected outputs: typed narrow wrapper, counter evidence, and parity/error
   tests. Launch-array and graph capture remain separate follow-up slices.
 - verification target: **met** — exact compact launch/sync/byte/fallback parity,
@@ -740,8 +664,7 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 - dependencies/blockers: K4 slab lifecycle; K5 optimizer batch; stable exact
   shape and pointer ownership.
 - checkpoint criteria: **met** — deterministic cgo/context reduction is
-  verified without changing device-copy counts, and graph/launch-array work
-  remains unstarted.
+ verified without changing device-copy counts, and graph/launch-array work remains unstarted.
 - report contract: Outcome; before/after entries and copies; parity/tests;
   caveats; checkpoint candidate; Arbiter next action.
 
@@ -923,23 +846,16 @@ Every benchmark packet records hardware, driver/toolchain, OS, Go version, artif
 
 - Wall-clock noise on shared host: use deterministic counters first; require quiet-host timing and loadavg for 5-10% claims.
 - K8's 56-process campaign ran under high, variable load and does not support
-  promotion: canonical graph-off regressed, canonical graph-on was
-  outlier-sensitive, and the next profile was effectively flat. A lower-load
-  K8 timing repeat is optional only if promotion is revisited.
+ promotion: canonical graph-off regressed, canonical graph-on was outlier-sensitive, and the next profile was effectively flat. A lower-load K8 timing repeat is optional only if promotion is revisited.
 - K9 scope is open until the residual launch-boundary/device-time breakdown is
-  profiled. Select exactly one default-off typed launch-array or
-  kernel-fusion/coalescing slice only when the evidence is stable; do not infer
-  a K9 implementation from this checkpoint.
+ profiled. Select exactly one default-off typed launch-array or kernel-fusion/coalescing slice only when the evidence is stable; do not infer a K9 implementation from this checkpoint.
 - K6 D2H fault injection: status-first early stop and stage-progress cleanup are
-  covered, but deterministic injected failures at pooled/active copy points
-  remain residual test-hardening work.
+ covered, but deterministic injected failures at pooled/active copy points remain residual test-hardening work.
 - S3d residual validation risks: explicit skip counts, flush counts, resident-gradient attribution, and exact corpus provenance must be surfaced before the next resident-step coordinator claim.
 - Backend name overclaims device execution: CAP-V2 and OBS-EXEC make device/fallback truth inspectable.
 - Apple framework temptation: Direct Metal remains core; MPSGraph selective; MLX/Core ML/BNNS adapters do not own `.mll`.
 - Go SIMD instability: as of 2026-08-15 Go 1.27 is unreleased and its SIMD
-  API is unstable; keep Go 1.26 scalar/default, and allow only build-tagged
-  microbench lanes with scalar parity/fallback until release/API stability and
-  representative wins.
+ API is unstable; keep Go 1.26 scalar/default, and allow only build-tagged microbench lanes with scalar parity/fallback until release/API stability and representative wins.
 - Dense-quality false positives: retrieval scoreboards decide; internal AUC/margin/top1 are diagnostics only.
 - Compact serving confusion: q5+q8 is serving evidence, not dense model evidence.
 - MS MARCO licensing: research-only unless acquisition manifest and policy explicitly allow release use.
