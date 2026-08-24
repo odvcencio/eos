@@ -1,0 +1,81 @@
+diff --git a/compiler/semantics.go b/compiler/semantics.go
+--- a/compiler/semantics.go
++++ b/compiler/semantics.go
+@@ -1,6 +1,5 @@
+ 	resultFields := callableResultFields(callable)
+ 	hasReturn := false
+ 	for _, stmt := range callable.Body {
+-		switch s := stmt.(type) {
++		if hasReturn {
++			diags = append(diags, diagnosticError(stmt.StmtSpan(), "unreachable statement after return"))
++			continue
++		}
+ 		case *syntax.LetStmt:
+ 			if prev, ok := localDecls[s.Name]; ok {
+ 				diags = append(diags, diagnosticError(s.Span, "duplicate local %q; first declared at %d:%d", s.Name, prev.Line, prev.Column))
+@@ -1,4 +1,4 @@
+ 		case *syntax.ReturnStmt:
+ 			hasReturn = true
+ 			exprs := returnStmtExprs(s)
++			if hasReturn {
++				diags = append(diags, diagnosticError(s.Span, "unreachable statement after return"))
++				continue
++			}
++			switch s := stmt.(type) {
+ 			if len(exprs) != len(resultFields) {
+ 				diags = append(diags, diagnosticError(s.Span, "return value count mismatch: got %d, want %d", len(exprs), len(resultFields)))
+ 				continue
+diff --git a/compiler/semantics.go b/compiler/semantics.go
+--- a/compiler/semantics.go
++++ b/compiler/semantics.go
+@@ -1,3 +1,3 @@
+ 	hasReturn := false
+ 	for _, stmt := range callable.Body {
+-		switch s := stmt.(type) {
++		if hasReturn {
++			diags = append(diags, diagnosticError(stmt.StmtSpan(), "unreachable statement after return"))
++			continue
++		}
++		switch s := stmt.(type) {
+ 		case *syntax.LetStmt:
+
+diff --git a/compiler/compiler_test.go b/compiler/compiler_test.go
+--- a/compiler/compiler_test.go
++++ b/compiler/compiler_test.go
+@@ -0,0 +1,30 @@
++
++func TestBuildUnreachableAfterReturn(t *testing.T) {
++	tests := []struct {
++		name string
++		src  string
++		want string
++	}{
++		{
++			name: "statement after return",
++			src: `func f() -> i32 {
++	let x: i32 = 1
++	return x
++	let y: i32 = 2
++}
++`,
++			want: "error:4:2: unreachable statement after return",
++		},
++		{
++			name: "second return after return",
++			src: `func f() -> i32 {
++	return 1
++	return 2
++}
++`,
++			want: "error:3:2: unreachable statement after return",
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			_, err := Build(tt.src)
++			if err == nil || !strings.Contains(err.Error(), tt.want) {
++				t.Fatalf("Build() error = %v, want containing %q", err, tt.want)
++			}
++		})
++	}
++}
