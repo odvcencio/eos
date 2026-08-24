@@ -86,10 +86,14 @@ func (l *cstLowerer) lowerParamDecl(n *gotreesitter.Node) Decl {
 		l.errorf(bindingNode, "expected @weight annotation")
 		return nil
 	}
+	binding, ok := l.unquoteEosString(weight)
+	if !ok {
+		return nil
+	}
 	return &ParamDecl{
 		Name:      l.Text(nameNode),
 		Type:      typ,
-		Binding:   unquoteEosString(l.Text(weight)),
+		Binding:   binding,
 		Trainable: l.Field(n, "trainable") != nil,
 		Span:      spanOf(n),
 	}
@@ -250,7 +254,11 @@ func (l *cstLowerer) lowerExpr(n *gotreesitter.Node) Expr {
 	case "number":
 		return &NumberExpr{Text: l.Text(n), Span: spanOf(n)}
 	case "string_literal":
-		return &StringExpr{Value: unquoteEosString(l.Text(n)), Span: spanOf(n)}
+		value, ok := l.unquoteEosString(n)
+		if !ok {
+			return nil
+		}
+		return &StringExpr{Value: value, Span: spanOf(n)}
 	case "call_expression":
 		return l.lowerCallExpr(n, false)
 	case "intrinsic_call_expression":
@@ -362,10 +370,12 @@ func spanOf(n *gotreesitter.Node) Span {
 	}
 }
 
-func unquoteEosString(raw string) string {
+func (l *cstLowerer) unquoteEosString(n *gotreesitter.Node) (string, bool) {
+	raw := l.Text(n)
 	value, err := strconv.Unquote(raw)
 	if err == nil {
-		return value
+		return value, true
 	}
-	return strings.Trim(raw, `"`)
+	l.errorf(n, "invalid Eos string literal %s: %v", raw, err)
+	return "", false
 }
