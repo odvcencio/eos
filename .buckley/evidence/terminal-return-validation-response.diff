@@ -1,0 +1,84 @@
+diff --git a/compiler/semantics.go b/compiler/semantics.go
+index 0000000..1111111 100644
+--- a/compiler/semantics.go
++++ b/compiler/semantics.go
+@@ -55,6 +55,11 @@ func validateCallable(callable *syntax.CallableDecl, env moduleTypeEnv) []syntax
+ 	hasReturn := false
+ 	for _, stmt := range callable.Body {
+ 		switch s := stmt.(type) {
++		default:
++			if hasReturn {
++				diags = append(diags, diagnosticError(stmt.StmtSpan(), "statement is unreachable; %s already returned", callable.Kind))
++			}
+ 		case *syntax.LetStmt:
+ 			if prev, ok := localDecls[s.Name]; ok {
+ 				diags = append(diags, diagnosticError(s.Span, "duplicate local %q; first declared at %d:%d", s.Name, prev.Line, prev.Column))
+@@ -64,7 +69,10 @@ func validateCallable(callable *syntax.CallableDecl, env moduleTypeEnv) []syntax
+ 			if typ.Kind != "" {
+ 				locals[s.Name] = typ
+ 			}
+ 		case *syntax.ReturnStmt:
++			if hasReturn {
++				continue
++			}
+ 			hasReturn = true
+ 			exprs := returnStmtExprs(s)
+ 			if len(exprs) != len(resultFields) {
+diff --git a/compiler/compiler_test.go b/compiler/compiler_test.go
+index 0000000..2222222 100644
+--- a/compiler/compiler_test.go
++++ b/compiler/compiler_test.go
+@@ -1,3 +1,4 @@
+ package compiler
+
+ import (
+@@ -20,3 +21,45 @@ func TestBuildRejectsReturnValueCountMismatch(t *testing.T) {
+ 	}
+ }
+
++func TestBuildRejectsStatementAfterReturn(t *testing.T) {
++	tests := []struct {
++		name string
++		src  string
++		want string
++		line int
++		col  int
++	}{
++		{
++			name: "trailing let",
++			src: `pipeline pass(x: f16[N]) -> f16[N] {
++    return x
++    let unreachable = normalize(x)
++}`,
++			want: "unreachable",
++			line: 3,
++			col:  5,
++		},
++		{
++			name: "trailing second return",
++			src: `pipeline pass(x: f16[N]) -> f16[N] {
++    return x
++    return x
++}`,
++			want: "unreachable",
++			line: 3,
++			col:  5,
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := Build([]byte(tc.src), Options{ModuleName: tc.name})
++			if err == nil {
++				t.Fatal("expected diagnostic error")
++			}
++			msg := err.Error()
++			if !strings.Contains(msg, tc.want) {
++				t.Fatalf("unexpected diagnostic:\n%v", err)
++			}
++			if !strings.Contains(msg, fmt.Sprintf("%d:%d", tc.line, tc.col)) {
++				t.Fatalf("diagnostic not source-tied at %d:%d:\n%v", tc.line, tc.col, err)
++			}
++		})
++	}
++}
