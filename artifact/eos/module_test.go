@@ -198,6 +198,28 @@ func TestValidateRejectsUnknownStepEntry(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDuplicateEntrypointNames(t *testing.T) {
+	module := NewModule("duplicate-entry")
+	module.EntryPoints = []EntryPoint{
+		{
+			Name: "embed",
+			Kind: EntryPointPipeline,
+		},
+		{
+			Name: "embed",
+			Kind: EntryPointPipeline,
+		},
+	}
+
+	err := module.Validate()
+	if err == nil {
+		t.Fatal("expected validate error")
+	}
+	if !strings.Contains(err.Error(), `duplicate entrypoint "embed"`) {
+		t.Fatalf("expected duplicate entrypoint error, got %v", err)
+	}
+}
+
 func TestValidateRejectsMissingKernelVariantSource(t *testing.T) {
 	module := NewModule("bad-kernel")
 	module.EntryPoints = []EntryPoint{

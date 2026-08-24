@@ -311,6 +311,9 @@ func (m *Module) Validate() error {
 		if entry.Name == "" {
 			return fmt.Errorf("entrypoint name is required")
 		}
+		if _, exists := entryByName[entry.Name]; exists {
+			return fmt.Errorf("duplicate entrypoint %q", entry.Name)
+		}
 		entryByName[entry.Name] = entry
 		for _, input := range entry.Inputs {
 			if input.Name == "" {
