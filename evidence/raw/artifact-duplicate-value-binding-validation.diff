@@ -1,0 +1,175 @@
+diff --git a/artifact/eos/module.go b/artifact/eos/module.go
+index 0000001..0000002 100644
+--- a/artifact/eos/module.go
++++ b/artifact/eos/module.go
+@@ -1,3 +1,5 @@
++// (context preserved)
+ package eos
+ 
+ import "fmt"
+@@ -40,15 +42,21 @@ func (m *Module) Validate() error {
+ 		entryByName[entry.Name] = entry
++		entryInputNames := map[string]bool{}
++		entryOutputNames := map[string]bool{}
+ 		for _, input := range entry.Inputs {
+ 			if input.Name == "" {
+ 				return fmt.Errorf("entrypoint %q input name is required", entry.Name)
+ 			}
++			if entryInputNames[input.Name] {
++				return fmt.Errorf("duplicate entrypoint %q input value binding name %q", entry.Name, input.Name)
++			}
++			entryInputNames[input.Name] = true
+ 			if err := validateValueType(input.Type); err != nil {
+ 				return fmt.Errorf("entrypoint %q input %q: %w", entry.Name, input.Name, err)
+ 			}
+ 		}
+ 		for _, output := range entry.Outputs {
+ 			if output.Name == "" {
+ 				return fmt.Errorf("entrypoint %q output name is required", entry.Name)
+ 			}
++			if entryOutputNames[output.Name] {
++				return fmt.Errorf("duplicate entrypoint %q output value binding name %q", entry.Name, output.Name)
++			}
++			entryOutputNames[output.Name] = true
+ 			if err := validateValueType(output.Type); err != nil {
+ 				return fmt.Errorf("entrypoint %q output %q: %w", entry.Name, output.Name, err)
+ 			}
+@@ -80,15 +88,21 @@ func (m *Module) Validate() error {
+ 		kernelByName[kernel.Name] = kernel
++		kernelInputNames := map[string]bool{}
++		kernelOutputNames := map[string]bool{}
+ 		for _, input := range kernel.Inputs {
+ 			if input.Name == "" {
+ 				return fmt.Errorf("kernel %q input name is required", kernel.Name)
+ 			}
++			if kernelInputNames[input.Name] {
++				return fmt.Errorf("duplicate kernel %q input value binding name %q", kernel.Name, input.Name)
++			}
++			kernelInputNames[input.Name] = true
+ 			if err := validateValueType(input.Type); err != nil {
+ 				return fmt.Errorf("kernel %q input %q: %w", kernel.Name, input.Name, err)
+ 			}
+ 		}
+ 		for _, output := range kernel.Outputs {
+ 			if output.Name == "" {
+ 				return fmt.Errorf("kernel %q output name is required", kernel.Name)
+ 			}
++			if kernelOutputNames[output.Name] {
++				return fmt.Errorf("duplicate kernel %q output value binding name %q", kernel.Name, output.Name)
++			}
++			kernelOutputNames[output.Name] = true
+ 			if err := validateValueType(output.Type); err != nil {
+ 				return fmt.Errorf("kernel %q output %q: %w", kernel.Name, output.Name, err)
+ 			}
+diff --git a/artifact/eos/module_test.go b/artifact/eos/module_test.go
+index 0000010..0000011 100644
+--- a/artifact/eos/module_test.go
++++ b/artifact/eos/module_test.go
+@@ -1,4 +1,4 @@
+-package eos
++package eos
+ 
+ import (
+ 	"strings"
+@@ -1000,3 +1000,120 @@ func existingTest(t *testing.T) {
+ }
+ 
++func TestValidateRejectsDuplicateValueBindingNames(t *testing.T) {
++	valueType := ValueType{
++		Kind:   ValueTensor,
++		Tensor: &TensorType{DType: "f32"},
++	}
++
++	cases := []struct {
++		name     string
++		module   *Module
++		wantSub  string
++	}{
++		{
++			name: "entrypoint_inputs",
++			module: &Module{
++				Name: "mod",
++				EntryPoints: []EntryPoint{{
++					Name:   "ep",
++					Inputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
++				}},
++			},
++			wantSub: `duplicate entrypoint "ep" input value binding name "value"`,
++		},
++		{
++			name: "entrypoint_outputs",
++			module: &Module{
++				Name: "mod",
++				EntryPoints: []EntryPoint{{
++					Name:    "ep",
++					Outputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
++				}},
++			},
++			wantSub: `duplicate entrypoint "ep" output value binding name "value"`,
++		},
++		{
++			name: "kernel_inputs",
++			module: &Module{
++				Name:                   "mod",
++				Requirements:           Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
++				Kernels: []Kernel{{
++					Name:   "binding_kernel",
++					Inputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
++					Variants: []KernelVariant{{
++						Backend: BackendWebGPU,
++						Entry:   "binding_kernel",
++						Source:  "@compute @workgroup_size(1) fn binding_kernel() {}",
++					}},
++				}},
++			},
++			wantSub: `duplicate kernel "binding_kernel" input value binding name "value"`,
++		},
++		{
++			name: "kernel_outputs",
++			module: &Module{
++				Name:         "mod",
++				Requirements: Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
++				Kernels: []Kernel{{
++					Name:    "binding_kernel",
++					Outputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
++					Variants: []KernelVariant{{
++						Backend: BackendWebGPU,
++						Entry:   "binding_kernel",
++						Source:  "@compute @workgroup_size(1) fn binding_kernel() {}",
++					}},
++				}},
++			},
++			wantSub: `duplicate kernel "binding_kernel" output value binding name "value"`,
++		},
++	}
++
++	for _, tc := range cases {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			err := tc.module.Validate()
++			if err == nil {
++				t.Fatal("Validate accepted duplicate value binding names")
++			}
++			if !strings.Contains(err.Error(), tc.wantSub) {
++				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
++			}
++		})
++	}
++}
++
++func TestValidateAcceptsCrossScopeDuplicateValueBindingNames(t *testing.T) {
++	valueType := ValueType{
++		Kind:   ValueTensor,
++		Tensor: &TensorType{DType: "f32"},
++	}
++	module := &Module{
++		Name: "mod",
++		EntryPoints: []EntryPoint{
++			{Name: "ep_a", Inputs: []ValueBinding{{Name: "value", Type: valueType}}},
++			{Name: "ep_b", Outputs: []ValueBinding{{Name: "value", Type: valueType}}},
++		},
++	}
++	if err := module.Validate(); err != nil {
++		t.Fatalf("Validate rejected cross-scope duplicate binding names: %v", err)
++	}
++}
