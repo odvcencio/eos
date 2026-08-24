@@ -280,6 +280,114 @@ func TestValidateRejectsDuplicateEntrypointNames(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDuplicateValueBindingNames(t *testing.T) {
+	valueType := ValueType{
+		Kind:   ValueTensor,
+		Tensor: &TensorType{DType: "f32"},
+	}
+
+	cases := []struct {
+		name    string
+		module  *Module
+		wantSub string
+	}{
+		{
+			name: "entrypoint_inputs",
+			module: &Module{
+				Version:      Version,
+				Name:         "mod",
+				Requirements: Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
+				EntryPoints: []EntryPoint{{
+					Name:   "ep",
+					Inputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
+				}},
+			},
+			wantSub: `duplicate entrypoint "ep" input value binding name "value"`,
+		},
+		{
+			name: "entrypoint_outputs",
+			module: &Module{
+				Version:      Version,
+				Name:         "mod",
+				Requirements: Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
+				EntryPoints: []EntryPoint{{
+					Name:    "ep",
+					Outputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
+				}},
+			},
+			wantSub: `duplicate entrypoint "ep" output value binding name "value"`,
+		},
+		{
+			name: "kernel_inputs",
+			module: &Module{
+				Version:      Version,
+				Name:         "mod",
+				Requirements: Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
+				Kernels: []Kernel{{
+					Name:   "binding_kernel",
+					Inputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
+					Variants: []KernelVariant{{
+						Backend: BackendWebGPU,
+						Entry:   "binding_kernel",
+						Source:  "@compute @workgroup_size(1) fn binding_kernel() {}",
+					}},
+				}},
+			},
+			wantSub: `duplicate kernel "binding_kernel" input value binding name "value"`,
+		},
+		{
+			name: "kernel_outputs",
+			module: &Module{
+				Version:      Version,
+				Name:         "mod",
+				Requirements: Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
+				Kernels: []Kernel{{
+					Name:    "binding_kernel",
+					Outputs: []ValueBinding{{Name: "value", Type: valueType}, {Name: "value", Type: valueType}},
+					Variants: []KernelVariant{{
+						Backend: BackendWebGPU,
+						Entry:   "binding_kernel",
+						Source:  "@compute @workgroup_size(1) fn binding_kernel() {}",
+					}},
+				}},
+			},
+			wantSub: `duplicate kernel "binding_kernel" output value binding name "value"`,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.module.Validate()
+			if err == nil {
+				t.Fatal("Validate accepted duplicate value binding names")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsCrossScopeDuplicateValueBindingNames(t *testing.T) {
+	valueType := ValueType{
+		Kind:   ValueTensor,
+		Tensor: &TensorType{DType: "f32"},
+	}
+	module := &Module{
+		Version:      Version,
+		Name:         "mod",
+		Requirements: Requirements{SupportedBackends: []BackendKind{BackendWebGPU}},
+		EntryPoints: []EntryPoint{
+			{Name: "ep_a", Inputs: []ValueBinding{{Name: "value", Type: valueType}}},
+			{Name: "ep_b", Outputs: []ValueBinding{{Name: "value", Type: valueType}}},
+		},
+	}
+	if err := module.Validate(); err != nil {
+		t.Fatalf("Validate rejected cross-scope duplicate binding names: %v", err)
+	}
+}
+
 func TestValidateRejectsMissingKernelVariantSource(t *testing.T) {
 	module := NewModule("bad-kernel")
 	module.EntryPoints = []EntryPoint{
