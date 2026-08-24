@@ -1,0 +1,21 @@
+diff --git a/artifact/eos/module.go b/artifact/eos/module.go
+index 0000000..0000001 100644
+--- a/artifact/eos/module.go
++++ b/artifact/eos/module.go
+@@ -1,3 +1,4 @@
++// placeholder context line to anchor hunk (unchanged)
+ // EntryPoint is a kernel or pipeline entry exposed by the module.
+ type EntryPoint struct {
+ 	Name    string         `json:"name"`
+@@ -2,6 +3,8 @@
+ 	entryByName := map[string]EntryPoint{}
+ 	for _, entry := range m.EntryPoints {
+ 		if entry.Name == "" {
+ 			return fmt.Errorf("entrypoint name is required")
+ 		}
++		if _, exists := entryByName[entry.Name]; exists {
++			return fmt.Errorf("duplicate entrypoint %q", entry.Name)
++		}
+ 		entryByName[entry.Name] = entry
+ 		for _, input := range entry.Inputs {
+ 			if input.Name == "" {
