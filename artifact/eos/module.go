@@ -315,10 +315,16 @@ func (m *Module) Validate() error {
 			return fmt.Errorf("duplicate entrypoint %q", entry.Name)
 		}
 		entryByName[entry.Name] = entry
+		entryInputNames := map[string]bool{}
+		entryOutputNames := map[string]bool{}
 		for _, input := range entry.Inputs {
 			if input.Name == "" {
 				return fmt.Errorf("entrypoint %q input name is required", entry.Name)
 			}
+			if entryInputNames[input.Name] {
+				return fmt.Errorf("duplicate entrypoint %q input value binding name %q", entry.Name, input.Name)
+			}
+			entryInputNames[input.Name] = true
 			if err := validateValueType(input.Type); err != nil {
 				return fmt.Errorf("entrypoint %q input %q: %w", entry.Name, input.Name, err)
 			}
@@ -327,6 +333,10 @@ func (m *Module) Validate() error {
 			if output.Name == "" {
 				return fmt.Errorf("entrypoint %q output name is required", entry.Name)
 			}
+			if entryOutputNames[output.Name] {
+				return fmt.Errorf("duplicate entrypoint %q output value binding name %q", entry.Name, output.Name)
+			}
+			entryOutputNames[output.Name] = true
 			if err := validateValueType(output.Type); err != nil {
 				return fmt.Errorf("entrypoint %q output %q: %w", entry.Name, output.Name, err)
 			}
@@ -354,10 +364,16 @@ func (m *Module) Validate() error {
 			return fmt.Errorf("duplicate kernel %q", kernel.Name)
 		}
 		kernelByName[kernel.Name] = kernel
+		kernelInputNames := map[string]bool{}
+		kernelOutputNames := map[string]bool{}
 		for _, input := range kernel.Inputs {
 			if input.Name == "" {
 				return fmt.Errorf("kernel %q input name is required", kernel.Name)
 			}
+			if kernelInputNames[input.Name] {
+				return fmt.Errorf("duplicate kernel %q input value binding name %q", kernel.Name, input.Name)
+			}
+			kernelInputNames[input.Name] = true
 			if err := validateValueType(input.Type); err != nil {
 				return fmt.Errorf("kernel %q input %q: %w", kernel.Name, input.Name, err)
 			}
@@ -366,6 +382,10 @@ func (m *Module) Validate() error {
 			if output.Name == "" {
 				return fmt.Errorf("kernel %q output name is required", kernel.Name)
 			}
+			if kernelOutputNames[output.Name] {
+				return fmt.Errorf("duplicate kernel %q output value binding name %q", kernel.Name, output.Name)
+			}
+			kernelOutputNames[output.Name] = true
 			if err := validateValueType(output.Type); err != nil {
 				return fmt.Errorf("kernel %q output %q: %w", kernel.Name, output.Name, err)
 			}
