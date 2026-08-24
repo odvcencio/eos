@@ -198,6 +198,66 @@ func TestValidateRejectsUnknownStepEntry(t *testing.T) {
 	}
 }
 
+func TestValidateRejectsDuplicateDeclarationNames(t *testing.T) {
+	cases := []struct {
+		name    string
+		mutate  func(m *Module)
+		wantSub string
+	}{
+		{
+			name: "param",
+			mutate: func(m *Module) {
+				m.Params = []Param{
+					{Name: "weights", Type: ValueType{Kind: ValueTensor, Tensor: &TensorType{DType: "f32"}}, Binding: "binding:0"},
+					{Name: "weights", Type: ValueType{Kind: ValueTensor, Tensor: &TensorType{DType: "f32"}}, Binding: "binding:1"},
+				}
+			},
+			wantSub: `duplicate param "weights"`,
+		},
+		{
+			name: "buffer",
+			mutate: func(m *Module) {
+				m.Buffers = []Buffer{
+					{Name: "scratch", DType: "f32"},
+					{Name: "scratch", DType: "f32"},
+				}
+			},
+			wantSub: `duplicate buffer "scratch"`,
+		},
+		{
+			name: "kernel",
+			mutate: func(m *Module) {
+				variant := KernelVariant{
+					Backend: BackendWebGPU,
+					Entry:   "duplicate_kernel",
+					Source:  "@compute @workgroup_size(1) fn duplicate_kernel() {}",
+				}
+				m.Requirements.SupportedBackends = []BackendKind{BackendWebGPU}
+				m.Kernels = []Kernel{
+					{Name: "duplicate_kernel", Variants: []KernelVariant{variant}},
+					{Name: "duplicate_kernel", Variants: []KernelVariant{variant}},
+				}
+			},
+			wantSub: `duplicate kernel "duplicate_kernel"`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			module := NewModule("duplicate-decl")
+			tc.mutate(module)
+
+			err := module.Validate()
+			if err == nil {
+				t.Fatal("expected validate error")
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantSub, err)
+			}
+		})
+	}
+}
+
 func TestValidateRejectsDuplicateEntrypointNames(t *testing.T) {
 	module := NewModule("duplicate-entry")
 	module.EntryPoints = []EntryPoint{
