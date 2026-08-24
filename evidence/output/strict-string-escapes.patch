@@ -1,0 +1,158 @@
+diff --git a/syntax/cst.go b/syntax/cst.go
+--- a/syntax/cst.go
++++ b/syntax/cst.go
+@@ -1,6 +1,6 @@
+ package syntax
+ 
+-import (
++import (
+ 	"fmt"
+ 	"strconv"
+ 	"strings"
+ )
+@@
+ weight := firstNamedChildOfType(l.Walker, bindingNode, "string_literal")
+ if weight == nil {
+ 	l.errorf(bindingNode, "expected @weight annotation")
+ 	return nil
+ }
++binding, ok := l.unquoteEosString(weight)
++if !ok {
++	return nil
++}
+ return &ParamDecl{
+-	Name:      l.Text(nameNode),
+-	Type:      typ,
+-	Binding:   unquoteEosString(l.Text(weight)),
++	Name:      l.Text(nameNode),
++	Type:      typ,
++	Binding:   binding,
+ 	Trainable: l.Field(n, "trainable") != nil,
+ 	Span:      spanOf(n),
+ }
+@@
+ case "string_literal":
+-	return &StringExpr{Value: unquoteEosString(l.Text(n)), Span: spanOf(n)}
++	value, ok := l.unquoteEosString(n)
++	if !ok {
++		return nil
++	}
++	return &StringExpr{Value: value, Span: spanOf(n)}
+@@
+-func unquoteEosString(raw string) string {
+-	value, err := strconv.Unquote(raw)
+-	if err == nil {
+-		return value
+-	}
+-	return strings.Trim(raw, `"`)
++// unquoteEosString lowers a string_literal node through strconv.Unquote.
++// On failure it reports an error on the literal's exact span and returns
++// ok=false so the caller omits the offending node from the CST.
++func (l *cstLowerer) unquoteEosString(n *gotreesitter.Node) (string, bool) {
++	raw := l.Text(n)
++	value, err := strconv.Unquote(raw)
++	if err == nil {
++		return value, true
++	}
++	l.errorf(n, "invalid Eos string literal %s: %v", raw, err)
++	return "", false
+ }
+diff --git a/syntax/parser_test.go b/syntax/parser_test.go
+--- a/syntax/parser_test.go
++++ b/syntax/parser_test.go
+@@
+ import (
+ 	"strings"
+ 	"testing"
+ )
++
++func TestParserRejectsInvalidEscapeInWeight(t *testing.T) {
++	src := `model m {
++  param p @weight("a\qb");
++}`
++	file, diags := Parse("test", src)
++	found := false
++	for _, d := range diags {
++		if d.Severity != SeverityError {
++			t.Fatalf("expected SeverityError diagnostics, got %+v", d)
++		}
++		if strings.Contains(d.Message, "invalid Eos string literal") {
++			found = true
++		}
++	}
++	if !found {
++		t.Fatalf("expected invalid Eos string literal diagnostic, got %+v", diags)
++	}
++	for _, d := range file.Decls {
++		if _, ok := d.(*ParamDecl); ok {
++			t.Fatalf("malformed @weight must not produce a ParamDecl")
++		}
++	}
++}
++
++func TestParserRejectsInvalidEscapeInStringExpr(t *testing.T) {
++	src := `model m {
++  train "a\q";
++}`
++	file, diags := Parse("test", src)
++	found := false
++	for _, d := range diags {
++		if d.Severity != SeverityError {
++			t.Fatalf("expected SeverityError diagnostics, got %+v", d)
++		}
++		if strings.Contains(d.Message, "invalid Eos string literal") {
++			found = true
++		}
++	}
++	if !found {
++		t.Fatalf("expected invalid Eos string literal diagnostic, got %+v", diags)
++	}
++	var walk func(e Expr) bool
++	walk = func(e Expr) bool {
++		switch v := e.(type) {
++		case *StringExpr:
++			if v.Value == "a\\q" || v.Value == "aq" {
++				return true
++			}
++		case *BinaryExpr:
++			return walk(v.Left) || walk(v.Right)
++		case *UnaryExpr:
++			return walk(v.Operand)
++		}
++		return false
++	}
++	for _, d := range file.Decls {
++		c, ok := d.(*CallableDecl)
++		if !ok {
++			continue
++		}
++		for _, s := range c.Body {
++			if e, ok := s.(*ExprStmt); ok && walk(e.Expr) {
++				t.Fatalf("malformed string literal must not produce a StringExpr")
++			}
++		}
++	}
++}
++
++func TestParserDecodesValidEscapes(t *testing.T) {
++	src := `model m {
++  param p @weight("a\"b\\c");
++}`
++	file, diags := Parse("test", src)
++	for _, d := range diags {
++		if d.Severity == SeverityError {
++			t.Fatalf("unexpected error diagnostic: %+v", d)
++		}
++	}
++	for _, d := range file.Decls {
++		p, ok := d.(*ParamDecl)
++		if !ok {
++			continue
++		}
++		if got, want := p.Binding, "a\"b\\c"; got != want {
++			t.Fatalf("Binding = %q, want %q", got, want)
++		}
++		return
++	}
++	t.Fatalf("expected a ParamDecl with decoded binding, got %+v", file.Decls)
++}
