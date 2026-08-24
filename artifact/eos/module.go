@@ -340,12 +340,18 @@ func (m *Module) Validate() error {
 		if buf.DType == "" {
 			return fmt.Errorf("buffer %q dtype is required", buf.Name)
 		}
+		if _, exists := bufferByName[buf.Name]; exists {
+			return fmt.Errorf("duplicate buffer %q", buf.Name)
+		}
 		bufferByName[buf.Name] = buf
 	}
 	kernelByName := map[string]Kernel{}
 	for _, kernel := range m.Kernels {
 		if kernel.Name == "" {
 			return fmt.Errorf("kernel name is required")
+		}
+		if _, exists := kernelByName[kernel.Name]; exists {
+			return fmt.Errorf("duplicate kernel %q", kernel.Name)
 		}
 		kernelByName[kernel.Name] = kernel
 		for _, input := range kernel.Inputs {
@@ -375,6 +381,9 @@ func (m *Module) Validate() error {
 	}
 	paramByName := map[string]Param{}
 	for _, param := range m.Params {
+		if _, exists := paramByName[param.Name]; exists {
+			return fmt.Errorf("duplicate param %q", param.Name)
+		}
 		paramByName[param.Name] = param
 	}
 	knownByEntry := map[string]map[string]bool{}
