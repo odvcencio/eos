@@ -1,0 +1,48 @@
+diff --git a/artifact/eos/module.go b/artifact/eos/module.go
+index b3f8e1f..c1a2d3e 100644
+--- a/artifact/eos/module.go
++++ b/artifact/eos/module.go
+@@ -120,6 +120,9 @@ func (m *Module) Validate() error {
+ 	entryByName := map[string]EntryPoint{}
+ 	for _, entry := range m.EntryPoints {
+ 		if entry.Name == "" {
+ 			return fmt.Errorf("entrypoint name is required")
+ 		}
++		if _, exists := entryByName[entry.Name]; exists {
++			return fmt.Errorf("duplicate entrypoint %q", entry.Name)
++		}
+ 		entryByName[entry.Name] = entry
+ 		for _, input := range entry.Inputs {
+ 			if input.Name == "" {
+ 				return fmt.Errorf("entrypoint %q input name is required", entry.Name)
+diff --git a/artifact/eos/module_test.go b/artifact/eos/module_test.go
+index d4e5f6a..e7b8c9d 100644
+--- a/artifact/eos/module_test.go
++++ b/artifact/eos/module_test.go
+@@ -240,3 +240,30 @@ func TestValidateRejectsUnknownStepEntry(t *testing.T) {
+ 	if err := module.Validate(); err == nil {
+ 		t.Fatal("expected validate error")
+ 	}
+ }
++
++func TestValidateRejectsDuplicateEntrypointNames(t *testing.T) {
++	module := NewModule("duplicate-entry")
++	module.EntryPoints = []EntryPoint{
++		{
++			Name: "embed",
++			Kind: EntryPointPipeline,
++		},
++		{
++			Name: "embed",
++			Kind: EntryPointPipeline,
++		},
++	}
++
++	err := module.Validate()
++	if err == nil {
++		t.Fatal("expected validate error")
++	}
++	if !strings.Contains(err.Error(), `duplicate entrypoint "embed"`) {
++		t.Fatalf("expected duplicate entrypoint error, got %v", err)
++	}
++}
