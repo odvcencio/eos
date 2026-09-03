@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
 	mll "m31labs.dev/mll"
@@ -41,6 +42,30 @@ type PackageManifest struct {
 	Files            []PackageManifestFile           `json:"files"`
 	ScoreSpectrum    EmbeddingScoreSpectrumPolicy    `json:"score_spectrum,omitempty"`
 	ListwiseGeometry EmbeddingListwiseGeometryPolicy `json:"listwise_geometry,omitempty"`
+	AOQTTransform    AOQTTransformPolicy             `json:"aoqt_transform,omitempty"`
+}
+
+const AOQTTransformPolicySchema = "eos.aoqt_transform_policy.v1"
+
+// AOQTTransformPolicy records package-level AOQT transform provenance and usage gates.
+type AOQTTransformPolicy struct {
+	Schema                      string            `json:"schema,omitempty"`
+	Enabled                     bool              `json:"enabled,omitempty"`
+	ResearchOnly                bool              `json:"research_only,omitempty"`
+	ResearchTrainAllowed        bool              `json:"research_train_allowed,omitempty"`
+	ReleaseTrainAllowed         bool              `json:"release_train_allowed,omitempty"`
+	CommercialUseAllowed        bool              `json:"commercial_use_allowed,omitempty"`
+	FreeOpenReleaseAllowed      bool              `json:"free_open_release_allowed,omitempty"`
+	QualityClaim                bool              `json:"quality_claim,omitempty"`
+	AnchorArtifactSHA256        string            `json:"anchor_artifact_sha256,omitempty"`
+	AnchorPackageManifestSHA256 string            `json:"anchor_package_manifest_sha256,omitempty"`
+	AnchorEmbeddingSpaceID      string            `json:"anchor_embedding_space_id,omitempty"`
+	DatasetManifestSHA256       string            `json:"dataset_manifest_sha256,omitempty"`
+	QrelsSHA256ByDataset        map[string]string `json:"qrels_sha256_by_dataset,omitempty"`
+	CompatibilityDigest         string            `json:"compatibility_digest,omitempty"`
+	TransformSHA256             string            `json:"transform_sha256,omitempty"`
+	PairingsSHA256              string            `json:"pairings_sha256,omitempty"`
+	AnglesSHA256                string            `json:"angles_sha256,omitempty"`
 }
 
 func DefaultPackageManifestPath(artifactPath string) string {
@@ -94,6 +119,9 @@ func (m PackageManifest) Validate() error {
 		if item.Bytes < 0 {
 			return fmt.Errorf("package manifest file %q size must be non-negative", item.Role)
 		}
+	}
+	if err := m.validateAOQTTransformRoleBinding(seen[EmbeddingPostPoolTransformRole]); err != nil {
+		return err
 	}
 	return nil
 }
@@ -153,6 +181,23 @@ func encodePackageManifestMLL(manifest PackageManifest) ([]byte, error) {
 			headIntMeta(strg, "listwise_geometry_batch_count", int64(manifest.ListwiseGeometry.ListwiseGeometryBatchCount)),
 			headStringMeta(strg, "listwise_geometry_auto_cleared_objectives", formatScoreSpectrumObjectiveNames(manifest.ListwiseGeometry.AutoClearedObjectives)),
 			headStringMeta(strg, "listwise_geometry_isolated_inherited_objectives", formatScoreSpectrumObjectiveNames(manifest.ListwiseGeometry.IsolatedInheritedObjectives)),
+			headStringMeta(strg, "aoqt_transform_schema", manifest.AOQTTransform.Schema),
+			headBoolMeta(strg, "aoqt_transform_enabled", manifest.AOQTTransform.Enabled),
+			headBoolMeta(strg, "aoqt_transform_research_only", manifest.AOQTTransform.ResearchOnly),
+			headBoolMeta(strg, "aoqt_transform_research_train_allowed", manifest.AOQTTransform.ResearchTrainAllowed),
+			headBoolMeta(strg, "aoqt_transform_release_train_allowed", manifest.AOQTTransform.ReleaseTrainAllowed),
+			headBoolMeta(strg, "aoqt_transform_commercial_use_allowed", manifest.AOQTTransform.CommercialUseAllowed),
+			headBoolMeta(strg, "aoqt_transform_free_open_release_allowed", manifest.AOQTTransform.FreeOpenReleaseAllowed),
+			headBoolMeta(strg, "aoqt_transform_quality_claim", manifest.AOQTTransform.QualityClaim),
+			headStringMeta(strg, "aoqt_transform_anchor_artifact_sha256", manifest.AOQTTransform.AnchorArtifactSHA256),
+			headStringMeta(strg, "aoqt_transform_anchor_package_manifest_sha256", manifest.AOQTTransform.AnchorPackageManifestSHA256),
+			headStringMeta(strg, "aoqt_transform_anchor_embedding_space_id", manifest.AOQTTransform.AnchorEmbeddingSpaceID),
+			headStringMeta(strg, "aoqt_transform_dataset_manifest_sha256", manifest.AOQTTransform.DatasetManifestSHA256),
+			headStringMeta(strg, "aoqt_transform_qrels_sha256_by_dataset", formatAOQTQrelsHashes(manifest.AOQTTransform.QrelsSHA256ByDataset)),
+			headStringMeta(strg, "aoqt_transform_compatibility_digest", manifest.AOQTTransform.CompatibilityDigest),
+			headStringMeta(strg, "aoqt_transform_transform_sha256", manifest.AOQTTransform.TransformSHA256),
+			headStringMeta(strg, "aoqt_transform_pairings_sha256", manifest.AOQTTransform.PairingsSHA256),
+			headStringMeta(strg, "aoqt_transform_angles_sha256", manifest.AOQTTransform.AnglesSHA256),
 		},
 	}
 
@@ -448,6 +493,60 @@ func decodePackageManifestMLL(data []byte) (PackageManifest, error) {
 		listwisePolicy.IsolatedInheritedObjectives = parseScoreSpectrumObjectiveNames(value)
 	}
 	listwisePolicy.ListwiseGeometryTrain = listwisePolicy.ListwiseGeometryResearchOnly || listwisePolicy.TrainAllowedForResearch || listwisePolicy.ReleaseTrainAllowed || listwisePolicy.CommercialUseAllowed || listwisePolicy.ListwiseGeometryBatchCount > 0 || len(listwisePolicy.SourceArtifactHashes) > 0 || len(listwisePolicy.AutoClearedObjectives) > 0 || len(listwisePolicy.IsolatedInheritedObjectives) > 0
+	aoqtPolicy := AOQTTransformPolicy{}
+	if aoqtPolicy.Schema, err = readOptionalString("aoqt_transform_schema"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.Enabled, err = readOptionalBool("aoqt_transform_enabled"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.ResearchOnly, err = readOptionalBool("aoqt_transform_research_only"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.ResearchTrainAllowed, err = readOptionalBool("aoqt_transform_research_train_allowed"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.ReleaseTrainAllowed, err = readOptionalBool("aoqt_transform_release_train_allowed"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.CommercialUseAllowed, err = readOptionalBool("aoqt_transform_commercial_use_allowed"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.FreeOpenReleaseAllowed, err = readOptionalBool("aoqt_transform_free_open_release_allowed"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.QualityClaim, err = readOptionalBool("aoqt_transform_quality_claim"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.AnchorArtifactSHA256, err = readOptionalString("aoqt_transform_anchor_artifact_sha256"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.AnchorPackageManifestSHA256, err = readOptionalString("aoqt_transform_anchor_package_manifest_sha256"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.AnchorEmbeddingSpaceID, err = readOptionalString("aoqt_transform_anchor_embedding_space_id"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.DatasetManifestSHA256, err = readOptionalString("aoqt_transform_dataset_manifest_sha256"); err != nil {
+		return PackageManifest{}, err
+	}
+	if value, err := readOptionalString("aoqt_transform_qrels_sha256_by_dataset"); err != nil {
+		return PackageManifest{}, err
+	} else {
+		aoqtPolicy.QrelsSHA256ByDataset = parseAOQTQrelsHashes(value)
+	}
+	if aoqtPolicy.CompatibilityDigest, err = readOptionalString("aoqt_transform_compatibility_digest"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.TransformSHA256, err = readOptionalString("aoqt_transform_transform_sha256"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.PairingsSHA256, err = readOptionalString("aoqt_transform_pairings_sha256"); err != nil {
+		return PackageManifest{}, err
+	}
+	if aoqtPolicy.AnglesSHA256, err = readOptionalString("aoqt_transform_angles_sha256"); err != nil {
+		return PackageManifest{}, err
+	}
 
 	r := bytes.NewReader(xpkgBody)
 	readU32 := func() (uint32, error) {
@@ -504,6 +603,7 @@ func decodePackageManifestMLL(data []byte) (PackageManifest, error) {
 		Files:            files,
 		ScoreSpectrum:    scorePolicy,
 		ListwiseGeometry: listwisePolicy,
+		AOQTTransform:    aoqtPolicy,
 	}
 	if err := manifest.Validate(); err != nil {
 		return PackageManifest{}, err
@@ -512,6 +612,14 @@ func decodePackageManifestMLL(data []byte) (PackageManifest, error) {
 }
 
 func BuildPackageManifest(kind PackageKind, mod *eosartifact.Module, files map[string]string) (PackageManifest, error) {
+	manifest, err := buildPackageManifestUnchecked(kind, mod, files)
+	if err != nil {
+		return PackageManifest{}, err
+	}
+	return manifest, manifest.Validate()
+}
+
+func buildPackageManifestUnchecked(kind PackageKind, mod *eosartifact.Module, files map[string]string) (PackageManifest, error) {
 	if mod == nil {
 		return PackageManifest{}, fmt.Errorf("nil module")
 	}
@@ -544,7 +652,7 @@ func BuildPackageManifest(kind PackageKind, mod *eosartifact.Module, files map[s
 		ArtifactVersion: mod.Version,
 		Files:           items,
 	}
-	return manifest, manifest.Validate()
+	return manifest, nil
 }
 
 func RebuildSiblingPackageManifest(artifactPath string) (PackageManifest, string, error) {
@@ -561,12 +669,13 @@ func RebuildSiblingPackageManifest(artifactPath string) (PackageManifest, string
 	if err != nil {
 		return PackageManifest{}, "", err
 	}
-	rebuilt, err := BuildPackageManifest(current.Kind, mod, files)
+	rebuilt, err := buildPackageManifestUnchecked(current.Kind, mod, files)
 	if err != nil {
 		return PackageManifest{}, "", err
 	}
 	rebuilt.ScoreSpectrum = current.ScoreSpectrum
 	rebuilt.ListwiseGeometry = current.ListwiseGeometry
+	rebuilt.AOQTTransform = current.AOQTTransform
 	outPath := DefaultPackageManifestPath(artifactPath)
 	if err := rebuilt.WriteFile(outPath); err != nil {
 		return PackageManifest{}, "", err
@@ -655,6 +764,23 @@ func (m PackageManifest) CacheKey() string {
 	write(fmt.Sprintf("%d", m.ListwiseGeometry.ListwiseGeometryBatchCount))
 	write(formatScoreSpectrumObjectiveNames(m.ListwiseGeometry.AutoClearedObjectives))
 	write(formatScoreSpectrumObjectiveNames(m.ListwiseGeometry.IsolatedInheritedObjectives))
+	write(m.AOQTTransform.Schema)
+	write(fmt.Sprintf("%t", m.AOQTTransform.Enabled))
+	write(fmt.Sprintf("%t", m.AOQTTransform.ResearchOnly))
+	write(fmt.Sprintf("%t", m.AOQTTransform.ResearchTrainAllowed))
+	write(fmt.Sprintf("%t", m.AOQTTransform.ReleaseTrainAllowed))
+	write(fmt.Sprintf("%t", m.AOQTTransform.CommercialUseAllowed))
+	write(fmt.Sprintf("%t", m.AOQTTransform.FreeOpenReleaseAllowed))
+	write(fmt.Sprintf("%t", m.AOQTTransform.QualityClaim))
+	write(m.AOQTTransform.AnchorArtifactSHA256)
+	write(m.AOQTTransform.AnchorPackageManifestSHA256)
+	write(m.AOQTTransform.AnchorEmbeddingSpaceID)
+	write(m.AOQTTransform.DatasetManifestSHA256)
+	write(formatAOQTQrelsHashes(m.AOQTTransform.QrelsSHA256ByDataset))
+	write(m.AOQTTransform.CompatibilityDigest)
+	write(m.AOQTTransform.TransformSHA256)
+	write(m.AOQTTransform.PairingsSHA256)
+	write(m.AOQTTransform.AnglesSHA256)
 	for _, item := range m.Files {
 		write(item.Role)
 		write(item.Path)
@@ -697,6 +823,107 @@ func (m PackageManifest) HasFileRole(role string) bool {
 		}
 	}
 	return false
+}
+
+func (m PackageManifest) validateAOQTTransformRoleBinding(hasTransformRole bool) error {
+	if hasTransformRole && m.Kind != PackageEmbedding {
+		return fmt.Errorf("package manifest file role %q is only supported for %q packages", EmbeddingPostPoolTransformRole, PackageEmbedding)
+	}
+	if hasTransformRole && !m.AOQTTransform.Enabled {
+		return fmt.Errorf("package manifest file role %q requires enabled AOQT transform policy", EmbeddingPostPoolTransformRole)
+	}
+	if m.AOQTTransform.Enabled && m.Kind != PackageEmbedding {
+		return fmt.Errorf("AOQT transform policy is only supported for %q packages", PackageEmbedding)
+	}
+	if m.AOQTTransform.Enabled && !hasTransformRole {
+		return fmt.Errorf("AOQT transform policy requires package file role %q", EmbeddingPostPoolTransformRole)
+	}
+	return m.AOQTTransform.Validate()
+}
+
+func (p AOQTTransformPolicy) Validate() error {
+	if !p.Enabled {
+		return nil
+	}
+	if p.Schema != AOQTTransformPolicySchema {
+		return fmt.Errorf("AOQT transform policy schema %q is not supported, want %q", p.Schema, AOQTTransformPolicySchema)
+	}
+	if !p.ResearchOnly || !p.ResearchTrainAllowed || p.ReleaseTrainAllowed || p.CommercialUseAllowed || p.FreeOpenReleaseAllowed || p.QualityClaim {
+		return fmt.Errorf("AOQT transform policy requires research_only=true, research_train_allowed=true, release_train_allowed=false, commercial_use_allowed=false, free_open_release_allowed=false, quality_claim=false")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"anchor_artifact_sha256", p.AnchorArtifactSHA256},
+		{"anchor_package_manifest_sha256", p.AnchorPackageManifestSHA256},
+		{"dataset_manifest_sha256", p.DatasetManifestSHA256},
+		{"compatibility_digest", p.CompatibilityDigest},
+		{"transform_sha256", p.TransformSHA256},
+		{"pairings_sha256", p.PairingsSHA256},
+		{"angles_sha256", p.AnglesSHA256},
+	} {
+		if field.value == "" {
+			return fmt.Errorf("AOQT transform policy %s is required", field.name)
+		}
+		if err := validateAOQTSHA256(field.value, "AOQT transform policy "+field.name); err != nil {
+			return err
+		}
+	}
+	if p.AnchorEmbeddingSpaceID == "" {
+		return fmt.Errorf("AOQT transform policy anchor_embedding_space_id is required")
+	}
+	if len(p.QrelsSHA256ByDataset) == 0 {
+		return fmt.Errorf("AOQT transform policy qrels_sha256_by_dataset coverage is required")
+	}
+	for dataset, sum := range p.QrelsSHA256ByDataset {
+		if strings.TrimSpace(dataset) == "" {
+			return fmt.Errorf("AOQT transform policy qrels dataset name is required")
+		}
+		if err := validateAOQTSHA256(sum, "AOQT transform policy qrels_sha256_by_dataset"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func formatAOQTQrelsHashes(values map[string]string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b bytes.Buffer
+	for i, key := range keys {
+		if i > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(key)
+		b.WriteByte('=')
+		b.WriteString(values[key])
+	}
+	return b.String()
+}
+
+func parseAOQTQrelsHashes(value string) map[string]string {
+	if value == "" {
+		return nil
+	}
+	out := map[string]string{}
+	for _, row := range bytes.Split([]byte(value), []byte{'\n'}) {
+		if len(row) == 0 {
+			continue
+		}
+		parts := bytes.SplitN(row, []byte{'='}, 2)
+		if len(parts) != 2 {
+			continue
+		}
+		out[string(parts[0])] = string(parts[1])
+	}
+	return out
 }
 
 func fileHash(path string) (string, int64, error) {

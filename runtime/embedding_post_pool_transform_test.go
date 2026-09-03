@@ -282,9 +282,12 @@ func writeTinyAOQTPackage(t *testing.T, transform AOQTGivensTransform, includeTr
 	if includeTransformRole {
 		files[EmbeddingPostPoolTransformRole] = DefaultPostPoolTransformPath(artifactPath)
 	}
-	packageManifest, err := BuildPackageManifest(PackageEmbedding, bundle.Artifact, files)
+	packageManifest, err := buildPackageManifestUnchecked(PackageEmbedding, bundle.Artifact, files)
 	if err != nil {
 		t.Fatalf("build package manifest: %v", err)
+	}
+	if includeTransformRole {
+		attachTinyAOQTPolicyForTest(t, &packageManifest, artifactPath, transform)
 	}
 	if err := packageManifest.WriteFile(DefaultPackageManifestPath(artifactPath)); err != nil {
 		t.Fatalf("write package manifest: %v", err)
