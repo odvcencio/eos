@@ -286,6 +286,122 @@ func TestRunTrainAOQTSidecarPlanOnlyWritesMetrics(t *testing.T) {
 	}
 }
 
+func TestRunTrainAOQTSidecarPlanOnlyAcceptsSourceArtifactHashFileAtRawV4Scale(t *testing.T) {
+	sourceHashes := makeAOQTSourceHashesForCLITest(16414)
+	fixture := writeTinyAOQTTrainCLIFixtureWithSourceHashes(t, sourceHashes)
+	hashFile := writeAOQTHashListFileForCLITest(t, sourceHashes)
+	metricsPath := filepath.Join(t.TempDir(), "aoqt.metrics.json")
+	args := append([]string{
+		"train-aoqt-sidecar",
+		"--plan-only",
+		"--allow-research-only-aoqt",
+		"--metrics-json", metricsPath,
+	}, aoqtTrainCLIArgsWithoutFlagValue(t, fixture.args, "--source-artifact-sha256")...)
+	args = append(args,
+		"--source-artifact-sha256-file", hashFile,
+		"--source-artifact-sha256-file-sha256", sha256FileForCLITest(t, hashFile),
+	)
+	if got := len(strings.Join(args, " ")); got > 20000 {
+		t.Fatalf("digest-bound source hash file args length = %d, want well below argv overflow scale", got)
+	}
+	output := captureRunOutput(t, args)
+	for _, want := range []string{
+		"AOQT sidecar metrics: " + metricsPath,
+		"plan: rows=1 candidates=2 pairs=2 steps=0 plan_only=true",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("plan-only file-bound output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunTrainAOQTSidecarRejectsTamperedSourceArtifactHashFile(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	hashFile := writeAOQTHashListFileForCLITest(t, []string{strings.Repeat("2", 64)})
+	expectedSHA := sha256FileForCLITest(t, hashFile)
+	if err := os.WriteFile(hashFile, []byte(strings.Repeat("7", 64)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := append([]string{
+		"train-aoqt-sidecar",
+		"--plan-only",
+		"--allow-research-only-aoqt",
+		"--metrics-json", filepath.Join(t.TempDir(), "aoqt.metrics.json"),
+	}, aoqtTrainCLIArgsWithoutFlagValue(t, fixture.args, "--source-artifact-sha256")...)
+	args = append(args,
+		"--source-artifact-sha256-file", hashFile,
+		"--source-artifact-sha256-file-sha256", expectedSHA,
+	)
+	_, err := captureRunOutputAndError(t, args)
+	if err == nil || !strings.Contains(err.Error(), "source-artifact-sha256-file sha256") {
+		t.Fatalf("tampered source hash file error = %v, want digest mismatch", err)
+	}
+}
+
+func TestRunTrainAOQTSidecarRejectsUnexpectedSourceArtifactHashFileValue(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	hashFile := writeAOQTHashListFileForCLITest(t, []string{strings.Repeat("7", 64)})
+	args := append([]string{
+		"train-aoqt-sidecar",
+		"--plan-only",
+		"--allow-research-only-aoqt",
+		"--metrics-json", filepath.Join(t.TempDir(), "aoqt.metrics.json"),
+	}, aoqtTrainCLIArgsWithoutFlagValue(t, fixture.args, "--source-artifact-sha256")...)
+	args = append(args,
+		"--source-artifact-sha256-file", hashFile,
+		"--source-artifact-sha256-file-sha256", sha256FileForCLITest(t, hashFile),
+	)
+	_, err := captureRunOutputAndError(t, args)
+	if err == nil || !strings.Contains(err.Error(), "source_artifact_hashes binding mismatch") {
+		t.Fatalf("unexpected source hash file error = %v, want manifest binding rejection", err)
+	}
+}
+
+func TestParseRequiredHashListBindingRejectsUnsafeSourceHashFileInputs(t *testing.T) {
+	hashA := strings.Repeat("1", 64)
+	hashB := strings.Repeat("2", 64)
+	writeRaw := func(name, payload string) string {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(payload), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	for _, tc := range []struct {
+		name      string
+		raw       string
+		fileBody  string
+		fileSHA   string
+		wantError string
+	}{
+		{name: "missing digest", fileBody: hashA + "\n", wantError: "is required"},
+		{name: "mutually exclusive", raw: hashA, fileBody: hashA + "\n", wantError: "mutually exclusive"},
+		{name: "empty file", fileBody: "", fileSHA: "actual", wantError: "at least one"},
+		{name: "blank line", fileBody: hashA + "\n\n" + hashB + "\n", fileSHA: "actual", wantError: "empty sha256"},
+		{name: "malformed", fileBody: strings.Repeat("z", 64) + "\n", fileSHA: "actual", wantError: "invalid"},
+		{name: "duplicate", fileBody: hashA + "\n" + hashA + "\n", fileSHA: "actual", wantError: "duplicate"},
+		{name: "unsorted", fileBody: hashB + "\n" + hashA + "\n", fileSHA: "actual", wantError: "sorted"},
+		{name: "digest without file", fileSHA: hashA, wantError: "requires --source-artifact-sha256-file"},
+		{name: "digest mismatch", fileBody: hashA + "\n", fileSHA: strings.Repeat("f", 64), wantError: "sha256 ="},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			filePath := ""
+			fileSHA := tc.fileSHA
+			if tc.fileBody != "" || tc.name == "empty file" {
+				filePath = writeRaw("source-hashes.txt", tc.fileBody)
+				if fileSHA == "actual" {
+					fileSHA = sha256FileForCLITest(t, filePath)
+				}
+			}
+			_, err := parseRequiredHashListBinding(tc.raw, filePath, fileSHA, "source-artifact-sha256")
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("error = %v, want %q", err, tc.wantError)
+			}
+		})
+	}
+}
+
 func TestRunTrainAOQTSidecarRejectsMissingResearchAuthorization(t *testing.T) {
 	fixture := writeTinyAOQTTrainCLIFixture(t)
 	_, err := captureRunOutputAndError(t, append([]string{
@@ -7997,8 +8113,15 @@ type tinyAOQTTrainCLIFixture struct {
 }
 
 func writeTinyAOQTTrainCLIFixture(t *testing.T) tinyAOQTTrainCLIFixture {
+	return writeTinyAOQTTrainCLIFixtureWithSourceHashes(t, []string{strings.Repeat("2", 64)})
+}
+
+func writeTinyAOQTTrainCLIFixtureWithSourceHashes(t *testing.T, sourceHashes []string) tinyAOQTTrainCLIFixture {
 	t.Helper()
 	dir := t.TempDir()
+	if len(sourceHashes) == 0 {
+		t.Fatal("sourceHashes must not be empty")
+	}
 	topology, err := eosruntime.NewAOQTGivensIdentityTopology(eosruntime.AOQTSidecarDim, eosruntime.AOQTSidecarStages, eosruntime.AOQTSidecarMaterializerTopologySeed, eosruntime.AOQTSidecarDefaultAngleCap)
 	if err != nil {
 		t.Fatalf("AOQT topology: %v", err)
@@ -8011,7 +8134,7 @@ func writeTinyAOQTTrainCLIFixture(t *testing.T) tinyAOQTTrainCLIFixture {
 	candidates := [][]float32{tinyAOQTUnitVector(0), tinyAOQTUnitVector(1)}
 	docIDs := []string{"positive", "negative"}
 	qrelsSHA := strings.Repeat("1", 64)
-	sourceSHA := strings.Repeat("2", 64)
+	sourceSHA := sourceHashes[0]
 	vectorCacheSHA := strings.Repeat("3", 64)
 	anchorArtifactSHA := strings.Repeat("4", 64)
 	anchorPackageSHA := strings.Repeat("5", 64)
@@ -8095,7 +8218,7 @@ func writeTinyAOQTTrainCLIFixture(t *testing.T) tinyAOQTTrainCLIFixture {
 		ObjectiveContract:    objective,
 		QrelsSHA256ByDataset: map[string]string{"toy": qrelsSHA},
 		SplitProof:           splitProof,
-		SourceArtifactHashes: []string{sourceSHA},
+		SourceArtifactHashes: append([]string(nil), sourceHashes...),
 		VectorCacheHashes:    []string{vectorCacheSHA},
 		RowCount:             1,
 		RowIDSHA256:          sha256LinesForTest([]string{row.RowID}),
@@ -8106,7 +8229,10 @@ func writeTinyAOQTTrainCLIFixture(t *testing.T) tinyAOQTTrainCLIFixture {
 	rowsPath := filepath.Join(dir, "rows.jsonl")
 	writeJSONForTest(t, manifestPath, manifest)
 	writeJSONLForTest(t, rowsPath, []any{row})
-	manifestSHA := sha256FileForCLITest(t, manifestPath)
+	manifestSHA, err := eosruntime.AOQTSidecarManifestSHA256(manifest)
+	if err != nil {
+		t.Fatalf("AOQT manifest sha256: %v", err)
+	}
 	rowsSHA := sha256FileForCLITest(t, rowsPath)
 	preflight := eosruntime.AOQTSidecarMaterializePreflight{
 		Schema:                    eosruntime.AOQTSidecarMaterializerPreflightSchema,
@@ -8139,12 +8265,50 @@ func writeTinyAOQTTrainCLIFixture(t *testing.T) tinyAOQTTrainCLIFixture {
 			"--expected-anchor-package-manifest-sha256", anchorPackageSHA,
 			"--anchor-embedding-space-id", "tiny-aoqt-space",
 			"--compatibility-digest", compatibilityDigest,
-			"--source-artifact-sha256", sourceSHA,
+			"--source-artifact-sha256", strings.Join(sourceHashes, ","),
 			"--vector-cache-sha256", vectorCacheSHA,
 		},
 		anchorArtifactSHA:   anchorArtifactSHA,
 		compatibilityDigest: compatibilityDigest,
 	}
+}
+
+func makeAOQTSourceHashesForCLITest(count int) []string {
+	hashes := make([]string, count)
+	for i := range hashes {
+		hashes[i] = fmt.Sprintf("%064x", i+1)
+	}
+	return hashes
+}
+
+func writeAOQTHashListFileForCLITest(t *testing.T, hashes []string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "source-artifact-sha256.txt")
+	if err := os.WriteFile(path, []byte(strings.Join(hashes, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func aoqtTrainCLIArgsWithoutFlagValue(t *testing.T, args []string, flagName string) []string {
+	t.Helper()
+	out := make([]string, 0, len(args))
+	removed := false
+	for i := 0; i < len(args); i++ {
+		if args[i] == flagName {
+			if i+1 >= len(args) {
+				t.Fatalf("%s in args has no value", flagName)
+			}
+			i++
+			removed = true
+			continue
+		}
+		out = append(out, args[i])
+	}
+	if !removed {
+		t.Fatalf("%s not found in args", flagName)
+	}
+	return out
 }
 
 func tinyAOQTUnitVector(index int) []float32 {

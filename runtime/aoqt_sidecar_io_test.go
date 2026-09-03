@@ -11,7 +11,10 @@ import (
 func TestAOQTCalibrationIOLoadsStrictManifestAndRows(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 81)
 	manifestPath, rowsPath := writeAOQTCalibrationIOFixture(t, set)
-	manifestSHA, rowsSHA := mustSHA256FileAOQTTest(t, manifestPath), mustSHA256FileAOQTTest(t, rowsPath)
+	manifestSHA, rowsSHA := mustAOQTManifestSHA256Test(t, set.Manifest), mustSHA256FileAOQTTest(t, rowsPath)
+	if rawManifestSHA := mustSHA256FileAOQTTest(t, manifestPath); rawManifestSHA == manifestSHA {
+		t.Fatalf("fixture raw manifest SHA unexpectedly equals canonical SHA %s", manifestSHA)
+	}
 
 	loaded, report, err := LoadAOQTSidecarCalibrationSet(AOQTSidecarCalibrationIOConfig{
 		ManifestPath:                        manifestPath,
@@ -60,7 +63,7 @@ func TestAOQTCalibrationIORejectsMalformedAndHashMismatch(t *testing.T) {
 	if _, _, err := LoadAOQTSidecarCalibrationSet(AOQTSidecarCalibrationIOConfig{
 		ManifestPath:                        manifestPath,
 		RowsJSONLPath:                       badRowsPath,
-		ExpectedManifestSHA256:              mustSHA256FileAOQTTest(t, manifestPath),
+		ExpectedManifestSHA256:              mustAOQTManifestSHA256Test(t, set.Manifest),
 		ExpectedRowsSHA256:                  badRowsSHA,
 		ExpectedAnchorArtifactSHA256:        set.Manifest.AnchorArtifactSHA256,
 		ExpectedAnchorPackageManifestSHA256: set.Manifest.AnchorPackageManifestSHA256,
@@ -77,7 +80,7 @@ func TestAOQTCalibrationIORejectsMalformedAndHashMismatch(t *testing.T) {
 	if _, _, err := LoadAOQTSidecarCalibrationSet(AOQTSidecarCalibrationIOConfig{
 		ManifestPath:                        manifestPath,
 		RowsJSONLPath:                       rowsPath,
-		ExpectedManifestSHA256:              mustSHA256FileAOQTTest(t, manifestPath),
+		ExpectedManifestSHA256:              mustAOQTManifestSHA256Test(t, set.Manifest),
 		ExpectedRowsSHA256:                  mustSHA256FileAOQTTest(t, rowsPath),
 		ExpectedAnchorArtifactSHA256:        set.Manifest.AnchorArtifactSHA256,
 		ExpectedAnchorPackageManifestSHA256: hex64("wrong-package"),
@@ -117,7 +120,7 @@ func TestAOQTCalibrationIORejectsDuplicateKeysAndMissingBindings(t *testing.T) {
 	if _, _, err := LoadAOQTSidecarCalibrationSet(AOQTSidecarCalibrationIOConfig{
 		ManifestPath:           manifestPath,
 		RowsJSONLPath:          duplicateRows,
-		ExpectedManifestSHA256: mustSHA256FileAOQTTest(t, manifestPath),
+		ExpectedManifestSHA256: mustAOQTManifestSHA256Test(t, set.Manifest),
 		ExpectedRowsSHA256:     mustSHA256FileAOQTTest(t, duplicateRows),
 	}); err == nil || !strings.Contains(err.Error(), "duplicate object key") {
 		t.Fatalf("duplicate row key error = %v, want duplicate-key rejection", err)
@@ -126,7 +129,7 @@ func TestAOQTCalibrationIORejectsDuplicateKeysAndMissingBindings(t *testing.T) {
 	if _, _, err := LoadAOQTSidecarCalibrationSet(AOQTSidecarCalibrationIOConfig{
 		ManifestPath:           manifestPath,
 		RowsJSONLPath:          rowsPath,
-		ExpectedManifestSHA256: mustSHA256FileAOQTTest(t, manifestPath),
+		ExpectedManifestSHA256: mustAOQTManifestSHA256Test(t, set.Manifest),
 		ExpectedRowsSHA256:     rowsSHA,
 	}); err == nil || !strings.Contains(err.Error(), "expected anchor_artifact_sha256 is required") {
 		t.Fatalf("missing IO binding error = %v, want all high-level bindings required", err)
@@ -273,6 +276,15 @@ func writeAOQTCalibrationIOFixture(t *testing.T, set AOQTSidecarCalibrationSet) 
 func mustSHA256FileAOQTTest(t *testing.T, path string) string {
 	t.Helper()
 	sum, err := sha256FileAOQT(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sum
+}
+
+func mustAOQTManifestSHA256Test(t *testing.T, manifest AOQTSidecarCalibrationManifest) string {
+	t.Helper()
+	sum, err := AOQTSidecarManifestSHA256(manifest)
 	if err != nil {
 		t.Fatal(err)
 	}

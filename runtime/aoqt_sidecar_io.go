@@ -60,13 +60,16 @@ func LoadAOQTSidecarCalibrationSet(cfg AOQTSidecarCalibrationIOConfig) (AOQTSide
 	if err != nil {
 		return AOQTSidecarCalibrationSet{}, AOQTSidecarCalibrationIOReport{}, err
 	}
-	manifestSHA := sha256BytesAOQT(manifestData)
-	if err := validateExpectedAOQTSHA256(manifestSHA, cfg.ExpectedManifestSHA256, "AOQT calibration manifest"); err != nil {
-		return AOQTSidecarCalibrationSet{}, AOQTSidecarCalibrationIOReport{}, err
-	}
 	var manifest AOQTSidecarCalibrationManifest
 	if err := strictUnmarshalAOQT(manifestData, &manifest); err != nil {
 		return AOQTSidecarCalibrationSet{}, AOQTSidecarCalibrationIOReport{}, fmt.Errorf("%s: invalid AOQT calibration manifest JSON: %w", cfg.ManifestPath, err)
+	}
+	manifestSHA, err := AOQTSidecarManifestSHA256(manifest)
+	if err != nil {
+		return AOQTSidecarCalibrationSet{}, AOQTSidecarCalibrationIOReport{}, err
+	}
+	if err := validateExpectedAOQTSHA256(manifestSHA, cfg.ExpectedManifestSHA256, "AOQT calibration manifest"); err != nil {
+		return AOQTSidecarCalibrationSet{}, AOQTSidecarCalibrationIOReport{}, err
 	}
 	rowsData, err := os.ReadFile(cfg.RowsJSONLPath)
 	if err != nil {

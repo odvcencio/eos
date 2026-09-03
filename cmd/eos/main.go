@@ -8921,7 +8921,7 @@ func printUsage() {
 	fmt.Println("calibrate-sparse-routing sweeps sparse routing policy budgets, including optional calibration-only oracle policies, on synthetic tensors and writes router recall, output delta, and score-work artifacts.")
 	fmt.Println("smoke-sparse-embedding-encoder runs a deterministic routed TurboQuant sparse-attention encoder-shaped smoke and writes manifest.json, summary.tsv, scorecard.json, and scorecard.tsv.")
 	fmt.Println("materialize-aoqt-sidecar builds fixture-only AOQT calibration rows, manifest, and preflight JSON from Stage3 train-only plans, bound vectors, top120 evidence, and qrels; quality_claim=false.")
-	fmt.Println("train-aoqt-sidecar validates strict AOQT calibration/preflight inputs, writes metrics in plan-only mode, and only writes a research-only candidate package after guarded non-plan eligibility.")
+	fmt.Println("train-aoqt-sidecar validates strict AOQT calibration/preflight inputs, supports digest-bound file input for large source-artifact hash lists, writes metrics in plan-only mode, and only writes a research-only candidate package after guarded non-plan eligibility.")
 	fmt.Println("plan-multivector-storage estimates how many TurboQuant child vectors per parent fit in one dense fp32 baseline-vector budget; use --baseline-dim to compare compact children against a larger dense baseline, and --series-lengths with --window-size/--window-stride to derive vectors per object from time-series windows.")
 	fmt.Println("init-model creates the Eos-owned default quantized embedding training package.")
 	fmt.Println("init-mirage creates the Eos-owned Mirage Image v1 host-reference artifact.")
