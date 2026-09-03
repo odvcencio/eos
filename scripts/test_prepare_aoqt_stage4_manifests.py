@@ -153,9 +153,22 @@ class PrepareAOQTStage4ManifestsTest(unittest.TestCase):
     def test_normalize_exclusions_is_qid_only_and_does_not_copy_qrels_columns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            legacy = write_json(root / "selected.json", {"selected_qids": ["dev-q2", "dev-q1"]})
-            qrels = root / "official.qrels"
-            qrels.write_text("test-q2 0 doc-a 1\ntest-q1 0 doc-b 0\n", encoding="utf-8")
+            legacy = write_json(
+                root / "selected.json",
+                {
+                    "selected_qids": {
+                        "fiqa": ["dev-q2", "dev-q1"],
+                        "nfcorpus": ["nf-dev-q"],
+                        "scifact": ["sci-dev-q"],
+                    }
+                },
+            )
+            fiqa_qrels = root / "fiqa.official.qrels"
+            fiqa_qrels.write_text("test-q2 0 doc-a 1\ntest-q1 0 doc-b 0\n", encoding="utf-8")
+            nf_qrels = root / "nfcorpus.official.qrels"
+            nf_qrels.write_text("nf-test-q 0 doc-c 1\n", encoding="utf-8")
+            sci_qrels = root / "scifact.official.qrels"
+            sci_qrels.write_text("sci-test-q 0 doc-d 1\n", encoding="utf-8")
             args = prep.parse_args(
                 [
                     "normalize-exclusions",
@@ -164,7 +177,11 @@ class PrepareAOQTStage4ManifestsTest(unittest.TestCase):
                     "--legacy-selected-qids",
                     str(legacy),
                     "--official-test-qrels",
-                    str(qrels),
+                    str(fiqa_qrels),
+                    "--official-test-qrels",
+                    str(nf_qrels),
+                    "--official-test-qrels",
+                    str(sci_qrels),
                     "--output",
                     str(root / "out.json"),
                 ]
@@ -172,8 +189,10 @@ class PrepareAOQTStage4ManifestsTest(unittest.TestCase):
             payload = prep.build_manifest(args)
 
         self.assertEqual(payload["schema"], builder.EXCLUSION_SCHEMA)
-        self.assertEqual(payload["qids"], ["dev-q1", "dev-q2", "test-q1", "test-q2"])
-        self.assertEqual(set(payload), {"schema", "name", "qids", "source_sha256", "source_sha256_by_file"})
+        self.assertEqual(payload["qids_by_dataset"]["fiqa"], ["dev-q1", "dev-q2", "test-q1", "test-q2"])
+        self.assertEqual(payload["qids_by_dataset"]["nfcorpus"], ["nf-dev-q", "nf-test-q"])
+        self.assertEqual(payload["qids_by_dataset"]["scifact"], ["sci-dev-q", "sci-test-q"])
+        self.assertEqual(set(payload), {"schema", "name", "qids_by_dataset", "source_sha256", "source_sha256_by_file"})
         serialized = json.dumps(payload, sort_keys=True)
         self.assertNotIn("doc-a", serialized)
         self.assertNotIn("doc-b", serialized)
@@ -181,18 +200,52 @@ class PrepareAOQTStage4ManifestsTest(unittest.TestCase):
     def test_normalize_exclusions_dedupes_repeated_qrels_qids_stably(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            qrels = root / "official.qrels"
-            qrels.write_text("q2 0 doc-a 1\nq1 0 doc-b 0\nq2 0 doc-c 1\n", encoding="utf-8")
-            args = prep.parse_args(["normalize-exclusions", "--name", "official-test", "--official-test-qrels", str(qrels), "--output", str(root / "out.json")])
+            fiqa_qrels = root / "fiqa.official.qrels"
+            fiqa_qrels.write_text("q2 0 doc-a 1\nq1 0 doc-b 0\nq2 0 doc-c 1\n", encoding="utf-8")
+            nf_qrels = root / "nfcorpus.official.qrels"
+            nf_qrels.write_text("nf-q 0 doc-d 1\n", encoding="utf-8")
+            sci_qrels = root / "scifact.official.qrels"
+            sci_qrels.write_text("sci-q 0 doc-e 1\n", encoding="utf-8")
+            args = prep.parse_args(
+                [
+                    "normalize-exclusions",
+                    "--name",
+                    "official-test",
+                    "--official-test-qrels",
+                    str(fiqa_qrels),
+                    "--official-test-qrels",
+                    str(nf_qrels),
+                    "--official-test-qrels",
+                    str(sci_qrels),
+                    "--output",
+                    str(root / "out.json"),
+                ]
+            )
             payload = prep.build_manifest(args)
-        self.assertEqual(payload["qids"], ["q1", "q2"])
+        self.assertEqual(payload["qids_by_dataset"]["fiqa"], ["q1", "q2"])
 
     def test_normalize_exclusions_rejects_nested_doc_or_score_leakage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            legacy = write_json(root / "selected.json", {"selected_qids": ["q1"], "doc_ids": ["d1"]})
+            legacy = write_json(root / "selected.json", {"selected_qids": {"fiqa": ["q1"], "nfcorpus": ["q2"], "scifact": ["q3"]}, "doc_ids": ["d1"]})
             args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
             with self.assertRaisesRegex(prep.ManifestError, "forbidden field"):
+                prep.build_manifest(args)
+
+    def test_normalize_exclusions_rejects_ambiguous_global_qids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(root / "selected.json", {"selected_qids": ["q1"]})
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            with self.assertRaisesRegex(prep.ManifestError, "ambiguous legacy global qids"):
+                prep.build_manifest(args)
+
+    def test_normalize_exclusions_rejects_missing_dataset_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(root / "selected.json", {"selected_qids": {"fiqa": ["q1"], "nfcorpus": ["q2"]}})
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            with self.assertRaisesRegex(prep.ManifestError, "missing required dataset coverage"):
                 prep.build_manifest(args)
 
     def test_adapt_vector_cache_outputs_ids_and_hashes_without_vectors(self) -> None:
@@ -660,9 +713,33 @@ class PrepareAOQTStage4ManifestsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             exclusions = [
-                write_json(root / "exclusions" / "dev4.json", {"schema": builder.EXCLUSION_SCHEMA, "name": "dev4", "qids": ["dev-q"], "source_sha256": fake_sha("dev4")}),
-                write_json(root / "exclusions" / "reserve4.json", {"schema": builder.EXCLUSION_SCHEMA, "name": "reserve4", "qids": ["reserve-q"], "source_sha256": fake_sha("reserve4")}),
-                write_json(root / "exclusions" / "official-test.json", {"schema": builder.EXCLUSION_SCHEMA, "name": "official-test", "qids": ["official-q"], "source_sha256": fake_sha("official")}),
+                write_json(
+                    root / "exclusions" / "dev4.json",
+                    {
+                        "schema": builder.EXCLUSION_SCHEMA,
+                        "name": "dev4",
+                        "qids_by_dataset": {dataset: [f"{dataset}-dev-q"] for dataset in builder.ALLOWED_DATASETS},
+                        "source_sha256": fake_sha("dev4"),
+                    },
+                ),
+                write_json(
+                    root / "exclusions" / "reserve4.json",
+                    {
+                        "schema": builder.EXCLUSION_SCHEMA,
+                        "name": "reserve4",
+                        "qids_by_dataset": {dataset: [f"{dataset}-reserve-q"] for dataset in builder.ALLOWED_DATASETS},
+                        "source_sha256": fake_sha("reserve4"),
+                    },
+                ),
+                write_json(
+                    root / "exclusions" / "official-test.json",
+                    {
+                        "schema": builder.EXCLUSION_SCHEMA,
+                        "name": "official-test",
+                        "qids_by_dataset": {dataset: [f"{dataset}-official-q"] for dataset in builder.ALLOWED_DATASETS},
+                        "source_sha256": fake_sha("official"),
+                    },
+                ),
             ]
             vector_manifests = []
             score_manifests = []

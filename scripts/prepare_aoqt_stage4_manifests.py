@@ -170,24 +170,66 @@ def require_qid(value: Any, label: str) -> str:
     return value
 
 
-def selected_qids_from_json(path: Path) -> list[str]:
+def require_dataset(value: Any, label: str) -> str:
+    try:
+        return calibration.require_dataset(value, label)
+    except calibration.PlanError as exc:
+        raise ManifestError(str(exc)) from exc
+
+
+def infer_dataset_from_path(path: Path) -> str:
+    label = display_path(path)
+    compact = re.sub(r"[^a-z0-9]+", "", label.lower())
+    matches = [dataset for dataset in calibration.ALLOWED_DATASETS if dataset in compact]
+    if len(matches) != 1:
+        raise ManifestError(f"{label}: official qrels path must identify exactly one dataset")
+    return matches[0]
+
+
+def qid_mapping_from_value(value: Any, label: str, dataset: Any = None) -> dict[str, list[str]]:
+    if isinstance(value, dict):
+        unexpected = sorted(set(value) - set(calibration.ALLOWED_DATASETS))
+        if unexpected:
+            raise ManifestError(f"{label}: unsupported qid datasets {unexpected}")
+        out: dict[str, list[str]] = {}
+        for key, qids in value.items():
+            qid_list = [require_qid(item, f"{label}: {key}") for item in qids] if isinstance(qids, list) else None
+            if qid_list is None or not qid_list:
+                raise ManifestError(f"{label}: {key} qids must be a non-empty list")
+            if len(qid_list) != len(set(qid_list)):
+                raise ManifestError(f"{label}: duplicate qids for dataset {key}")
+            out[require_dataset(key, label)] = qid_list
+        return out
+    if isinstance(value, list):
+        if dataset is None:
+            raise ManifestError(f"{label}: ambiguous legacy global qids require an explicit dataset mapping")
+        dataset_name = require_dataset(dataset, label)
+        qid_list = [require_qid(item, label) for item in value]
+        if not qid_list:
+            raise ManifestError(f"{label}: qids must be non-empty")
+        if len(qid_list) != len(set(qid_list)):
+            raise ManifestError(f"{label}: duplicate qids for dataset {dataset_name}")
+        return {dataset_name: qid_list}
+    raise ManifestError(f"{label}: expected selected_qids/qids mapping by dataset")
+
+
+def selected_qids_from_json(path: Path) -> dict[str, list[str]]:
     payload = load_json(path)
     label = display_path(path)
     reject_forbidden_payload_keys(payload, label)
-    allowed = {"selected_qids", "qids", "name", "schema"}
+    allowed = {"selected_qids", "qids", "qids_by_dataset", "name", "schema", "dataset"}
     unexpected = sorted(set(payload) - allowed)
     if unexpected:
         raise ManifestError(f"{label}: qid-only JSON has unexpected fields {unexpected}")
-    values = payload.get("selected_qids", payload.get("qids"))
-    if not isinstance(values, list):
-        raise ManifestError(f"{label}: expected selected_qids or qids list")
-    return [require_qid(value, label) for value in values]
+    values = payload.get("qids_by_dataset", payload.get("selected_qids", payload.get("qids")))
+    return qid_mapping_from_value(values, label, payload.get("dataset"))
 
 
-def selected_qids_from_qrels(path: Path) -> list[str]:
+def selected_qids_from_qrels(path: Path) -> dict[str, list[str]]:
     qids: list[str] = []
     seen: set[str] = set()
     label = display_path(path)
+    dataset = infer_dataset_from_path(path)
     with repo_path(path).open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             text = line.strip()
@@ -200,23 +242,39 @@ def selected_qids_from_qrels(path: Path) -> list[str]:
                 qids.append(qid)
     if not qids:
         raise ManifestError(f"{label}: no qids found in qrels first column")
-    return qids
+    return {dataset: qids}
+
+
+def merge_qids_by_dataset(sources: Iterable[dict[str, list[str]]]) -> dict[str, list[str]]:
+    merged: dict[str, list[str]] = {dataset: [] for dataset in calibration.ALLOWED_DATASETS}
+    seen: dict[str, set[str]] = {dataset: set() for dataset in calibration.ALLOWED_DATASETS}
+    for source in sources:
+        for dataset, qids in source.items():
+            dataset_name = require_dataset(dataset, "normalize-exclusions")
+            for qid in qids:
+                if qid in seen[dataset_name]:
+                    raise ManifestError(f"normalize-exclusions: duplicate qids for dataset {dataset_name}")
+                seen[dataset_name].add(qid)
+                merged[dataset_name].append(qid)
+    missing = [dataset for dataset in calibration.ALLOWED_DATASETS if not merged[dataset]]
+    if missing:
+        raise ManifestError(f"normalize-exclusions: missing required dataset coverage {missing}")
+    return {dataset: sorted(merged[dataset]) for dataset in calibration.ALLOWED_DATASETS}
 
 
 def normalize_exclusions(args: argparse.Namespace) -> dict[str, Any]:
     if not args.legacy_selected_qids and not args.official_test_qrels:
         raise ManifestError("normalize-exclusions: at least one qid source is required")
-    qids: list[str] = []
+    sources: list[dict[str, list[str]]] = []
     for path in args.legacy_selected_qids:
-        qids.extend(selected_qids_from_json(path))
+        sources.append(selected_qids_from_json(path))
     for path in args.official_test_qrels:
-        qids.extend(selected_qids_from_qrels(path))
-    if len(qids) != len(set(qids)):
-        raise ManifestError("normalize-exclusions: duplicate qids across qid-only sources")
+        sources.append(selected_qids_from_qrels(path))
+    qids_by_dataset = merge_qids_by_dataset(sources)
     payload = {
         "schema": calibration.EXCLUSION_SCHEMA,
         "name": args.name,
-        "qids": sorted(qids),
+        "qids_by_dataset": qids_by_dataset,
         **source_hashes([*args.legacy_selected_qids, *args.official_test_qrels]),
     }
     return payload

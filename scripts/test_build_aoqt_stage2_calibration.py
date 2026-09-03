@@ -57,7 +57,7 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             name: {
                 "schema": builder.EXCLUSION_SCHEMA,
                 "name": name,
-                "qids": [f"{name}-qid"],
+                "qids_by_dataset": {dataset: [f"{name}-{dataset}-qid"] for dataset in builder.ALLOWED_DATASETS},
                 "source_sha256": fake_sha(f"{name}-source"),
             }
             for name in builder.REQUIRED_EXCLUSION_NAMES
@@ -243,6 +243,27 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             with self.assertRaisesRegex(builder.PlanError, "qid-only"):
                 builder.build_plan(builder.parse_args(self.build_args(fixture)))
 
+    def test_rejects_legacy_global_exclusion_qids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            path = fixture["exclusions"][0]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            del payload["qids_by_dataset"]
+            payload["qids"] = ["ambiguous-qid"]
+            write_json(path, payload)
+            with self.assertRaisesRegex(builder.PlanError, "ambiguous legacy global qids"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_rejects_exclusion_missing_dataset_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            path = fixture["exclusions"][0]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            del payload["qids_by_dataset"]["scifact"]
+            write_json(path, payload)
+            with self.assertRaisesRegex(builder.PlanError, "missing required dataset coverage"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
     def test_rejects_nested_exclusion_payload_even_without_doc_ids_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self.fixture(Path(tmp))
@@ -271,10 +292,10 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             score = json.loads(score_path.read_text(encoding="utf-8"))
             original_dev4 = fixture["exclusions"][0]
             original_payload = json.loads(original_dev4.read_text(encoding="utf-8"))
-            original_payload["qids"] = [score["rows"][0]["qid"]]
+            original_payload["qids_by_dataset"][score["dataset"]] = [score["rows"][0]["qid"]]
             write_json(original_dev4, original_payload)
             duplicate_payload = copy.deepcopy(original_payload)
-            duplicate_payload["qids"] = ["replacement-dev4-qid"]
+            duplicate_payload["qids_by_dataset"][score["dataset"]] = ["replacement-dev4-qid"]
             duplicate_path = write_json(root / "exclusions" / "dev4-duplicate.json", duplicate_payload)
             fixture["exclusions"] = [*fixture["exclusions"], duplicate_path]
             with self.assertRaisesRegex(builder.PlanError, "duplicate qid-only set 'dev4'"):
@@ -520,10 +541,23 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             score_path = fixture["score_paths"][0]
             exclusion = json.loads(exclusion_path.read_text(encoding="utf-8"))
             score = json.loads(score_path.read_text(encoding="utf-8"))
-            exclusion["qids"] = [score["rows"][0]["qid"]]
+            exclusion["qids_by_dataset"][score["dataset"]] = [score["rows"][0]["qid"]]
             write_json(exclusion_path, exclusion)
             with self.assertRaisesRegex(builder.PlanError, "is excluded"):
                 builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_allows_cross_dataset_qid_collision_in_exclusions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            exclusion_path = fixture["exclusions"][0]
+            score_path = fixture["score_paths"][0]
+            exclusion = json.loads(exclusion_path.read_text(encoding="utf-8"))
+            score = json.loads(score_path.read_text(encoding="utf-8"))
+            other_dataset = next(dataset for dataset in builder.ALLOWED_DATASETS if dataset != score["dataset"])
+            exclusion["qids_by_dataset"][other_dataset] = [score["rows"][0]["qid"]]
+            write_json(exclusion_path, exclusion)
+            plan = builder.build_plan(builder.parse_args(self.build_args(fixture)))
+            self.assertEqual(plan["selection_policy"]["official_exclusion_mode"], "dataset_scoped_qid_only")
 
     def test_rejects_missing_q5_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

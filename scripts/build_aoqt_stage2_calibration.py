@@ -163,6 +163,33 @@ def require_sha256_mapping(value: Any, label: str, field: str) -> dict[str, str]
     return dict(sorted(out.items()))
 
 
+def require_qid_string(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value or re.search(r"\s", value):
+        raise PlanError(f"{label}: qids must be non-empty strings without whitespace")
+    return value
+
+
+def require_qids_by_dataset(value: Any, label: str) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        raise PlanError(f"{label}: qids_by_dataset mapping is required")
+    unexpected = sorted(set(value) - set(ALLOWED_DATASETS))
+    if unexpected:
+        raise PlanError(f"{label}: unsupported exclusion datasets {unexpected}")
+    missing = [dataset for dataset in ALLOWED_DATASETS if dataset not in value]
+    if missing:
+        raise PlanError(f"{label}: missing required dataset coverage {missing}")
+    out: dict[str, list[str]] = {}
+    for dataset in ALLOWED_DATASETS:
+        qids = value.get(dataset)
+        if not isinstance(qids, list) or not qids:
+            raise PlanError(f"{label}: qids_by_dataset.{dataset} must be a non-empty qid list")
+        normalized = [require_qid_string(qid, f"{label}: qids_by_dataset.{dataset}") for qid in qids]
+        if len(normalized) != len(set(normalized)):
+            raise PlanError(f"{label}: duplicate exclusion qids for dataset {dataset}")
+        out[dataset] = sorted(normalized)
+    return out
+
+
 def canonical_dataset_source_provenance(value: Any, label: str) -> dict[str, str]:
     mapping = require_sha256_mapping(value, label, "dataset_source_provenance")
     if mapping is None:
@@ -322,38 +349,53 @@ def validate_anchor(path: Path, expected_sha256: str | None) -> dict[str, Any]:
 def validate_exclusions(paths: list[Path]) -> dict[str, Any]:
     if not paths:
         raise PlanError("exclusions: at least one qid-only exclusion manifest is required")
-    names: dict[str, set[str]] = {}
+    names: dict[str, dict[str, set[str]]] = {}
     audit = []
     for path in paths:
         payload = load_json(path)
         label = display_path(path)
         require_schema(payload, EXCLUSION_SCHEMA, label)
-        allowed = {"schema", "name", "qids", "source_sha256", "source_sha256_by_file"}
+        if "qids" in payload:
+            raise PlanError(f"{label}: ambiguous legacy global qids are not allowed; use qids_by_dataset")
+        allowed = {"schema", "name", "qids_by_dataset", "source_sha256", "source_sha256_by_file"}
         unexpected = sorted(set(payload) - allowed)
         if unexpected:
             raise PlanError(f"{label}: exclusion manifest must be qid-only; unexpected fields {unexpected}")
         name = str(payload.get("name", ""))
-        qids = payload.get("qids")
-        if not name or not isinstance(qids, list) or not all(isinstance(qid, str) and qid for qid in qids):
-            raise PlanError(f"{label}: invalid exclusion name/qids")
-        if not qids:
-            raise PlanError(f"{label}: qids must be non-empty")
+        if not name:
+            raise PlanError(f"{label}: invalid exclusion name")
+        qids_by_dataset = require_qids_by_dataset(payload.get("qids_by_dataset"), label)
         if name not in REQUIRED_EXCLUSION_NAMES:
             require_no_forbidden_split_tokens({"name": name}, label)
         provenance = require_provenance_hashes(payload, label)
-        if len(qids) != len(set(qids)):
-            raise PlanError(f"{label}: duplicate exclusion qids")
         if name in names:
             raise PlanError(f"exclusions: duplicate qid-only set {name!r}")
-        names[name] = set(qids)
-        audit.append({"name": name, "path": label, "qid_count": len(qids), "manifest_sha256": sha256_file(path), "provenance": provenance})
+        names[name] = {dataset: set(qids) for dataset, qids in qids_by_dataset.items()}
+        qid_count_by_dataset = {dataset: len(qids_by_dataset[dataset]) for dataset in ALLOWED_DATASETS}
+        audit.append(
+            {
+                "name": name,
+                "path": label,
+                "qid_count_by_dataset": qid_count_by_dataset,
+                "qids_by_dataset_sha256": sha256_json(qids_by_dataset),
+                "manifest_sha256": sha256_file(path),
+                "provenance": provenance,
+            }
+        )
     missing = [name for name in REQUIRED_EXCLUSION_NAMES if name not in names]
     if missing:
         raise PlanError(f"exclusions: missing required qid-only sets {missing}")
-    all_qids: set[str] = set()
-    for qids in names.values():
-        all_qids.update(qids)
-    return {"sets": sorted(audit, key=lambda item: item["name"]), "excluded_qids": sorted(all_qids)}
+    excluded_qids_by_dataset: dict[str, set[str]] = {dataset: set() for dataset in ALLOWED_DATASETS}
+    for qids_by_dataset in names.values():
+        for dataset, qids in qids_by_dataset.items():
+            excluded_qids_by_dataset[dataset].update(qids)
+    excluded_qids_by_dataset_out = {dataset: sorted(qids) for dataset, qids in excluded_qids_by_dataset.items()}
+    return {
+        "sets": sorted(audit, key=lambda item: item["name"]),
+        "excluded_qid_count_by_dataset": {dataset: len(excluded_qids_by_dataset_out[dataset]) for dataset in ALLOWED_DATASETS},
+        "excluded_qids_by_dataset_sha256": sha256_json(excluded_qids_by_dataset_out),
+        "excluded_qids_by_dataset": excluded_qids_by_dataset_out,
+    }
 
 
 def validate_vector_caches(paths: list[Path], anchor: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -470,7 +512,7 @@ def require_provenance_consistency(vector_caches: dict[str, dict[str, Any]], sco
     return qrels_by_dataset, source_by_dataset
 
 
-def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dict[str, dict[str, Any]], anchor: dict[str, Any], turboquant_seed: int) -> dict[str, Any]:
+def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str]], vector_caches: dict[str, dict[str, Any]], anchor: dict[str, Any], turboquant_seed: int) -> dict[str, Any]:
     payload = load_json(path)
     label = display_path(path)
     require_schema(payload, SCORE_CACHE_SCHEMA, label)
@@ -482,6 +524,7 @@ def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dic
     if "qrels_sha256" not in provenance:
         raise PlanError(f"{label}: qrels_sha256 provenance is required")
     dataset = require_dataset(payload.get("dataset"), label)
+    excluded_qids = excluded_qids_by_dataset.get(dataset, set())
     bits = parse_int_field(payload.get("bits", -1), label, "bits")
     if bits not in {3, 5}:
         raise PlanError(f"{label}: bits must be 3 or 5")
@@ -657,7 +700,7 @@ def require_guard_coverage(rows: list[dict[str, Any]]) -> None:
         raise PlanError("plan: NFCorpus q5 boundary coverage is not allowed")
 
 
-def workload(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def workload(rows: list[dict[str, Any]], excluded_qid_count_by_dataset: dict[str, int]) -> dict[str, Any]:
     bucket_counts = Counter(str(row["bucket"]) for row in rows)
     domain_counts = Counter(str(row["dataset"]) for row in rows)
     bit_counts = Counter(str(row["bits"]) for row in rows)
@@ -672,6 +715,7 @@ def workload(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "bit_counts": {str(k): bit_counts[k] for k in sorted(bit_counts)},
         "angle_count": TOPOLOGY["angle_count"],
         "planned_work_units": pair_count * TOPOLOGY["angle_count"],
+        "excluded_qid_count_by_dataset": dict(sorted(excluded_qid_count_by_dataset.items())),
         "actual_train_pairs": 0,
         "actual_vectors_written": 0,
         "actual_similarity_values_written": 0,
@@ -719,9 +763,9 @@ def stripped_score_cache_audit(score_caches: list[dict[str, Any]]) -> list[dict[
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     anchor = validate_anchor(args.anchor_manifest, args.expected_anchor_sha256)
     exclusions = validate_exclusions(args.exclusion_qids)
-    excluded_qids = set(exclusions["excluded_qids"])
+    excluded_qids_by_dataset = {dataset: set(qids) for dataset, qids in exclusions["excluded_qids_by_dataset"].items()}
     vector_caches = validate_vector_caches(args.vector_cache, anchor)
-    score_caches = [validate_score_cache(path, excluded_qids, vector_caches, anchor, args.turboquant_seed) for path in args.score_cache]
+    score_caches = [validate_score_cache(path, excluded_qids_by_dataset, vector_caches, anchor, args.turboquant_seed) for path in args.score_cache]
     seen_score_keys: set[tuple[str, int]] = set()
     for cache in score_caches:
         key = (cache["dataset"], cache["bits"])
@@ -756,7 +800,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "topology": TOPOLOGY,
         "legal_scope": LEGAL_SCOPE,
         "anchor": anchor,
-        "exclusions": {k: v for k, v in exclusions.items() if k != "excluded_qids"},
+        "exclusions": {k: v for k, v in exclusions.items() if k != "excluded_qids_by_dataset"},
         "input_manifests": {
             "vector_caches": stripped_vector_cache_audit(vector_caches),
             "score_caches": stripped_score_cache_audit(score_caches),
@@ -769,13 +813,13 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "turboquant_seed": args.turboquant_seed,
             "top10_guard_limit": args.top10_limit,
             "nf_boundary_window": [args.nf_start, args.nf_end],
-            "official_exclusion_mode": "qid_only",
+            "official_exclusion_mode": "dataset_scoped_qid_only",
             "forbidden_splits": list(FORBIDDEN_SPLITS),
         },
         "rows": rows,
         "row_ids_sha256": sha256_json([row["row_id"] for row in rows]),
         "rows_sha256": rows_sha,
-        "workload": workload(rows),
+        "workload": workload(rows, exclusions["excluded_qid_count_by_dataset"]),
         "provenance": {
             "builder": display_path(Path(__file__)),
             "builder_sha256": sha256_file(Path(__file__)),
