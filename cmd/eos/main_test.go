@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 	eosruntime "m31labs.dev/eos/runtime"
 	"m31labs.dev/eos/runtime/backend"
 	mll "m31labs.dev/mll"
+	"m31labs.dev/turboquant"
 )
 
 func TestRunGraphPrintsSourceJSON(t *testing.T) {
@@ -247,6 +249,110 @@ func TestRunMaterializeAOQTSidecarRejectsDuplicateExclusionQIDManifests(t *testi
 	err := runMaterializeAOQTSidecar([]string{"--exclusion-qids", "dev4.json,reserve4.json,dev4.json"})
 	if err == nil || !strings.Contains(err.Error(), "duplicate --exclusion-qids") {
 		t.Fatalf("error = %v, want duplicate exclusion-qids failure", err)
+	}
+}
+
+func TestRunTrainAOQTSidecarPlanOnlyWritesMetrics(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	metricsPath := filepath.Join(t.TempDir(), "aoqt.metrics.json")
+	output := captureRunOutput(t, append([]string{
+		"train-aoqt-sidecar",
+		"--plan-only",
+		"--allow-research-only-aoqt",
+		"--metrics-json", metricsPath,
+	}, fixture.args...))
+	for _, want := range []string{
+		"AOQT sidecar metrics: " + metricsPath,
+		"plan: rows=1 candidates=2 pairs=2 steps=0 plan_only=true",
+		"seeds: turboquant=5581486560434873699 topology=191",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("plan-only output missing %q\noutput:\n%s", want, output)
+		}
+	}
+	data, err := os.ReadFile(metricsPath)
+	if err != nil {
+		t.Fatalf("read AOQT metrics: %v", err)
+	}
+	var metrics eosruntime.AOQTSidecarRunMetrics
+	if err := json.Unmarshal(data, &metrics); err != nil {
+		t.Fatalf("decode AOQT metrics: %v\n%s", err, data)
+	}
+	if metrics.Schema != eosruntime.AOQTSidecarMetricsSchema || !metrics.Plan.PlanOnly || metrics.Plan.StepCount != 0 || metrics.Summary.Steps != 0 {
+		t.Fatalf("unexpected plan-only metrics: %+v", metrics)
+	}
+	if metrics.Inputs.AnchorArtifactSHA256 != fixture.anchorArtifactSHA || metrics.Inputs.CompatibilityDigest != fixture.compatibilityDigest {
+		t.Fatalf("metrics did not bind expected provenance: %+v", metrics.Inputs)
+	}
+}
+
+func TestRunTrainAOQTSidecarRejectsMissingResearchAuthorization(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	_, err := captureRunOutputAndError(t, append([]string{
+		"train-aoqt-sidecar",
+		"--plan-only",
+		"--metrics-json", filepath.Join(t.TempDir(), "aoqt.metrics.json"),
+	}, fixture.args...))
+	if err == nil || !strings.Contains(err.Error(), "requires explicit research-only train authorization") {
+		t.Fatalf("missing authorization error = %v, want research-only opt-in rejection", err)
+	}
+}
+
+func TestRunTrainAOQTSidecarPlanOnlyRejectsOutputPackage(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	_, err := captureRunOutputAndError(t, append([]string{
+		"train-aoqt-sidecar",
+		"--plan-only",
+		"--allow-research-only-aoqt",
+		"--metrics-json", filepath.Join(t.TempDir(), "aoqt.metrics.json"),
+		"--output", filepath.Join(t.TempDir(), "candidate.mll"),
+	}, fixture.args...))
+	if err == nil || !strings.Contains(err.Error(), "plan-only writes metrics only") {
+		t.Fatalf("plan-only output error = %v, want output rejection", err)
+	}
+}
+
+func TestExportMLLRejectsAOQTCandidatePackage(t *testing.T) {
+	dir := t.TempDir()
+	artifactPath := filepath.Join(dir, "candidate.mll")
+	if err := os.WriteFile(artifactPath, []byte("placeholder"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := eosruntime.PackageManifest{
+		Version:         eosruntime.PackageManifestVersion,
+		Kind:            eosruntime.PackageEmbedding,
+		ModuleName:      "tiny-aoqt",
+		ArtifactVersion: "test",
+		Files: []eosruntime.PackageManifestFile{
+			{Role: "artifact", Path: filepath.Base(artifactPath), SHA256: strings.Repeat("a", 64), Bytes: 11},
+			{Role: eosruntime.EmbeddingPostPoolTransformRole, Path: "candidate.post_pool_transform.json", SHA256: strings.Repeat("b", 64), Bytes: 2},
+		},
+		AOQTTransform: eosruntime.AOQTTransformPolicy{
+			Schema:                      eosruntime.AOQTTransformPolicySchema,
+			Enabled:                     true,
+			ResearchOnly:                true,
+			ResearchTrainAllowed:        true,
+			ReleaseTrainAllowed:         false,
+			CommercialUseAllowed:        false,
+			FreeOpenReleaseAllowed:      false,
+			QualityClaim:                false,
+			AnchorArtifactSHA256:        strings.Repeat("c", 64),
+			AnchorPackageManifestSHA256: strings.Repeat("3", 64),
+			AnchorEmbeddingSpaceID:      "tiny-space",
+			DatasetManifestSHA256:       strings.Repeat("d", 64),
+			QrelsSHA256ByDataset:        map[string]string{"toy": strings.Repeat("4", 64)},
+			CompatibilityDigest:         strings.Repeat("e", 64),
+			TransformSHA256:             strings.Repeat("f", 64),
+			PairingsSHA256:              strings.Repeat("1", 64),
+			AnglesSHA256:                strings.Repeat("2", 64),
+		},
+	}
+	if err := manifest.WriteFile(eosruntime.DefaultPackageManifestPath(artifactPath)); err != nil {
+		t.Fatalf("write AOQT package manifest: %v", err)
+	}
+	_, err := captureRunOutputAndError(t, []string{"export-mll", artifactPath, filepath.Join(dir, "sealed.mll")})
+	if err == nil || !strings.Contains(err.Error(), "export-mll rejects AOQT candidate packages") {
+		t.Fatalf("export-mll AOQT rejection = %v, want explicit guard", err)
 	}
 }
 
@@ -7882,6 +7988,249 @@ func readTrainMetricsProfileForTest(t *testing.T, path string) trainMetricsProfi
 		t.Fatalf("decode train metrics %q: %v\n%s", path, err, string(data))
 	}
 	return got
+}
+
+type tinyAOQTTrainCLIFixture struct {
+	args                []string
+	anchorArtifactSHA   string
+	compatibilityDigest string
+}
+
+func writeTinyAOQTTrainCLIFixture(t *testing.T) tinyAOQTTrainCLIFixture {
+	t.Helper()
+	dir := t.TempDir()
+	topology, err := eosruntime.NewAOQTGivensIdentityTopology(eosruntime.AOQTSidecarDim, eosruntime.AOQTSidecarStages, eosruntime.AOQTSidecarMaterializerTopologySeed, eosruntime.AOQTSidecarDefaultAngleCap)
+	if err != nil {
+		t.Fatalf("AOQT topology: %v", err)
+	}
+	pairingsSHA, err := topology.PairingsSHA256()
+	if err != nil {
+		t.Fatalf("AOQT pairings sha: %v", err)
+	}
+	query := tinyAOQTUnitVector(0)
+	candidates := [][]float32{tinyAOQTUnitVector(0), tinyAOQTUnitVector(1)}
+	docIDs := []string{"positive", "negative"}
+	qrelsSHA := strings.Repeat("1", 64)
+	sourceSHA := strings.Repeat("2", 64)
+	vectorCacheSHA := strings.Repeat("3", 64)
+	anchorArtifactSHA := strings.Repeat("4", 64)
+	anchorPackageSHA := strings.Repeat("5", 64)
+	compatibilityDigest := strings.Repeat("6", 64)
+	splitProof := eosruntime.AOQTSidecarTrainOnlySplitProof{
+		Split:       "train",
+		TrainOnly:   true,
+		ProofSHA256: strings.Repeat("7", 64),
+		ExclusionIdentities: []string{
+			"dev", "dev4", "reserve", "reserve4", "test", "official", "official-test", "proxy",
+		},
+	}
+	legal := eosruntime.AOQTSidecarLegalGates{ResearchTrainAllowed: true}
+	weights := eosruntime.AOQTSidecarRowWeights{Q3ScoreDistill: 1}
+	objective := eosruntime.AOQTSidecarObjectiveContract{
+		Dim:              eosruntime.AOQTSidecarDim,
+		TurboQuantSeed:   eosruntime.AOQTSidecarMaterializerQuantSeed,
+		GainBit:          3,
+		Q3GuardBit:       3,
+		Q5GuardBit:       5,
+		ScoreSurface:     eosruntime.AOQTSidecarPreparedIPScoreSurface,
+		GainCutoff:       10,
+		GainTau:          0.05,
+		GuardTau:         0.05,
+		ScoreDistillTau:  0.05,
+		NFBoundarySource: "nf_boundary80_120",
+		WeightSums:       weights,
+	}
+	row := eosruntime.AOQTSidecarCalibrationRow{
+		Schema:                eosruntime.AOQTSidecarRowSchema,
+		RowID:                 "toy:0001",
+		Dataset:               "toy",
+		QueryID:               "q1",
+		QueryVectorID:         "toy:q1",
+		QueryVectorSHA256:     tinyAOQTVectorSHA256(query),
+		QueryVector:           query,
+		CandidateDocIDs:       docIDs,
+		CandidateVectorIDs:    []string{"toy:d1", "toy:d2"},
+		CandidateVectorSHA256: []string{tinyAOQTVectorSHA256(candidates[0]), tinyAOQTVectorSHA256(candidates[1])},
+		CandidateVectors:      candidates,
+		QrelGains:             []float32{1, 0},
+		CandidateSources:      []string{"qrel", "q3_boundary"},
+		EligiblePairMask:      [][]bool{{false, true}, {true, false}},
+		GuardClass:            "toy",
+		AnchorScores: eosruntime.AOQTSidecarAnchorScores{
+			Dense: []float32{1, 0},
+			Q3:    tinyAOQTPreparedScores(query, candidates, 3),
+			Q5:    tinyAOQTPreparedScores(query, candidates, 5),
+		},
+		AnchorRanks:         eosruntime.AOQTSidecarAnchorRanks{Dense: []int{1, 2}},
+		Weights:             weights,
+		SourceArtifactHash:  sourceSHA,
+		QrelsSHA256:         qrelsSHA,
+		SplitProof:          splitProof,
+		CompatibilityDigest: compatibilityDigest,
+		LegalGates:          legal,
+	}
+	row.AnchorRanks.Q3 = tinyAOQTRanks(docIDs, row.AnchorScores.Q3)
+	row.AnchorRanks.Q5 = tinyAOQTRanks(docIDs, row.AnchorScores.Q5)
+	manifest := eosruntime.AOQTSidecarCalibrationManifest{
+		Schema:                      eosruntime.AOQTSidecarManifestSchema,
+		AnchorArtifactPath:          filepath.Join(dir, "anchor.mll"),
+		AnchorArtifactSHA256:        anchorArtifactSHA,
+		AnchorPackageManifestSHA256: anchorPackageSHA,
+		AnchorEmbeddingSpaceID:      "tiny-aoqt-space",
+		Dim:                         eosruntime.AOQTSidecarDim,
+		Topology: eosruntime.AOQTSidecarTopologyBinding{
+			Kind:           eosruntime.AOQTTopologyKindGivensV1,
+			Dim:            eosruntime.AOQTSidecarDim,
+			Stages:         eosruntime.AOQTSidecarStages,
+			PairsPerStage:  eosruntime.AOQTSidecarPairsPerStage,
+			AngleCount:     eosruntime.AOQTSidecarAngleCount,
+			Seed:           eosruntime.AOQTSidecarMaterializerTopologySeed,
+			PairingsSHA256: pairingsSHA,
+		},
+		TurboQuantSeed: eosruntime.AOQTSidecarMaterializerQuantSeed,
+		QuantSurfaces: []eosruntime.AOQTSidecarQuantSurface{
+			{BitWidth: 3, Seed: eosruntime.AOQTSidecarMaterializerQuantSeed, ScoreSurface: eosruntime.AOQTSidecarPreparedIPScoreSurface, PreparedQuery: true},
+			{BitWidth: 5, Seed: eosruntime.AOQTSidecarMaterializerQuantSeed, ScoreSurface: eosruntime.AOQTSidecarPreparedIPScoreSurface, PreparedQuery: true},
+		},
+		ObjectiveContract:    objective,
+		QrelsSHA256ByDataset: map[string]string{"toy": qrelsSHA},
+		SplitProof:           splitProof,
+		SourceArtifactHashes: []string{sourceSHA},
+		VectorCacheHashes:    []string{vectorCacheSHA},
+		RowCount:             1,
+		RowIDSHA256:          sha256LinesForTest([]string{row.RowID}),
+		CompatibilityDigest:  compatibilityDigest,
+		LegalGates:           legal,
+	}
+	manifestPath := filepath.Join(dir, "manifest.json")
+	rowsPath := filepath.Join(dir, "rows.jsonl")
+	writeJSONForTest(t, manifestPath, manifest)
+	writeJSONLForTest(t, rowsPath, []any{row})
+	manifestSHA := sha256FileForCLITest(t, manifestPath)
+	rowsSHA := sha256FileForCLITest(t, rowsPath)
+	preflight := eosruntime.AOQTSidecarMaterializePreflight{
+		Schema:                    eosruntime.AOQTSidecarMaterializerPreflightSchema,
+		QualityClaim:              false,
+		ResearchOnly:              true,
+		ActualTrainingRan:         false,
+		ActualEvalRan:             false,
+		ActualVectorExportRan:     false,
+		RowCount:                  1,
+		CandidateCount:            2,
+		PairCount:                 2,
+		TurboQuantSeed:            eosruntime.AOQTSidecarMaterializerQuantSeed,
+		TopologySeed:              eosruntime.AOQTSidecarMaterializerTopologySeed,
+		CalibrationManifestSHA256: manifestSHA,
+		LegalGates:                legal,
+		ObjectiveContract:         objective,
+	}
+	preflightPath := filepath.Join(dir, "preflight.json")
+	writeJSONForTest(t, preflightPath, preflight)
+	preflightSHA := sha256FileForCLITest(t, preflightPath)
+	return tinyAOQTTrainCLIFixture{
+		args: []string{
+			"--manifest", manifestPath,
+			"--rows", rowsPath,
+			"--preflight", preflightPath,
+			"--expected-manifest-sha256", manifestSHA,
+			"--expected-rows-sha256", rowsSHA,
+			"--expected-preflight-sha256", preflightSHA,
+			"--expected-anchor-artifact-sha256", anchorArtifactSHA,
+			"--expected-anchor-package-manifest-sha256", anchorPackageSHA,
+			"--anchor-embedding-space-id", "tiny-aoqt-space",
+			"--compatibility-digest", compatibilityDigest,
+			"--source-artifact-sha256", sourceSHA,
+			"--vector-cache-sha256", vectorCacheSHA,
+		},
+		anchorArtifactSHA:   anchorArtifactSHA,
+		compatibilityDigest: compatibilityDigest,
+	}
+}
+
+func tinyAOQTUnitVector(index int) []float32 {
+	vec := make([]float32, eosruntime.AOQTSidecarDim)
+	vec[index] = 1
+	return vec
+}
+
+func tinyAOQTPreparedScores(query []float32, candidates [][]float32, bits int) []float32 {
+	q := turboquant.NewIPWithSeed(eosruntime.AOQTSidecarDim, bits, eosruntime.AOQTSidecarMaterializerQuantSeed)
+	prepared := q.PrepareQuery(query)
+	out := make([]float32, len(candidates))
+	for i, candidate := range candidates {
+		out[i] = q.InnerProductPrepared(q.Quantize(candidate), prepared)
+	}
+	return out
+}
+
+func tinyAOQTRanks(docIDs []string, scores []float32) []int {
+	if scores[0] > scores[1] || (scores[0] == scores[1] && docIDs[0] < docIDs[1]) {
+		return []int{1, 2}
+	}
+	return []int{2, 1}
+}
+
+func tinyAOQTVectorSHA256(vec []float32) string {
+	h := sha256.New()
+	var buf [4]byte
+	for _, value := range vec {
+		binary.LittleEndian.PutUint32(buf[:], math.Float32bits(value))
+		_, _ = h.Write(buf[:])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func sha256LinesForTest(values []string) string {
+	h := sha256.New()
+	for _, value := range values {
+		_, _ = h.Write([]byte(value))
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func writeJSONForTest(t *testing.T, path string, value any) {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, '\n')
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeJSONLForTest(t *testing.T, path string, values []any) {
+	t.Helper()
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		data, err := json.Marshal(value)
+		if err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+		if _, err := file.Write(append(data, '\n')); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func sha256FileForCLITest(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func writeTrainableArtifact(t *testing.T) string {

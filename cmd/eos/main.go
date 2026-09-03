@@ -213,6 +213,8 @@ func run(args []string) error {
 		return runSmokeSparseEmbeddingEncoder(args[1:])
 	case "materialize-aoqt-sidecar":
 		return runMaterializeAOQTSidecar(args[1:])
+	case "train-aoqt-sidecar":
+		return runTrainAOQTSidecar(args[1:])
 	case "plan-multivector-storage":
 		return runPlanMultiVectorStorage(args[1:])
 	case "train-embed":
@@ -4925,6 +4927,9 @@ func runExportMLL(args []string) error {
 	if fs.NArg() > 1 {
 		outputPath = fs.Arg(1)
 	}
+	if err := rejectAOQTCandidateExportMLL(artifactPath); err != nil {
+		return err
+	}
 	writtenPath, err := eosruntime.ExportPackageToMLLWithOptions(artifactPath, outputPath, eosruntime.MLLExportOptions{
 		PackQuantizedWeights: *packQuantized,
 	})
@@ -8849,6 +8854,7 @@ func printUsage() {
 	fmt.Println("  eos calibrate-sparse-routing [flags]")
 	fmt.Println("  eos smoke-sparse-embedding-encoder [flags]")
 	fmt.Println("  eos materialize-aoqt-sidecar [flags]")
+	fmt.Println("  eos train-aoqt-sidecar [flags]")
 	fmt.Println("  eos plan-multivector-storage [flags]")
 	fmt.Println("  eos init-model [flags] <artifact.mll>")
 	fmt.Println("  eos init-mirage [flags] <artifact.mll>")
@@ -8915,6 +8921,7 @@ func printUsage() {
 	fmt.Println("calibrate-sparse-routing sweeps sparse routing policy budgets, including optional calibration-only oracle policies, on synthetic tensors and writes router recall, output delta, and score-work artifacts.")
 	fmt.Println("smoke-sparse-embedding-encoder runs a deterministic routed TurboQuant sparse-attention encoder-shaped smoke and writes manifest.json, summary.tsv, scorecard.json, and scorecard.tsv.")
 	fmt.Println("materialize-aoqt-sidecar builds fixture-only AOQT calibration rows, manifest, and preflight JSON from Stage3 train-only plans, bound vectors, top120 evidence, and qrels; quality_claim=false.")
+	fmt.Println("train-aoqt-sidecar validates strict AOQT calibration/preflight inputs, writes metrics in plan-only mode, and only writes a research-only candidate package after guarded non-plan eligibility.")
 	fmt.Println("plan-multivector-storage estimates how many TurboQuant child vectors per parent fit in one dense fp32 baseline-vector budget; use --baseline-dim to compare compact children against a larger dense baseline, and --series-lengths with --window-size/--window-stride to derive vectors per object from time-series windows.")
 	fmt.Println("init-model creates the Eos-owned default quantized embedding training package.")
 	fmt.Println("init-mirage creates the Eos-owned Mirage Image v1 host-reference artifact.")
