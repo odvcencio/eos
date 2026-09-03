@@ -43,6 +43,8 @@ type AOQTSidecarTrainSummary struct {
 	Steps                      int                            `json:"steps"`
 	InitialLoss                float32                        `json:"initial_loss"`
 	FinalLoss                  float32                        `json:"final_loss"`
+	InitialObjectiveComponents AOQTSidecarObjectiveComponents `json:"initial_objective_components"`
+	FinalObjectiveComponents   AOQTSidecarObjectiveComponents `json:"final_objective_components"`
 	InitialObjectiveActivation AOQTSidecarObjectiveActivation `json:"initial_objective_activation"`
 	FinalObjectiveActivation   AOQTSidecarObjectiveActivation `json:"final_objective_activation"`
 	AngleL2                    float32                        `json:"angle_l2"`
@@ -60,9 +62,32 @@ type AOQTSidecarObjectiveInput struct {
 
 type AOQTSidecarObjectiveResult struct {
 	Loss           float32
+	Components     AOQTSidecarObjectiveComponents
 	QueryGrad      []float32
 	CandidateGrads [][]float32
 	Activation     AOQTSidecarObjectiveActivation
+}
+
+type AOQTSidecarObjectiveComponents struct {
+	Q3Gain          float32 `json:"q3_gain"`
+	Q3OrderGuard    float32 `json:"q3_order_guard"`
+	Q3ScoreDistill  float32 `json:"q3_score_distill"`
+	Q5OrderGuard    float32 `json:"q5_order_guard"`
+	Q5ScoreDistill  float32 `json:"q5_score_distill"`
+	NFBoundaryGuard float32 `json:"nf_boundary_guard"`
+}
+
+func (c *AOQTSidecarObjectiveComponents) Add(other AOQTSidecarObjectiveComponents) {
+	c.Q3Gain += other.Q3Gain
+	c.Q3OrderGuard += other.Q3OrderGuard
+	c.Q3ScoreDistill += other.Q3ScoreDistill
+	c.Q5OrderGuard += other.Q5OrderGuard
+	c.Q5ScoreDistill += other.Q5ScoreDistill
+	c.NFBoundaryGuard += other.NFBoundaryGuard
+}
+
+func (c AOQTSidecarObjectiveComponents) Sum() float32 {
+	return c.Q3Gain + c.Q3OrderGuard + c.Q3ScoreDistill + c.Q5OrderGuard + c.Q5ScoreDistill + c.NFBoundaryGuard
 }
 
 type AOQTSidecarObjectiveActivation struct {
@@ -191,7 +216,9 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3_gain weight %.9g has no active contributing prepared-IP LambdaNDCG pairs", row.Weights.Q3Gain)
 		}
 		scale := row.Weights.Q3Gain
-		result.Loss += loss.Loss * scale
+		component := loss.Loss * scale
+		result.Loss += component
+		result.Components.Q3Gain += component
 		result.Activation.Q3GainEligiblePairs += loss.EligiblePairs
 		result.Activation.Q3GainContributingPairs += loss.ContributingPairs
 		q3Gain.accumulateScoreGrads(loss.Grad, scale, result.QueryGrad, result.CandidateGrads)
@@ -206,7 +233,9 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3_order_guard weight %.9g has no active contributing prepared-IP guard pairs", row.Weights.Q3OrderGuard)
 		}
 		scale := row.Weights.Q3OrderGuard
-		result.Loss += loss * scale
+		component := loss * scale
+		result.Loss += component
+		result.Components.Q3OrderGuard += component
 		result.Activation.Q3OrderGuardPairs += pairs
 		result.Activation.Q3OrderGuardContributing += contributing
 		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
@@ -217,7 +246,9 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3_score_distill weight %.9g has no prepared-IP score coverage", row.Weights.Q3ScoreDistill)
 		}
 		scale := row.Weights.Q3ScoreDistill
-		result.Loss += loss * scale
+		component := loss * scale
+		result.Loss += component
+		result.Components.Q3ScoreDistill += component
 		result.Activation.Q3ScoreDistillCount += count
 		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
 	}
@@ -227,7 +258,9 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT nf_boundary_guard weight %.9g has no active contributing prepared-IP guard pairs", row.Weights.NFBoundaryGuard)
 		}
 		scale := row.Weights.NFBoundaryGuard
-		result.Loss += loss * scale
+		component := loss * scale
+		result.Loss += component
+		result.Components.NFBoundaryGuard += component
 		result.Activation.NFBoundaryGuardPairs += pairs
 		result.Activation.NFBoundaryGuardContributing += contributing
 		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
@@ -240,7 +273,9 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 				return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q5_order_guard weight %.9g has no active contributing prepared-IP guard pairs", row.Weights.Q5OrderGuard)
 			}
 			scale := row.Weights.Q5OrderGuard
-			result.Loss += loss * scale
+			component := loss * scale
+			result.Loss += component
+			result.Components.Q5OrderGuard += component
 			result.Activation.Q5OrderGuardPairs += pairs
 			result.Activation.Q5OrderGuardContributing += contributing
 			q5.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
@@ -251,7 +286,9 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 				return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q5_score_distill weight %.9g has no prepared-IP score coverage", row.Weights.Q5ScoreDistill)
 			}
 			scale := row.Weights.Q5ScoreDistill
-			result.Loss += loss * scale
+			component := loss * scale
+			result.Loss += component
+			result.Components.Q5ScoreDistill += component
 			result.Activation.Q5ScoreDistillCount += count
 			q5.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
 		}
@@ -416,13 +453,14 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	var initialSet bool
 	for step := 0; step < t.config.MaxSteps; step++ {
 		rows := deterministicAOQTRowOrder(set.Rows, t.config.WorkplanSeed, step)
-		loss, grad, activation, err := t.lossAndAngleGrad(rows, objective)
+		loss, grad, activation, components, err := t.lossAndAngleGrad(rows, objective)
 		if err != nil {
 			return summary, err
 		}
 		if !initialSet {
 			summary.InitialLoss = loss
 			summary.InitialObjectiveActivation = activation
+			summary.InitialObjectiveComponents = components
 			initialSet = true
 		}
 		if err := t.applyAdam(grad); err != nil {
@@ -430,12 +468,13 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 		}
 		summary.Steps++
 	}
-	finalLoss, _, finalActivation, err := t.lossAndAngleGrad(set.Rows, objective)
+	finalLoss, _, finalActivation, finalComponents, err := t.lossAndAngleGrad(set.Rows, objective)
 	if err != nil {
 		return summary, err
 	}
 	summary.FinalLoss = finalLoss
 	summary.FinalObjectiveActivation = finalActivation
+	summary.FinalObjectiveComponents = finalComponents
 	finalTransform := t.Transform()
 	angles, err := finalTransform.AnglesSHA256()
 	if err != nil {
@@ -519,15 +558,16 @@ func (t *AOQTSidecarTrainer) SetAnglesForTest(angles []float32) error {
 	return t.ProjectAngles()
 }
 
-func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective) (float32, []float32, AOQTSidecarObjectiveActivation, error) {
+func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective) (float32, []float32, AOQTSidecarObjectiveActivation, AOQTSidecarObjectiveComponents, error) {
 	totalGrad := make([]float32, len(t.angles))
 	totalLoss := float32(0)
 	var totalActivation AOQTSidecarObjectiveActivation
+	var totalComponents AOQTSidecarObjectiveComponents
 	transform := t.Transform()
 	for _, row := range rows {
 		query, candidates, err := transformAOQTRow(transform, row)
 		if err != nil {
-			return 0, nil, totalActivation, err
+			return 0, nil, totalActivation, totalComponents, err
 		}
 		result, err := objective.EvaluateAOQT(AOQTSidecarObjectiveInput{
 			Row:        aoqtObjectiveRowView(row),
@@ -535,32 +575,76 @@ func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, 
 			Candidates: cloneAOQTVectors(candidates),
 		})
 		if err != nil {
-			return 0, nil, totalActivation, err
+			return 0, nil, totalActivation, totalComponents, err
 		}
 		if !isFinite32(result.Loss) {
-			return 0, nil, totalActivation, fmt.Errorf("AOQT objective loss must be finite")
+			return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective loss must be finite")
+		}
+		if err := validateAOQTObjectiveComponents(result.Components, "AOQT objective components"); err != nil {
+			return 0, nil, totalActivation, totalComponents, err
+		}
+		if err := validateAOQTLossMatchesComponents(result.Loss, result.Components, "AOQT objective"); err != nil {
+			return 0, nil, totalActivation, totalComponents, err
 		}
 		if len(result.QueryGrad) != transform.Dim {
-			return 0, nil, totalActivation, fmt.Errorf("AOQT objective query grad dim = %d, want %d", len(result.QueryGrad), transform.Dim)
+			return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective query grad dim = %d, want %d", len(result.QueryGrad), transform.Dim)
 		}
 		if len(result.CandidateGrads) != len(row.CandidateVectors) {
-			return 0, nil, totalActivation, fmt.Errorf("AOQT objective candidate grad count = %d, want %d", len(result.CandidateGrads), len(row.CandidateVectors))
+			return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective candidate grad count = %d, want %d", len(result.CandidateGrads), len(row.CandidateVectors))
 		}
 		totalLoss += result.Loss
 		totalActivation.Add(result.Activation)
+		totalComponents.Add(result.Components)
 		if err := accumulateAOQTVectorAngleGrad(transform, row.QueryVector, result.QueryGrad, totalGrad); err != nil {
-			return 0, nil, totalActivation, err
+			return 0, nil, totalActivation, totalComponents, err
 		}
 		for i, grad := range result.CandidateGrads {
 			if len(grad) != transform.Dim {
-				return 0, nil, totalActivation, fmt.Errorf("AOQT objective candidate grad %d dim = %d, want %d", i, len(grad), transform.Dim)
+				return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective candidate grad %d dim = %d, want %d", i, len(grad), transform.Dim)
 			}
 			if err := accumulateAOQTVectorAngleGrad(transform, row.CandidateVectors[i], grad, totalGrad); err != nil {
-				return 0, nil, totalActivation, err
+				return 0, nil, totalActivation, totalComponents, err
 			}
 		}
 	}
-	return totalLoss, totalGrad, totalActivation, nil
+	return totalLoss, totalGrad, totalActivation, totalComponents, nil
+}
+
+func validateAOQTObjectiveComponents(components AOQTSidecarObjectiveComponents, label string) error {
+	for _, item := range []struct {
+		name  string
+		value float32
+	}{
+		{"q3_gain", components.Q3Gain},
+		{"q3_order_guard", components.Q3OrderGuard},
+		{"q3_score_distill", components.Q3ScoreDistill},
+		{"q5_order_guard", components.Q5OrderGuard},
+		{"q5_score_distill", components.Q5ScoreDistill},
+		{"nf_boundary_guard", components.NFBoundaryGuard},
+	} {
+		if !isFinite32(item.value) || item.value < 0 {
+			return fmt.Errorf("%s.%s must be finite and non-negative", label, item.name)
+		}
+	}
+	return nil
+}
+
+func validateAOQTLossMatchesComponents(loss float32, components AOQTSidecarObjectiveComponents, label string) error {
+	if !isFinite32(loss) || loss < 0 {
+		return fmt.Errorf("%s loss must be finite and non-negative", label)
+	}
+	sum := components.Sum()
+	tolerance := float32(1e-5)
+	if abs := float32(math.Abs(float64(loss))); abs > 1 {
+		tolerance *= abs
+	}
+	if abs := float32(math.Abs(float64(sum))); abs > 1 && abs*1e-5 > tolerance {
+		tolerance = abs * 1e-5
+	}
+	if float32(math.Abs(float64(loss-sum))) > tolerance {
+		return fmt.Errorf("%s loss %.9g must equal component sum %.9g within %.9g", label, loss, sum, tolerance)
+	}
+	return nil
 }
 
 func (t *AOQTSidecarTrainer) applyAdam(grad []float32) error {

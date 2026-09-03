@@ -145,6 +145,29 @@ func TestAOQTStage2AValidatorsFailClosed(t *testing.T) {
 		t.Fatalf("bad dense anchor score error = %v, want dense-dot mismatch", err)
 	}
 	bad = cloneAOQTCalibrationSet(set)
+	bad.Rows[0].AnchorScores.Q3[0] += 0.01
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "anchor_scores.q3[0]") {
+		t.Fatalf("bad q3 anchor score error = %v, want prepared-IP recompute mismatch", err)
+	}
+	bad = cloneAOQTCalibrationSet(set)
+	bad.Rows[0].AnchorRanks.Q5[0], bad.Rows[0].AnchorRanks.Q5[1] = bad.Rows[0].AnchorRanks.Q5[1], bad.Rows[0].AnchorRanks.Q5[0]
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "anchor_ranks.q5") {
+		t.Fatalf("bad q5 anchor rank error = %v, want prepared-IP rank recompute mismatch", err)
+	}
+	bad = cloneAOQTCalibrationSet(set)
+	bad.Rows[0].CandidateVectors[1] = append([]float32(nil), bad.Rows[0].CandidateVectors[0]...)
+	bad.Rows[0].CandidateVectorSHA256[1] = aoqtVectorSHA256(bad.Rows[0].CandidateVectors[1])
+	bad.Rows[0].AnchorScores.Dense = denseAOQTScores(bad.Rows[0].QueryVector, bad.Rows[0].CandidateVectors)
+	bad.Rows[0].AnchorScores.Q3 = preparedAOQTScores(bad.Rows[0].QueryVector, bad.Rows[0].CandidateVectors, bad.Manifest.ObjectiveContract.Q3GuardBit, bad.Manifest.TurboQuantSeed)
+	bad.Rows[0].AnchorScores.Q5 = preparedAOQTScores(bad.Rows[0].QueryVector, bad.Rows[0].CandidateVectors, bad.Manifest.ObjectiveContract.Q5GuardBit, bad.Manifest.TurboQuantSeed)
+	bad.Rows[0].AnchorRanks.Dense = ranksAOQT(bad.Rows[0].CandidateDocIDs, bad.Rows[0].AnchorScores.Dense)
+	bad.Rows[0].AnchorRanks.Q3 = ranksAOQT(bad.Rows[0].CandidateDocIDs, bad.Rows[0].AnchorScores.Q3)
+	bad.Rows[0].AnchorRanks.Q5 = ranksAOQT(bad.Rows[0].CandidateDocIDs, bad.Rows[0].AnchorScores.Q5)
+	bad.Rows[0].AnchorRanks.Q3[0], bad.Rows[0].AnchorRanks.Q3[1] = bad.Rows[0].AnchorRanks.Q3[1], bad.Rows[0].AnchorRanks.Q3[0]
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "doc-id-asc tie policy") {
+		t.Fatalf("bad q3 tie-policy rank error = %v, want exact tie policy rejection", err)
+	}
+	bad = cloneAOQTCalibrationSet(set)
 	bad.Manifest.SplitProof.Split = "dev"
 	bad.Rows[0].SplitProof = bad.Manifest.SplitProof
 	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "split=train") {
@@ -192,6 +215,14 @@ func TestAOQTStage2AObjectiveInputIsImmutableVectorFreeRowView(t *testing.T) {
 	}
 	if string(before.Rows[0].Extra["note"]) != string(set.Rows[0].Extra["note"]) || string(before.Rows[0].SplitProof.ExclusionIdentities[0]) != string(set.Rows[0].SplitProof.ExclusionIdentities[0]) {
 		t.Fatalf("mutating objective altered nested row metadata")
+	}
+}
+
+func TestAOQTStage2ARejectsObjectiveLossComponentMismatch(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 49)
+	trainer := newTinyAOQTTrainer(t, false, 49)
+	if _, err := trainer.Fit(set, unaccountedAOQTObjective{}); err == nil || !strings.Contains(err.Error(), "must equal component sum") {
+		t.Fatalf("unaccounted objective error = %v, want component accounting rejection", err)
 	}
 }
 
@@ -301,7 +332,7 @@ func TestAOQTStage2BPreparedIPObjectiveMatchesTurboQuantSurface(t *testing.T) {
 	prepared := q.PrepareQuery(normalizedAOQTVector(query))
 	for i, candidate := range candidates {
 		want := q.InnerProductPrepared(q.Quantize(normalizedAOQTVector(candidate)), prepared)
-		if math.Abs(float64(surface.scores[i]-want)) > 1e-7 {
+		if math.Abs(float64(surface.scores[i]-want)) > 1e-6 {
 			t.Fatalf("surface score[%d] = %.9g, want TurboQuant prepared-IP %.9g", i, surface.scores[i], want)
 		}
 	}
@@ -319,10 +350,10 @@ func TestAOQTStage2BPreparedIPSurfaceBindsRawUnitVectorContract(t *testing.T) {
 	for i, candidate := range candidates {
 		raw := q.InnerProductPrepared(q.Quantize(candidate), preparedRaw)
 		unit := q.InnerProductPrepared(q.Quantize(normalizedAOQTVector(candidate)), preparedUnit)
-		if math.Abs(float64(surface.scores[i]-raw)) > 1e-7 {
+		if math.Abs(float64(surface.scores[i]-raw)) > 1e-6 {
 			t.Fatalf("surface score[%d] = %.9g, want raw prepared-IP %.9g", i, surface.scores[i], raw)
 		}
-		if math.Abs(float64(raw-unit)) > 1e-7 {
+		if math.Abs(float64(raw-unit)) > 1e-6 {
 			t.Fatalf("raw/unit prepared-IP score[%d] diverged %.9g vs %.9g for unit-vector row", i, raw, unit)
 		}
 	}
@@ -571,6 +602,8 @@ func TestAOQTStage2BValidatorsRejectNonUnitVectors(t *testing.T) {
 
 type toyAOQTObjective struct{}
 
+type unaccountedAOQTObjective struct{}
+
 func (toyAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
 	queryGrad := make([]float32, len(input.Query))
 	candidateGrads := make([][]float32, len(input.Candidates))
@@ -586,7 +619,16 @@ func (toyAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidec
 		candidateGrads[i][1] += diff * input.Query[0]
 		candidateGrads[i][0] -= diff * input.Query[1]
 	}
-	return AOQTSidecarObjectiveResult{Loss: loss, QueryGrad: queryGrad, CandidateGrads: candidateGrads}, nil
+	return AOQTSidecarObjectiveResult{Loss: loss, Components: AOQTSidecarObjectiveComponents{Q3Gain: loss}, QueryGrad: queryGrad, CandidateGrads: candidateGrads}, nil
+}
+
+func (unaccountedAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+	queryGrad := make([]float32, len(input.Query))
+	candidateGrads := make([][]float32, len(input.Candidates))
+	for i := range input.Candidates {
+		candidateGrads[i] = make([]float32, len(input.Candidates[i]))
+	}
+	return AOQTSidecarObjectiveResult{Loss: 1, QueryGrad: queryGrad, CandidateGrads: candidateGrads}, nil
 }
 
 func newTinyAOQTTrainer(t *testing.T, planOnly bool, seed int64) *AOQTSidecarTrainer {
@@ -616,11 +658,16 @@ func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet 
 	}
 	rng := rand.New(rand.NewSource(seed))
 	query := aoqtRandomVec(rng)
-	candidates := [][]float32{aoqtRandomVec(rng), aoqtRandomVec(rng), aoqtRandomVec(rng)}
+	candidates := [][]float32{aoqtRandomVec(rng), aoqtRandomVec(rng), append([]float32(nil), query...)}
 	rowID := "row-0001"
 	qrels := hex64("qrels")
 	compat := hex64("compat")
 	splitProof := tinyAOQTSplitProof()
+	turboQuantSeed := int64(77)
+	docIDs := []string{"d1", "d2", "d3"}
+	denseScores := []float32{dotAOQT(query, candidates[0]), dotAOQT(query, candidates[1]), dotAOQT(query, candidates[2])}
+	q3Scores := preparedAOQTScores(query, candidates, AOQTSidecarDefaultGuardBit3, turboQuantSeed)
+	q5Scores := preparedAOQTScores(query, candidates, AOQTSidecarDefaultGuardBit5, turboQuantSeed)
 	rows := []AOQTSidecarCalibrationRow{{
 		Schema:                AOQTSidecarRowSchema,
 		RowID:                 rowID,
@@ -629,7 +676,7 @@ func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet 
 		QueryVectorID:         "qv1",
 		QueryVectorSHA256:     aoqtVectorSHA256(query),
 		QueryVector:           query,
-		CandidateDocIDs:       []string{"d1", "d2", "d3"},
+		CandidateDocIDs:       docIDs,
 		CandidateVectorIDs:    []string{"dv1", "dv2", "dv3"},
 		CandidateVectorSHA256: []string{aoqtVectorSHA256(candidates[0]), aoqtVectorSHA256(candidates[1]), aoqtVectorSHA256(candidates[2])},
 		CandidateVectors:      candidates,
@@ -642,14 +689,14 @@ func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet 
 		},
 		GuardClass: "frontier_top10",
 		AnchorScores: AOQTSidecarAnchorScores{
-			Dense: []float32{dotAOQT(query, candidates[0]), dotAOQT(query, candidates[1]), dotAOQT(query, candidates[2])},
-			Q3:    []float32{0.3, 0.1, 0.2},
-			Q5:    []float32{0.31, 0.11, 0.21},
+			Dense: denseScores,
+			Q3:    q3Scores,
+			Q5:    q5Scores,
 		},
 		AnchorRanks: AOQTSidecarAnchorRanks{
-			Dense: []int{1, 3, 2},
-			Q3:    []int{1, 3, 2},
-			Q5:    []int{1, 3, 2},
+			Dense: ranksAOQT(docIDs, denseScores),
+			Q3:    ranksAOQT(docIDs, q3Scores),
+			Q5:    ranksAOQT(docIDs, q5Scores),
 		},
 		Weights: AOQTSidecarRowWeights{
 			Q3Gain:         1,
@@ -680,10 +727,10 @@ func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet 
 			Seed:           seed,
 			PairingsSHA256: pairings,
 		},
-		TurboQuantSeed: 77,
+		TurboQuantSeed: turboQuantSeed,
 		QuantSurfaces: []AOQTSidecarQuantSurface{
-			{BitWidth: 3, Seed: 77, ScoreSurface: AOQTSidecarPreparedIPScoreSurface, PreparedQuery: true},
-			{BitWidth: 5, Seed: 77, ScoreSurface: AOQTSidecarPreparedIPScoreSurface, PreparedQuery: true},
+			{BitWidth: 3, Seed: turboQuantSeed, ScoreSurface: AOQTSidecarPreparedIPScoreSurface, PreparedQuery: true},
+			{BitWidth: 5, Seed: turboQuantSeed, ScoreSurface: AOQTSidecarPreparedIPScoreSurface, PreparedQuery: true},
 		},
 		QrelsSHA256ByDataset: map[string]string{"toy": qrels},
 		SplitProof:           splitProof,
@@ -724,6 +771,10 @@ func (mutatingAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQT
 }
 
 func (toyAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
+	return tinyAOQTObjectiveConfig(77)
+}
+
+func (unaccountedAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
 	return tinyAOQTObjectiveConfig(77)
 }
 

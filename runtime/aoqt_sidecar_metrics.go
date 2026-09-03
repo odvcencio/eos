@@ -5,6 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
+	"strings"
 )
 
 const AOQTSidecarMetricsSchema = "eos.q3_aoqt_sidecar_metrics.v1"
@@ -28,6 +30,18 @@ type AOQTSidecarRunMetricInputs struct {
 	DatasetManifestSHA256       string            `json:"dataset_manifest_sha256"`
 	QrelsSHA256ByDataset        map[string]string `json:"qrels_sha256_by_dataset"`
 	CompatibilityDigest         string            `json:"compatibility_digest"`
+}
+
+type AOQTSidecarCandidateEligibilityPolicy struct {
+	DenseMaxAbsDeltaTolerance          float64 `json:"dense_max_abs_delta_tolerance"`
+	AngleMaxAbsCap                     float32 `json:"angle_max_abs_cap"`
+	RequireObjectiveActivation         bool    `json:"require_objective_activation"`
+	Q3GainAllowedLossIncrease          float32 `json:"q3_gain_allowed_loss_increase"`
+	Q3OrderGuardAllowedLossIncrease    float32 `json:"q3_order_guard_allowed_loss_increase"`
+	Q3ScoreDistillAllowedLossIncrease  float32 `json:"q3_score_distill_allowed_loss_increase"`
+	Q5OrderGuardAllowedLossIncrease    float32 `json:"q5_order_guard_allowed_loss_increase"`
+	Q5ScoreDistillAllowedLossIncrease  float32 `json:"q5_score_distill_allowed_loss_increase"`
+	NFBoundaryGuardAllowedLossIncrease float32 `json:"nf_boundary_guard_allowed_loss_increase"`
 }
 
 func NewAOQTSidecarRunMetrics(set AOQTSidecarCalibrationSet, summary AOQTSidecarTrainSummary) (AOQTSidecarRunMetrics, error) {
@@ -111,6 +125,18 @@ func (m AOQTSidecarRunMetrics) Validate() error {
 	if err := validateAOQTResearchOnlyLegalGates(m.LegalGates, "AOQT metrics"); err != nil {
 		return err
 	}
+	if err := validateAOQTObjectiveComponents(m.Summary.InitialObjectiveComponents, "AOQT metrics summary.initial_objective_components"); err != nil {
+		return err
+	}
+	if err := validateAOQTObjectiveComponents(m.Summary.FinalObjectiveComponents, "AOQT metrics summary.final_objective_components"); err != nil {
+		return err
+	}
+	if err := validateAOQTLossMatchesComponents(m.Summary.InitialLoss, m.Summary.InitialObjectiveComponents, "AOQT metrics summary.initial"); err != nil {
+		return err
+	}
+	if err := validateAOQTLossMatchesComponents(m.Summary.FinalLoss, m.Summary.FinalObjectiveComponents, "AOQT metrics summary.final"); err != nil {
+		return err
+	}
 	for _, field := range []struct {
 		name  string
 		value string
@@ -146,6 +172,131 @@ func (m AOQTSidecarRunMetrics) Validate() error {
 		}
 		if err := validateAOQTSHA256(sum, "AOQT metrics inputs.qrels_sha256_by_dataset"); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func ValidateAOQTSidecarCandidateEligibility(metrics AOQTSidecarRunMetrics, policy AOQTSidecarCandidateEligibilityPolicy) error {
+	policy = normalizedAOQTSidecarCandidateEligibilityPolicy(policy)
+	if err := validateAOQTSidecarCandidateEligibilityPolicy(policy); err != nil {
+		return err
+	}
+	if err := metrics.Validate(); err != nil {
+		return err
+	}
+	if metrics.Plan.PlanOnly || metrics.Summary.Steps == 0 {
+		return fmt.Errorf("AOQT candidate eligibility requires a non-plan training summary")
+	}
+	if metrics.Summary.QualityClaim || metrics.QualityClaim {
+		return fmt.Errorf("AOQT candidate eligibility cannot be based on a quality claim")
+	}
+	if !isFinite32(metrics.Summary.InitialLoss) || !isFinite32(metrics.Summary.FinalLoss) {
+		return fmt.Errorf("AOQT candidate eligibility losses must be finite")
+	}
+	if metrics.Summary.DenseMaxAbsDelta < 0 || math.IsNaN(metrics.Summary.DenseMaxAbsDelta) || math.IsInf(metrics.Summary.DenseMaxAbsDelta, 0) {
+		return fmt.Errorf("AOQT candidate dense_max_abs_delta must be finite and non-negative")
+	}
+	if metrics.Summary.DenseMaxAbsDelta > policy.DenseMaxAbsDeltaTolerance {
+		return fmt.Errorf("AOQT candidate dense_max_abs_delta %.9g exceeds tolerance %.9g", metrics.Summary.DenseMaxAbsDelta, policy.DenseMaxAbsDeltaTolerance)
+	}
+	if strings.TrimSpace(metrics.Summary.AnglesSHA256) == "" {
+		return fmt.Errorf("AOQT candidate angle audit hash is required")
+	}
+	if err := validateAOQTSHA256(metrics.Summary.AnglesSHA256, "AOQT candidate angles_sha256"); err != nil {
+		return err
+	}
+	if !isFinite32(metrics.Summary.AngleL2) || metrics.Summary.AngleL2 < 0 {
+		return fmt.Errorf("AOQT candidate angle_l2 must be finite and non-negative")
+	}
+	if !isFinite32(metrics.Summary.AngleMaxAbs) || metrics.Summary.AngleMaxAbs < 0 {
+		return fmt.Errorf("AOQT candidate angle_max_abs must be finite and non-negative")
+	}
+	if metrics.Summary.AngleMaxAbs > policy.AngleMaxAbsCap+1e-7 {
+		return fmt.Errorf("AOQT candidate angle_max_abs %.9g exceeds cap %.9g", metrics.Summary.AngleMaxAbs, policy.AngleMaxAbsCap)
+	}
+	if policy.RequireObjectiveActivation {
+		if err := validateAOQTActiveObjectiveContributions(metrics.ObjectiveContract.WeightSums, metrics.Summary.FinalObjectiveActivation); err != nil {
+			return err
+		}
+	}
+	return validateAOQTAllowedComponentRegressions(metrics.Summary.InitialObjectiveComponents, metrics.Summary.FinalObjectiveComponents, policy)
+}
+
+func normalizedAOQTSidecarCandidateEligibilityPolicy(policy AOQTSidecarCandidateEligibilityPolicy) AOQTSidecarCandidateEligibilityPolicy {
+	if policy.DenseMaxAbsDeltaTolerance == 0 {
+		policy.DenseMaxAbsDeltaTolerance = 5e-4
+	}
+	if policy.AngleMaxAbsCap == 0 {
+		policy.AngleMaxAbsCap = AOQTSidecarDefaultAngleCap
+	}
+	policy.RequireObjectiveActivation = true
+	return policy
+}
+
+func validateAOQTSidecarCandidateEligibilityPolicy(policy AOQTSidecarCandidateEligibilityPolicy) error {
+	if policy.DenseMaxAbsDeltaTolerance <= 0 || math.IsNaN(policy.DenseMaxAbsDeltaTolerance) || math.IsInf(policy.DenseMaxAbsDeltaTolerance, 0) {
+		return fmt.Errorf("AOQT candidate dense_max_abs_delta_tolerance must be finite and positive")
+	}
+	if policy.AngleMaxAbsCap <= 0 || !isFinite32(policy.AngleMaxAbsCap) || policy.AngleMaxAbsCap > AOQTSidecarHardMaxAngleCap {
+		return fmt.Errorf("AOQT candidate angle_max_abs_cap must be finite, positive, and <= hard cap %.9g", AOQTSidecarHardMaxAngleCap)
+	}
+	for _, item := range []struct {
+		name  string
+		value float32
+	}{
+		{"q3_gain_allowed_loss_increase", policy.Q3GainAllowedLossIncrease},
+		{"q3_order_guard_allowed_loss_increase", policy.Q3OrderGuardAllowedLossIncrease},
+		{"q3_score_distill_allowed_loss_increase", policy.Q3ScoreDistillAllowedLossIncrease},
+		{"q5_order_guard_allowed_loss_increase", policy.Q5OrderGuardAllowedLossIncrease},
+		{"q5_score_distill_allowed_loss_increase", policy.Q5ScoreDistillAllowedLossIncrease},
+		{"nf_boundary_guard_allowed_loss_increase", policy.NFBoundaryGuardAllowedLossIncrease},
+	} {
+		if !isFinite32(item.value) || item.value < 0 {
+			return fmt.Errorf("AOQT candidate %s must be finite and non-negative", item.name)
+		}
+	}
+	return nil
+}
+
+func validateAOQTActiveObjectiveContributions(weights AOQTSidecarRowWeights, activation AOQTSidecarObjectiveActivation) error {
+	if weights.Q3Gain > 0 && (activation.Q3GainEligiblePairs == 0 || activation.Q3GainContributingPairs == 0) {
+		return fmt.Errorf("AOQT candidate q3_gain objective is inactive or non-contributing")
+	}
+	if weights.Q3OrderGuard > 0 && (activation.Q3OrderGuardPairs == 0 || activation.Q3OrderGuardContributing == 0) {
+		return fmt.Errorf("AOQT candidate q3_order_guard objective is inactive or non-contributing")
+	}
+	if weights.Q3ScoreDistill > 0 && activation.Q3ScoreDistillCount == 0 {
+		return fmt.Errorf("AOQT candidate q3_score_distill objective is inactive")
+	}
+	if weights.Q5OrderGuard > 0 && (activation.Q5OrderGuardPairs == 0 || activation.Q5OrderGuardContributing == 0) {
+		return fmt.Errorf("AOQT candidate q5_order_guard objective is inactive or non-contributing")
+	}
+	if weights.Q5ScoreDistill > 0 && activation.Q5ScoreDistillCount == 0 {
+		return fmt.Errorf("AOQT candidate q5_score_distill objective is inactive")
+	}
+	if weights.NFBoundaryGuard > 0 && (activation.NFBoundaryGuardPairs == 0 || activation.NFBoundaryGuardContributing == 0) {
+		return fmt.Errorf("AOQT candidate nf_boundary_guard objective is inactive or non-contributing")
+	}
+	return nil
+}
+
+func validateAOQTAllowedComponentRegressions(initial, final AOQTSidecarObjectiveComponents, policy AOQTSidecarCandidateEligibilityPolicy) error {
+	for _, item := range []struct {
+		name    string
+		initial float32
+		final   float32
+		allowed float32
+	}{
+		{"q3_gain", initial.Q3Gain, final.Q3Gain, policy.Q3GainAllowedLossIncrease},
+		{"q3_order_guard", initial.Q3OrderGuard, final.Q3OrderGuard, policy.Q3OrderGuardAllowedLossIncrease},
+		{"q3_score_distill", initial.Q3ScoreDistill, final.Q3ScoreDistill, policy.Q3ScoreDistillAllowedLossIncrease},
+		{"q5_order_guard", initial.Q5OrderGuard, final.Q5OrderGuard, policy.Q5OrderGuardAllowedLossIncrease},
+		{"q5_score_distill", initial.Q5ScoreDistill, final.Q5ScoreDistill, policy.Q5ScoreDistillAllowedLossIncrease},
+		{"nf_boundary_guard", initial.NFBoundaryGuard, final.NFBoundaryGuard, policy.NFBoundaryGuardAllowedLossIncrease},
+	} {
+		if item.final-item.initial > item.allowed+1e-7 {
+			return fmt.Errorf("AOQT candidate %s component regressed by %.9g, allowed %.9g", item.name, item.final-item.initial, item.allowed)
 		}
 	}
 	return nil

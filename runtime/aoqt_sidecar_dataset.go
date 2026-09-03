@@ -29,6 +29,7 @@ const (
 
 	AOQTSidecarPreparedIPScoreSurface = "turboquant.ip.prepared_v1"
 	AOQTSidecarDenseAnchorTolerance   = float32(1e-6)
+	AOQTSidecarQuantAnchorTolerance   = float32(1e-6)
 	AOQTSidecarUnitVectorTolerance    = float32(2e-5)
 )
 
@@ -487,6 +488,9 @@ func (r AOQTSidecarCalibrationRow) Validate(manifest AOQTSidecarCalibrationManif
 	if err := validateAOQTRankLengths(r.AnchorRanks.Q5, n, "anchor_ranks.q5"); err != nil {
 		return err
 	}
+	if err := validateAOQTDeclaredAnchors(r, manifest); err != nil {
+		return err
+	}
 	if len(r.EligiblePairMask) > 0 {
 		if len(r.EligiblePairMask) != n {
 			return fmt.Errorf("eligible_pair_mask rows = %d, want %d", len(r.EligiblePairMask), n)
@@ -624,6 +628,48 @@ func validateAOQTRankLengths(ranks []int, want int, name string) error {
 			return fmt.Errorf("%s repeats rank %d; ranks must be a unique 1..%d permutation", name, rank, want)
 		}
 		seen[rank] = true
+	}
+	return nil
+}
+
+func validateAOQTDeclaredAnchors(row AOQTSidecarCalibrationRow, manifest AOQTSidecarCalibrationManifest) error {
+	if err := validateAOQTRanksMatchScores(row.AnchorRanks.Dense, ranksAOQT(row.CandidateDocIDs, row.AnchorScores.Dense), "anchor_ranks.dense"); err != nil {
+		return err
+	}
+	q3 := newAOQTPreparedIPSurface(row.QueryVector, row.CandidateVectors, manifest.Dim, manifest.ObjectiveContract.Q3GuardBit, manifest.TurboQuantSeed)
+	if err := validateAOQTScoresMatchSurface(row.AnchorScores.Q3, q3.scores, "anchor_scores.q3"); err != nil {
+		return err
+	}
+	if err := validateAOQTRanksMatchScores(row.AnchorRanks.Q3, ranksAOQT(row.CandidateDocIDs, q3.scores), "anchor_ranks.q3"); err != nil {
+		return err
+	}
+	q5 := newAOQTPreparedIPSurface(row.QueryVector, row.CandidateVectors, manifest.Dim, manifest.ObjectiveContract.Q5GuardBit, manifest.TurboQuantSeed)
+	if err := validateAOQTScoresMatchSurface(row.AnchorScores.Q5, q5.scores, "anchor_scores.q5"); err != nil {
+		return err
+	}
+	return validateAOQTRanksMatchScores(row.AnchorRanks.Q5, ranksAOQT(row.CandidateDocIDs, q5.scores), "anchor_ranks.q5")
+}
+
+func validateAOQTScoresMatchSurface(got, want []float32, label string) error {
+	if len(got) != len(want) {
+		return fmt.Errorf("%s length = %d, want %d", label, len(got), len(want))
+	}
+	for i := range got {
+		if float32(math.Abs(float64(got[i]-want[i]))) > AOQTSidecarQuantAnchorTolerance {
+			return fmt.Errorf("%s[%d] = %.9g, want prepared-IP score %.9g within %.9g", label, i, got[i], want[i], AOQTSidecarQuantAnchorTolerance)
+		}
+	}
+	return nil
+}
+
+func validateAOQTRanksMatchScores(got, want []int, label string) error {
+	if len(got) != len(want) {
+		return fmt.Errorf("%s length = %d, want %d", label, len(got), len(want))
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return fmt.Errorf("%s[%d] = %d, want recomputed rank %d using score-desc/doc-id-asc tie policy", label, i, got[i], want[i])
+		}
 	}
 	return nil
 }
