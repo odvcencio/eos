@@ -29,6 +29,7 @@ const (
 
 	AOQTSidecarPreparedIPScoreSurface = "turboquant.ip.prepared_v1"
 	AOQTSidecarDenseAnchorTolerance   = float32(1e-6)
+	AOQTSidecarUnitVectorTolerance    = float32(2e-5)
 )
 
 var requiredAOQTSplitExclusionIdentities = []string{
@@ -73,6 +74,23 @@ type AOQTSidecarTrainOnlySplitProof struct {
 	ExclusionIdentities []string `json:"exclusion_identities"`
 }
 
+type AOQTSidecarObjectiveContract struct {
+	Dim              int                   `json:"dim"`
+	TurboQuantSeed   int64                 `json:"turboquant_seed"`
+	GainBit          int                   `json:"gain_bit"`
+	Q3GuardBit       int                   `json:"q3_guard_bit"`
+	Q5GuardBit       int                   `json:"q5_guard_bit"`
+	ScoreSurface     string                `json:"score_surface"`
+	GainCutoff       int                   `json:"gain_cutoff"`
+	GainTau          float32               `json:"gain_tau"`
+	GainMargin       float32               `json:"gain_margin"`
+	GuardTau         float32               `json:"guard_tau"`
+	GuardMargin      float32               `json:"guard_margin"`
+	ScoreDistillTau  float32               `json:"score_distill_tau"`
+	NFBoundarySource string                `json:"nf_boundary_source"`
+	WeightSums       AOQTSidecarRowWeights `json:"weight_sums"`
+}
+
 type AOQTSidecarCalibrationManifest struct {
 	Schema                      string                         `json:"schema"`
 	CreatedAtUTC                string                         `json:"created_at_utc,omitempty"`
@@ -84,6 +102,7 @@ type AOQTSidecarCalibrationManifest struct {
 	Topology                    AOQTSidecarTopologyBinding     `json:"topology"`
 	TurboQuantSeed              int64                          `json:"turboquant_seed"`
 	QuantSurfaces               []AOQTSidecarQuantSurface      `json:"quant_surfaces"`
+	ObjectiveContract           AOQTSidecarObjectiveContract   `json:"objective_contract"`
 	QrelsSHA256ByDataset        map[string]string              `json:"qrels_sha256_by_dataset"`
 	SplitProof                  AOQTSidecarTrainOnlySplitProof `json:"split_proof"`
 	SourceArtifactHashes        []string                       `json:"source_artifact_hashes"`
@@ -173,6 +192,9 @@ func (set AOQTSidecarCalibrationSet) Validate() error {
 	if got := aoqtRowIDSHA256(rowIDs); got != set.Manifest.RowIDSHA256 {
 		return fmt.Errorf("AOQT calibration row_id_sha256 mismatch")
 	}
+	if err := validateAOQTCalibrationObjectiveContract(set.Manifest.ObjectiveContract, set.Rows); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -193,6 +215,9 @@ func (m AOQTSidecarCalibrationManifest) Validate() error {
 		return fmt.Errorf("AOQT manifest turboquant_seed is required")
 	}
 	if err := validateAOQTQuantSurfaces(m.QuantSurfaces, m.TurboQuantSeed); err != nil {
+		return err
+	}
+	if err := m.ObjectiveContract.Validate(m); err != nil {
 		return err
 	}
 	if len(m.QrelsSHA256ByDataset) == 0 {
@@ -294,6 +319,57 @@ func (b AOQTSidecarTopologyBinding) Validate() error {
 	return validateAOQTSHA256(b.PairingsSHA256, "AOQT topology pairings_sha256")
 }
 
+func (c AOQTSidecarObjectiveContract) Validate(manifest AOQTSidecarCalibrationManifest) error {
+	if c.Dim != manifest.Dim {
+		return fmt.Errorf("AOQT objective contract dim = %d, want manifest dim %d", c.Dim, manifest.Dim)
+	}
+	if c.TurboQuantSeed != manifest.TurboQuantSeed {
+		return fmt.Errorf("AOQT objective contract turboquant_seed = %d, want manifest turboquant_seed %d", c.TurboQuantSeed, manifest.TurboQuantSeed)
+	}
+	if c.ScoreSurface != AOQTSidecarPreparedIPScoreSurface {
+		return fmt.Errorf("AOQT objective contract score_surface = %q, want %q", c.ScoreSurface, AOQTSidecarPreparedIPScoreSurface)
+	}
+	for _, item := range []struct {
+		name string
+		bit  int
+	}{
+		{"gain_bit", c.GainBit},
+		{"q3_guard_bit", c.Q3GuardBit},
+		{"q5_guard_bit", c.Q5GuardBit},
+	} {
+		if item.bit < 2 || item.bit > 8 {
+			return fmt.Errorf("AOQT objective contract %s = %d, want 2..8", item.name, item.bit)
+		}
+		if !aoqtManifestHasQuantSurface(manifest.QuantSurfaces, item.bit, c.TurboQuantSeed) {
+			return fmt.Errorf("AOQT objective contract %s bit_width %d is not declared as prepared-IP quant surface", item.name, item.bit)
+		}
+	}
+	if c.GainCutoff <= 0 {
+		return fmt.Errorf("AOQT objective contract gain_cutoff must be positive")
+	}
+	for _, item := range []struct {
+		name  string
+		value float32
+	}{
+		{"gain_tau", c.GainTau},
+		{"gain_margin", c.GainMargin},
+		{"guard_tau", c.GuardTau},
+		{"guard_margin", c.GuardMargin},
+		{"score_distill_tau", c.ScoreDistillTau},
+	} {
+		if !isFinite32(item.value) {
+			return fmt.Errorf("AOQT objective contract %s must be finite", item.name)
+		}
+	}
+	if c.GainTau <= 0 || c.GuardTau <= 0 || c.ScoreDistillTau <= 0 {
+		return fmt.Errorf("AOQT objective contract taus must be positive")
+	}
+	if strings.TrimSpace(c.NFBoundarySource) == "" {
+		return fmt.Errorf("AOQT objective contract nf_boundary_source is required")
+	}
+	return validateAOQTRowWeights(c.WeightSums)
+}
+
 func (r AOQTSidecarCalibrationRow) Validate(manifest AOQTSidecarCalibrationManifest) error {
 	if r.Schema != AOQTSidecarRowSchema {
 		return fmt.Errorf("schema %q is not supported, want %q", r.Schema, AOQTSidecarRowSchema)
@@ -349,6 +425,9 @@ func (r AOQTSidecarCalibrationRow) Validate(manifest AOQTSidecarCalibrationManif
 	if len(r.QueryVector) != manifest.Dim {
 		return fmt.Errorf("query_vector dim = %d, want %d", len(r.QueryVector), manifest.Dim)
 	}
+	if err := validateAOQTUnitVector(r.QueryVector, "query_vector"); err != nil {
+		return err
+	}
 	if len(r.CandidateVectors) != n {
 		return fmt.Errorf("candidate_vectors length = %d, want %d", len(r.CandidateVectors), n)
 	}
@@ -372,6 +451,9 @@ func (r AOQTSidecarCalibrationRow) Validate(manifest AOQTSidecarCalibrationManif
 			return fmt.Errorf("candidate_vectors[%d] dim = %d, want %d", i, len(r.CandidateVectors[i]), manifest.Dim)
 		}
 		if err := validateAOQTFiniteVector(r.CandidateVectors[i], fmt.Sprintf("candidate_vectors[%d]", i)); err != nil {
+			return err
+		}
+		if err := validateAOQTUnitVector(r.CandidateVectors[i], fmt.Sprintf("candidate_vectors[%d]", i)); err != nil {
 			return err
 		}
 		if got := aoqtVectorSHA256(r.CandidateVectors[i]); got != r.CandidateVectorSHA256[i] {
@@ -418,7 +500,10 @@ func (r AOQTSidecarCalibrationRow) Validate(manifest AOQTSidecarCalibrationManif
 			}
 		}
 	}
-	return validateAOQTRowWeights(r.Weights)
+	if err := validateAOQTRowWeights(r.Weights); err != nil {
+		return err
+	}
+	return validateAOQTRowObjectiveCoverage(r, manifest.ObjectiveContract)
 }
 
 func validateAOQTQuantSurfaces(surfaces []AOQTSidecarQuantSurface, seed int64) error {
@@ -447,6 +532,15 @@ func validateAOQTQuantSurfaces(surfaces []AOQTSidecarQuantSurface, seed int64) e
 		}
 	}
 	return nil
+}
+
+func aoqtManifestHasQuantSurface(surfaces []AOQTSidecarQuantSurface, bitWidth int, seed int64) bool {
+	for _, surface := range surfaces {
+		if surface.BitWidth == bitWidth && surface.Seed == seed && surface.ScoreSurface == AOQTSidecarPreparedIPScoreSurface && surface.PreparedQuery {
+			return true
+		}
+	}
+	return false
 }
 
 func validateAOQTHashList(values []string, label string) error {
@@ -521,10 +615,15 @@ func validateAOQTRankLengths(ranks []int, want int, name string) error {
 	if len(ranks) != want {
 		return fmt.Errorf("%s length = %d, want %d", name, len(ranks), want)
 	}
+	seen := make([]bool, want+1)
 	for i, rank := range ranks {
-		if rank <= 0 {
-			return fmt.Errorf("%s[%d] must be positive", name, i)
+		if rank <= 0 || rank > want {
+			return fmt.Errorf("%s[%d] = %d, want unique permutation rank in 1..%d", name, i, rank, want)
 		}
+		if seen[rank] {
+			return fmt.Errorf("%s repeats rank %d; ranks must be a unique 1..%d permutation", name, rank, want)
+		}
+		seen[rank] = true
 	}
 	return nil
 }
@@ -536,6 +635,136 @@ func validateAOQTFiniteVector(vec []float32, name string) error {
 		}
 	}
 	return nil
+}
+
+func validateAOQTUnitVector(vec []float32, name string) error {
+	norm := vectorNorm(vec)
+	if float32(math.Abs(float64(norm-1))) > AOQTSidecarUnitVectorTolerance {
+		return fmt.Errorf("%s norm = %.9g, want unit vector within %.9g so prepared-IP raw-vector scoring is unambiguous", name, norm, AOQTSidecarUnitVectorTolerance)
+	}
+	return nil
+}
+
+func validateAOQTRowObjectiveCoverage(row AOQTSidecarCalibrationRow, contract AOQTSidecarObjectiveContract) error {
+	if row.Weights.Q3Gain > 0 {
+		gainPairs := countAOQTGainEligiblePairs(row.QrelGains, row.EligiblePairMask)
+		if gainPairs == 0 {
+			return fmt.Errorf("row %q q3_gain weight %.9g has no usable gain-ordered eligible pairs", row.RowID, row.Weights.Q3Gain)
+		}
+	}
+	if row.Weights.Q3OrderGuard > 0 {
+		pairs := countAOQTRankOrderedPairs(row.AnchorRanks.Q3, row.EligiblePairMask)
+		if pairs == 0 {
+			return fmt.Errorf("row %q q3_order_guard weight %.9g has no usable anchor-rank guard pairs", row.RowID, row.Weights.Q3OrderGuard)
+		}
+	}
+	if row.Weights.Q5OrderGuard > 0 {
+		pairs := countAOQTRankOrderedPairs(row.AnchorRanks.Q5, row.EligiblePairMask)
+		if pairs == 0 {
+			return fmt.Errorf("row %q q5_order_guard weight %.9g has no usable anchor-rank guard pairs", row.RowID, row.Weights.Q5OrderGuard)
+		}
+	}
+	if row.Weights.NFBoundaryGuard > 0 {
+		pairs := countAOQTNFBoundaryGuardPairs(row.AnchorRanks.Q3, row.CandidateSources, contract.NFBoundarySource, row.EligiblePairMask)
+		if pairs == 0 {
+			return fmt.Errorf("row %q nf_boundary_guard weight %.9g has no usable NF boundary guard pairs for source %q", row.RowID, row.Weights.NFBoundaryGuard, contract.NFBoundarySource)
+		}
+	}
+	if row.Weights.Q3ScoreDistill > 0 && len(row.CandidateDocIDs) < 2 {
+		return fmt.Errorf("row %q q3_score_distill weight %.9g requires at least two candidates", row.RowID, row.Weights.Q3ScoreDistill)
+	}
+	if row.Weights.Q5ScoreDistill > 0 && len(row.CandidateDocIDs) < 2 {
+		return fmt.Errorf("row %q q5_score_distill weight %.9g requires at least two candidates", row.RowID, row.Weights.Q5ScoreDistill)
+	}
+	return nil
+}
+
+func validateAOQTCalibrationObjectiveContract(contract AOQTSidecarObjectiveContract, rows []AOQTSidecarCalibrationRow) error {
+	sums := sumAOQTRowWeights(rows)
+	if !aoqtRowWeightsNearEqual(contract.WeightSums, sums) {
+		return fmt.Errorf("AOQT objective contract weight_sums do not match calibration rows")
+	}
+	return nil
+}
+
+func sumAOQTRowWeights(rows []AOQTSidecarCalibrationRow) AOQTSidecarRowWeights {
+	var out AOQTSidecarRowWeights
+	for _, row := range rows {
+		out.Q3Gain += row.Weights.Q3Gain
+		out.Q3OrderGuard += row.Weights.Q3OrderGuard
+		out.Q3ScoreDistill += row.Weights.Q3ScoreDistill
+		out.Q5OrderGuard += row.Weights.Q5OrderGuard
+		out.Q5ScoreDistill += row.Weights.Q5ScoreDistill
+		out.NFBoundaryGuard += row.Weights.NFBoundaryGuard
+	}
+	return out
+}
+
+func aoqtRowWeightsNearEqual(a, b AOQTSidecarRowWeights) bool {
+	return float32Near(a.Q3Gain, b.Q3Gain, 1e-6) &&
+		float32Near(a.Q3OrderGuard, b.Q3OrderGuard, 1e-6) &&
+		float32Near(a.Q3ScoreDistill, b.Q3ScoreDistill, 1e-6) &&
+		float32Near(a.Q5OrderGuard, b.Q5OrderGuard, 1e-6) &&
+		float32Near(a.Q5ScoreDistill, b.Q5ScoreDistill, 1e-6) &&
+		float32Near(a.NFBoundaryGuard, b.NFBoundaryGuard, 1e-6)
+}
+
+func float32Near(a, b, tolerance float32) bool {
+	return float32(math.Abs(float64(a-b))) <= tolerance
+}
+
+func countAOQTGainEligiblePairs(gains []float32, eligiblePairs [][]bool) int {
+	var count int
+	for high := range gains {
+		for low := range gains {
+			if gains[high] <= gains[low] {
+				continue
+			}
+			if len(eligiblePairs) > 0 && !eligiblePairs[high][low] {
+				continue
+			}
+			count++
+		}
+	}
+	return count
+}
+
+func countAOQTRankOrderedPairs(ranks []int, eligiblePairs [][]bool) int {
+	var count int
+	for high := range ranks {
+		for low := range ranks {
+			if high == low || ranks[high] >= ranks[low] {
+				continue
+			}
+			if len(eligiblePairs) > 0 && !eligiblePairs[high][low] {
+				continue
+			}
+			count++
+		}
+	}
+	return count
+}
+
+func countAOQTNFBoundaryGuardPairs(ranks []int, sources []string, boundarySource string, eligiblePairs [][]bool) int {
+	if len(ranks) != len(sources) {
+		return 0
+	}
+	var count int
+	for boundary := range ranks {
+		if sources[boundary] != boundarySource {
+			continue
+		}
+		for other := range ranks {
+			if boundary == other || ranks[boundary] >= ranks[other] {
+				continue
+			}
+			if len(eligiblePairs) > 0 && !eligiblePairs[boundary][other] {
+				continue
+			}
+			count++
+		}
+	}
+	return count
 }
 
 func validateAOQTSHA256(value, label string) error {
@@ -568,4 +797,15 @@ func aoqtVectorSHA256(vec []float32) string {
 		_, _ = h.Write(buf[:])
 	}
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+func cloneAOQTRawMessageMap(in map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(in))
+	for k, v := range in {
+		out[k] = append(json.RawMessage(nil), v...)
+	}
+	return out
 }

@@ -3,11 +3,14 @@ package eosruntime
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
 	"strings"
 	"testing"
+
+	"m31labs.dev/turboquant"
 )
 
 func TestAOQTStage2ATopologyAndPlanAreDeterministic(t *testing.T) {
@@ -187,6 +190,9 @@ func TestAOQTStage2AObjectiveInputIsImmutableVectorFreeRowView(t *testing.T) {
 	if before.Rows[0].CandidateDocIDs[0] != set.Rows[0].CandidateDocIDs[0] || before.Rows[0].AnchorScores.Dense[0] != set.Rows[0].AnchorScores.Dense[0] {
 		t.Fatalf("mutating objective altered row metadata")
 	}
+	if string(before.Rows[0].Extra["note"]) != string(set.Rows[0].Extra["note"]) || string(before.Rows[0].SplitProof.ExclusionIdentities[0]) != string(set.Rows[0].SplitProof.ExclusionIdentities[0]) {
+		t.Fatalf("mutating objective altered nested row metadata")
+	}
 }
 
 func TestAOQTStage2AMetricsBindInputsAndRejectClaims(t *testing.T) {
@@ -250,6 +256,316 @@ func TestAOQTStage2AAngleGradientMatchesFiniteDifference(t *testing.T) {
 	fd := (dotAOQT(plusVec, upstream) - dotAOQT(minusVec, upstream)) / (2 * eps)
 	if math.Abs(float64(got[0]-fd)) > 2e-4 {
 		t.Fatalf("angle grad = %.9g, finite diff %.9g", got[0], fd)
+	}
+}
+
+func TestAOQTStage2BPreparedIPObjectiveMatchesTurboQuantSurface(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 67)
+	row := set.Rows[0]
+	query := append([]float32(nil), row.QueryVector...)
+	candidates := cloneAOQTVectors(row.CandidateVectors)
+	objective, err := NewAOQTSidecarPreparedIPObjective(AOQTSidecarPreparedIPObjectiveConfig{
+		TurboQuantSeed: set.Manifest.TurboQuantSeed,
+	})
+	if err != nil {
+		t.Fatalf("objective: %v", err)
+	}
+	result, err := objective.EvaluateAOQT(AOQTSidecarObjectiveInput{
+		Row:        aoqtObjectiveRowView(row),
+		Query:      query,
+		Candidates: candidates,
+	})
+	if err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if result.Loss <= 0 {
+		t.Fatalf("loss = %.9g, want positive synthetic q3/q5 objective", result.Loss)
+	}
+	if len(result.QueryGrad) != AOQTSidecarDim || len(result.CandidateGrads) != len(candidates) {
+		t.Fatalf("unexpected gradient shapes")
+	}
+	var gradL2 float64
+	for _, v := range result.QueryGrad {
+		gradL2 += float64(v * v)
+	}
+	for _, grad := range result.CandidateGrads {
+		for _, v := range grad {
+			gradL2 += float64(v * v)
+		}
+	}
+	if gradL2 == 0 {
+		t.Fatalf("prepared-IP objective produced zero vector gradient")
+	}
+	surface := newAOQTPreparedIPSurface(query, candidates, AOQTSidecarDim, AOQTSidecarDefaultGainBit, set.Manifest.TurboQuantSeed)
+	q := turboquant.NewIPWithSeed(AOQTSidecarDim, AOQTSidecarDefaultGainBit, set.Manifest.TurboQuantSeed)
+	prepared := q.PrepareQuery(normalizedAOQTVector(query))
+	for i, candidate := range candidates {
+		want := q.InnerProductPrepared(q.Quantize(normalizedAOQTVector(candidate)), prepared)
+		if math.Abs(float64(surface.scores[i]-want)) > 1e-7 {
+			t.Fatalf("surface score[%d] = %.9g, want TurboQuant prepared-IP %.9g", i, surface.scores[i], want)
+		}
+	}
+}
+
+func TestAOQTStage2BPreparedIPSurfaceBindsRawUnitVectorContract(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 68)
+	row := set.Rows[0]
+	query := append([]float32(nil), row.QueryVector...)
+	candidates := cloneAOQTVectors(row.CandidateVectors)
+	surface := newAOQTPreparedIPSurface(query, candidates, AOQTSidecarDim, AOQTSidecarDefaultGainBit, set.Manifest.TurboQuantSeed)
+	q := turboquant.NewIPWithSeed(AOQTSidecarDim, AOQTSidecarDefaultGainBit, set.Manifest.TurboQuantSeed)
+	preparedRaw := q.PrepareQuery(query)
+	preparedUnit := q.PrepareQuery(normalizedAOQTVector(query))
+	for i, candidate := range candidates {
+		raw := q.InnerProductPrepared(q.Quantize(candidate), preparedRaw)
+		unit := q.InnerProductPrepared(q.Quantize(normalizedAOQTVector(candidate)), preparedUnit)
+		if math.Abs(float64(surface.scores[i]-raw)) > 1e-7 {
+			t.Fatalf("surface score[%d] = %.9g, want raw prepared-IP %.9g", i, surface.scores[i], raw)
+		}
+		if math.Abs(float64(raw-unit)) > 1e-7 {
+			t.Fatalf("raw/unit prepared-IP score[%d] diverged %.9g vs %.9g for unit-vector row", i, raw, unit)
+		}
+	}
+}
+
+func TestAOQTStage2BPositiveGuardsFailClosedWhenInert(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 69)
+	objective, err := NewAOQTSidecarPreparedIPObjective(tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed))
+	if err != nil {
+		t.Fatalf("objective: %v", err)
+	}
+	for _, tc := range []struct {
+		name      string
+		weights   AOQTSidecarRowWeights
+		wantError string
+	}{
+		{
+			name:      "q3",
+			weights:   AOQTSidecarRowWeights{Q3OrderGuard: 1},
+			wantError: "q3_order_guard weight",
+		},
+		{
+			name:      "q5",
+			weights:   AOQTSidecarRowWeights{Q5OrderGuard: 1},
+			wantError: "q5_order_guard weight",
+		},
+		{
+			name:      "nf",
+			weights:   AOQTSidecarRowWeights{NFBoundaryGuard: 1},
+			wantError: "nf_boundary_guard weight",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := aoqtObjectiveRowView(set.Rows[0])
+			row.Weights = tc.weights
+			row.EligiblePairMask = [][]bool{
+				{false, false, false},
+				{false, false, false},
+				{false, false, false},
+			}
+			_, err := objective.EvaluateAOQT(AOQTSidecarObjectiveInput{
+				Row:        row,
+				Query:      append([]float32(nil), set.Rows[0].QueryVector...),
+				Candidates: cloneAOQTVectors(set.Rows[0].CandidateVectors),
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.wantError) || !strings.Contains(err.Error(), "no active contributing") {
+				t.Fatalf("error = %v, want inert positive %s guard rejection", err, tc.name)
+			}
+		})
+	}
+}
+
+func TestAOQTStage2BValidQ5AndNFGuardsActivate(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 70)
+	set.Rows[0].Weights.NFBoundaryGuard = 0.75
+	set.Rows[0].EligiblePairMask[2][1] = true
+	set.Manifest.ObjectiveContract = tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed).ObjectiveContract(sumAOQTRowWeights(set.Rows))
+	if err := set.Validate(); err != nil {
+		t.Fatalf("fixture with q5/nf guards invalid: %v", err)
+	}
+	objective, err := NewAOQTSidecarPreparedIPObjective(tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed))
+	if err != nil {
+		t.Fatalf("objective: %v", err)
+	}
+	result, err := objective.EvaluateAOQT(AOQTSidecarObjectiveInput{
+		Row:        aoqtObjectiveRowView(set.Rows[0]),
+		Query:      append([]float32(nil), set.Rows[0].QueryVector...),
+		Candidates: cloneAOQTVectors(set.Rows[0].CandidateVectors),
+	})
+	if err != nil {
+		t.Fatalf("evaluate valid q5/nf fixture: %v", err)
+	}
+	if result.Activation.Q5OrderGuardPairs == 0 || result.Activation.Q5OrderGuardContributing == 0 {
+		t.Fatalf("q5 guard activation = %+v, want active contributing q5 guard", result.Activation)
+	}
+	if result.Activation.Q5ScoreDistillCount != len(set.Rows[0].CandidateDocIDs) {
+		t.Fatalf("q5 score distill count = %d, want %d", result.Activation.Q5ScoreDistillCount, len(set.Rows[0].CandidateDocIDs))
+	}
+	if result.Activation.NFBoundaryGuardPairs == 0 || result.Activation.NFBoundaryGuardContributing == 0 {
+		t.Fatalf("NF guard activation = %+v, want active contributing NF guard", result.Activation)
+	}
+}
+
+func TestAOQTStage2BPreparedIPObjectiveMovesAnglesDeterministically(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 71)
+	objective, err := NewAOQTSidecarPreparedIPObjective(AOQTSidecarPreparedIPObjectiveConfig{
+		TurboQuantSeed: set.Manifest.TurboQuantSeed,
+	})
+	if err != nil {
+		t.Fatalf("objective: %v", err)
+	}
+	a := newTinyAOQTTrainer(t, false, 71)
+	b := newTinyAOQTTrainer(t, false, 71)
+	sa, err := a.Fit(set, objective)
+	if err != nil {
+		t.Fatalf("fit A: %v", err)
+	}
+	sb, err := b.Fit(set, objective)
+	if err != nil {
+		t.Fatalf("fit B: %v", err)
+	}
+	if sa.AnglesSHA256 != sb.AnglesSHA256 {
+		t.Fatalf("angle hashes differ: %s vs %s", sa.AnglesSHA256, sb.AnglesSHA256)
+	}
+	var moved bool
+	for _, angle := range a.Angles() {
+		if angle != 0 {
+			moved = true
+			break
+		}
+	}
+	if !moved {
+		t.Fatalf("prepared-IP objective did not move AOQT angles")
+	}
+}
+
+func TestAOQTStage2BOrderGuardOpposesUnsafeMovement(t *testing.T) {
+	scores := []float32{0.1, 0.5, 0.2}
+	ranks := []int{1, 3, 2}
+	loss, grads, pairs, contributing := aoqtAnchorOrderGuardLossAndGrad(scores, ranks, nil, 0.05, 0.01)
+	if loss <= 0 {
+		t.Fatalf("guard loss = %.9g, want active violation", loss)
+	}
+	if pairs == 0 || contributing == 0 {
+		t.Fatalf("guard activation pairs=%d contributing=%d, want active coverage", pairs, contributing)
+	}
+	if grads[0] >= 0 {
+		t.Fatalf("guard grad for anchor-best doc = %.9g, want negative so descent raises it", grads[0])
+	}
+	if grads[1] <= 0 {
+		t.Fatalf("guard grad for unsafe promoted doc = %.9g, want positive so descent lowers it", grads[1])
+	}
+}
+
+func TestAOQTStage2BValidatorsRejectRankAndMetricsPlanDefects(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 73)
+	bad := cloneAOQTCalibrationSet(set)
+	bad.Rows[0].AnchorRanks.Q3 = []int{1, 1, 3}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "unique 1..3 permutation") {
+		t.Fatalf("duplicate rank error = %v, want unique permutation rejection", err)
+	}
+	trainer := newTinyAOQTTrainer(t, true, 73)
+	summary, err := trainer.Fit(set, nil)
+	if err != nil {
+		t.Fatalf("plan-only fit: %v", err)
+	}
+	summary.Plan.RowCount++
+	if _, err := NewAOQTSidecarRunMetrics(set, summary); err == nil || !strings.Contains(err.Error(), "row_count") {
+		t.Fatalf("bad metrics plan error = %v, want row_count rejection", err)
+	}
+	summary, err = trainer.Fit(set, nil)
+	if err != nil {
+		t.Fatalf("plan-only fit 2: %v", err)
+	}
+	metrics, err := NewAOQTSidecarRunMetrics(set, summary)
+	if err != nil {
+		t.Fatalf("metrics: %v", err)
+	}
+	metrics.Summary.Plan.PairingsSHA256 = hex64("different-plan")
+	if err := metrics.Validate(); err == nil || !strings.Contains(err.Error(), "plan must exactly match summary.plan") {
+		t.Fatalf("metrics plan mismatch error = %v, want rejection", err)
+	}
+}
+
+func TestAOQTStage2BObjectiveContractMismatchesFailClosed(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 74)
+	for _, tc := range []struct {
+		name string
+		cfg  AOQTSidecarPreparedIPObjectiveConfig
+	}{
+		{
+			name: "seed",
+			cfg:  AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: set.Manifest.TurboQuantSeed + 1},
+		},
+		{
+			name: "gain-bit",
+			cfg:  AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: set.Manifest.TurboQuantSeed, GainBit: 4},
+		},
+		{
+			name: "q5-bit",
+			cfg:  AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: set.Manifest.TurboQuantSeed, Q5GuardBit: 4},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objective, err := NewAOQTSidecarPreparedIPObjective(tc.cfg)
+			if err != nil {
+				t.Fatalf("objective: %v", err)
+			}
+			if _, err := newTinyAOQTTrainer(t, false, 74).Fit(set, objective); err == nil || !strings.Contains(err.Error(), "objective config does not match") {
+				t.Fatalf("fit error = %v, want objective/manifest contract rejection", err)
+			}
+		})
+	}
+	bad := cloneAOQTCalibrationSet(set)
+	bad.Manifest.ObjectiveContract.GainBit = 4
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "bit_width 4 is not declared") {
+		t.Fatalf("manifest objective bit error = %v, want undeclared quant surface rejection", err)
+	}
+}
+
+func TestAOQTStage2BMetricsExposeAndValidateObjectiveProvenance(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 75)
+	trainer := newTinyAOQTTrainer(t, true, 75)
+	summary, err := trainer.Fit(set, nil)
+	if err != nil {
+		t.Fatalf("plan-only fit: %v", err)
+	}
+	metrics, err := NewAOQTSidecarRunMetrics(set, summary)
+	if err != nil {
+		t.Fatalf("metrics: %v", err)
+	}
+	if !aoqtObjectiveContractsEqual(metrics.ObjectiveContract, set.Manifest.ObjectiveContract) {
+		t.Fatalf("metrics objective contract = %+v, want manifest contract %+v", metrics.ObjectiveContract, set.Manifest.ObjectiveContract)
+	}
+	if metrics.ObjectiveContract.TurboQuantSeed != set.Manifest.TurboQuantSeed || metrics.ObjectiveContract.GainBit != AOQTSidecarDefaultGainBit || metrics.ObjectiveContract.Q5GuardBit != AOQTSidecarDefaultGuardBit5 {
+		t.Fatalf("metrics objective provenance not bound to configured TQ seed/bits: %+v", metrics.ObjectiveContract)
+	}
+	if metrics.ObjectiveContract.ScoreSurface != AOQTSidecarPreparedIPScoreSurface {
+		t.Fatalf("metrics score surface = %q, want %q", metrics.ObjectiveContract.ScoreSurface, AOQTSidecarPreparedIPScoreSurface)
+	}
+	metrics.ObjectiveContract.TurboQuantSeed++
+	if err := metrics.Validate(); err == nil || !strings.Contains(err.Error(), "objective_contract must exactly match") {
+		t.Fatalf("mutated metrics objective error = %v, want provenance mismatch rejection", err)
+	}
+}
+
+func TestAOQTStage2BValidatorsRejectNonUnitVectors(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 76)
+	bad := cloneAOQTCalibrationSet(set)
+	bad.Rows[0].QueryVector[0] *= 0.5
+	bad.Rows[0].QueryVectorSHA256 = aoqtVectorSHA256(bad.Rows[0].QueryVector)
+	for i := range bad.Rows[0].CandidateVectors {
+		bad.Rows[0].AnchorScores.Dense[i] = dotAOQT(bad.Rows[0].QueryVector, bad.Rows[0].CandidateVectors[i])
+	}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "query_vector norm") {
+		t.Fatalf("non-unit query error = %v, want unit-vector rejection", err)
+	}
+	bad = cloneAOQTCalibrationSet(set)
+	bad.Rows[0].CandidateVectors[0][0] *= 0.5
+	bad.Rows[0].CandidateVectorSHA256[0] = aoqtVectorSHA256(bad.Rows[0].CandidateVectors[0])
+	bad.Rows[0].AnchorScores.Dense[0] = dotAOQT(bad.Rows[0].QueryVector, bad.Rows[0].CandidateVectors[0])
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "candidate_vectors[0] norm") {
+		t.Fatalf("non-unit candidate error = %v, want unit-vector rejection", err)
 	}
 }
 
@@ -347,6 +663,7 @@ func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet 
 		SplitProof:          splitProof,
 		CompatibilityDigest: compat,
 		LegalGates:          aoqtResearchOnlyGates(),
+		Extra:               map[string]json.RawMessage{"note": json.RawMessage(`{"fixture":true}`)},
 	}}
 	manifest := AOQTSidecarCalibrationManifest{
 		Schema:                      AOQTSidecarManifestSchema,
@@ -376,7 +693,9 @@ func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet 
 		RowIDSHA256:          aoqtRowIDSHA256([]string{rowID}),
 		CompatibilityDigest:  compat,
 		LegalGates:           aoqtResearchOnlyGates(),
+		Extra:                map[string]json.RawMessage{"fixture": json.RawMessage(`true`)},
 	}
+	manifest.ObjectiveContract = tinyAOQTObjectiveConfig(manifest.TurboQuantSeed).ObjectiveContract(sumAOQTRowWeights(rows))
 	set := AOQTSidecarCalibrationSet{Manifest: manifest, Rows: rows}
 	if err := set.Validate(); err != nil {
 		t.Fatalf("fixture invalid: %v", err)
@@ -392,6 +711,8 @@ func (mutatingAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQT
 	}
 	input.Row.CandidateDocIDs[0] = "mutated-doc"
 	input.Row.AnchorScores.Dense[0] = 99
+	input.Row.SplitProof.ExclusionIdentities[0] = "mutated-split"
+	input.Row.Extra["note"][0] = 'x'
 	input.Query[0] = 99
 	input.Candidates[0][0] = 99
 	queryGrad := make([]float32, len(input.Query))
@@ -400,6 +721,18 @@ func (mutatingAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQT
 		candidateGrads[i] = make([]float32, len(input.Candidates[i]))
 	}
 	return AOQTSidecarObjectiveResult{Loss: 0, QueryGrad: queryGrad, CandidateGrads: candidateGrads}, nil
+}
+
+func (toyAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
+	return tinyAOQTObjectiveConfig(77)
+}
+
+func (mutatingAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
+	return tinyAOQTObjectiveConfig(77)
+}
+
+func tinyAOQTObjectiveConfig(seed int64) AOQTSidecarPreparedIPObjectiveConfig {
+	return AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: seed}
 }
 
 func tinyAOQTSplitProof() AOQTSidecarTrainOnlySplitProof {
@@ -419,6 +752,13 @@ func aoqtRandomVec(rng *rand.Rand) []float32 {
 	out := make([]float32, AOQTSidecarDim)
 	for i := range out {
 		out[i] = float32(rng.NormFloat64() * 0.01)
+	}
+	norm := vectorNorm(out)
+	if norm != 0 {
+		inv := 1 / norm
+		for i := range out {
+			out[i] *= inv
+		}
 	}
 	return out
 }
@@ -453,6 +793,7 @@ func cloneAOQTCalibrationSet(in AOQTSidecarCalibrationSet) AOQTSidecarCalibratio
 	out.Manifest.SplitProof.ExclusionIdentities = append([]string(nil), in.Manifest.SplitProof.ExclusionIdentities...)
 	out.Manifest.SourceArtifactHashes = append([]string(nil), in.Manifest.SourceArtifactHashes...)
 	out.Manifest.VectorCacheHashes = append([]string(nil), in.Manifest.VectorCacheHashes...)
+	out.Manifest.Extra = cloneAOQTRawMessageMap(in.Manifest.Extra)
 	out.Rows = append([]AOQTSidecarCalibrationRow(nil), in.Rows...)
 	for i := range out.Rows {
 		out.Rows[i].CandidateDocIDs = append([]string(nil), in.Rows[i].CandidateDocIDs...)
@@ -476,6 +817,7 @@ func cloneAOQTCalibrationSet(in AOQTSidecarCalibrationSet) AOQTSidecarCalibratio
 		for j := range out.Rows[i].EligiblePairMask {
 			out.Rows[i].EligiblePairMask[j] = append([]bool(nil), in.Rows[i].EligiblePairMask[j]...)
 		}
+		out.Rows[i].Extra = cloneAOQTRawMessageMap(in.Rows[i].Extra)
 	}
 	return out
 }

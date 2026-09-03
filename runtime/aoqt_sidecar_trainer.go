@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+
+	"m31labs.dev/turboquant"
 )
 
 type AOQTSidecarTrainConfig struct {
@@ -36,15 +38,18 @@ type AOQTSidecarWorkPlan struct {
 }
 
 type AOQTSidecarTrainSummary struct {
-	Plan             AOQTSidecarWorkPlan `json:"plan"`
-	Steps            int                 `json:"steps"`
-	InitialLoss      float32             `json:"initial_loss"`
-	FinalLoss        float32             `json:"final_loss"`
-	AngleL2          float32             `json:"angle_l2"`
-	AngleMaxAbs      float32             `json:"angle_max_abs"`
-	AnglesSHA256     string              `json:"angles_sha256"`
-	DenseMaxAbsDelta float64             `json:"dense_max_abs_delta"`
-	QualityClaim     bool                `json:"quality_claim"`
+	Plan                       AOQTSidecarWorkPlan            `json:"plan"`
+	ObjectiveContract          AOQTSidecarObjectiveContract   `json:"objective_contract"`
+	Steps                      int                            `json:"steps"`
+	InitialLoss                float32                        `json:"initial_loss"`
+	FinalLoss                  float32                        `json:"final_loss"`
+	InitialObjectiveActivation AOQTSidecarObjectiveActivation `json:"initial_objective_activation"`
+	FinalObjectiveActivation   AOQTSidecarObjectiveActivation `json:"final_objective_activation"`
+	AngleL2                    float32                        `json:"angle_l2"`
+	AngleMaxAbs                float32                        `json:"angle_max_abs"`
+	AnglesSHA256               string                         `json:"angles_sha256"`
+	DenseMaxAbsDelta           float64                        `json:"dense_max_abs_delta"`
+	QualityClaim               bool                           `json:"quality_claim"`
 }
 
 type AOQTSidecarObjectiveInput struct {
@@ -57,10 +62,204 @@ type AOQTSidecarObjectiveResult struct {
 	Loss           float32
 	QueryGrad      []float32
 	CandidateGrads [][]float32
+	Activation     AOQTSidecarObjectiveActivation
+}
+
+type AOQTSidecarObjectiveActivation struct {
+	Q3GainEligiblePairs         int `json:"q3_gain_eligible_pairs"`
+	Q3GainContributingPairs     int `json:"q3_gain_contributing_pairs"`
+	Q3OrderGuardPairs           int `json:"q3_order_guard_pairs"`
+	Q3OrderGuardContributing    int `json:"q3_order_guard_contributing_pairs"`
+	Q3ScoreDistillCount         int `json:"q3_score_distill_count"`
+	Q5OrderGuardPairs           int `json:"q5_order_guard_pairs"`
+	Q5OrderGuardContributing    int `json:"q5_order_guard_contributing_pairs"`
+	Q5ScoreDistillCount         int `json:"q5_score_distill_count"`
+	NFBoundaryGuardPairs        int `json:"nf_boundary_guard_pairs"`
+	NFBoundaryGuardContributing int `json:"nf_boundary_guard_contributing_pairs"`
+}
+
+func (a *AOQTSidecarObjectiveActivation) Add(other AOQTSidecarObjectiveActivation) {
+	a.Q3GainEligiblePairs += other.Q3GainEligiblePairs
+	a.Q3GainContributingPairs += other.Q3GainContributingPairs
+	a.Q3OrderGuardPairs += other.Q3OrderGuardPairs
+	a.Q3OrderGuardContributing += other.Q3OrderGuardContributing
+	a.Q3ScoreDistillCount += other.Q3ScoreDistillCount
+	a.Q5OrderGuardPairs += other.Q5OrderGuardPairs
+	a.Q5OrderGuardContributing += other.Q5OrderGuardContributing
+	a.Q5ScoreDistillCount += other.Q5ScoreDistillCount
+	a.NFBoundaryGuardPairs += other.NFBoundaryGuardPairs
+	a.NFBoundaryGuardContributing += other.NFBoundaryGuardContributing
 }
 
 type AOQTSidecarVectorObjective interface {
 	EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error)
+}
+
+type AOQTSidecarPreparedIPObjectiveContractProvider interface {
+	AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig
+}
+
+type AOQTSidecarPreparedIPObjectiveConfig struct {
+	Dim              int
+	TurboQuantSeed   int64
+	GainBit          int
+	Q3GuardBit       int
+	Q5GuardBit       int
+	GainCutoff       int
+	GainTau          float32
+	GainMargin       float32
+	GuardTau         float32
+	GuardMargin      float32
+	ScoreDistillTau  float32
+	NFBoundarySource string
+}
+
+func (cfg AOQTSidecarPreparedIPObjectiveConfig) ObjectiveContract(weights AOQTSidecarRowWeights) AOQTSidecarObjectiveContract {
+	cfg = normalizedAOQTPreparedIPObjectiveConfig(cfg)
+	return AOQTSidecarObjectiveContract{
+		Dim:              cfg.Dim,
+		TurboQuantSeed:   cfg.TurboQuantSeed,
+		GainBit:          cfg.GainBit,
+		Q3GuardBit:       cfg.Q3GuardBit,
+		Q5GuardBit:       cfg.Q5GuardBit,
+		ScoreSurface:     AOQTSidecarPreparedIPScoreSurface,
+		GainCutoff:       cfg.GainCutoff,
+		GainTau:          cfg.GainTau,
+		GainMargin:       cfg.GainMargin,
+		GuardTau:         cfg.GuardTau,
+		GuardMargin:      cfg.GuardMargin,
+		ScoreDistillTau:  cfg.ScoreDistillTau,
+		NFBoundarySource: cfg.NFBoundarySource,
+		WeightSums:       weights,
+	}
+}
+
+type AOQTSidecarPreparedIPObjective struct {
+	config AOQTSidecarPreparedIPObjectiveConfig
+}
+
+func NewAOQTSidecarPreparedIPObjective(cfg AOQTSidecarPreparedIPObjectiveConfig) (AOQTSidecarPreparedIPObjective, error) {
+	cfg = normalizedAOQTPreparedIPObjectiveConfig(cfg)
+	if err := validateAOQTPreparedIPObjectiveConfig(cfg); err != nil {
+		return AOQTSidecarPreparedIPObjective{}, err
+	}
+	return AOQTSidecarPreparedIPObjective{config: cfg}, nil
+}
+
+func (o AOQTSidecarPreparedIPObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
+	return o.config
+}
+
+func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+	cfg := o.config
+	if err := validateAOQTPreparedIPObjectiveConfig(cfg); err != nil {
+		return AOQTSidecarObjectiveResult{}, err
+	}
+	if len(input.Query) != cfg.Dim {
+		return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT prepared-IP query dim = %d, want %d", len(input.Query), cfg.Dim)
+	}
+	if len(input.Candidates) == 0 {
+		return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT prepared-IP candidates are required")
+	}
+	row := input.Row
+	n := len(input.Candidates)
+	if len(row.CandidateDocIDs) != n || len(row.QrelGains) != n {
+		return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT prepared-IP row metadata length mismatch")
+	}
+	if len(row.AnchorScores.Q3) != n || len(row.AnchorScores.Q5) != n || len(row.AnchorRanks.Q3) != n || len(row.AnchorRanks.Q5) != n {
+		return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT prepared-IP anchor q3/q5 metadata length mismatch")
+	}
+	for i, candidate := range input.Candidates {
+		if len(candidate) != cfg.Dim {
+			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT prepared-IP candidate %d dim = %d, want %d", i, len(candidate), cfg.Dim)
+		}
+	}
+	result := AOQTSidecarObjectiveResult{
+		QueryGrad:      make([]float32, cfg.Dim),
+		CandidateGrads: make([][]float32, n),
+	}
+	for i := range result.CandidateGrads {
+		result.CandidateGrads[i] = make([]float32, cfg.Dim)
+	}
+	q3Gain := newAOQTPreparedIPSurface(input.Query, input.Candidates, cfg.Dim, cfg.GainBit, cfg.TurboQuantSeed)
+	if row.Weights.Q3Gain > 0 {
+		loss, err := topkLambdaNDCGLossAndGrad(q3Gain.scores, row.QrelGains, row.CandidateDocIDs, cfg.GainCutoff, cfg.GainTau, cfg.GainMargin, row.EligiblePairMask)
+		if err != nil {
+			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3 prepared-IP LambdaNDCG: %w", err)
+		}
+		if loss.EligiblePairs == 0 || loss.ContributingPairs == 0 {
+			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3_gain weight %.9g has no active contributing prepared-IP LambdaNDCG pairs", row.Weights.Q3Gain)
+		}
+		scale := row.Weights.Q3Gain
+		result.Loss += loss.Loss * scale
+		result.Activation.Q3GainEligiblePairs += loss.EligiblePairs
+		result.Activation.Q3GainContributingPairs += loss.ContributingPairs
+		q3Gain.accumulateScoreGrads(loss.Grad, scale, result.QueryGrad, result.CandidateGrads)
+	}
+	q3Guard := q3Gain
+	if cfg.Q3GuardBit != cfg.GainBit {
+		q3Guard = newAOQTPreparedIPSurface(input.Query, input.Candidates, cfg.Dim, cfg.Q3GuardBit, cfg.TurboQuantSeed)
+	}
+	if row.Weights.Q3OrderGuard > 0 {
+		loss, grads, pairs, contributing := aoqtAnchorOrderGuardLossAndGrad(q3Guard.scores, row.AnchorRanks.Q3, row.EligiblePairMask, cfg.GuardTau, cfg.GuardMargin)
+		if pairs == 0 || contributing == 0 {
+			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3_order_guard weight %.9g has no active contributing prepared-IP guard pairs", row.Weights.Q3OrderGuard)
+		}
+		scale := row.Weights.Q3OrderGuard
+		result.Loss += loss * scale
+		result.Activation.Q3OrderGuardPairs += pairs
+		result.Activation.Q3OrderGuardContributing += contributing
+		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
+	}
+	if row.Weights.Q3ScoreDistill > 0 {
+		loss, grads, count := aoqtCenteredScoreDistillLossAndGrad(q3Guard.scores, row.AnchorScores.Q3, cfg.ScoreDistillTau)
+		if count == 0 {
+			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q3_score_distill weight %.9g has no prepared-IP score coverage", row.Weights.Q3ScoreDistill)
+		}
+		scale := row.Weights.Q3ScoreDistill
+		result.Loss += loss * scale
+		result.Activation.Q3ScoreDistillCount += count
+		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
+	}
+	if row.Weights.NFBoundaryGuard > 0 {
+		loss, grads, pairs, contributing := aoqtNFBoundaryGuardLossAndGrad(q3Guard.scores, row.AnchorRanks.Q3, row.CandidateSources, cfg.NFBoundarySource, row.EligiblePairMask, cfg.GuardTau, cfg.GuardMargin)
+		if pairs == 0 || contributing == 0 {
+			return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT nf_boundary_guard weight %.9g has no active contributing prepared-IP guard pairs", row.Weights.NFBoundaryGuard)
+		}
+		scale := row.Weights.NFBoundaryGuard
+		result.Loss += loss * scale
+		result.Activation.NFBoundaryGuardPairs += pairs
+		result.Activation.NFBoundaryGuardContributing += contributing
+		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
+	}
+	if row.Weights.Q5OrderGuard > 0 || row.Weights.Q5ScoreDistill > 0 {
+		q5 := newAOQTPreparedIPSurface(input.Query, input.Candidates, cfg.Dim, cfg.Q5GuardBit, cfg.TurboQuantSeed)
+		if row.Weights.Q5OrderGuard > 0 {
+			loss, grads, pairs, contributing := aoqtAnchorOrderGuardLossAndGrad(q5.scores, row.AnchorRanks.Q5, row.EligiblePairMask, cfg.GuardTau, cfg.GuardMargin)
+			if pairs == 0 || contributing == 0 {
+				return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q5_order_guard weight %.9g has no active contributing prepared-IP guard pairs", row.Weights.Q5OrderGuard)
+			}
+			scale := row.Weights.Q5OrderGuard
+			result.Loss += loss * scale
+			result.Activation.Q5OrderGuardPairs += pairs
+			result.Activation.Q5OrderGuardContributing += contributing
+			q5.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
+		}
+		if row.Weights.Q5ScoreDistill > 0 {
+			loss, grads, count := aoqtCenteredScoreDistillLossAndGrad(q5.scores, row.AnchorScores.Q5, cfg.ScoreDistillTau)
+			if count == 0 {
+				return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT q5_score_distill weight %.9g has no prepared-IP score coverage", row.Weights.Q5ScoreDistill)
+			}
+			scale := row.Weights.Q5ScoreDistill
+			result.Loss += loss * scale
+			result.Activation.Q5ScoreDistillCount += count
+			q5.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
+		}
+	}
+	if !isFinite32(result.Loss) {
+		return AOQTSidecarObjectiveResult{}, fmt.Errorf("AOQT prepared-IP loss must be finite")
+	}
+	return result, nil
 }
 
 type AOQTSidecarTrainer struct {
@@ -199,7 +398,7 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	if err != nil {
 		return AOQTSidecarTrainSummary{}, err
 	}
-	summary := AOQTSidecarTrainSummary{Plan: plan, QualityClaim: false}
+	summary := AOQTSidecarTrainSummary{Plan: plan, ObjectiveContract: set.Manifest.ObjectiveContract, QualityClaim: false}
 	if t.config.PlanOnly {
 		angles, err := t.Transform().AnglesSHA256()
 		if err != nil {
@@ -211,15 +410,19 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	if objective == nil {
 		return summary, fmt.Errorf("AOQT objective is required for non-plan training")
 	}
+	if err := validateAOQTFitObjectiveContract(set.Manifest.ObjectiveContract, objective); err != nil {
+		return summary, err
+	}
 	var initialSet bool
 	for step := 0; step < t.config.MaxSteps; step++ {
 		rows := deterministicAOQTRowOrder(set.Rows, t.config.WorkplanSeed, step)
-		loss, grad, err := t.lossAndAngleGrad(rows, objective)
+		loss, grad, activation, err := t.lossAndAngleGrad(rows, objective)
 		if err != nil {
 			return summary, err
 		}
 		if !initialSet {
 			summary.InitialLoss = loss
+			summary.InitialObjectiveActivation = activation
 			initialSet = true
 		}
 		if err := t.applyAdam(grad); err != nil {
@@ -227,11 +430,12 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 		}
 		summary.Steps++
 	}
-	finalLoss, _, err := t.lossAndAngleGrad(set.Rows, objective)
+	finalLoss, _, finalActivation, err := t.lossAndAngleGrad(set.Rows, objective)
 	if err != nil {
 		return summary, err
 	}
 	summary.FinalLoss = finalLoss
+	summary.FinalObjectiveActivation = finalActivation
 	finalTransform := t.Transform()
 	angles, err := finalTransform.AnglesSHA256()
 	if err != nil {
@@ -245,6 +449,35 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	}
 	summary.DenseMaxAbsDelta = dense
 	return summary, nil
+}
+
+func validateAOQTFitObjectiveContract(contract AOQTSidecarObjectiveContract, objective AOQTSidecarVectorObjective) error {
+	provider, ok := objective.(AOQTSidecarPreparedIPObjectiveContractProvider)
+	if !ok {
+		return fmt.Errorf("AOQT non-plan training requires objective contract provider")
+	}
+	got := provider.AOQTPreparedIPObjectiveConfig().ObjectiveContract(contract.WeightSums)
+	if !aoqtObjectiveContractsEqual(got, contract) {
+		return fmt.Errorf("AOQT objective config does not match calibration manifest objective_contract")
+	}
+	return nil
+}
+
+func aoqtObjectiveContractsEqual(a, b AOQTSidecarObjectiveContract) bool {
+	return a.Dim == b.Dim &&
+		a.TurboQuantSeed == b.TurboQuantSeed &&
+		a.GainBit == b.GainBit &&
+		a.Q3GuardBit == b.Q3GuardBit &&
+		a.Q5GuardBit == b.Q5GuardBit &&
+		a.ScoreSurface == b.ScoreSurface &&
+		a.GainCutoff == b.GainCutoff &&
+		float32Near(a.GainTau, b.GainTau, 1e-8) &&
+		float32Near(a.GainMargin, b.GainMargin, 1e-8) &&
+		float32Near(a.GuardTau, b.GuardTau, 1e-8) &&
+		float32Near(a.GuardMargin, b.GuardMargin, 1e-8) &&
+		float32Near(a.ScoreDistillTau, b.ScoreDistillTau, 1e-8) &&
+		a.NFBoundarySource == b.NFBoundarySource &&
+		aoqtRowWeightsNearEqual(a.WeightSums, b.WeightSums)
 }
 
 func (t *AOQTSidecarTrainer) Transform() AOQTGivensTransform {
@@ -286,14 +519,15 @@ func (t *AOQTSidecarTrainer) SetAnglesForTest(angles []float32) error {
 	return t.ProjectAngles()
 }
 
-func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective) (float32, []float32, error) {
+func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective) (float32, []float32, AOQTSidecarObjectiveActivation, error) {
 	totalGrad := make([]float32, len(t.angles))
 	totalLoss := float32(0)
+	var totalActivation AOQTSidecarObjectiveActivation
 	transform := t.Transform()
 	for _, row := range rows {
 		query, candidates, err := transformAOQTRow(transform, row)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, totalActivation, err
 		}
 		result, err := objective.EvaluateAOQT(AOQTSidecarObjectiveInput{
 			Row:        aoqtObjectiveRowView(row),
@@ -301,31 +535,32 @@ func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, 
 			Candidates: cloneAOQTVectors(candidates),
 		})
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, totalActivation, err
 		}
 		if !isFinite32(result.Loss) {
-			return 0, nil, fmt.Errorf("AOQT objective loss must be finite")
+			return 0, nil, totalActivation, fmt.Errorf("AOQT objective loss must be finite")
 		}
 		if len(result.QueryGrad) != transform.Dim {
-			return 0, nil, fmt.Errorf("AOQT objective query grad dim = %d, want %d", len(result.QueryGrad), transform.Dim)
+			return 0, nil, totalActivation, fmt.Errorf("AOQT objective query grad dim = %d, want %d", len(result.QueryGrad), transform.Dim)
 		}
 		if len(result.CandidateGrads) != len(row.CandidateVectors) {
-			return 0, nil, fmt.Errorf("AOQT objective candidate grad count = %d, want %d", len(result.CandidateGrads), len(row.CandidateVectors))
+			return 0, nil, totalActivation, fmt.Errorf("AOQT objective candidate grad count = %d, want %d", len(result.CandidateGrads), len(row.CandidateVectors))
 		}
 		totalLoss += result.Loss
+		totalActivation.Add(result.Activation)
 		if err := accumulateAOQTVectorAngleGrad(transform, row.QueryVector, result.QueryGrad, totalGrad); err != nil {
-			return 0, nil, err
+			return 0, nil, totalActivation, err
 		}
 		for i, grad := range result.CandidateGrads {
 			if len(grad) != transform.Dim {
-				return 0, nil, fmt.Errorf("AOQT objective candidate grad %d dim = %d, want %d", i, len(grad), transform.Dim)
+				return 0, nil, totalActivation, fmt.Errorf("AOQT objective candidate grad %d dim = %d, want %d", i, len(grad), transform.Dim)
 			}
 			if err := accumulateAOQTVectorAngleGrad(transform, row.CandidateVectors[i], grad, totalGrad); err != nil {
-				return 0, nil, err
+				return 0, nil, totalActivation, err
 			}
 		}
 	}
-	return totalLoss, totalGrad, nil
+	return totalLoss, totalGrad, totalActivation, nil
 }
 
 func (t *AOQTSidecarTrainer) applyAdam(grad []float32) error {
@@ -397,7 +632,7 @@ func accumulateAOQTVectorAngleGrad(transform AOQTGivensTransform, input, outputG
 }
 
 func aoqtForwardActivations(transform AOQTGivensTransform, input []float32) ([][]float32, error) {
-	if err := transform.Validate(); err != nil {
+	if err := validateAOQTGivensTrainingSnapshot(transform); err != nil {
 		return nil, err
 	}
 	if len(input) != transform.Dim {
@@ -529,6 +764,7 @@ func aoqtObjectiveRowView(row AOQTSidecarCalibrationRow) AOQTSidecarCalibrationR
 	view := row
 	view.QueryVector = nil
 	view.CandidateVectors = nil
+	view.SplitProof.ExclusionIdentities = append([]string(nil), row.SplitProof.ExclusionIdentities...)
 	view.CandidateDocIDs = append([]string(nil), row.CandidateDocIDs...)
 	view.CandidateVectorIDs = append([]string(nil), row.CandidateVectorIDs...)
 	view.CandidateVectorSHA256 = append([]string(nil), row.CandidateVectorSHA256...)
@@ -544,7 +780,291 @@ func aoqtObjectiveRowView(row AOQTSidecarCalibrationRow) AOQTSidecarCalibrationR
 	view.AnchorRanks.Dense = append([]int(nil), row.AnchorRanks.Dense...)
 	view.AnchorRanks.Q3 = append([]int(nil), row.AnchorRanks.Q3...)
 	view.AnchorRanks.Q5 = append([]int(nil), row.AnchorRanks.Q5...)
+	view.Extra = cloneAOQTRawMessageMap(row.Extra)
 	return view
+}
+
+func validateAOQTGivensTrainingSnapshot(transform AOQTGivensTransform) error {
+	if transform.Version == "" {
+		return fmt.Errorf("AOQT transform version is required")
+	}
+	if transform.Version != AOQTTransformVersion {
+		return fmt.Errorf("AOQT transform version %q is not supported, want %q", transform.Version, AOQTTransformVersion)
+	}
+	if transform.Kind != EmbeddingPostPoolTransformAOQTGivens {
+		return fmt.Errorf("AOQT transform kind %q is not supported, want %q", transform.Kind, EmbeddingPostPoolTransformAOQTGivens)
+	}
+	if transform.Dim <= 0 {
+		return fmt.Errorf("AOQT transform dim must be positive")
+	}
+	if len(transform.Stages) == 0 {
+		return fmt.Errorf("AOQT transform must contain at least one stage")
+	}
+	for stageIndex, stage := range transform.Stages {
+		if len(stage.Pairs) == 0 {
+			return fmt.Errorf("AOQT stage %d has no pairs", stageIndex)
+		}
+		if len(stage.Angles) != len(stage.Pairs) {
+			return fmt.Errorf("AOQT stage %d angle count = %d, want %d", stageIndex, len(stage.Angles), len(stage.Pairs))
+		}
+		seen := map[int]bool{}
+		for pairIndex, pair := range stage.Pairs {
+			a, b := pair[0], pair[1]
+			if a < 0 || a >= transform.Dim || b < 0 || b >= transform.Dim {
+				return fmt.Errorf("AOQT stage %d pair %d = [%d %d] outside dim %d", stageIndex, pairIndex, a, b, transform.Dim)
+			}
+			if a == b {
+				return fmt.Errorf("AOQT stage %d pair %d repeats coordinate %d", stageIndex, pairIndex, a)
+			}
+			if seen[a] || seen[b] {
+				return fmt.Errorf("AOQT stage %d coordinate appears in more than one pair", stageIndex)
+			}
+			seen[a], seen[b] = true, true
+			angle := stage.Angles[pairIndex]
+			if math.IsNaN(float64(angle)) || math.IsInf(float64(angle), 0) {
+				return fmt.Errorf("AOQT stage %d angle %d is not finite", stageIndex, pairIndex)
+			}
+			if transform.AngleCap > 0 && float32(math.Abs(float64(angle))) > transform.AngleCap+1e-7 {
+				return fmt.Errorf("AOQT stage %d angle %d exceeds angle_cap", stageIndex, pairIndex)
+			}
+		}
+	}
+	return nil
+}
+
+type aoqtPreparedIPSurface struct {
+	dim                  int
+	scores               []float32
+	queryRaw             []float32
+	queryNormalized      []float32
+	queryNorm            float32
+	candidateRaw         [][]float32
+	candidateNormalized  [][]float32
+	candidateNorms       []float32
+	candidateDequantized [][]float32
+}
+
+func newAOQTPreparedIPSurface(query []float32, candidates [][]float32, dim, bitWidth int, seed int64) aoqtPreparedIPSurface {
+	q := turboquant.NewIPWithSeed(dim, bitWidth, seed)
+	surface := aoqtPreparedIPSurface{
+		dim:                  dim,
+		scores:               make([]float32, len(candidates)),
+		queryRaw:             append([]float32(nil), query...),
+		queryNormalized:      append([]float32(nil), query...),
+		queryNorm:            vectorNorm(query),
+		candidateRaw:         make([][]float32, len(candidates)),
+		candidateNormalized:  make([][]float32, len(candidates)),
+		candidateNorms:       make([]float32, len(candidates)),
+		candidateDequantized: make([][]float32, len(candidates)),
+	}
+	prepared := q.PrepareQuery(surface.queryRaw)
+	for i, candidate := range candidates {
+		surface.candidateRaw[i] = append([]float32(nil), candidate...)
+		surface.candidateNormalized[i] = append([]float32(nil), candidate...)
+		surface.candidateNorms[i] = vectorNorm(candidate)
+		qx := q.Quantize(surface.candidateRaw[i])
+		surface.candidateDequantized[i] = q.Dequantize(qx)
+		surface.scores[i] = q.InnerProductPrepared(qx, prepared)
+	}
+	return surface
+}
+
+func (s aoqtPreparedIPSurface) accumulateScoreGrads(scoreGrads []float32, scale float32, queryGrad []float32, candidateGrads [][]float32) {
+	if scale == 0 || len(scoreGrads) != len(s.scores) {
+		return
+	}
+	for i, grad := range scoreGrads {
+		if grad == 0 {
+			continue
+		}
+		accumulateNormalizedPrefixSTEGrad(s.queryRaw, s.queryNormalized, s.queryNorm, s.candidateDequantized[i], grad*scale, queryGrad)
+		accumulateNormalizedPrefixSTEGrad(s.candidateRaw[i], s.candidateNormalized[i], s.candidateNorms[i], s.queryNormalized, grad*scale, candidateGrads[i])
+	}
+}
+
+func normalizedAOQTVector(vec []float32) []float32 {
+	out := make([]float32, len(vec))
+	norm := vectorNorm(vec)
+	if norm == 0 {
+		return out
+	}
+	inv := 1 / norm
+	for i, v := range vec {
+		out[i] = v * inv
+	}
+	return out
+}
+
+func aoqtAnchorOrderGuardLossAndGrad(scores []float32, ranks []int, eligiblePairs [][]bool, tau, margin float32) (float32, []float32, int, int) {
+	grads := make([]float32, len(scores))
+	if len(scores) == 0 || len(ranks) != len(scores) {
+		return 0, grads, 0, 0
+	}
+	var loss float32
+	var pairs int
+	var contributing int
+	for high := range scores {
+		for low := range scores {
+			if high == low || ranks[high] >= ranks[low] {
+				continue
+			}
+			if len(eligiblePairs) > 0 && !eligiblePairs[high][low] {
+				continue
+			}
+			z := (scores[low] - scores[high] + margin) / tau
+			pairScale := sigmoid32(z) / tau
+			loss += softplus32(z)
+			grads[high] -= pairScale
+			grads[low] += pairScale
+			pairs++
+			if pairScale != 0 {
+				contributing++
+			}
+		}
+	}
+	if pairs == 0 {
+		return 0, grads, 0, 0
+	}
+	inv := 1 / float32(pairs)
+	for i := range grads {
+		grads[i] *= inv
+	}
+	return loss * inv, grads, pairs, contributing
+}
+
+func aoqtNFBoundaryGuardLossAndGrad(scores []float32, ranks []int, sources []string, boundarySource string, eligiblePairs [][]bool, tau, margin float32) (float32, []float32, int, int) {
+	grads := make([]float32, len(scores))
+	if len(scores) == 0 || len(ranks) != len(scores) || len(sources) != len(scores) {
+		return 0, grads, 0, 0
+	}
+	var loss float32
+	var pairs int
+	var contributing int
+	for boundary := range scores {
+		if sources[boundary] != boundarySource {
+			continue
+		}
+		for other := range scores {
+			if boundary == other || ranks[boundary] >= ranks[other] {
+				continue
+			}
+			if len(eligiblePairs) > 0 && !eligiblePairs[boundary][other] {
+				continue
+			}
+			z := (scores[other] - scores[boundary] + margin) / tau
+			pairScale := sigmoid32(z) / tau
+			loss += softplus32(z)
+			grads[boundary] -= pairScale
+			grads[other] += pairScale
+			pairs++
+			if pairScale != 0 {
+				contributing++
+			}
+		}
+	}
+	if pairs == 0 {
+		return 0, grads, 0, 0
+	}
+	inv := 1 / float32(pairs)
+	for i := range grads {
+		grads[i] *= inv
+	}
+	return loss * inv, grads, pairs, contributing
+}
+
+func aoqtCenteredScoreDistillLossAndGrad(scores, anchors []float32, tau float32) (float32, []float32, int) {
+	grads := make([]float32, len(scores))
+	if len(scores) == 0 || len(scores) != len(anchors) {
+		return 0, grads, 0
+	}
+	var scoreMean, anchorMean float32
+	for i := range scores {
+		scoreMean += scores[i]
+		anchorMean += anchors[i]
+	}
+	invN := 1 / float32(len(scores))
+	scoreMean *= invN
+	anchorMean *= invN
+	var loss float32
+	for i := range scores {
+		residual := ((scores[i] - scoreMean) - (anchors[i] - anchorMean)) / tau
+		loss += 0.5 * residual * residual * invN
+		grads[i] = residual * invN / tau
+	}
+	return loss, grads, len(scores)
+}
+
+func normalizedAOQTPreparedIPObjectiveConfig(cfg AOQTSidecarPreparedIPObjectiveConfig) AOQTSidecarPreparedIPObjectiveConfig {
+	if cfg.Dim == 0 {
+		cfg.Dim = AOQTSidecarDim
+	}
+	if cfg.GainBit == 0 {
+		cfg.GainBit = AOQTSidecarDefaultGainBit
+	}
+	if cfg.Q3GuardBit == 0 {
+		cfg.Q3GuardBit = AOQTSidecarDefaultGuardBit3
+	}
+	if cfg.Q5GuardBit == 0 {
+		cfg.Q5GuardBit = AOQTSidecarDefaultGuardBit5
+	}
+	if cfg.GainCutoff == 0 {
+		cfg.GainCutoff = 10
+	}
+	if cfg.GainTau == 0 {
+		cfg.GainTau = 0.05
+	}
+	if cfg.GuardTau == 0 {
+		cfg.GuardTau = 0.05
+	}
+	if cfg.ScoreDistillTau == 0 {
+		cfg.ScoreDistillTau = 1
+	}
+	if cfg.NFBoundarySource == "" {
+		cfg.NFBoundarySource = "nf_boundary80_120"
+	}
+	return cfg
+}
+
+func validateAOQTPreparedIPObjectiveConfig(cfg AOQTSidecarPreparedIPObjectiveConfig) error {
+	if cfg.Dim != AOQTSidecarDim {
+		return fmt.Errorf("AOQT prepared-IP dim = %d, want %d", cfg.Dim, AOQTSidecarDim)
+	}
+	if cfg.TurboQuantSeed == 0 {
+		return fmt.Errorf("AOQT prepared-IP turboquant seed is required")
+	}
+	for _, item := range []struct {
+		name string
+		bit  int
+	}{
+		{"gain_bit", cfg.GainBit},
+		{"q3_guard_bit", cfg.Q3GuardBit},
+		{"q5_guard_bit", cfg.Q5GuardBit},
+	} {
+		if item.bit < 2 || item.bit > 8 {
+			return fmt.Errorf("AOQT prepared-IP %s = %d, want 2..8", item.name, item.bit)
+		}
+	}
+	if cfg.GainCutoff <= 0 {
+		return fmt.Errorf("AOQT prepared-IP gain cutoff must be positive")
+	}
+	for _, item := range []struct {
+		name  string
+		value float32
+	}{
+		{"gain_tau", cfg.GainTau},
+		{"guard_tau", cfg.GuardTau},
+		{"score_distill_tau", cfg.ScoreDistillTau},
+		{"gain_margin", cfg.GainMargin},
+		{"guard_margin", cfg.GuardMargin},
+	} {
+		if !isFinite32(item.value) {
+			return fmt.Errorf("AOQT prepared-IP %s must be finite", item.name)
+		}
+	}
+	if cfg.GainTau <= 0 || cfg.GuardTau <= 0 || cfg.ScoreDistillTau <= 0 {
+		return fmt.Errorf("AOQT prepared-IP taus must be positive")
+	}
+	return nil
 }
 
 func cloneAOQTVectors(in [][]float32) [][]float32 {
