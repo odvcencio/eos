@@ -657,6 +657,111 @@ func TestAOQTStage2BValidatorsRejectNonUnitVectors(t *testing.T) {
 	}
 }
 
+func TestAOQTTransactionalStepRollsBackExactStateWhenUnsafe(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 77)
+	trainer := newTinyAOQTTrainer(t, false, 77)
+	grad := make([]float32, AOQTSidecarAngleCount)
+	grad[0] = 1
+	before := trainer.snapshotOptimizerState()
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
+	if err != nil {
+		t.Fatalf("transactional step: %v", err)
+	}
+	if accepted {
+		t.Fatalf("unsafe proposal accepted")
+	}
+	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
+		t.Fatalf("optimizer state was not restored exactly after rejected proposals")
+	}
+	if diagnostics.ProposalAttempts != aoqtTransactionalMaxAttemptsPerStep || diagnostics.RejectedProposals != aoqtTransactionalMaxAttemptsPerStep || diagnostics.Backtracks != aoqtTransactionalMaxAttemptsPerStep {
+		t.Fatalf("diagnostics = %+v, want every proposal rejected/backtracked", diagnostics)
+	}
+}
+
+func TestAOQTTransactionalStepAcceptsSmallerScale(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 78)
+	trainer := newTinyAOQTTrainer(t, false, 78)
+	grad := make([]float32, AOQTSidecarAngleCount)
+	grad[0] = 1
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		if math.Abs(float64(trainer.angles[0])) > 0.0075 {
+			return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+		}
+		return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
+	if err != nil {
+		t.Fatalf("transactional step: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("smaller safe proposal was rejected")
+	}
+	if diagnostics.ProposalAttempts != 2 || diagnostics.RejectedProposals != 1 || diagnostics.Backtracks != 1 {
+		t.Fatalf("diagnostics = %+v, want one backtrack then acceptance", diagnostics)
+	}
+	if got := math.Abs(float64(trainer.angles[0])); got < 0.0049 || got > 0.0051 {
+		t.Fatalf("accepted angle magnitude = %.9g, want half-scale Adam proposal", got)
+	}
+	if trainer.step != 1 {
+		t.Fatalf("trainer step = %d, want accepted Adam step", trainer.step)
+	}
+}
+
+func TestAOQTTransactionalFitRejectsZeroAcceptedAndRestoresState(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 79)
+	trainer := newTinyAOQTTrainer(t, false, 79)
+	before := trainer.snapshotOptimizerState()
+	objective := &statefulRejectingAOQTObjective{config: tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed)}
+
+	summary, err := trainer.Fit(set, objective)
+	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") {
+		t.Fatalf("fit error = %v, want zero-accepted transactional failure", err)
+	}
+	if summary.OptimizerDiagnostics == nil || summary.OptimizerDiagnostics.AcceptedSteps != 0 || summary.OptimizerDiagnostics.ProposalAttempts != aoqtTransactionalMaxAttemptsPerStep {
+		t.Fatalf("diagnostics = %+v, want zero accepted and bounded proposals", summary.OptimizerDiagnostics)
+	}
+	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
+		t.Fatalf("optimizer state was not restored after zero accepted fit")
+	}
+}
+
+func TestAOQTTransactionalDiagnosticsHashIsDeterministic(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 80)
+	a := newTinyAOQTTrainer(t, false, 80)
+	b := newTinyAOQTTrainer(t, false, 80)
+	sa, err := a.Fit(set, toyAOQTObjective{})
+	if err != nil {
+		t.Fatalf("fit A: %v", err)
+	}
+	sb, err := b.Fit(set, toyAOQTObjective{})
+	if err != nil {
+		t.Fatalf("fit B: %v", err)
+	}
+	if sa.OptimizerDiagnostics == nil || sb.OptimizerDiagnostics == nil {
+		t.Fatalf("optimizer diagnostics missing")
+	}
+	if *sa.OptimizerDiagnostics != *sb.OptimizerDiagnostics || sa.OptimizerDiagnosticsSHA256 != sb.OptimizerDiagnosticsSHA256 {
+		t.Fatalf("diagnostics differ: %+v/%s vs %+v/%s", *sa.OptimizerDiagnostics, sa.OptimizerDiagnosticsSHA256, *sb.OptimizerDiagnostics, sb.OptimizerDiagnosticsSHA256)
+	}
+	if sa.OptimizerDiagnostics.AcceptedSteps != sa.Steps || sa.OptimizerDiagnostics.AcceptedSteps == 0 {
+		t.Fatalf("diagnostics accepted steps = %d summary steps = %d", sa.OptimizerDiagnostics.AcceptedSteps, sa.Steps)
+	}
+	if got, err := sa.OptimizerDiagnostics.SHA256(); err != nil || got != sa.OptimizerDiagnosticsSHA256 {
+		t.Fatalf("diagnostics sha = %s/%v, want %s", got, err, sa.OptimizerDiagnosticsSHA256)
+	}
+}
+
 type toyAOQTObjective struct{}
 
 type unaccountedAOQTObjective struct{}
@@ -676,7 +781,7 @@ func (toyAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidec
 		candidateGrads[i][1] += diff * input.Query[0]
 		candidateGrads[i][0] -= diff * input.Query[1]
 	}
-	return AOQTSidecarObjectiveResult{Loss: loss, Components: AOQTSidecarObjectiveComponents{Q3Gain: loss}, QueryGrad: queryGrad, CandidateGrads: candidateGrads}, nil
+	return AOQTSidecarObjectiveResult{Loss: loss, Components: AOQTSidecarObjectiveComponents{Q3Gain: loss}, QueryGrad: queryGrad, CandidateGrads: candidateGrads, Activation: aoqtActiveObjectiveForWeights(input.Row.Weights, len(input.Candidates))}, nil
 }
 
 func (unaccountedAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
@@ -824,7 +929,7 @@ func (mutatingAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQT
 	for i := range candidateGrads {
 		candidateGrads[i] = make([]float32, len(input.Candidates[i]))
 	}
-	return AOQTSidecarObjectiveResult{Loss: 0, QueryGrad: queryGrad, CandidateGrads: candidateGrads}, nil
+	return AOQTSidecarObjectiveResult{Loss: 0, QueryGrad: queryGrad, CandidateGrads: candidateGrads, Activation: aoqtActiveObjectiveForWeights(input.Row.Weights, len(input.Candidates))}, nil
 }
 
 func (toyAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
@@ -841,6 +946,88 @@ func (mutatingAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPrepared
 
 func tinyAOQTObjectiveConfig(seed int64) AOQTSidecarPreparedIPObjectiveConfig {
 	return AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: seed}
+}
+
+type statefulRejectingAOQTObjective struct {
+	config AOQTSidecarPreparedIPObjectiveConfig
+	calls  int
+}
+
+func (o *statefulRejectingAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
+	return o.config
+}
+
+func (o *statefulRejectingAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+	o.calls++
+	queryGrad := make([]float32, len(input.Query))
+	if len(queryGrad) > 0 {
+		queryGrad[0] = 1
+	}
+	candidateGrads := make([][]float32, len(input.Candidates))
+	for i := range input.Candidates {
+		candidateGrads[i] = make([]float32, len(input.Candidates[i]))
+	}
+	loss := float32(1)
+	if o.calls > 1 {
+		loss = 2
+	}
+	return AOQTSidecarObjectiveResult{
+		Loss:           loss,
+		Components:     AOQTSidecarObjectiveComponents{Q3Gain: loss},
+		QueryGrad:      queryGrad,
+		CandidateGrads: candidateGrads,
+		Activation:     aoqtActiveObjectiveForWeights(input.Row.Weights, len(input.Candidates)),
+	}, nil
+}
+
+func aoqtSafeStepEvaluation(loss float32, weights AOQTSidecarRowWeights) aoqtStepEvaluation {
+	return aoqtStepEvaluation{
+		loss:       loss,
+		components: AOQTSidecarObjectiveComponents{Q3Gain: loss},
+		activation: aoqtActiveObjectiveForWeights(weights, 3),
+	}
+}
+
+func aoqtActiveObjectiveForWeights(weights AOQTSidecarRowWeights, candidates int) AOQTSidecarObjectiveActivation {
+	if candidates < 2 {
+		candidates = 2
+	}
+	activation := AOQTSidecarObjectiveActivation{}
+	if weights.Q3Gain > 0 {
+		activation.Q3GainEligiblePairs = 1
+		activation.Q3GainContributingPairs = 1
+	}
+	if weights.Q3OrderGuard > 0 {
+		activation.Q3OrderGuardPairs = 1
+		activation.Q3OrderGuardContributing = 1
+	}
+	if weights.Q3ScoreDistill > 0 {
+		activation.Q3ScoreDistillCount = candidates
+	}
+	if weights.Q5OrderGuard > 0 {
+		activation.Q5OrderGuardPairs = 1
+		activation.Q5OrderGuardContributing = 1
+	}
+	if weights.Q5ScoreDistill > 0 {
+		activation.Q5ScoreDistillCount = candidates
+	}
+	if weights.NFBoundaryGuard > 0 {
+		activation.NFBoundaryGuardPairs = 1
+		activation.NFBoundaryGuardContributing = 1
+	}
+	return activation
+}
+
+func float32SlicesEqual(a, b []float32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func snapshotAOQTVectorAngleGradReference(transform AOQTGivensTransform, input, outputGrad []float32) ([]float32, error) {

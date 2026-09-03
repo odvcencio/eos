@@ -1,6 +1,9 @@
 package eosruntime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/rand"
@@ -38,20 +41,34 @@ type AOQTSidecarWorkPlan struct {
 }
 
 type AOQTSidecarTrainSummary struct {
-	Plan                       AOQTSidecarWorkPlan            `json:"plan"`
-	ObjectiveContract          AOQTSidecarObjectiveContract   `json:"objective_contract"`
-	Steps                      int                            `json:"steps"`
-	InitialLoss                float32                        `json:"initial_loss"`
-	FinalLoss                  float32                        `json:"final_loss"`
-	InitialObjectiveComponents AOQTSidecarObjectiveComponents `json:"initial_objective_components"`
-	FinalObjectiveComponents   AOQTSidecarObjectiveComponents `json:"final_objective_components"`
-	InitialObjectiveActivation AOQTSidecarObjectiveActivation `json:"initial_objective_activation"`
-	FinalObjectiveActivation   AOQTSidecarObjectiveActivation `json:"final_objective_activation"`
-	AngleL2                    float32                        `json:"angle_l2"`
-	AngleMaxAbs                float32                        `json:"angle_max_abs"`
-	AnglesSHA256               string                         `json:"angles_sha256"`
-	DenseMaxAbsDelta           float64                        `json:"dense_max_abs_delta"`
-	QualityClaim               bool                           `json:"quality_claim"`
+	Plan                       AOQTSidecarWorkPlan              `json:"plan"`
+	ObjectiveContract          AOQTSidecarObjectiveContract     `json:"objective_contract"`
+	Steps                      int                              `json:"steps"`
+	InitialLoss                float32                          `json:"initial_loss"`
+	FinalLoss                  float32                          `json:"final_loss"`
+	InitialObjectiveComponents AOQTSidecarObjectiveComponents   `json:"initial_objective_components"`
+	FinalObjectiveComponents   AOQTSidecarObjectiveComponents   `json:"final_objective_components"`
+	InitialObjectiveActivation AOQTSidecarObjectiveActivation   `json:"initial_objective_activation"`
+	FinalObjectiveActivation   AOQTSidecarObjectiveActivation   `json:"final_objective_activation"`
+	AngleL2                    float32                          `json:"angle_l2"`
+	AngleMaxAbs                float32                          `json:"angle_max_abs"`
+	AnglesSHA256               string                           `json:"angles_sha256"`
+	DenseMaxAbsDelta           float64                          `json:"dense_max_abs_delta"`
+	OptimizerDiagnostics       *AOQTSidecarOptimizerDiagnostics `json:"optimizer_diagnostics,omitempty"`
+	OptimizerDiagnosticsSHA256 string                           `json:"optimizer_diagnostics_sha256,omitempty"`
+	QualityClaim               bool                             `json:"quality_claim"`
+}
+
+type AOQTSidecarOptimizerDiagnostics struct {
+	PlannedSteps       int `json:"planned_steps"`
+	AttemptedSteps     int `json:"attempted_steps"`
+	AcceptedSteps      int `json:"accepted_steps"`
+	ProposalAttempts   int `json:"proposal_attempts"`
+	AcceptedProposals  int `json:"accepted_proposals"`
+	RejectedProposals  int `json:"rejected_proposals"`
+	Backtracks         int `json:"backtracks"`
+	MaxAttemptsPerStep int `json:"max_attempts_per_step"`
+	ExhaustedSteps     int `json:"exhausted_steps"`
 }
 
 type AOQTSidecarObjectiveInput struct {
@@ -450,6 +467,10 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	if err := validateAOQTFitObjectiveContract(set.Manifest.ObjectiveContract, objective); err != nil {
 		return summary, err
 	}
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       t.config.MaxSteps,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
 	var initialSet bool
 	for step := 0; step < t.config.MaxSteps; step++ {
 		rows := deterministicAOQTRowOrder(set.Rows, t.config.WorkplanSeed, step)
@@ -463,11 +484,39 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 			summary.InitialObjectiveComponents = components
 			initialSet = true
 		}
-		if err := t.applyAdam(grad); err != nil {
+		accepted, err := t.acceptTransactionalAdamStep(grad, aoqtStepEvaluation{
+			loss:       loss,
+			activation: activation,
+			components: components,
+		}, func() (aoqtStepEvaluation, error) {
+			loss, _, activation, components, err := t.lossAndAngleGrad(rows, objective)
+			return aoqtStepEvaluation{loss: loss, activation: activation, components: components}, err
+		}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
+		if err != nil {
 			return summary, err
 		}
+		diagnostics.AttemptedSteps++
+		if !accepted {
+			diagnostics.ExhaustedSteps++
+			if diagnostics.AcceptedSteps == 0 {
+				summary.OptimizerDiagnostics = &diagnostics
+				if sum, err := diagnostics.SHA256(); err == nil {
+					summary.OptimizerDiagnosticsSHA256 = sum
+				}
+				return summary, fmt.Errorf("AOQT transactional optimizer accepted zero safe steps after %d proposal attempts", diagnostics.ProposalAttempts)
+			}
+			break
+		}
+		diagnostics.AcceptedSteps++
+		diagnostics.AcceptedProposals++
 		summary.Steps++
 	}
+	summary.OptimizerDiagnostics = &diagnostics
+	diagnosticsSHA, err := diagnostics.SHA256()
+	if err != nil {
+		return summary, err
+	}
+	summary.OptimizerDiagnosticsSHA256 = diagnosticsSHA
 	finalLoss, _, finalActivation, finalComponents, err := t.lossAndAngleGrad(set.Rows, objective)
 	if err != nil {
 		return summary, err
@@ -488,6 +537,110 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	}
 	summary.DenseMaxAbsDelta = dense
 	return summary, nil
+}
+
+type aoqtStepEvaluation struct {
+	loss       float32
+	activation AOQTSidecarObjectiveActivation
+	components AOQTSidecarObjectiveComponents
+}
+
+type aoqtOptimizerState struct {
+	angles []float32
+	adamM  []float32
+	adamV  []float32
+	step   int
+}
+
+const (
+	aoqtTransactionalMaxAttemptsPerStep = 12
+	aoqtTransactionalLossEpsilon        = float32(1e-7)
+)
+
+func (d AOQTSidecarOptimizerDiagnostics) SHA256() (string, error) {
+	data, err := json.Marshal(d)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad []float32, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics) (bool, error) {
+	if evaluate == nil {
+		return false, fmt.Errorf("AOQT transactional optimizer evaluator is required")
+	}
+	if diagnostics == nil {
+		return false, fmt.Errorf("AOQT transactional optimizer diagnostics are required")
+	}
+	if !isFinite32(baseline.loss) {
+		return false, fmt.Errorf("AOQT transactional optimizer baseline loss must be finite")
+	}
+	if err := validateAOQTObjectiveComponents(baseline.components, "AOQT transactional optimizer baseline components"); err != nil {
+		return false, err
+	}
+	if err := validateAOQTLossMatchesComponents(baseline.loss, baseline.components, "AOQT transactional optimizer baseline"); err != nil {
+		return false, err
+	}
+	state := t.snapshotOptimizerState()
+	scale := float32(1)
+	for attempt := 0; attempt < aoqtTransactionalMaxAttemptsPerStep; attempt++ {
+		t.restoreOptimizerState(state)
+		diagnostics.ProposalAttempts++
+		if err := t.applyAdamScaled(grad, scale); err != nil {
+			t.restoreOptimizerState(state)
+			return false, err
+		}
+		candidate, err := evaluate()
+		if err != nil {
+			t.restoreOptimizerState(state)
+			return false, err
+		}
+		if aoqtAcceptsTransactionalStep(baseline, candidate, weights) {
+			return true, nil
+		}
+		diagnostics.RejectedProposals++
+		diagnostics.Backtracks++
+		scale *= 0.5
+	}
+	t.restoreOptimizerState(state)
+	return false, nil
+}
+
+func aoqtAcceptsTransactionalStep(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) bool {
+	if !isFinite32(candidate.loss) || candidate.loss-baseline.loss > aoqtTransactionalLossEpsilon {
+		return false
+	}
+	if err := validateAOQTObjectiveComponents(candidate.components, "AOQT transactional optimizer candidate components"); err != nil {
+		return false
+	}
+	if err := validateAOQTLossMatchesComponents(candidate.loss, candidate.components, "AOQT transactional optimizer candidate"); err != nil {
+		return false
+	}
+	if err := validateAOQTActiveObjectiveContributions(weights, candidate.activation); err != nil {
+		return false
+	}
+	policy := normalizedAOQTSidecarCandidateEligibilityPolicy(AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true})
+	if err := validateAOQTAllowedComponentRegressions(baseline.components, candidate.components, policy); err != nil {
+		return false
+	}
+	return true
+}
+
+func (t *AOQTSidecarTrainer) snapshotOptimizerState() aoqtOptimizerState {
+	return aoqtOptimizerState{
+		angles: append([]float32(nil), t.angles...),
+		adamM:  append([]float32(nil), t.adamM...),
+		adamV:  append([]float32(nil), t.adamV...),
+		step:   t.step,
+	}
+}
+
+func (t *AOQTSidecarTrainer) restoreOptimizerState(state aoqtOptimizerState) {
+	copy(t.angles, state.angles)
+	copy(t.adamM, state.adamM)
+	copy(t.adamV, state.adamV)
+	t.step = state.step
 }
 
 func validateAOQTFitObjectiveContract(contract AOQTSidecarObjectiveContract, objective AOQTSidecarVectorObjective) error {
@@ -657,8 +810,15 @@ func validateAOQTLossMatchesComponents(loss float32, components AOQTSidecarObjec
 }
 
 func (t *AOQTSidecarTrainer) applyAdam(grad []float32) error {
+	return t.applyAdamScaled(grad, 1)
+}
+
+func (t *AOQTSidecarTrainer) applyAdamScaled(grad []float32, scale float32) error {
 	if len(grad) != len(t.angles) {
 		return fmt.Errorf("AOQT gradient count = %d, want %d", len(grad), len(t.angles))
+	}
+	if scale <= 0 || !isFinite32(scale) {
+		return fmt.Errorf("AOQT Adam proposal scale must be finite and positive")
 	}
 	t.step++
 	b1, b2 := t.config.Beta1, t.config.Beta2
@@ -672,7 +832,7 @@ func (t *AOQTSidecarTrainer) applyAdam(grad []float32) error {
 		t.adamV[i] = b2*t.adamV[i] + (1-b2)*g*g
 		mhat := t.adamM[i] / (1 - float32(math.Pow(float64(b1), float64(t.step))))
 		vhat := t.adamV[i] / (1 - float32(math.Pow(float64(b2), float64(t.step))))
-		t.angles[i] -= lr * mhat / (float32(math.Sqrt(float64(vhat))) + eps)
+		t.angles[i] -= scale * lr * mhat / (float32(math.Sqrt(float64(vhat))) + eps)
 	}
 	return t.ProjectAngles()
 }

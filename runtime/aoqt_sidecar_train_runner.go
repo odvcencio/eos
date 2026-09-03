@@ -36,7 +36,13 @@ type AOQTSidecarTrainRunnerResult struct {
 	PackageResult *AOQTSidecarCandidatePackageResult
 }
 
+type aoqtRunnerObjectiveFactory func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error)
+
 func RunAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig) (AOQTSidecarTrainRunnerResult, error) {
+	return runAOQTSidecarTraining(cfg, aoqtRunnerObjectiveFromContract)
+}
+
+func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory aoqtRunnerObjectiveFactory) (AOQTSidecarTrainRunnerResult, error) {
 	if err := validateAOQTSidecarTrainRunnerConfig(cfg); err != nil {
 		return AOQTSidecarTrainRunnerResult{}, err
 	}
@@ -79,7 +85,10 @@ func RunAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig) (AOQTSidecarTrainR
 	}
 	var objective AOQTSidecarVectorObjective
 	if !cfg.PlanOnly {
-		objective, err = objectiveFromAOQTContract(set.Manifest.ObjectiveContract)
+		if objectiveFactory == nil {
+			return AOQTSidecarTrainRunnerResult{}, fmt.Errorf("AOQT objective factory is required for non-plan training")
+		}
+		objective, err = objectiveFactory(set.Manifest.ObjectiveContract)
 		if err != nil {
 			return AOQTSidecarTrainRunnerResult{}, err
 		}
@@ -119,6 +128,14 @@ func RunAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig) (AOQTSidecarTrainR
 		result.PackageResult = &packageResult
 	}
 	return result, nil
+}
+
+func aoqtRunnerObjectiveFromContract(contract AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+	objective, err := objectiveFromAOQTContract(contract)
+	if err != nil {
+		return nil, err
+	}
+	return objective, nil
 }
 
 func validateAOQTSidecarTrainRunnerConfig(cfg AOQTSidecarTrainRunnerConfig) error {

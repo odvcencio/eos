@@ -119,8 +119,11 @@ func (m AOQTSidecarRunMetrics) Validate() error {
 		if m.Plan.StepCount != 0 || m.Summary.Steps != 0 {
 			return fmt.Errorf("AOQT plan-only metrics must have zero planned and completed steps")
 		}
-	} else if m.Summary.Steps != m.Plan.StepCount {
-		return fmt.Errorf("AOQT metrics summary.steps = %d, want plan.step_count %d", m.Summary.Steps, m.Plan.StepCount)
+		if m.Summary.OptimizerDiagnostics != nil || strings.TrimSpace(m.Summary.OptimizerDiagnosticsSHA256) != "" {
+			return fmt.Errorf("AOQT plan-only metrics must not include optimizer diagnostics")
+		}
+	} else if err := validateAOQTOptimizerDiagnostics(m.Plan, m.Summary); err != nil {
+		return err
 	}
 	if err := validateAOQTResearchOnlyLegalGates(m.LegalGates, "AOQT metrics"); err != nil {
 		return err
@@ -187,6 +190,9 @@ func ValidateAOQTSidecarCandidateEligibility(metrics AOQTSidecarRunMetrics, poli
 	}
 	if metrics.Plan.PlanOnly || metrics.Summary.Steps == 0 {
 		return fmt.Errorf("AOQT candidate eligibility requires a non-plan training summary")
+	}
+	if metrics.Summary.OptimizerDiagnostics != nil && metrics.Summary.OptimizerDiagnostics.AcceptedSteps <= 0 {
+		return fmt.Errorf("AOQT candidate eligibility requires at least one accepted safe optimizer step")
 	}
 	if metrics.Summary.QualityClaim || metrics.QualityClaim {
 		return fmt.Errorf("AOQT candidate eligibility cannot be based on a quality claim")
@@ -320,8 +326,71 @@ func validateAOQTSidecarSummaryPlan(summary AOQTSidecarTrainSummary, manifest AO
 		if summary.Plan.StepCount != 0 || summary.Steps != 0 {
 			return fmt.Errorf("AOQT summary plan-only run must have zero planned and completed steps")
 		}
-	} else if summary.Steps != summary.Plan.StepCount {
-		return fmt.Errorf("AOQT summary steps = %d, want plan step_count %d", summary.Steps, summary.Plan.StepCount)
+		if summary.OptimizerDiagnostics != nil || strings.TrimSpace(summary.OptimizerDiagnosticsSHA256) != "" {
+			return fmt.Errorf("AOQT summary plan-only run must not include optimizer diagnostics")
+		}
+	} else if err := validateAOQTOptimizerDiagnostics(summary.Plan, summary); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSidecarTrainSummary) error {
+	if summary.OptimizerDiagnostics == nil {
+		return fmt.Errorf("AOQT optimizer diagnostics are required for non-plan AOQT summaries")
+	}
+	diagnostics := *summary.OptimizerDiagnostics
+	if diagnostics.PlannedSteps != plan.StepCount {
+		return fmt.Errorf("AOQT optimizer diagnostics planned_steps = %d, want plan step_count %d", diagnostics.PlannedSteps, plan.StepCount)
+	}
+	if diagnostics.MaxAttemptsPerStep != aoqtTransactionalMaxAttemptsPerStep {
+		return fmt.Errorf("AOQT optimizer diagnostics max_attempts_per_step = %d, want %d", diagnostics.MaxAttemptsPerStep, aoqtTransactionalMaxAttemptsPerStep)
+	}
+	if diagnostics.AttemptedSteps <= 0 || diagnostics.AttemptedSteps > diagnostics.PlannedSteps {
+		return fmt.Errorf("AOQT optimizer diagnostics attempted_steps = %d outside [1,%d]", diagnostics.AttemptedSteps, diagnostics.PlannedSteps)
+	}
+	if diagnostics.AcceptedSteps != summary.Steps {
+		return fmt.Errorf("AOQT optimizer diagnostics accepted_steps = %d, want summary.steps %d", diagnostics.AcceptedSteps, summary.Steps)
+	}
+	if diagnostics.AcceptedProposals != diagnostics.AcceptedSteps {
+		return fmt.Errorf("AOQT optimizer diagnostics accepted_proposals = %d, want accepted_steps %d", diagnostics.AcceptedProposals, diagnostics.AcceptedSteps)
+	}
+	if diagnostics.AcceptedSteps <= 0 {
+		return fmt.Errorf("AOQT optimizer diagnostics accepted_steps must be positive")
+	}
+	if diagnostics.AcceptedSteps > diagnostics.AttemptedSteps {
+		return fmt.Errorf("AOQT optimizer diagnostics accepted_steps exceeds attempted_steps")
+	}
+	if diagnostics.ProposalAttempts != diagnostics.AcceptedProposals+diagnostics.RejectedProposals {
+		return fmt.Errorf("AOQT optimizer diagnostics proposal accounting mismatch")
+	}
+	if diagnostics.Backtracks != diagnostics.RejectedProposals {
+		return fmt.Errorf("AOQT optimizer diagnostics backtracks = %d, want rejected_proposals %d", diagnostics.Backtracks, diagnostics.RejectedProposals)
+	}
+	if diagnostics.ProposalAttempts < diagnostics.AttemptedSteps || diagnostics.ProposalAttempts > diagnostics.AttemptedSteps*diagnostics.MaxAttemptsPerStep {
+		return fmt.Errorf("AOQT optimizer diagnostics proposal_attempts = %d outside expected range", diagnostics.ProposalAttempts)
+	}
+	if diagnostics.ExhaustedSteps < 0 || diagnostics.ExhaustedSteps > 1 {
+		return fmt.Errorf("AOQT optimizer diagnostics exhausted_steps = %d, want 0 or 1", diagnostics.ExhaustedSteps)
+	}
+	if diagnostics.ExhaustedSteps == 0 && diagnostics.AcceptedSteps != diagnostics.AttemptedSteps {
+		return fmt.Errorf("AOQT optimizer diagnostics accepted_steps = %d, want attempted_steps %d when no step exhausted", diagnostics.AcceptedSteps, diagnostics.AttemptedSteps)
+	}
+	if diagnostics.ExhaustedSteps == 1 && diagnostics.AcceptedSteps+1 != diagnostics.AttemptedSteps {
+		return fmt.Errorf("AOQT optimizer diagnostics attempted_steps must equal accepted_steps+1 when a step exhausts")
+	}
+	if strings.TrimSpace(summary.OptimizerDiagnosticsSHA256) == "" {
+		return fmt.Errorf("AOQT optimizer diagnostics sha256 is required")
+	}
+	if err := validateAOQTSHA256(summary.OptimizerDiagnosticsSHA256, "AOQT optimizer diagnostics sha256"); err != nil {
+		return err
+	}
+	got, err := diagnostics.SHA256()
+	if err != nil {
+		return err
+	}
+	if got != summary.OptimizerDiagnosticsSHA256 {
+		return fmt.Errorf("AOQT optimizer diagnostics sha256 mismatch")
 	}
 	return nil
 }

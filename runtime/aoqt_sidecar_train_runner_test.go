@@ -69,6 +69,44 @@ func TestAOQTSidecarTrainRunnerRejectsPreflightManifestDigestDrift(t *testing.T)
 	}
 }
 
+func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OutputArtifactPath = filepath.Join(t.TempDir(), "candidate.mll")
+	objectiveFactory := func(contract AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		return &statefulRejectingAOQTObjective{config: AOQTSidecarPreparedIPObjectiveConfig{
+			Dim:              contract.Dim,
+			TurboQuantSeed:   contract.TurboQuantSeed,
+			GainBit:          contract.GainBit,
+			Q3GuardBit:       contract.Q3GuardBit,
+			Q5GuardBit:       contract.Q5GuardBit,
+			GainCutoff:       contract.GainCutoff,
+			GainTau:          contract.GainTau,
+			GainMargin:       contract.GainMargin,
+			GuardTau:         contract.GuardTau,
+			GuardMargin:      contract.GuardMargin,
+			ScoreDistillTau:  contract.ScoreDistillTau,
+			NFBoundarySource: contract.NFBoundarySource,
+		}}, nil
+	}
+
+	if _, err := runAOQTSidecarTraining(trainCfg, objectiveFactory); err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") {
+		t.Fatalf("run AOQT sidecar training error = %v, want zero-accepted failure", err)
+	}
+	for role, candidate := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(trainCfg.OutputArtifactPath, true)) {
+		if _, err := os.Lstat(candidate); err == nil {
+			t.Fatalf("runner wrote %s output %q despite zero accepted safe steps", role, candidate)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat %s output: %v", role, err)
+		}
+	}
+}
+
 func aoqtTrainRunnerConfigFromMaterializerFixture(t *testing.T, materializerCfg AOQTSidecarMaterializeConfig) AOQTSidecarTrainRunnerConfig {
 	t.Helper()
 	manifest := readAOQTManifestForTrainRunnerTest(t, materializerCfg.ManifestJSONPath)

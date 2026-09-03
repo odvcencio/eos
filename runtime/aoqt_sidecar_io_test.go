@@ -212,6 +212,14 @@ func TestAOQTCandidateEligibilityRejectsUnsafeOutputsAndAllowsSafePass(t *testin
 			want: "angle_max_abs",
 		},
 		{
+			name: "missing-diagnostics",
+			mutate: func(m *AOQTSidecarRunMetrics) {
+				m.Summary.OptimizerDiagnostics = nil
+				m.Summary.OptimizerDiagnosticsSHA256 = ""
+			},
+			want: "optimizer diagnostics are required",
+		},
+		{
 			name: "inert",
 			mutate: func(m *AOQTSidecarRunMetrics) {
 				m.Summary.FinalObjectiveActivation.Q5OrderGuardContributing = 0
@@ -327,6 +335,20 @@ func safeTinyAOQTCandidateMetrics(t *testing.T, set AOQTSidecarCalibrationSet, a
 		AnglesSHA256:               anglesSHA,
 		DenseMaxAbsDelta:           0,
 	}
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       plan.StepCount,
+		AttemptedSteps:     plan.StepCount,
+		AcceptedSteps:      plan.StepCount,
+		ProposalAttempts:   plan.StepCount,
+		AcceptedProposals:  plan.StepCount,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+	summary.OptimizerDiagnostics = &diagnostics
+	diagnosticsSHA, err := diagnostics.SHA256()
+	if err != nil {
+		t.Fatalf("diagnostics sha: %v", err)
+	}
+	summary.OptimizerDiagnosticsSHA256 = diagnosticsSHA
 	metrics, err := NewAOQTSidecarRunMetrics(set, summary)
 	if err != nil {
 		t.Fatalf("metrics: %v", err)
