@@ -218,8 +218,14 @@ func ValidateAOQTSidecarCandidateEligibility(metrics AOQTSidecarRunMetrics, poli
 	if !isFinite32(metrics.Summary.AngleMaxAbs) || metrics.Summary.AngleMaxAbs < 0 {
 		return fmt.Errorf("AOQT candidate angle_max_abs must be finite and non-negative")
 	}
+	if metrics.Summary.AngleMaxAbs == 0 {
+		return fmt.Errorf("AOQT candidate angle_max_abs must be non-zero")
+	}
 	if metrics.Summary.AngleMaxAbs > policy.AngleMaxAbsCap+1e-7 {
 		return fmt.Errorf("AOQT candidate angle_max_abs %.9g exceeds cap %.9g", metrics.Summary.AngleMaxAbs, policy.AngleMaxAbsCap)
+	}
+	if metrics.Summary.FinalObjectiveComponents.Q3Gain >= metrics.Summary.InitialObjectiveComponents.Q3Gain {
+		return fmt.Errorf("AOQT candidate q3_gain component must strictly improve")
 	}
 	if policy.RequireObjectiveActivation {
 		if err := validateAOQTActiveObjectiveContributions(metrics.ObjectiveContract.WeightSums, metrics.Summary.FinalObjectiveActivation); err != nil {
@@ -363,6 +369,43 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 	}
 	if diagnostics.ProposalAttempts != diagnostics.AcceptedProposals+diagnostics.RejectedProposals {
 		return fmt.Errorf("AOQT optimizer diagnostics proposal accounting mismatch")
+	}
+	hasOptimizerPathDiagnostics := diagnostics.AdamProposalAttempts != 0 ||
+		diagnostics.AdamAcceptedProposals != 0 ||
+		diagnostics.AdamRejectedProposals != 0 ||
+		diagnostics.CoordinateProposalAttempts != 0 ||
+		diagnostics.CoordinateAcceptedProposals != 0 ||
+		diagnostics.CoordinateRejectedProposals != 0
+	if hasOptimizerPathDiagnostics {
+		if diagnostics.AdamProposalAttempts != diagnostics.AdamAcceptedProposals+diagnostics.AdamRejectedProposals {
+			return fmt.Errorf("AOQT optimizer diagnostics adam proposal accounting mismatch")
+		}
+		if diagnostics.CoordinateProposalAttempts != diagnostics.CoordinateAcceptedProposals+diagnostics.CoordinateRejectedProposals {
+			return fmt.Errorf("AOQT optimizer diagnostics coordinate proposal accounting mismatch")
+		}
+		if diagnostics.AdamProposalAttempts+diagnostics.CoordinateProposalAttempts != diagnostics.ProposalAttempts {
+			return fmt.Errorf("AOQT optimizer diagnostics optimizer-path proposal accounting mismatch")
+		}
+		if diagnostics.AdamAcceptedProposals+diagnostics.CoordinateAcceptedProposals != diagnostics.AcceptedProposals {
+			return fmt.Errorf("AOQT optimizer diagnostics optimizer-path accepted proposal accounting mismatch")
+		}
+		if diagnostics.AdamRejectedProposals+diagnostics.CoordinateRejectedProposals != diagnostics.RejectedProposals {
+			return fmt.Errorf("AOQT optimizer diagnostics optimizer-path rejected proposal accounting mismatch")
+		}
+		if diagnostics.CoordinateProposalAttempts > 0 {
+			if diagnostics.CoordinateTopAngles <= 0 || diagnostics.CoordinateTopAngles > aoqtTransactionalCoordinateTopAngles {
+				return fmt.Errorf("AOQT optimizer diagnostics coordinate_top_angles = %d outside expected range", diagnostics.CoordinateTopAngles)
+			}
+			if diagnostics.CoordinateMagnitudeCount <= 0 || diagnostics.CoordinateMagnitudeCount > aoqtTransactionalCoordinateMagnitudeCount {
+				return fmt.Errorf("AOQT optimizer diagnostics coordinate_magnitude_count = %d outside expected range", diagnostics.CoordinateMagnitudeCount)
+			}
+			if strings.TrimSpace(diagnostics.CoordinateSearchOrderingHash) == "" {
+				return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_ordering_sha256 is required")
+			}
+			if err := validateAOQTSHA256(diagnostics.CoordinateSearchOrderingHash, "AOQT optimizer diagnostics coordinate_search_ordering_sha256"); err != nil {
+				return err
+			}
+		}
 	}
 	if diagnostics.Backtracks != diagnostics.RejectedProposals {
 		return fmt.Errorf("AOQT optimizer diagnostics backtracks = %d, want rejected_proposals %d", diagnostics.Backtracks, diagnostics.RejectedProposals)

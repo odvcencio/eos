@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sort"
 
 	"m31labs.dev/turboquant"
 )
@@ -60,15 +61,24 @@ type AOQTSidecarTrainSummary struct {
 }
 
 type AOQTSidecarOptimizerDiagnostics struct {
-	PlannedSteps       int `json:"planned_steps"`
-	AttemptedSteps     int `json:"attempted_steps"`
-	AcceptedSteps      int `json:"accepted_steps"`
-	ProposalAttempts   int `json:"proposal_attempts"`
-	AcceptedProposals  int `json:"accepted_proposals"`
-	RejectedProposals  int `json:"rejected_proposals"`
-	Backtracks         int `json:"backtracks"`
-	MaxAttemptsPerStep int `json:"max_attempts_per_step"`
-	ExhaustedSteps     int `json:"exhausted_steps"`
+	PlannedSteps                 int    `json:"planned_steps"`
+	AttemptedSteps               int    `json:"attempted_steps"`
+	AcceptedSteps                int    `json:"accepted_steps"`
+	ProposalAttempts             int    `json:"proposal_attempts"`
+	AcceptedProposals            int    `json:"accepted_proposals"`
+	RejectedProposals            int    `json:"rejected_proposals"`
+	Backtracks                   int    `json:"backtracks"`
+	MaxAttemptsPerStep           int    `json:"max_attempts_per_step"`
+	ExhaustedSteps               int    `json:"exhausted_steps"`
+	AdamProposalAttempts         int    `json:"adam_proposal_attempts,omitempty"`
+	AdamAcceptedProposals        int    `json:"adam_accepted_proposals,omitempty"`
+	AdamRejectedProposals        int    `json:"adam_rejected_proposals,omitempty"`
+	CoordinateProposalAttempts   int    `json:"coordinate_proposal_attempts,omitempty"`
+	CoordinateAcceptedProposals  int    `json:"coordinate_accepted_proposals,omitempty"`
+	CoordinateRejectedProposals  int    `json:"coordinate_rejected_proposals,omitempty"`
+	CoordinateTopAngles          int    `json:"coordinate_top_angles,omitempty"`
+	CoordinateMagnitudeCount     int    `json:"coordinate_magnitude_count,omitempty"`
+	CoordinateSearchOrderingHash string `json:"coordinate_search_ordering_sha256,omitempty"`
 }
 
 type AOQTSidecarObjectiveInput struct {
@@ -508,7 +518,6 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 			break
 		}
 		diagnostics.AcceptedSteps++
-		diagnostics.AcceptedProposals++
 		summary.Steps++
 	}
 	summary.OptimizerDiagnostics = &diagnostics
@@ -553,8 +562,12 @@ type aoqtOptimizerState struct {
 }
 
 const (
-	aoqtTransactionalMaxAttemptsPerStep = 12
-	aoqtTransactionalLossEpsilon        = float32(1e-7)
+	aoqtTransactionalMaxAttemptsPerStep        = 20
+	aoqtTransactionalAdamMaxAttemptsPerStep    = 4
+	aoqtTransactionalCoordinateTopAngles       = 4
+	aoqtTransactionalCoordinateMagnitudeCount  = 2
+	aoqtTransactionalLossEpsilon               = float32(1e-7)
+	aoqtTransactionalQ3ImprovementMinMagnitude = float32(0)
 )
 
 func (d AOQTSidecarOptimizerDiagnostics) SHA256() (string, error) {
@@ -584,9 +597,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad []float32, baselin
 	}
 	state := t.snapshotOptimizerState()
 	scale := float32(1)
-	for attempt := 0; attempt < aoqtTransactionalMaxAttemptsPerStep; attempt++ {
+	attemptsThisStep := 0
+	for attempt := 0; attempt < aoqtTransactionalAdamMaxAttemptsPerStep && attemptsThisStep < aoqtTransactionalMaxAttemptsPerStep; attempt++ {
 		t.restoreOptimizerState(state)
 		diagnostics.ProposalAttempts++
+		diagnostics.AdamProposalAttempts++
+		attemptsThisStep++
 		if err := t.applyAdamScaled(grad, scale); err != nil {
 			t.restoreOptimizerState(state)
 			return false, err
@@ -596,15 +612,93 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad []float32, baselin
 			t.restoreOptimizerState(state)
 			return false, err
 		}
-		if aoqtAcceptsTransactionalStep(baseline, candidate, weights) {
+		if t.acceptsTransactionalProposal(state, baseline, candidate, weights) {
+			diagnostics.AdamAcceptedProposals++
+			diagnostics.AcceptedProposals++
 			return true, nil
 		}
 		diagnostics.RejectedProposals++
+		diagnostics.AdamRejectedProposals++
 		diagnostics.Backtracks++
 		scale *= 0.5
 	}
+	accepted, err := t.acceptTransactionalCoordinateStep(grad, state, baseline, evaluate, weights, diagnostics, attemptsThisStep)
+	if err != nil || accepted {
+		return accepted, err
+	}
 	t.restoreOptimizerState(state)
 	return false, nil
+}
+
+func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad []float32, state aoqtOptimizerState, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics, attemptsThisStep int) (bool, error) {
+	order, err := rankedAOQTCoordinateSearchAngles(grad)
+	if err != nil {
+		t.restoreOptimizerState(state)
+		return false, err
+	}
+	if len(order) == 0 || attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
+		t.restoreOptimizerState(state)
+		return false, nil
+	}
+	top := aoqtTransactionalCoordinateTopAngles
+	if len(order) < top {
+		top = len(order)
+	}
+	magnitudes := aoqtCoordinateSearchMagnitudes(t.config.LearningRate)
+	if len(magnitudes) == 0 {
+		t.restoreOptimizerState(state)
+		return false, fmt.Errorf("AOQT coordinate search requires at least one finite positive magnitude")
+	}
+	diagnostics.CoordinateTopAngles = top
+	diagnostics.CoordinateMagnitudeCount = len(magnitudes)
+	if hash, err := aoqtCoordinateSearchOrderingSHA256(order[:top], magnitudes); err != nil {
+		t.restoreOptimizerState(state)
+		return false, err
+	} else {
+		diagnostics.CoordinateSearchOrderingHash = hash
+	}
+	for _, ranked := range order[:top] {
+		directions := aoqtCoordinateSearchDirections(grad[ranked.index])
+		for _, direction := range directions {
+			for _, magnitude := range magnitudes {
+				if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
+					t.restoreOptimizerState(state)
+					return false, nil
+				}
+				t.restoreOptimizerState(state)
+				diagnostics.ProposalAttempts++
+				diagnostics.CoordinateProposalAttempts++
+				attemptsThisStep++
+				t.angles[ranked.index] += direction * magnitude
+				if err := t.ProjectAngles(); err != nil {
+					t.restoreOptimizerState(state)
+					return false, err
+				}
+				candidate, err := evaluate()
+				if err != nil {
+					t.restoreOptimizerState(state)
+					return false, err
+				}
+				if t.acceptsTransactionalProposal(state, baseline, candidate, weights) {
+					diagnostics.CoordinateAcceptedProposals++
+					diagnostics.AcceptedProposals++
+					return true, nil
+				}
+				diagnostics.RejectedProposals++
+				diagnostics.CoordinateRejectedProposals++
+				diagnostics.Backtracks++
+			}
+		}
+	}
+	t.restoreOptimizerState(state)
+	return false, nil
+}
+
+func (t *AOQTSidecarTrainer) acceptsTransactionalProposal(state aoqtOptimizerState, baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) bool {
+	if !aoqtAnglesMoved(state.angles, t.angles) {
+		return false
+	}
+	return aoqtAcceptsTransactionalStep(baseline, candidate, weights)
 }
 
 func aoqtAcceptsTransactionalStep(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) bool {
@@ -620,11 +714,87 @@ func aoqtAcceptsTransactionalStep(baseline, candidate aoqtStepEvaluation, weight
 	if err := validateAOQTActiveObjectiveContributions(weights, candidate.activation); err != nil {
 		return false
 	}
+	if candidate.components.Q3Gain >= baseline.components.Q3Gain-aoqtTransactionalQ3ImprovementMinMagnitude {
+		return false
+	}
 	policy := normalizedAOQTSidecarCandidateEligibilityPolicy(AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true})
 	if err := validateAOQTAllowedComponentRegressions(baseline.components, candidate.components, policy); err != nil {
 		return false
 	}
 	return true
+}
+
+type aoqtCoordinateSearchRank struct {
+	index int
+	abs   float32
+}
+
+func rankedAOQTCoordinateSearchAngles(grad []float32) ([]aoqtCoordinateSearchRank, error) {
+	order := make([]aoqtCoordinateSearchRank, 0, len(grad))
+	for i, g := range grad {
+		if !isFinite32(g) {
+			return nil, fmt.Errorf("AOQT coordinate search gradient %d is not finite", i)
+		}
+		abs := float32(math.Abs(float64(g)))
+		if abs == 0 {
+			continue
+		}
+		order = append(order, aoqtCoordinateSearchRank{index: i, abs: abs})
+	}
+	sort.SliceStable(order, func(i, j int) bool {
+		if order[i].abs == order[j].abs {
+			return order[i].index < order[j].index
+		}
+		return order[i].abs > order[j].abs
+	})
+	return order, nil
+}
+
+func aoqtCoordinateSearchDirections(gradient float32) [2]float32 {
+	if gradient < 0 {
+		return [2]float32{1, -1}
+	}
+	return [2]float32{-1, 1}
+}
+
+func aoqtCoordinateSearchMagnitudes(learningRate float32) []float32 {
+	magnitudes := make([]float32, 0, aoqtTransactionalCoordinateMagnitudeCount)
+	magnitude := learningRate
+	for i := 0; i < aoqtTransactionalCoordinateMagnitudeCount; i++ {
+		if magnitude > 0 && isFinite32(magnitude) {
+			magnitudes = append(magnitudes, magnitude)
+		}
+		magnitude *= 0.5
+	}
+	return magnitudes
+}
+
+func aoqtCoordinateSearchOrderingSHA256(order []aoqtCoordinateSearchRank, magnitudes []float32) (string, error) {
+	payload := struct {
+		Order      []int     `json:"order"`
+		Magnitudes []float32 `json:"magnitudes"`
+	}{Order: make([]int, len(order)), Magnitudes: append([]float32(nil), magnitudes...)}
+	for i, item := range order {
+		payload.Order[i] = item.index
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func aoqtAnglesMoved(before, after []float32) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for i := range before {
+		if before[i] != after[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *AOQTSidecarTrainer) snapshotOptimizerState() aoqtOptimizerState {
