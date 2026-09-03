@@ -390,11 +390,16 @@ def validate_exclusions(paths: list[Path]) -> dict[str, Any]:
         for dataset, qids in qids_by_dataset.items():
             excluded_qids_by_dataset[dataset].update(qids)
     excluded_qids_by_dataset_out = {dataset: sorted(qids) for dataset, qids in excluded_qids_by_dataset.items()}
+    excluded_qids_by_dataset_by_set = {
+        name: {dataset: sorted(qids_by_dataset[dataset]) for dataset in ALLOWED_DATASETS}
+        for name, qids_by_dataset in sorted(names.items())
+    }
     return {
         "sets": sorted(audit, key=lambda item: item["name"]),
         "excluded_qid_count_by_dataset": {dataset: len(excluded_qids_by_dataset_out[dataset]) for dataset in ALLOWED_DATASETS},
         "excluded_qids_by_dataset_sha256": sha256_json(excluded_qids_by_dataset_out),
         "excluded_qids_by_dataset": excluded_qids_by_dataset_out,
+        "excluded_qids_by_dataset_by_set": excluded_qids_by_dataset_by_set,
     }
 
 
@@ -512,7 +517,40 @@ def require_provenance_consistency(vector_caches: dict[str, dict[str, Any]], sco
     return qrels_by_dataset, source_by_dataset
 
 
-def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str]], vector_caches: dict[str, dict[str, Any]], anchor: dict[str, Any], turboquant_seed: int) -> dict[str, Any]:
+def exclusion_sets_by_dataset_qid(exclusions: dict[str, Any]) -> dict[str, dict[str, list[str]]]:
+    out: dict[str, dict[str, list[str]]] = {dataset: {} for dataset in ALLOWED_DATASETS}
+    by_set = exclusions.get("excluded_qids_by_dataset_by_set")
+    if not isinstance(by_set, dict):
+        raise PlanError("exclusions: missing dataset-scoped set mapping")
+    for name, qids_by_dataset in by_set.items():
+        if not isinstance(name, str) or not isinstance(qids_by_dataset, dict):
+            raise PlanError("exclusions: invalid dataset-scoped set mapping")
+        for dataset in ALLOWED_DATASETS:
+            qids = qids_by_dataset.get(dataset)
+            if not isinstance(qids, list):
+                raise PlanError(f"exclusions: invalid dataset-scoped qids for {name!r}:{dataset}")
+            for qid in qids:
+                if not isinstance(qid, str):
+                    raise PlanError(f"exclusions: invalid qid in {name!r}:{dataset}")
+                out[dataset].setdefault(qid, []).append(name)
+    return {
+        dataset: {qid: sorted(names) for qid, names in qids.items()}
+        for dataset, qids in out.items()
+    }
+
+
+def excluded_source_row_audit(dataset: str, bits: int, label: str, qid: str, exclusion_sets: list[str]) -> dict[str, Any]:
+    return {
+        "dataset": dataset,
+        "bits": bits,
+        "source_cache_path": label,
+        "qid_sha256": sha256_json({"dataset": dataset, "qid": qid}),
+        "source_row_id_sha256": sha256_json({"dataset": dataset, "bits": bits, "qid": qid}),
+        "exclusion_sets": sorted(exclusion_sets),
+    }
+
+
+def validate_score_cache(path: Path, exclusion_sets_by_qid: dict[str, dict[str, list[str]]], vector_caches: dict[str, dict[str, Any]], anchor: dict[str, Any], turboquant_seed: int) -> dict[str, Any]:
     payload = load_json(path)
     label = display_path(path)
     require_schema(payload, SCORE_CACHE_SCHEMA, label)
@@ -524,7 +562,7 @@ def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str
     if "qrels_sha256" not in provenance:
         raise PlanError(f"{label}: qrels_sha256 provenance is required")
     dataset = require_dataset(payload.get("dataset"), label)
-    excluded_qids = excluded_qids_by_dataset.get(dataset, set())
+    excluded_qids = exclusion_sets_by_qid.get(dataset, {})
     bits = parse_int_field(payload.get("bits", -1), label, "bits")
     if bits not in {3, 5}:
         raise PlanError(f"{label}: bits must be 3 or 5")
@@ -556,6 +594,7 @@ def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str
     query_ids = query_cache["ids"]
     doc_ids = doc_cache["ids"]
     normalized_rows = []
+    excluded_rows = []
     seen_qids: set[str] = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -563,13 +602,11 @@ def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str
         qid = row.get("qid")
         if not isinstance(qid, str) or not qid:
             raise PlanError(f"{label}: invalid qid")
-        if qid in excluded_qids:
-            raise PlanError(f"{label}: qid {qid!r} is excluded")
-        if qid not in query_ids:
-            raise PlanError(f"{label}: qid {qid!r} missing query vector cache")
         if qid in seen_qids:
             raise PlanError(f"{label}: duplicate qid {qid!r}")
         seen_qids.add(qid)
+        if qid not in query_ids:
+            raise PlanError(f"{label}: qid {qid!r} missing query vector cache")
         docs = row.get("docs")
         if not isinstance(docs, list) or len(docs) < 120:
             raise PlanError(f"{label}: qid {qid!r} needs at least 120 ranked docs")
@@ -595,6 +632,10 @@ def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str
                 raise PlanError(f"{label}: gain must be non-negative integer")
             seen_docs.add(doc_id)
             normalized_docs.append({"doc_id": doc_id, "rank": rank, "gain": gain})
+        exclusion_sets = excluded_qids.get(qid)
+        if exclusion_sets is not None:
+            excluded_rows.append(excluded_source_row_audit(dataset, bits, label, qid, exclusion_sets))
+            continue
         normalized_rows.append({"qid": qid, "docs": normalized_docs})
     return {
         "path": label,
@@ -607,6 +648,8 @@ def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str
         "provenance": provenance,
         "turboquant": {"score_mode": "prepared_ip", "bits": bits, "seed": turboquant_seed},
         "vector_cache": expected_vector_binding,
+        "source_qid_count": len(rows),
+        "excluded_rows": sorted(excluded_rows, key=lambda row: (row["dataset"], row["bits"], row["source_row_id_sha256"], row["source_cache_path"])),
         "rows": sorted(normalized_rows, key=lambda row: row["qid"]),
     }
 
@@ -705,6 +748,36 @@ def build_rows(score_caches: list[dict[str, Any]], top10_limit: int, nf_start: i
     return sorted(rows, key=lambda row: row["row_id"]), audit
 
 
+def source_exclusion_audit(score_caches: list[dict[str, Any]]) -> dict[str, Any]:
+    excluded_rows = [
+        row
+        for cache in score_caches
+        for row in cache.get("excluded_rows", [])
+    ]
+    excluded_rows = sorted(excluded_rows, key=lambda row: (row["dataset"], row["bits"], row["source_row_id_sha256"], row["source_cache_path"]))
+    count_by_dataset = Counter(str(row["dataset"]) for row in excluded_rows)
+    count_by_dataset_bits = Counter(f"{row['dataset']}:q{row['bits']}" for row in excluded_rows)
+    count_by_dataset_exclusion_set: Counter[str] = Counter()
+    qid_sha_by_dataset: dict[str, set[str]] = {dataset: set() for dataset in ALLOWED_DATASETS}
+    for row in excluded_rows:
+        dataset = str(row["dataset"])
+        qid_sha_by_dataset[dataset].add(str(row["qid_sha256"]))
+        for name in row["exclusion_sets"]:
+            count_by_dataset_exclusion_set[f"{dataset}:{name}"] += 1
+    source_row_id_hashes = [row["source_row_id_sha256"] for row in excluded_rows]
+    qid_sha_by_dataset_out = {dataset: sorted(values) for dataset, values in qid_sha_by_dataset.items()}
+    return {
+        "policy": "filter_dataset_scoped_excluded_qids_before_guard_window_selection",
+        "excluded_source_row_count": len(excluded_rows),
+        "excluded_source_row_count_by_dataset": dict(sorted(count_by_dataset.items())),
+        "excluded_source_row_count_by_dataset_bits": dict(sorted(count_by_dataset_bits.items())),
+        "excluded_source_row_count_by_dataset_exclusion_set": dict(sorted(count_by_dataset_exclusion_set.items())),
+        "excluded_source_row_id_hashes_sha256": sha256_json(source_row_id_hashes),
+        "excluded_source_qid_hashes_by_dataset_sha256": sha256_json(qid_sha_by_dataset_out),
+        "excluded_source_rows": excluded_rows,
+    }
+
+
 def require_guard_coverage(rows: list[dict[str, Any]]) -> None:
     covered = {(row["dataset"], row["bits"], row["bucket"]) for row in rows}
     missing_top10 = [
@@ -780,6 +853,9 @@ def stripped_score_cache_audit(score_caches: list[dict[str, Any]]) -> list[dict[
             "provenance": item["provenance"],
             "turboquant": item["turboquant"],
             "vector_cache": item["vector_cache"],
+            "source_qid_count": item["source_qid_count"],
+            "excluded_source_row_count": len(item.get("excluded_rows", [])),
+            "excluded_source_row_id_hashes_sha256": sha256_json([row["source_row_id_sha256"] for row in item.get("excluded_rows", [])]),
             "qid_count": len(item["rows"]),
         }
         for item in sorted(score_caches, key=lambda value: (value["dataset"], value["bits"], value["path"]))
@@ -789,9 +865,9 @@ def stripped_score_cache_audit(score_caches: list[dict[str, Any]]) -> list[dict[
 def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     anchor = validate_anchor(args.anchor_manifest, args.expected_anchor_sha256)
     exclusions = validate_exclusions(args.exclusion_qids)
-    excluded_qids_by_dataset = {dataset: set(qids) for dataset, qids in exclusions["excluded_qids_by_dataset"].items()}
+    exclusion_sets_by_qid = exclusion_sets_by_dataset_qid(exclusions)
     vector_caches = validate_vector_caches(args.vector_cache, anchor)
-    score_caches = [validate_score_cache(path, excluded_qids_by_dataset, vector_caches, anchor, args.turboquant_seed) for path in args.score_cache]
+    score_caches = [validate_score_cache(path, exclusion_sets_by_qid, vector_caches, anchor, args.turboquant_seed) for path in args.score_cache]
     seen_score_keys: set[tuple[str, int]] = set()
     for cache in score_caches:
         key = (cache["dataset"], cache["bits"])
@@ -804,6 +880,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
                 raise PlanError(f"score caches: missing train {dataset} q{bits}")
     qrels_sha256_by_dataset, dataset_source_provenance_by_dataset = require_provenance_consistency(vector_caches, score_caches)
     rows, row_selection_audit = build_rows(score_caches, args.top10_limit, args.nf_start, args.nf_end)
+    row_selection_audit["source_exclusions"] = source_exclusion_audit(score_caches)
     require_guard_coverage(rows)
     if not rows:
         raise PlanError("plan: no eligible guard rows")
@@ -826,7 +903,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "topology": TOPOLOGY,
         "legal_scope": LEGAL_SCOPE,
         "anchor": anchor,
-        "exclusions": {k: v for k, v in exclusions.items() if k != "excluded_qids_by_dataset"},
+        "exclusions": {k: v for k, v in exclusions.items() if k not in {"excluded_qids_by_dataset", "excluded_qids_by_dataset_by_set"}},
         "input_manifests": {
             "vector_caches": stripped_vector_cache_audit(vector_caches),
             "score_caches": stripped_score_cache_audit(score_caches),
@@ -852,6 +929,9 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "builder_sha256": sha256_file(Path(__file__)),
             "qrels_sha256_by_dataset": qrels_sha256_by_dataset,
             "dataset_source_provenance_by_dataset": dataset_source_provenance_by_dataset,
+            "source_exclusion_audit_sha256": sha256_json(row_selection_audit["source_exclusions"]),
+            "source_exclusion_row_count": row_selection_audit["source_exclusions"]["excluded_source_row_count"],
+            "source_exclusion_row_id_hashes_sha256": row_selection_audit["source_exclusions"]["excluded_source_row_id_hashes_sha256"],
             "self_hash_excludes": ["created_utc", "provenance.plan_sha256"],
         },
     }

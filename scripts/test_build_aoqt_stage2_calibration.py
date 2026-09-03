@@ -598,7 +598,58 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
                     with self.assertRaisesRegex(builder.PlanError, pattern):
                         builder.build_plan(builder.parse_args(self.build_args(fixture)))
 
-    def test_rejects_excluded_qid_in_training_cache(self) -> None:
+    def test_skips_same_dataset_excluded_source_qid_with_deterministic_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            exclusion_path = fixture["exclusions"][0]
+            score_path = fixture["score_paths"][0]
+            exclusion = json.loads(exclusion_path.read_text(encoding="utf-8"))
+            score = json.loads(score_path.read_text(encoding="utf-8"))
+            excluded_qid = score["rows"][0]["qid"]
+            exclusion_set_name = exclusion["name"]
+            exclusion["qids_by_dataset"][score["dataset"]] = [excluded_qid]
+            write_json(exclusion_path, exclusion)
+            args = builder.parse_args(self.build_args(fixture))
+            plan1 = builder.build_plan(args)
+            plan2 = builder.build_plan(args)
+
+            audit = plan1["row_selection_audit"]["source_exclusions"]
+            self.assertEqual(audit, plan2["row_selection_audit"]["source_exclusions"])
+            self.assertEqual(audit["excluded_source_row_count"], 2)
+            self.assertEqual(audit["excluded_source_row_count_by_dataset"], {score["dataset"]: 2})
+            self.assertEqual(
+                audit["excluded_source_row_count_by_dataset_exclusion_set"],
+                {f"{score['dataset']}:{exclusion_set_name}": 2},
+            )
+            self.assertEqual(
+                audit["excluded_source_row_count_by_dataset_bits"],
+                {f"{score['dataset']}:q3": 1, f"{score['dataset']}:q5": 1},
+            )
+            self.assertEqual(
+                audit["excluded_source_qid_hashes_by_dataset_sha256"],
+                builder.sha256_json(
+                    {
+                        dataset: [builder.sha256_json({"dataset": dataset, "qid": excluded_qid})] if dataset == score["dataset"] else []
+                        for dataset in builder.ALLOWED_DATASETS
+                    }
+                ),
+            )
+            self.assertNotIn(excluded_qid, json.dumps(audit, sort_keys=True))
+            self.assertNotIn(excluded_qid, {row["qid"] for row in plan1["rows"]})
+            self.assertFalse(any(excluded_qid in row["row_id"] for row in plan1["rows"]))
+            self.assertEqual(plan1["workload"]["row_count"], 12)
+            self.assertEqual(plan1["workload"]["bit_counts"], {"3": 7, "5": 5})
+
+            score_audits = [
+                item
+                for item in plan1["input_manifests"]["score_caches"]
+                if item["dataset"] == score["dataset"]
+            ]
+            self.assertEqual({item["excluded_source_row_count"] for item in score_audits}, {1})
+            self.assertEqual({item["source_qid_count"] for item in score_audits}, {2})
+            self.assertEqual({item["qid_count"] for item in score_audits}, {1})
+
+    def test_excluded_source_qid_still_must_obey_score_cache_row_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fixture = self.fixture(Path(tmp))
             exclusion_path = fixture["exclusions"][0]
@@ -606,8 +657,10 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             exclusion = json.loads(exclusion_path.read_text(encoding="utf-8"))
             score = json.loads(score_path.read_text(encoding="utf-8"))
             exclusion["qids_by_dataset"][score["dataset"]] = [score["rows"][0]["qid"]]
+            score["rows"][0]["docs"][0]["score"] = 99.0
             write_json(exclusion_path, exclusion)
-            with self.assertRaisesRegex(builder.PlanError, "is excluded"):
+            write_json(score_path, score)
+            with self.assertRaisesRegex(builder.PlanError, "doc_id/rank/gain"):
                 builder.build_plan(builder.parse_args(self.build_args(fixture)))
 
     def test_allows_cross_dataset_qid_collision_in_exclusions(self) -> None:
@@ -622,6 +675,18 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             write_json(exclusion_path, exclusion)
             plan = builder.build_plan(builder.parse_args(self.build_args(fixture)))
             self.assertEqual(plan["selection_policy"]["official_exclusion_mode"], "dataset_scoped_qid_only")
+            self.assertIn(score["rows"][0]["qid"], {row["qid"] for row in plan["rows"] if row["dataset"] == score["dataset"]})
+            self.assertEqual(plan["row_selection_audit"]["source_exclusions"]["excluded_source_row_count"], 0)
+
+    def test_exclusion_filter_fails_closed_when_required_guard_coverage_vanishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            exclusion_path = fixture["exclusions"][0]
+            exclusion = json.loads(exclusion_path.read_text(encoding="utf-8"))
+            exclusion["qids_by_dataset"]["fiqa"] = ["fiqa-q1", "fiqa-q2"]
+            write_json(exclusion_path, exclusion)
+            with self.assertRaisesRegex(builder.PlanError, "missing top10 guard coverage"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
 
     def test_rejects_missing_q5_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
