@@ -28,7 +28,7 @@ def fake_sha(seed: str) -> str:
 
 
 class BuildAOQTStage2CalibrationTest(unittest.TestCase):
-    def common_binding(self, anchor_sha: str, anchor_payload: dict) -> dict[str, object]:
+    def common_binding(self, anchor_sha: str, anchor_payload: dict, source_sha: str, dataset_source: dict[str, str]) -> dict[str, object]:
         return {
             "anchor": {
                 "package_sha256": anchor_payload["package_sha256"],
@@ -36,8 +36,10 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             },
             "topology": {"id": builder.TOPOLOGY["id"], "sha256": builder.TOPOLOGY_SHA256},
             "legal_scope": copy.deepcopy(builder.LEGAL_SCOPE),
-            "source_sha256": fake_sha("source"),
+            "source_sha256": source_sha,
             "qrels_sha256": fake_sha("qrels"),
+            "dataset_source_provenance": dict(sorted(dataset_source.items())),
+            "dataset_source_provenance_sha256": builder.sha256_json(dict(sorted(dataset_source.items()))),
         }
 
     def fixture(self, root: Path) -> dict[str, object]:
@@ -63,8 +65,16 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
         query_ids = {dataset: [f"{dataset}-q1", f"{dataset}-q2"] for dataset in builder.ALLOWED_DATASETS}
         doc_ids = {dataset: [f"{dataset}-d{i:03d}" for i in range(1, 126)] for dataset in builder.ALLOWED_DATASETS}
         vector_paths = []
+        vector_source = {
+            dataset: {
+                "query_vector": fake_sha(f"{dataset}-query-source"),
+                "doc_vector": fake_sha(f"{dataset}-doc-source"),
+            }
+            for dataset in builder.ALLOWED_DATASETS
+        }
         for dataset in builder.ALLOWED_DATASETS:
             for role, ids in (("query", query_ids[dataset]), ("doc", doc_ids[dataset])):
+                component = f"{role}_vector"
                 vector_paths.append(
                     write_json(
                         root / "vectors" / f"{dataset}.{role}.json",
@@ -75,7 +85,7 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
                             "role": role,
                             "cache_sha256": fake_sha(f"{dataset}-{role}"),
                             "ids": ids,
-                            **self.common_binding(anchor_manifest_sha, anchor),
+                            **self.common_binding(anchor_manifest_sha, anchor, vector_source[dataset][component], {component: vector_source[dataset][component]}),
                         },
                     )
                 )
@@ -84,6 +94,12 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             for bits in (3, 5):
                 query_manifest = root / "vectors" / f"{dataset}.query.json"
                 doc_manifest = root / "vectors" / f"{dataset}.doc.json"
+                score_component = f"q{bits}_score"
+                score_source = fake_sha(f"{dataset}-{score_component}-source")
+                dataset_source = {
+                    **vector_source[dataset],
+                    score_component: score_source,
+                }
                 rows = []
                 for qid in query_ids[dataset]:
                     docs = []
@@ -105,14 +121,14 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
                             "bits": bits,
                             "score_mode": "prepared_ip",
                             "top_k": 120,
-                            "turboquant": {"score_mode": "prepared_ip", "bits": bits, "seed": 191},
+                            "turboquant": {"score_mode": "prepared_ip", "bits": bits, "seed": builder.DEFAULT_TURBOQUANT_SEED},
                             "vector_cache": {
                                 "query_manifest_sha256": builder.sha256_file(query_manifest),
                                 "query_cache_sha256": fake_sha(f"{dataset}-query"),
                                 "doc_manifest_sha256": builder.sha256_file(doc_manifest),
                                 "doc_cache_sha256": fake_sha(f"{dataset}-doc"),
                             },
-                            **self.common_binding(anchor_manifest_sha, anchor),
+                            **self.common_binding(anchor_manifest_sha, anchor, score_source, dataset_source),
                             "rows": rows,
                         },
                     )
@@ -150,6 +166,8 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             self.assertEqual({k: v for k, v in plan1.items() if k != volatile}, {k: v for k, v in plan2.items() if k != volatile})
             self.assertEqual(plan1["schema"], builder.SCHEMA)
             self.assertEqual(plan1["mode"], "plan_only")
+            self.assertEqual(plan1["topology_seed"], builder.DEFAULT_TOPOLOGY_SEED)
+            self.assertEqual(plan1["turboquant"]["seed"], builder.DEFAULT_TURBOQUANT_SEED)
             self.assertFalse(plan1["actual_training_ran"])
             self.assertFalse(plan1["actual_eval_ran"])
             self.assertEqual(plan1["topology"]["angle_count"], 1536)
@@ -300,10 +318,43 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             for path in fixture["score_paths"]:
                 if str(path).endswith("fiqa.q5.json"):
                     payload = json.loads(path.read_text(encoding="utf-8"))
-                    payload["source_sha256"] = fake_sha("fiqa-q5-drifted-source")
+                    payload["dataset_source_provenance"]["query_vector"] = fake_sha("fiqa-query-drifted-source")
+                    payload["dataset_source_provenance_sha256"] = builder.sha256_json(payload["dataset_source_provenance"])
                     write_json(path, payload)
                     break
             with self.assertRaisesRegex(builder.PlanError, "source provenance mismatch for dataset fiqa"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_rejects_vector_manifest_source_sha_component_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            path = fixture["vector_paths"][0]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["source_sha256"] = fake_sha("self-consistent-but-wrong-query-vector-artifact")
+            write_json(path, payload)
+            with self.assertRaisesRegex(builder.PlanError, "query_vector source_sha256 does not match"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_rejects_score_manifest_source_sha_component_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            for path in fixture["score_paths"]:
+                if str(path).endswith("fiqa.q3.json"):
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    payload["source_sha256"] = fake_sha("self-consistent-but-wrong-q3-score-artifact")
+                    write_json(path, payload)
+                    break
+            with self.assertRaisesRegex(builder.PlanError, "q3_score source_sha256 does not match"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_rejects_dataset_source_provenance_signature_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            path = fixture["vector_paths"][0]
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            payload["dataset_source_provenance_sha256"] = fake_sha("wrong-dataset-source-signature")
+            write_json(path, payload)
+            with self.assertRaisesRegex(builder.PlanError, "dataset_source_provenance_sha256 mismatch"):
                 builder.build_plan(builder.parse_args(self.build_args(fixture)))
 
     def test_rejects_score_cache_turboquant_seed_mismatch(self) -> None:
@@ -311,10 +362,24 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             fixture = self.fixture(Path(tmp))
             path = fixture["score_paths"][0]
             payload = json.loads(path.read_text(encoding="utf-8"))
-            payload["turboquant"]["seed"] = 192
+            payload["turboquant"]["seed"] = builder.DEFAULT_TOPOLOGY_SEED
             write_json(path, payload)
             with self.assertRaisesRegex(builder.PlanError, "TurboQuant prepared-IP config binding mismatch"):
                 builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_accepts_explicit_turboquant_seed_without_changing_topology_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            seed = 1234567
+            for path in fixture["score_paths"]:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                payload["turboquant"]["seed"] = seed
+                write_json(path, payload)
+            args = builder.parse_args(self.build_args(fixture) + ["--turboquant-seed", str(seed)])
+            plan = builder.build_plan(args)
+            self.assertEqual(plan["seed"], builder.DEFAULT_TOPOLOGY_SEED)
+            self.assertEqual(plan["topology_seed"], builder.DEFAULT_TOPOLOGY_SEED)
+            self.assertEqual(plan["turboquant"]["seed"], seed)
 
     def test_rejects_score_cache_vector_cache_binding_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -29,8 +29,11 @@ EXCLUSION_SCHEMA = "eos.aoqt_stage2.exclusion_qids.v1"
 VECTOR_CACHE_SCHEMA = "eos.aoqt_stage2.vector_cache_manifest.v1"
 SCORE_CACHE_SCHEMA = "eos.aoqt_stage2.score_cache_manifest.v1"
 ALLOWED_DATASETS = ("fiqa", "nfcorpus", "scifact")
+DATASET_SOURCE_PROVENANCE_COMPONENTS = ("query_vector", "doc_vector", "q3_score", "q5_score")
 FORBIDDEN_SPLITS = ("dev", "reserve", "official", "test", "eval", "heldout")
 REQUIRED_EXCLUSION_NAMES = ("dev4", "reserve4", "official-test")
+DEFAULT_TOPOLOGY_SEED = 191
+DEFAULT_TURBOQUANT_SEED = 5581486560434873699
 TOPOLOGY = {
     "id": "aoqt_givens_v1",
     "dim": 384,
@@ -61,7 +64,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--vector-cache", type=Path, action="append", default=[])
     parser.add_argument("--score-cache", type=Path, action="append", default=[])
     parser.add_argument("--output-plan", type=Path, required=True)
-    parser.add_argument("--seed", type=int, default=191)
+    parser.add_argument("--seed", type=int, default=DEFAULT_TOPOLOGY_SEED)
+    parser.add_argument("--turboquant-seed", type=int, default=DEFAULT_TURBOQUANT_SEED)
     parser.add_argument("--top10-limit", type=int, default=10)
     parser.add_argument("--nf-start", type=int, default=80)
     parser.add_argument("--nf-end", type=int, default=120)
@@ -159,6 +163,25 @@ def require_sha256_mapping(value: Any, label: str, field: str) -> dict[str, str]
     return dict(sorted(out.items()))
 
 
+def canonical_dataset_source_provenance(value: Any, label: str) -> dict[str, str]:
+    mapping = require_sha256_mapping(value, label, "dataset_source_provenance")
+    if mapping is None:
+        raise PlanError(f"{label}: dataset_source_provenance is required")
+    unexpected = sorted(set(mapping) - set(DATASET_SOURCE_PROVENANCE_COMPONENTS))
+    if unexpected:
+        raise PlanError(f"{label}: unexpected dataset_source_provenance components {unexpected}")
+    return mapping
+
+
+def require_dataset_source_provenance(payload: dict[str, Any], label: str) -> dict[str, str]:
+    mapping = canonical_dataset_source_provenance(payload.get("dataset_source_provenance"), label)
+    expected_signature = sha256_json(mapping)
+    observed_signature = require_sha256(payload.get("dataset_source_provenance_sha256"), label, "dataset_source_provenance_sha256")
+    if observed_signature != expected_signature:
+        raise PlanError(f"{label}: dataset_source_provenance_sha256 mismatch")
+    return mapping
+
+
 def require_provenance_hashes(payload: dict[str, Any], label: str) -> dict[str, Any]:
     source_sha = payload.get("source_sha256")
     source_map = require_sha256_mapping(payload.get("source_sha256_by_file"), label, "source_sha256_by_file")
@@ -172,7 +195,26 @@ def require_provenance_hashes(payload: dict[str, Any], label: str) -> dict[str, 
     qrels_sha = payload.get("qrels_sha256")
     if qrels_sha is not None:
         provenance["qrels_sha256"] = require_sha256(qrels_sha, label, "qrels_sha256")
+    dataset_source = payload.get("dataset_source_provenance")
+    if dataset_source is not None:
+        provenance["dataset_source_provenance"] = require_dataset_source_provenance(payload, label)
+        provenance["dataset_source_provenance_sha256"] = payload["dataset_source_provenance_sha256"]
     return provenance
+
+
+def require_component_source_sha(provenance: dict[str, Any], label: str, component: str) -> str:
+    source_sha = provenance.get("source_sha256")
+    if not isinstance(source_sha, str):
+        raise PlanError(f"{label}: source_sha256 provenance is required")
+    dataset_sources = provenance.get("dataset_source_provenance")
+    if not isinstance(dataset_sources, dict):
+        raise PlanError(f"{label}: dataset_source_provenance is required")
+    component_sha = dataset_sources.get(component)
+    if component_sha is None:
+        raise PlanError(f"{label}: dataset_source_provenance missing component {component!r}")
+    if component_sha != source_sha:
+        raise PlanError(f"{label}: {component} source_sha256 does not match dataset_source_provenance component")
+    return source_sha
 
 
 def require_anchor_topology_legal_binding(payload: dict[str, Any], label: str, anchor: dict[str, Any]) -> dict[str, Any]:
@@ -331,6 +373,7 @@ def validate_vector_caches(paths: list[Path], anchor: dict[str, Any]) -> dict[st
         role = str(payload.get("role", ""))
         if role not in {"query", "doc"}:
             raise PlanError(f"{label}: role must be query or doc")
+        require_component_source_sha(provenance, label, f"{role}_vector")
         ids = payload.get("ids")
         if not isinstance(ids, list) or not all(isinstance(item, str) and item for item in ids):
             raise PlanError(f"{label}: ids must be non-empty strings")
@@ -374,17 +417,19 @@ def qrels_sha256(item: dict[str, Any], label: str) -> str:
     return value
 
 
-def source_provenance_signature(item: dict[str, Any], label: str) -> str:
+def source_provenance_signature(item: dict[str, Any], label: str) -> dict[str, str]:
     provenance = item.get("provenance")
     if not isinstance(provenance, dict):
         raise PlanError(f"{label}: provenance is required")
-    source_sha = provenance.get("source_sha256")
-    source_map = provenance.get("source_sha256_by_file")
-    return sha256_json({"source_sha256": source_sha, "source_sha256_by_file": source_map})
+    source_map = provenance.get("dataset_source_provenance")
+    if not isinstance(source_map, dict):
+        raise PlanError(f"{label}: dataset_source_provenance is required")
+    return source_map
 
 
-def require_provenance_consistency(vector_caches: dict[str, dict[str, Any]], score_caches: list[dict[str, Any]]) -> dict[str, str]:
-    by_dataset: dict[str, str] = {}
+def require_provenance_consistency(vector_caches: dict[str, dict[str, Any]], score_caches: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    qrels_by_dataset: dict[str, str] = {}
+    source_by_dataset: dict[str, dict[str, Any]] = {}
     for dataset in ALLOWED_DATASETS:
         labels_and_hashes = [
             (f"vector cache {dataset}:query", qrels_sha256(vector_caches[f"{dataset}:query"], f"vector cache {dataset}:query")),
@@ -397,7 +442,7 @@ def require_provenance_consistency(vector_caches: dict[str, dict[str, Any]], sco
         if len(observed) != 1:
             details = ", ".join(f"{label}={value}" for label, value in labels_and_hashes)
             raise PlanError(f"qrels provenance mismatch for dataset {dataset}: {details}")
-        by_dataset[dataset] = labels_and_hashes[0][1]
+        qrels_by_dataset[dataset] = labels_and_hashes[0][1]
         labels_and_sources = [
             (f"vector cache {dataset}:query", source_provenance_signature(vector_caches[f"{dataset}:query"], f"vector cache {dataset}:query")),
             (f"vector cache {dataset}:doc", source_provenance_signature(vector_caches[f"{dataset}:doc"], f"vector cache {dataset}:doc")),
@@ -405,14 +450,27 @@ def require_provenance_consistency(vector_caches: dict[str, dict[str, Any]], sco
         for cache in score_caches:
             if cache["dataset"] == dataset:
                 labels_and_sources.append((f"score cache {dataset} q{cache['bits']}", source_provenance_signature(cache, f"score cache {dataset} q{cache['bits']}")))
-        source_observed = {value for _, value in labels_and_sources}
-        if len(source_observed) != 1:
-            details = ", ".join(f"{label}={value}" for label, value in labels_and_sources)
-            raise PlanError(f"source provenance mismatch for dataset {dataset}: {details}")
-    return by_dataset
+        merged: dict[str, str] = {}
+        component_sources: dict[str, list[str]] = defaultdict(list)
+        for label, source_map in labels_and_sources:
+            for component, value in source_map.items():
+                component_sources[component].append(label)
+                prior = merged.get(component)
+                if prior is not None and prior != value:
+                    raise PlanError(f"source provenance mismatch for dataset {dataset}: component {component} differs")
+                merged[component] = value
+        missing = [component for component in DATASET_SOURCE_PROVENANCE_COMPONENTS if component not in merged]
+        if missing:
+            raise PlanError(f"source provenance mismatch for dataset {dataset}: missing components {missing}")
+        source_by_dataset[dataset] = {
+            "components": dict(sorted(merged.items())),
+            "sha256": sha256_json(dict(sorted(merged.items()))),
+            "component_sources": {component: sorted(labels) for component, labels in sorted(component_sources.items())},
+        }
+    return qrels_by_dataset, source_by_dataset
 
 
-def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dict[str, dict[str, Any]], anchor: dict[str, Any], seed: int) -> dict[str, Any]:
+def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dict[str, dict[str, Any]], anchor: dict[str, Any], turboquant_seed: int) -> dict[str, Any]:
     payload = load_json(path)
     label = display_path(path)
     require_schema(payload, SCORE_CACHE_SCHEMA, label)
@@ -427,6 +485,7 @@ def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dic
     bits = parse_int_field(payload.get("bits", -1), label, "bits")
     if bits not in {3, 5}:
         raise PlanError(f"{label}: bits must be 3 or 5")
+    require_component_source_sha(provenance, label, f"q{bits}_score")
     if payload.get("score_mode") != "prepared_ip":
         raise PlanError(f"{label}: score_mode must be prepared_ip")
     top_k = parse_int_field(payload.get("top_k", 0), label, "top_k")
@@ -435,7 +494,7 @@ def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dic
     tq = payload.get("turboquant")
     if not isinstance(tq, dict):
         raise PlanError(f"{label}: turboquant binding object is required")
-    if tq.get("score_mode") != "prepared_ip" or tq.get("bits") != bits or tq.get("seed") != seed:
+    if tq.get("score_mode") != "prepared_ip" or tq.get("bits") != bits or tq.get("seed") != turboquant_seed:
         raise PlanError(f"{label}: TurboQuant prepared-IP config binding mismatch")
     query_cache = vector_caches[f"{dataset}:query"]
     doc_cache = vector_caches[f"{dataset}:doc"]
@@ -505,7 +564,7 @@ def validate_score_cache(path: Path, excluded_qids: set[str], vector_caches: dic
         "top_k": top_k,
         "binding": binding,
         "provenance": provenance,
-        "turboquant": {"score_mode": "prepared_ip", "bits": bits, "seed": seed},
+        "turboquant": {"score_mode": "prepared_ip", "bits": bits, "seed": turboquant_seed},
         "vector_cache": expected_vector_binding,
         "rows": sorted(normalized_rows, key=lambda row: row["qid"]),
     }
@@ -662,7 +721,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
     exclusions = validate_exclusions(args.exclusion_qids)
     excluded_qids = set(exclusions["excluded_qids"])
     vector_caches = validate_vector_caches(args.vector_cache, anchor)
-    score_caches = [validate_score_cache(path, excluded_qids, vector_caches, anchor, args.seed) for path in args.score_cache]
+    score_caches = [validate_score_cache(path, excluded_qids, vector_caches, anchor, args.turboquant_seed) for path in args.score_cache]
     seen_score_keys: set[tuple[str, int]] = set()
     for cache in score_caches:
         key = (cache["dataset"], cache["bits"])
@@ -673,7 +732,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         for bits in (3, 5):
             if (dataset, bits) not in seen_score_keys:
                 raise PlanError(f"score caches: missing train {dataset} q{bits}")
-    qrels_sha256_by_dataset = require_provenance_consistency(vector_caches, score_caches)
+    qrels_sha256_by_dataset, dataset_source_provenance_by_dataset = require_provenance_consistency(vector_caches, score_caches)
     rows = build_rows(score_caches, args.top10_limit, args.nf_start, args.nf_end)
     require_guard_coverage(rows)
     if not rows:
@@ -687,6 +746,13 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
         "actual_training_ran": False,
         "actual_eval_ran": False,
         "seed": args.seed,
+        "topology_seed": args.seed,
+        "turboquant": {
+            "score_mode": "prepared_ip",
+            "seed": args.turboquant_seed,
+            "required_bits": [3, 5],
+            "top_k": 120,
+        },
         "topology": TOPOLOGY,
         "legal_scope": LEGAL_SCOPE,
         "anchor": anchor,
@@ -700,6 +766,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "datasets": list(ALLOWED_DATASETS),
             "required_score_bits": [3, 5],
             "score_mode": "prepared_ip",
+            "turboquant_seed": args.turboquant_seed,
             "top10_guard_limit": args.top10_limit,
             "nf_boundary_window": [args.nf_start, args.nf_end],
             "official_exclusion_mode": "qid_only",
@@ -713,6 +780,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "builder": display_path(Path(__file__)),
             "builder_sha256": sha256_file(Path(__file__)),
             "qrels_sha256_by_dataset": qrels_sha256_by_dataset,
+            "dataset_source_provenance_by_dataset": dataset_source_provenance_by_dataset,
             "self_hash_excludes": ["created_utc", "provenance.plan_sha256"],
         },
     }
