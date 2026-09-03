@@ -58,6 +58,10 @@ func ExportPackageToMLLWithOptions(artifactPath, outPath string, opts MLLExportO
 		return "", err
 	}
 
+	if err := rejectPostPoolTransformForMLLExport(artifactPath); err != nil {
+		return "", err
+	}
+
 	packageKind, err := verifyPackageManifestForMLL(artifactPath)
 	if err != nil {
 		return "", err
@@ -427,6 +431,24 @@ func verifyPackageManifestForMLL(artifactPath string) (PackageKind, error) {
 		return "", err
 	}
 	return manifest.Kind, nil
+}
+
+func rejectPostPoolTransformForMLLExport(artifactPath string) error {
+	manifestPath := ResolveEmbeddingManifestPath(artifactPath)
+	if _, err := os.Stat(manifestPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	manifest, err := ReadEmbeddingManifestFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("read embedding_manifest: %w", err)
+	}
+	if manifest.requiresPostPoolTransform() {
+		return fmt.Errorf("MLL export does not support embedding post_pool_transform %q; AOQT sidecar packages must remain as verified sibling packages", manifest.PostPoolTransform)
+	}
+	return nil
 }
 
 func loadWeightsForMLLExport(artifactPath string, mod *eosartifact.Module) (map[string]*backend.Tensor, error) {

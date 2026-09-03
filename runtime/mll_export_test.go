@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	eosartifact "m31labs.dev/eos/artifact/eos"
@@ -176,6 +177,17 @@ func TestExportPackageToMLLRequiresWeightsForParams(t *testing.T) {
 	path := writeMLLTrainableArtifact(t)
 	if _, err := ExportPackageToMLL(path, ""); err == nil {
 		t.Fatalf("expected missing weight file error")
+	}
+}
+
+func TestExportPackageToMLLRejectsAOQTPostPoolTransformWithoutPackageManifest(t *testing.T) {
+	path := writeTinyAOQTPackage(t, tinyAOQTGivensTransform(2, 0), true)
+	if err := os.Remove(DefaultPackageManifestPath(path)); err != nil {
+		t.Fatalf("remove package manifest: %v", err)
+	}
+
+	if _, err := ExportPackageToMLL(path, ""); err == nil || !strings.Contains(err.Error(), "does not support embedding post_pool_transform") {
+		t.Fatalf("ExportPackageToMLL AOQT error = %v, want post_pool_transform guard", err)
 	}
 }
 

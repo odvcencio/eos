@@ -2,6 +2,7 @@ package eosruntime
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -224,6 +225,107 @@ func TestWriteAOQTSidecarCandidatePackageRejectsResearchOnlyAnchorEmbedding(t *t
 	}
 }
 
+func TestWriteAOQTSidecarCandidatePackageCleansCreatedOutputsAfterInjectedFailure(t *testing.T) {
+	anchor := writeTinyAOQTAnchorPackage(t)
+	out := filepath.Join(t.TempDir(), "candidate.mll")
+	cfg := tinyAOQTCandidatePackageConfig(t, anchor, out)
+	anchorManifest := mustReadPackageManifestForAOQTTest(t, DefaultPackageManifestPath(anchor))
+	anchorPaths, err := packageRolePaths(anchor, anchorManifest)
+	if err != nil {
+		t.Fatalf("anchor package paths: %v", err)
+	}
+	oldWriter := writeAOQTCandidatePackageManifestExclusive
+	writeAOQTCandidatePackageManifestExclusive = func(manifest PackageManifest, path string, cleanup *aoqtCandidateCleanup) error {
+		data, err := encodePackageManifestMLL(manifest)
+		if err != nil {
+			return err
+		}
+		if err := writeAOQTExclusiveFile(path, data, 0o644, cleanup); err != nil {
+			return err
+		}
+		return fmt.Errorf("injected package manifest post-create failure")
+	}
+	defer func() {
+		writeAOQTCandidatePackageManifestExclusive = oldWriter
+	}()
+
+	_, err = WriteAOQTSidecarCandidatePackage(cfg)
+	if err == nil || !strings.Contains(err.Error(), "injected package manifest post-create failure") {
+		t.Fatalf("write candidate injected failure error = %v, want post-create injected failure", err)
+	}
+	for role, path := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(out, true)) {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("candidate output %q residue at %s after injected failure: %v", role, path, err)
+		}
+	}
+	for role, path := range anchorPaths {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("anchor role %q was removed or became unreadable at %s: %v", role, path, err)
+		}
+	}
+}
+
+func TestAOQTCandidateCleanupSkipsSwappedOutputPaths(t *testing.T) {
+	dir := t.TempDir()
+	registered := filepath.Join(dir, "candidate.mll")
+	foreign := filepath.Join(dir, "foreign.mll")
+	if err := os.WriteFile(foreign, []byte("foreign\n"), 0o644); err != nil {
+		t.Fatalf("write foreign file: %v", err)
+	}
+
+	cleanup := newAOQTCandidateCleanup()
+	out, err := os.OpenFile(registered, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Fatalf("create registered file: %v", err)
+	}
+	cleanup.createdFile(registered, out)
+	if err := out.Close(); err != nil {
+		t.Fatalf("close registered file: %v", err)
+	}
+	if err := os.Remove(registered); err != nil {
+		t.Fatalf("remove registered file before swap: %v", err)
+	}
+	if err := os.WriteFile(registered, []byte("replacement\n"), 0o644); err != nil {
+		t.Fatalf("write replacement file: %v", err)
+	}
+
+	cleanup.run()
+	if got, err := os.ReadFile(registered); err != nil || string(got) != "replacement\n" {
+		t.Fatalf("swapped regular file was removed or changed: data=%q err=%v", string(got), err)
+	}
+	if got, err := os.ReadFile(foreign); err != nil || string(got) != "foreign\n" {
+		t.Fatalf("foreign file was removed or changed: data=%q err=%v", string(got), err)
+	}
+
+	symlinkPath := filepath.Join(dir, "candidate-symlink.mll")
+	cleanup = newAOQTCandidateCleanup()
+	out, err = os.OpenFile(symlinkPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		t.Fatalf("create symlink-registered file: %v", err)
+	}
+	cleanup.createdFile(symlinkPath, out)
+	if err := out.Close(); err != nil {
+		t.Fatalf("close symlink-registered file: %v", err)
+	}
+	if err := os.Remove(symlinkPath); err != nil {
+		t.Fatalf("remove symlink-registered file before swap: %v", err)
+	}
+	if err := os.Symlink(foreign, symlinkPath); err != nil {
+		t.Fatalf("create replacement symlink: %v", err)
+	}
+
+	cleanup.run()
+	if info, err := os.Lstat(symlinkPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("swapped symlink was removed or changed: info=%v err=%v", info, err)
+	}
+	if got, err := os.ReadFile(foreign); err != nil || string(got) != "foreign\n" {
+		t.Fatalf("symlink target was removed or changed: data=%q err=%v", string(got), err)
+	}
+}
+
 func TestAOQTCandidatePackageLoadFailsClosedForOmittedPolicy(t *testing.T) {
 	anchor := writeTinyAOQTAnchorPackage(t)
 	cfg := tinyAOQTCandidatePackageConfig(t, anchor, filepath.Join(t.TempDir(), "candidate.mll"))
@@ -396,6 +498,15 @@ func tinyAOQTCandidatePackageConfig(t *testing.T, anchor, out string) AOQTSideca
 		CompatibilityDigest:                 strings.Repeat("3", 64),
 		Transform:                           transform,
 	}
+}
+
+func mustReadPackageManifestForAOQTTest(t *testing.T, path string) PackageManifest {
+	t.Helper()
+	manifest, err := ReadPackageManifestFile(path)
+	if err != nil {
+		t.Fatalf("read package manifest: %v", err)
+	}
+	return manifest
 }
 
 func attachTinyAOQTPolicyForTest(t *testing.T, manifest *PackageManifest, artifactPath string, transform AOQTGivensTransform) {

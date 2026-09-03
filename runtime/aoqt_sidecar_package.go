@@ -31,6 +31,8 @@ type AOQTSidecarCandidatePackageResult struct {
 	AOQTPolicy      AOQTTransformPolicy
 }
 
+var writeAOQTCandidatePackageManifestExclusive = writeAOQTPackageManifestExclusive
+
 // WriteAOQTSidecarCandidatePackage copies an immutable anchor package into a
 // fresh sibling package and binds a post-pool AOQT transform sidecar.
 func WriteAOQTSidecarCandidatePackage(cfg AOQTSidecarCandidatePackageConfig) (AOQTSidecarCandidatePackageResult, error) {
@@ -95,28 +97,30 @@ func WriteAOQTSidecarCandidatePackage(cfg AOQTSidecarCandidatePackageConfig) (AO
 	if err := os.MkdirAll(filepath.Dir(cfg.OutputArtifactPath), 0o755); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
+	cleanup := newAOQTCandidateCleanup()
+	defer cleanup.run()
 
-	if err := copyAOQTFile(anchorPaths["artifact"], outPaths.ArtifactPath, cfg.UseHardlinks); err != nil {
+	if err := copyAOQTFile(anchorPaths["artifact"], outPaths.ArtifactPath, cfg.UseHardlinks, cleanup); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
 	if anchorPackage.HasFileRole("tokenizer") {
-		if err := copyAOQTFile(anchorPaths["tokenizer"], outPaths.TokenizerPath, cfg.UseHardlinks); err != nil {
+		if err := copyAOQTFile(anchorPaths["tokenizer"], outPaths.TokenizerPath, cfg.UseHardlinks, cleanup); err != nil {
 			return AOQTSidecarCandidatePackageResult{}, err
 		}
 	}
-	if err := copyAOQTFile(anchorPaths["weights"], outPaths.WeightFilePath, cfg.UseHardlinks); err != nil {
+	if err := copyAOQTFile(anchorPaths["weights"], outPaths.WeightFilePath, cfg.UseHardlinks, cleanup); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
-	if err := copyAOQTFile(anchorPaths["memory_plan"], outPaths.MemoryPlanPath, cfg.UseHardlinks); err != nil {
+	if err := copyAOQTFile(anchorPaths["memory_plan"], outPaths.MemoryPlanPath, cfg.UseHardlinks, cleanup); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
 
 	candidateManifest := anchorManifest
 	candidateManifest.PostPoolTransform = EmbeddingPostPoolTransformAOQTGivens
-	if err := writeAOQTEmbeddingManifestExclusive(candidateManifest, outPaths.ManifestPath); err != nil {
+	if err := writeAOQTEmbeddingManifestExclusive(candidateManifest, outPaths.ManifestPath, cleanup); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
-	if err := writeAOQTGivensTransformExclusive(cfg.Transform, outPaths.PostPoolTransformPath); err != nil {
+	if err := writeAOQTGivensTransformExclusive(cfg.Transform, outPaths.PostPoolTransformPath, cleanup); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
 	transformSHA, _, err := fileHash(outPaths.PostPoolTransformPath)
@@ -174,7 +178,7 @@ func WriteAOQTSidecarCandidatePackage(cfg AOQTSidecarCandidatePackageConfig) (AO
 	if err := verifyAOQTTransformPolicyBinding(candidatePackage, outPaths, cfg.Transform); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
-	if err := writeAOQTPackageManifestExclusive(candidatePackage, outPaths.PackageManifestPath); err != nil {
+	if err := writeAOQTCandidatePackageManifestExclusive(candidatePackage, outPaths.PackageManifestPath, cleanup); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
 	verifyPaths, err := packageRolePaths(outPaths.ArtifactPath, candidatePackage)
@@ -184,6 +188,7 @@ func WriteAOQTSidecarCandidatePackage(cfg AOQTSidecarCandidatePackageConfig) (AO
 	if err := candidatePackage.VerifyFiles(verifyPaths); err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
+	cleanup.commit()
 
 	return AOQTSidecarCandidatePackageResult{
 		Paths:           outPaths,
@@ -235,6 +240,97 @@ func validateAOQTCandidatePackageConfig(cfg AOQTSidecarCandidatePackageConfig) e
 		}
 	}
 	return cfg.Transform.Validate()
+}
+
+type aoqtCandidateCleanup struct {
+	entries []aoqtCandidateCleanupEntry
+	active  bool
+}
+
+type aoqtCandidateCleanupEntry struct {
+	path string
+	file *os.File
+}
+
+func newAOQTCandidateCleanup() *aoqtCandidateCleanup {
+	return &aoqtCandidateCleanup{active: true}
+}
+
+func (c *aoqtCandidateCleanup) createdFile(path string, file *os.File) {
+	if c == nil || path == "" {
+		return
+	}
+	hold, err := openAOQTCleanupHandle(path, file)
+	if err != nil {
+		return
+	}
+	c.entries = append(c.entries, aoqtCandidateCleanupEntry{path: path, file: hold})
+}
+
+func (c *aoqtCandidateCleanup) commit() {
+	if c != nil {
+		c.active = false
+		c.closeEntries()
+	}
+}
+
+func (c *aoqtCandidateCleanup) run() {
+	if c == nil || !c.active {
+		return
+	}
+	defer c.closeEntries()
+	for i := len(c.entries) - 1; i >= 0; i-- {
+		entry := c.entries[i]
+		if entry.path == "" {
+			continue
+		}
+		info, err := os.Lstat(entry.path)
+		if err != nil || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		createdInfo, err := entry.file.Stat()
+		if err != nil || !os.SameFile(createdInfo, info) {
+			continue
+		}
+		_ = os.Remove(entry.path)
+	}
+}
+
+func (c *aoqtCandidateCleanup) closeEntries() {
+	if c == nil {
+		return
+	}
+	for i := range c.entries {
+		if c.entries[i].file == nil {
+			continue
+		}
+		_ = c.entries[i].file.Close()
+		c.entries[i].file = nil
+	}
+}
+
+func openAOQTCleanupHandle(path string, file *os.File) (*os.File, error) {
+	if file == nil {
+		return nil, fmt.Errorf("AOQT candidate cleanup file handle is required")
+	}
+	createdInfo, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	hold, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	holdInfo, err := hold.Stat()
+	if err != nil {
+		_ = hold.Close()
+		return nil, err
+	}
+	if !os.SameFile(createdInfo, holdInfo) {
+		_ = hold.Close()
+		return nil, fmt.Errorf("AOQT candidate cleanup path changed after create: %s", path)
+	}
+	return hold, nil
 }
 
 func aoqtCandidateOutputPaths(artifactPath string, includeTokenizer bool) EmbeddingPackagePaths {
@@ -297,7 +393,7 @@ func packageRolePaths(artifactPath string, manifest PackageManifest) (map[string
 	return out, nil
 }
 
-func copyAOQTFile(src, dst string, hardlink bool) error {
+func copyAOQTFile(src, dst string, hardlink bool, cleanup *aoqtCandidateCleanup) error {
 	if hardlink {
 		return fmt.Errorf("AOQT candidate package hardlinks are not supported; copy-only output is required")
 	}
@@ -310,6 +406,7 @@ func copyAOQTFile(src, dst string, hardlink bool) error {
 	if err != nil {
 		return err
 	}
+	cleanup.createdFile(dst, out)
 	_, copyErr := io.Copy(out, in)
 	closeErr := out.Close()
 	if copyErr != nil {
@@ -318,15 +415,15 @@ func copyAOQTFile(src, dst string, hardlink bool) error {
 	return closeErr
 }
 
-func writeAOQTEmbeddingManifestExclusive(manifest EmbeddingManifest, path string) error {
+func writeAOQTEmbeddingManifestExclusive(manifest EmbeddingManifest, path string, cleanup *aoqtCandidateCleanup) error {
 	data, err := encodeAuthoredManifestMLL("embedding_manifest", EmbeddingManifestVersion, manifest.nameOrDefault(), "Eos embedding manifest", manifest.mllValues())
 	if err != nil {
 		return err
 	}
-	return writeAOQTExclusiveFile(path, data, 0o644)
+	return writeAOQTExclusiveFile(path, data, 0o644, cleanup)
 }
 
-func writeAOQTGivensTransformExclusive(transform AOQTGivensTransform, path string) error {
+func writeAOQTGivensTransformExclusive(transform AOQTGivensTransform, path string, cleanup *aoqtCandidateCleanup) error {
 	if err := transform.Validate(); err != nil {
 		return err
 	}
@@ -335,10 +432,10 @@ func writeAOQTGivensTransformExclusive(transform AOQTGivensTransform, path strin
 		return err
 	}
 	data = append(data, '\n')
-	return writeAOQTExclusiveFile(path, data, 0o644)
+	return writeAOQTExclusiveFile(path, data, 0o644, cleanup)
 }
 
-func writeAOQTPackageManifestExclusive(manifest PackageManifest, path string) error {
+func writeAOQTPackageManifestExclusive(manifest PackageManifest, path string, cleanup *aoqtCandidateCleanup) error {
 	if err := manifest.Validate(); err != nil {
 		return err
 	}
@@ -346,10 +443,10 @@ func writeAOQTPackageManifestExclusive(manifest PackageManifest, path string) er
 	if err != nil {
 		return err
 	}
-	return writeAOQTExclusiveFile(path, data, 0o644)
+	return writeAOQTExclusiveFile(path, data, 0o644, cleanup)
 }
 
-func writeAOQTExclusiveFile(path string, data []byte, perm os.FileMode) error {
+func writeAOQTExclusiveFile(path string, data []byte, perm os.FileMode, cleanup *aoqtCandidateCleanup) error {
 	if path == "" {
 		return fmt.Errorf("AOQT candidate output path is required")
 	}
@@ -362,6 +459,7 @@ func writeAOQTExclusiveFile(path string, data []byte, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
+	cleanup.createdFile(path, out)
 	n, writeErr := out.Write(data)
 	closeErr := out.Close()
 	if writeErr != nil {
