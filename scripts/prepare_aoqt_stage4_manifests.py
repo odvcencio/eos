@@ -38,7 +38,7 @@ QID_ONLY_JSON_FIELDS = {
     "source_sha256_by_file",
 }
 QID_CARRIER_FIELDS = ("qids_by_dataset", "selected_qids", "qids")
-LEGACY_WRAPPER_SPLITS = {"train", "dev", "reserve", "official", "official-test", "test"}
+LEGACY_WRAPPER_SPLITS = {"dev4", "reserve4"}
 
 
 class ManifestError(ValueError):
@@ -210,15 +210,20 @@ def require_wrapper_name(value: Any, label: str) -> None:
         raise ManifestError(f"{label}: name must not contain whitespace")
 
 
-def require_wrapper_split(value: Any, label: str) -> None:
+def require_wrapper_split(value: Any, label: str, expected_name: str) -> None:
     split = require_wrapper_text(value, label, "split")
     if split not in LEGACY_WRAPPER_SPLITS:
         raise ManifestError(f"{label}: split must be one of {sorted(LEGACY_WRAPPER_SPLITS)}")
+    if split != expected_name:
+        raise ManifestError(f"{label}: split must exactly match requested name {expected_name!r}")
 
 
 def require_source_selected_qids(value: Any, label: str) -> None:
+    if isinstance(value, str):
+        require_pathish_metadata_key(value, label, "source_selected_qids")
+        return
     if not isinstance(value, dict):
-        raise ManifestError(f"{label}: source_selected_qids must be a dataset-keyed string mapping")
+        raise ManifestError(f"{label}: source_selected_qids must be a string or dataset-keyed string mapping")
     unexpected = sorted(set(value) - set(calibration.ALLOWED_DATASETS))
     missing = [dataset for dataset in calibration.ALLOWED_DATASETS if dataset not in value]
     if unexpected:
@@ -226,13 +231,13 @@ def require_source_selected_qids(value: Any, label: str) -> None:
     if missing:
         raise ManifestError(f"{label}: source_selected_qids missing required dataset coverage {missing}")
     for dataset in calibration.ALLOWED_DATASETS:
-        require_wrapper_text(value[dataset], label, f"source_selected_qids.{dataset}")
+        require_pathish_metadata_key(value[dataset], label, f"source_selected_qids.{dataset}")
 
 
 def require_pathish_metadata_key(value: Any, label: str, field: str) -> str:
     key = require_wrapper_text(value, label, f"{field} key")
     parts = [part for part in key.split("/") if part]
-    if "\\" in key or not parts or any(part in {".", ".."} for part in parts):
+    if "\\" in key or re.search(r"\s", key) or not parts or any(part in {".", ".."} for part in parts):
         raise ManifestError(f"{label}: {field} keys must be path/name strings")
     if "/" not in key and "." not in key:
         raise ManifestError(f"{label}: {field} keys must be path/name strings, not arbitrary fields")
@@ -250,11 +255,15 @@ def require_sha256_mapping(value: Any, label: str, field: str) -> None:
             raise ManifestError(str(exc)) from exc
 
 
-def validate_legacy_qid_wrapper(payload: dict[str, Any], label: str) -> list[dict[str, list[str]]]:
+def validate_legacy_qid_wrapper(payload: dict[str, Any], label: str, expected_name: str) -> list[dict[str, list[str]]]:
     reject_forbidden_payload_keys(payload, label)
     unexpected = sorted(set(payload) - QID_ONLY_JSON_FIELDS)
     if unexpected:
         raise ManifestError(f"{label}: qid-only JSON has unexpected fields {unexpected}")
+    if expected_name not in LEGACY_WRAPPER_SPLITS:
+        raise ManifestError(f"{label}: legacy selected_qids inputs are only allowed for {sorted(LEGACY_WRAPPER_SPLITS)}")
+    if "split" not in payload:
+        raise ManifestError(f"{label}: legacy selected_qids input must declare split {expected_name!r}")
 
     if "schema" in payload:
         require_wrapper_schema(payload["schema"], label)
@@ -262,8 +271,7 @@ def validate_legacy_qid_wrapper(payload: dict[str, Any], label: str) -> list[dic
         require_wrapper_name(payload["name"], label)
     if "dataset" in payload:
         require_dataset(payload["dataset"], label)
-    if "split" in payload:
-        require_wrapper_split(payload["split"], label)
+    require_wrapper_split(payload["split"], label, expected_name)
     if "source_selected_qids" in payload:
         require_source_selected_qids(payload["source_selected_qids"], label)
     if "source_sha256" in payload:
@@ -318,11 +326,15 @@ def qid_mapping_from_value(value: Any, label: str) -> dict[str, list[str]]:
     raise ManifestError(f"{label}: expected selected_qids/qids mapping by dataset")
 
 
-def selected_qids_from_json(path: Path) -> dict[str, list[str]]:
+def selected_qids_from_json(path: Path, expected_name: str) -> dict[str, list[str]]:
     payload = load_json(path)
     label = display_path(path)
-    mappings = validate_legacy_qid_wrapper(payload, label)
+    mappings = validate_legacy_qid_wrapper(payload, label, expected_name)
     return mappings[0]
+
+
+def is_qrels_header(tokens: list[str]) -> bool:
+    return len(tokens) >= 2 and tokens[0] == "query-id" and any(token in {"corpus-id", "doc-id", "score", "relevance"} for token in tokens[1:])
 
 
 def selected_qids_from_qrels(path: Path) -> dict[str, list[str]]:
@@ -331,11 +343,17 @@ def selected_qids_from_qrels(path: Path) -> dict[str, list[str]]:
     label = display_path(path)
     dataset = infer_dataset_from_path(path)
     with repo_path(path).open("r", encoding="utf-8") as handle:
+        data_row_index = 0
         for line_number, line in enumerate(handle, start=1):
             text = line.strip()
             if not text or text.startswith("#"):
                 continue
-            qid = text.split()[0]
+            tokens = text.split()
+            if data_row_index == 0 and is_qrels_header(tokens):
+                data_row_index += 1
+                continue
+            data_row_index += 1
+            qid = tokens[0]
             qid = require_qid(qid, f"{label}:{line_number}")
             if qid not in seen:
                 seen.add(qid)
@@ -343,6 +361,26 @@ def selected_qids_from_qrels(path: Path) -> dict[str, list[str]]:
     if not qids:
         raise ManifestError(f"{label}: no qids found in qrels first column")
     return {dataset: qids}
+
+
+def validate_exclusion_source_binding(args: argparse.Namespace) -> None:
+    has_legacy = bool(args.legacy_selected_qids)
+    has_official = bool(args.official_test_qrels)
+    if not has_legacy and not has_official:
+        raise ManifestError("normalize-exclusions: at least one qid source is required")
+    if has_legacy and has_official:
+        raise ManifestError("normalize-exclusions: legacy_selected_qids and official_test_qrels source classes must not be mixed")
+    if has_official:
+        if args.name != "official-test":
+            raise ManifestError("normalize-exclusions: official_test_qrels inputs are only allowed for name 'official-test'")
+        expected_count = len(calibration.ALLOWED_DATASETS)
+        if len(args.official_test_qrels) != expected_count:
+            raise ManifestError(f"normalize-exclusions: official-test requires exactly {expected_count} official qrels inputs")
+    if has_legacy:
+        if args.name not in LEGACY_WRAPPER_SPLITS:
+            raise ManifestError(f"normalize-exclusions: legacy_selected_qids inputs are only allowed for {sorted(LEGACY_WRAPPER_SPLITS)}")
+        if len(args.legacy_selected_qids) != 1:
+            raise ManifestError("normalize-exclusions: dev4/reserve4 require exactly one legacy selected_qids wrapper")
 
 
 def merge_qids_by_dataset(sources: Iterable[dict[str, list[str]]]) -> dict[str, list[str]]:
@@ -363,11 +401,10 @@ def merge_qids_by_dataset(sources: Iterable[dict[str, list[str]]]) -> dict[str, 
 
 
 def normalize_exclusions(args: argparse.Namespace) -> dict[str, Any]:
-    if not args.legacy_selected_qids and not args.official_test_qrels:
-        raise ManifestError("normalize-exclusions: at least one qid source is required")
+    validate_exclusion_source_binding(args)
     sources: list[dict[str, list[str]]] = []
     for path in args.legacy_selected_qids:
-        sources.append(selected_qids_from_json(path))
+        sources.append(selected_qids_from_json(path, args.name))
     for path in args.official_test_qrels:
         sources.append(selected_qids_from_qrels(path))
     qids_by_dataset = merge_qids_by_dataset(sources)
@@ -551,11 +588,20 @@ def require_source_row_metadata(row: dict[str, Any], label: str, dataset: str, b
     surface = require_field(row, "scoring_surface", label)
     if surface != "turboquant_ip_prepared":
         raise ManifestError(f"{label}: scoring_surface must be turboquant_ip_prepared")
-    if int(row.get("rerank_overfetch", 0) or 0) != 0 or int(row.get("rerank_bits", 0) or 0) != 0 or str(row.get("rerank_storage", "") or ""):
+    if require_optional_zero_int(row, label, "rerank_overfetch") != 0 or require_optional_zero_int(row, label, "rerank_bits") != 0 or str(row.get("rerank_storage", "") or ""):
         raise ManifestError(f"{label}: rerank source rows are not allowed")
     per_query_top_k = require_field(row, "top_k_limit", label)
     if per_query_top_k != top_k:
         raise ManifestError(f"{label}: source per-query top_k must be {top_k}")
+
+
+def require_optional_zero_int(row: dict[str, Any], label: str, field: str) -> int:
+    value = row.get(field, 0)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ManifestError(f"{label}: {field} must be integer 0 when present")
+    return value
 
 
 def read_score_rows(path: Path, top_k: int, query_ids: set[str], doc_ids: set[str], dataset: str, bits: int, turboquant_seed: int) -> list[dict[str, Any]]:
@@ -593,8 +639,6 @@ def read_score_rows(path: Path, top_k: int, query_ids: set[str], doc_ids: set[st
             missing = [doc["doc_id"] for doc in docs if doc["doc_id"] not in doc_ids]
             if missing:
                 raise ManifestError(f"{label}:{line_number}: doc_id {missing[0]!r} missing doc vector manifest")
-            if not any(int(doc["gain"]) > 0 for doc in docs):
-                raise ManifestError(f"{label}:{line_number}: qid {qid!r} has no positive in top{top_k}")
             seen_qids.add(qid)
             rows.append({"qid": qid, "docs": docs})
     if not rows:

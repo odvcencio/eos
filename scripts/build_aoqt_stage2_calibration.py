@@ -595,8 +595,6 @@ def validate_score_cache(path: Path, excluded_qids_by_dataset: dict[str, set[str
                 raise PlanError(f"{label}: gain must be non-negative integer")
             seen_docs.add(doc_id)
             normalized_docs.append({"doc_id": doc_id, "rank": rank, "gain": gain})
-        if not any(doc["gain"] > 0 for doc in normalized_docs[:120]):
-            raise PlanError(f"{label}: qid {qid!r} has no positive in top120")
         normalized_rows.append({"qid": qid, "docs": normalized_docs})
     return {
         "path": label,
@@ -623,60 +621,88 @@ def pair_ids(row_id: str, docs: list[dict[str, Any]]) -> list[dict[str, str]]:
     return sorted(pairs, key=lambda item: item["pair_id"])
 
 
-def top10_row(dataset: str, bits: int, row: dict[str, Any], limit: int) -> dict[str, Any] | None:
+def unusable_row_audit(row_id: str, dataset: str, bits: int, bucket: str, qid: str, rank_window: list[int], docs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    positive_count = sum(1 for doc in docs if doc["gain"] > 0)
+    zero_gain_count = sum(1 for doc in docs if doc["gain"] == 0)
+    if positive_count > 0 and zero_gain_count > 0:
+        return None
+    reason = "no_positive_candidate" if positive_count == 0 else "no_zero_gain_candidate"
+    return {
+        "row_id": row_id,
+        "dataset": dataset,
+        "bits": bits,
+        "bucket": bucket,
+        "qid": qid,
+        "rank_window": rank_window,
+        "reason": reason,
+        "candidate_count": len(docs),
+        "positive_candidate_count": positive_count,
+        "zero_gain_candidate_count": zero_gain_count,
+    }
+
+
+def build_pairable_row(dataset: str, bits: int, bucket: str, qid: str, rank_window: list[int], docs: list[dict[str, Any]], row_id: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    skip = unusable_row_audit(row_id, dataset, bits, bucket, qid, rank_window, docs)
+    if skip is not None:
+        return None, skip
+    pairs = pair_ids(row_id, docs)
+    if not pairs:
+        raise PlanError(f"plan: row {row_id!r} unexpectedly has no eligible positive/zero-gain pairs")
+    return {
+        "row_id": row_id,
+        "dataset": dataset,
+        "bits": bits,
+        "bucket": bucket,
+        "qid": qid,
+        "rank_window": rank_window,
+        "candidate_doc_ids": [doc["doc_id"] for doc in docs],
+        "positive_doc_ids": [doc["doc_id"] for doc in docs if doc["gain"] > 0],
+        "negative_doc_ids": [doc["doc_id"] for doc in docs if doc["gain"] == 0],
+        "pair_ids": pairs,
+    }, None
+
+
+def top10_row(dataset: str, bits: int, row: dict[str, Any], limit: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     docs = row["docs"][:limit]
-    if not any(doc["gain"] > 0 for doc in docs):
-        return None
     row_id = f"{dataset}.q{bits}.top10.{row['qid']}"
-    return {
-        "row_id": row_id,
-        "dataset": dataset,
-        "bits": bits,
-        "bucket": "top10_guard",
-        "qid": row["qid"],
-        "rank_window": [1, limit],
-        "candidate_doc_ids": [doc["doc_id"] for doc in docs],
-        "positive_doc_ids": [doc["doc_id"] for doc in docs if doc["gain"] > 0],
-        "negative_doc_ids": [doc["doc_id"] for doc in docs if doc["gain"] == 0],
-        "pair_ids": pair_ids(row_id, docs),
-    }
+    return build_pairable_row(dataset, bits, "top10_guard", row["qid"], [1, limit], docs, row_id)
 
 
-def nf_boundary_row(dataset: str, bits: int, row: dict[str, Any], start: int, end: int) -> dict[str, Any] | None:
+def nf_boundary_row(dataset: str, bits: int, row: dict[str, Any], start: int, end: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     if dataset != "nfcorpus" or bits != 3:
-        return None
+        return None, None
     docs = row["docs"][start - 1 : end]
-    if not any(doc["gain"] > 0 for doc in docs):
-        return None
     row_id = f"{dataset}.q{bits}.nf80_120.{row['qid']}"
-    return {
-        "row_id": row_id,
-        "dataset": dataset,
-        "bits": bits,
-        "bucket": "nf_boundary80_120_guard",
-        "qid": row["qid"],
-        "rank_window": [start, end],
-        "candidate_doc_ids": [doc["doc_id"] for doc in docs],
-        "positive_doc_ids": [doc["doc_id"] for doc in docs if doc["gain"] > 0],
-        "negative_doc_ids": [doc["doc_id"] for doc in docs if doc["gain"] == 0],
-        "pair_ids": pair_ids(row_id, docs),
-    }
+    return build_pairable_row(dataset, bits, "nf_boundary80_120_guard", row["qid"], [start, end], docs, row_id)
 
 
-def build_rows(score_caches: list[dict[str, Any]], top10_limit: int, nf_start: int, nf_end: int) -> list[dict[str, Any]]:
+def build_rows(score_caches: list[dict[str, Any]], top10_limit: int, nf_start: int, nf_end: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     rows = []
+    skipped_rows = []
     for cache in sorted(score_caches, key=lambda item: (item["dataset"], item["bits"], item["path"])):
         for source_row in cache["rows"]:
             for built in (
                 top10_row(cache["dataset"], cache["bits"], source_row, top10_limit),
                 nf_boundary_row(cache["dataset"], cache["bits"], source_row, nf_start, nf_end),
             ):
-                if built is not None:
-                    rows.append(built)
+                row, skip = built
+                if row is not None:
+                    rows.append(row)
+                if skip is not None:
+                    skipped_rows.append(skip)
     row_ids = [row["row_id"] for row in rows]
     if len(row_ids) != len(set(row_ids)):
         raise PlanError("plan: duplicate row ids")
-    return sorted(rows, key=lambda row: row["row_id"])
+    skipped_rows = sorted(skipped_rows, key=lambda row: row["row_id"])
+    skip_counts = Counter(f"{row['bucket']}:{row['reason']}" for row in skipped_rows)
+    audit = {
+        "skip_policy": "skip_guard_windows_without_at_least_one_positive_and_one_zero_gain_candidate",
+        "skipped_row_count": len(skipped_rows),
+        "skip_counts": dict(sorted(skip_counts.items())),
+        "skipped_rows": skipped_rows,
+        "skipped_rows_sha256": sha256_json(skipped_rows),
+    }
+    return sorted(rows, key=lambda row: row["row_id"]), audit
 
 
 def require_guard_coverage(rows: list[dict[str, Any]]) -> None:
@@ -777,7 +803,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             if (dataset, bits) not in seen_score_keys:
                 raise PlanError(f"score caches: missing train {dataset} q{bits}")
     qrels_sha256_by_dataset, dataset_source_provenance_by_dataset = require_provenance_consistency(vector_caches, score_caches)
-    rows = build_rows(score_caches, args.top10_limit, args.nf_start, args.nf_end)
+    rows, row_selection_audit = build_rows(score_caches, args.top10_limit, args.nf_start, args.nf_end)
     require_guard_coverage(rows)
     if not rows:
         raise PlanError("plan: no eligible guard rows")
@@ -817,6 +843,7 @@ def build_plan(args: argparse.Namespace) -> dict[str, Any]:
             "forbidden_splits": list(FORBIDDEN_SPLITS),
         },
         "rows": rows,
+        "row_selection_audit": row_selection_audit,
         "row_ids_sha256": sha256_json([row["row_id"] for row in rows]),
         "rows_sha256": rows_sha,
         "workload": workload(rows, exclusions["excluded_qid_count_by_dataset"]),

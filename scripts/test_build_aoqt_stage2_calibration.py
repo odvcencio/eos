@@ -177,6 +177,8 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             self.assertEqual(plan1["workload"]["actual_train_pairs"], 0)
             self.assertEqual(plan1["workload"]["actual_vectors_written"], 0)
             self.assertEqual(plan1["workload"]["actual_similarity_values_written"], 0)
+            self.assertEqual(plan1["row_selection_audit"]["skipped_row_count"], 0)
+            self.assertEqual(plan1["row_selection_audit"]["skip_counts"], {})
             serialized = json.dumps(plan1, sort_keys=True)
             self.assertNotIn("embedding", json.dumps(plan1["rows"], sort_keys=True).lower())
             self.assertNotIn("vector", json.dumps(plan1["rows"], sort_keys=True).lower())
@@ -424,6 +426,68 @@ class BuildAOQTStage2CalibrationTest(unittest.TestCase):
             write_json(path, payload)
             with self.assertRaisesRegex(builder.PlanError, "missing top10 guard coverage"):
                 builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_skips_all_positive_and_all_zero_guard_windows_with_deterministic_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            for path in fixture["score_paths"]:
+                if str(path).endswith("fiqa.q3.json"):
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    for doc in payload["rows"][0]["docs"][:10]:
+                        doc["gain"] = 1
+                    write_json(path, payload)
+                if str(path).endswith("scifact.q5.json"):
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    for doc in payload["rows"][0]["docs"]:
+                        doc["gain"] = 0
+                    write_json(path, payload)
+            args = builder.parse_args(self.build_args(fixture))
+            plan1 = builder.build_plan(args)
+            plan2 = builder.build_plan(args)
+
+            audit = plan1["row_selection_audit"]
+            self.assertEqual(audit, plan2["row_selection_audit"])
+            self.assertEqual(audit["skipped_row_count"], 2)
+            self.assertEqual(
+                audit["skip_counts"],
+                {
+                    "top10_guard:no_positive_candidate": 1,
+                    "top10_guard:no_zero_gain_candidate": 1,
+                },
+            )
+            skipped_ids = {row["row_id"] for row in audit["skipped_rows"]}
+            emitted_ids = {row["row_id"] for row in plan1["rows"]}
+            self.assertFalse(skipped_ids & emitted_ids)
+            self.assertIn("fiqa.q3.top10.fiqa-q1", skipped_ids)
+            self.assertIn("scifact.q5.top10.scifact-q1", skipped_ids)
+
+    def test_all_positive_top10_rows_fail_closed_when_required_coverage_disappears(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            for path in fixture["score_paths"]:
+                if str(path).endswith("fiqa.q3.json"):
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    for row in payload["rows"]:
+                        for doc in row["docs"][:10]:
+                            doc["gain"] = 1
+                    write_json(path, payload)
+                    break
+            with self.assertRaisesRegex(builder.PlanError, "missing top10 guard coverage"):
+                builder.build_plan(builder.parse_args(self.build_args(fixture)))
+
+    def test_emitted_guard_rows_always_have_eligible_pairs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture = self.fixture(Path(tmp))
+            plan = builder.build_plan(builder.parse_args(self.build_args(fixture)))
+            top10 = next(row for row in plan["rows"] if row["row_id"] == "fiqa.q3.top10.fiqa-q1")
+
+            self.assertEqual(top10["positive_doc_ids"], ["fiqa-d001"])
+            self.assertEqual(top10["negative_doc_ids"], [f"fiqa-d{i:03d}" for i in range(2, 11)])
+            self.assertEqual(len(top10["pair_ids"]), 9)
+            for row in plan["rows"]:
+                self.assertTrue(row["positive_doc_ids"], row["row_id"])
+                self.assertTrue(row["negative_doc_ids"], row["row_id"])
+                self.assertTrue(row["pair_ids"], row["row_id"])
 
     def test_rejects_missing_nfcorpus_q3_boundary_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
