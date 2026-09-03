@@ -80,15 +80,17 @@ type EmbeddingManifest struct {
 	FFNLayerNorm          bool              `json:"ffn_layernorm,omitempty"`
 	ProjectionParam       string            `json:"projection_param,omitempty"`
 	OutputProjectionParam string            `json:"output_projection_param,omitempty"`
+	PostPoolTransform     string            `json:"post_pool_transform,omitempty"`
 	Tokenizer             TokenizerManifest `json:"tokenizer,omitempty"`
 }
 
 // EmbeddingModel is a manifest-backed embedding serving handle.
 type EmbeddingModel struct {
-	program       *Program
-	manifest      EmbeddingManifest
-	tokenizerFile *TokenizerFile
-	tokenizer     *BPETokenizer
+	program           *Program
+	manifest          EmbeddingManifest
+	tokenizerFile     *TokenizerFile
+	tokenizer         *BPETokenizer
+	postPoolTransform *AOQTGivensTransform
 }
 
 // ReadEmbeddingManifestFile decodes an authored MLL embedding manifest.
@@ -124,11 +126,18 @@ func (rt *Runtime) LoadEmbedding(ctx context.Context, mod *eosartifact.Module, m
 	if err := manifest.ValidateModule(mod); err != nil {
 		return nil, err
 	}
+	cfg := loadConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	if err := validatePostPoolTransformForManifest(manifest, cfg.postPoolTransform); err != nil {
+		return nil, err
+	}
 	prog, err := rt.Load(ctx, mod, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &EmbeddingModel{program: prog, manifest: manifest}, nil
+	return &EmbeddingModel{program: prog, manifest: manifest, postPoolTransform: cfg.postPoolTransform}, nil
 }
 
 // LoadEmbeddingFile reads a .mll artifact and loads it as an embedding model.
@@ -204,6 +213,7 @@ func (m EmbeddingManifest) mllValues() map[string]authoredManifestValue {
 		"ffn_layernorm":           authoredBool(m.FFNLayerNorm),
 		"projection_param":        authoredString(m.ProjectionParam),
 		"output_projection_param": authoredString(m.OutputProjectionParam),
+		"post_pool_transform":     authoredString(m.PostPoolTransform),
 		"tokenizer.vocab_size":    authoredInt(int64(m.Tokenizer.VocabSize)),
 		"tokenizer.max_sequence":  authoredInt(int64(m.Tokenizer.MaxSequence)),
 		"tokenizer.pad_id":        authoredInt(int64(m.Tokenizer.PadID)),
@@ -400,6 +410,11 @@ func embeddingManifestFromDoc(doc authoredManifestDoc) (EmbeddingManifest, error
 	} else {
 		manifest.OutputProjectionParam = value
 	}
+	if value, _, err := doc.string("post_pool_transform"); err != nil {
+		return EmbeddingManifest{}, err
+	} else {
+		manifest.PostPoolTransform = value
+	}
 	if value, _, err := doc.int("tokenizer.vocab_size"); err != nil {
 		return EmbeddingManifest{}, err
 	} else {
@@ -588,7 +603,7 @@ func (m *EmbeddingModel) EmbedWithRole(ctx context.Context, tokens []int32, role
 		if err := m.validateEmbeddingResult(result, false); err != nil {
 			return EmbeddingResult{}, err
 		}
-		return result, nil
+		return m.applyPostPoolTransform(result)
 	}
 	entry, err := findEntryPoint(m.program.module, m.manifest.PooledEntry)
 	if err != nil {
@@ -642,7 +657,7 @@ func (m *EmbeddingModel) EmbedWithRole(ctx context.Context, tokens []int32, role
 	if err := m.validateEmbeddingResult(result, false); err != nil {
 		return EmbeddingResult{}, err
 	}
-	return result, nil
+	return m.applyPostPoolTransform(result)
 }
 
 // EmbedBatch executes the batched pooled embedding entrypoint.
@@ -652,6 +667,10 @@ func (m *EmbeddingModel) EmbedBatch(ctx context.Context, batches [][]int32) (Emb
 
 // EmbedBatchWithRole executes the batched pooled embedding entrypoint with an explicit semantic role.
 func (m *EmbeddingModel) EmbedBatchWithRole(ctx context.Context, batches [][]int32, role string) (EmbeddingResult, error) {
+	return m.embedBatchWithRole(ctx, batches, role, true)
+}
+
+func (m *EmbeddingModel) embedBatchWithRole(ctx context.Context, batches [][]int32, role string, applyTransform bool) (EmbeddingResult, error) {
 	if m == nil || m.program == nil {
 		return EmbeddingResult{}, fmt.Errorf("embedding model is not loaded")
 	}
@@ -678,7 +697,10 @@ func (m *EmbeddingModel) EmbedBatchWithRole(ctx context.Context, batches [][]int
 		if err := m.validateEmbeddingResult(result, true); err != nil {
 			return EmbeddingResult{}, err
 		}
-		return result, nil
+		if !applyTransform {
+			return result, nil
+		}
+		return m.applyPostPoolTransform(result)
 	}
 	entry, err := findEntryPoint(m.program.module, m.manifest.BatchEntry)
 	if err != nil {
@@ -732,6 +754,26 @@ func (m *EmbeddingModel) EmbedBatchWithRole(ctx context.Context, batches [][]int
 	if err := m.validateEmbeddingResult(result, true); err != nil {
 		return EmbeddingResult{}, err
 	}
+	if !applyTransform {
+		return result, nil
+	}
+	return m.applyPostPoolTransform(result)
+}
+
+func (m *EmbeddingModel) applyPostPoolTransform(result EmbeddingResult) (EmbeddingResult, error) {
+	if m == nil || m.postPoolTransform == nil {
+		return result, nil
+	}
+	transformed, err := m.postPoolTransform.ApplyTensor(result.Embeddings)
+	if err != nil {
+		return EmbeddingResult{}, err
+	}
+	result.Embeddings = transformed
+	if result.Raw.Outputs != nil && result.OutputName != "" {
+		value := result.Raw.Outputs[result.OutputName]
+		value.Data = transformed
+		result.Raw.Outputs[result.OutputName] = value
+	}
 	return result, nil
 }
 
@@ -775,7 +817,7 @@ func (m *EmbeddingModel) embedBatchByTokenLength(ctx context.Context, batches []
 		for i, slot := range slots {
 			groupBatches[i] = slot.tokens
 		}
-		result, err := m.EmbedBatchWithRole(ctx, groupBatches, role)
+		result, err := m.embedBatchWithRole(ctx, groupBatches, role, false)
 		if err != nil {
 			return EmbeddingResult{}, err
 		}
@@ -835,7 +877,7 @@ func (m *EmbeddingModel) embedBatchByTokenLength(ctx context.Context, batches []
 	if err := m.validateEmbeddingResult(result, true); err != nil {
 		return EmbeddingResult{}, err
 	}
-	return result, nil
+	return m.applyPostPoolTransform(result)
 }
 
 func embeddingRows(t *backend.Tensor, wantRows int) ([][]float32, error) {
@@ -1014,6 +1056,9 @@ func (m EmbeddingManifest) ValidateModule(mod *eosartifact.Module) error {
 	if err := m.validateArchitectureMetadata(); err != nil {
 		return err
 	}
+	if err := m.validatePostPoolTransformDeclaration(); err != nil {
+		return err
+	}
 	if (m.AttentionResidual || m.AttentionLayerNorm) && m.AttentionQueryParam == "" {
 		return fmt.Errorf("attention residual/layernorm requires attention params")
 	}
@@ -1138,6 +1183,15 @@ func (m EmbeddingManifest) validateArchitectureMetadata() error {
 		return fmt.Errorf("output_projection_param is required when architecture_version=%q and output_dim (%d) differs from model_dim (%d)", m.ArchitectureVersion, m.OutputDim, m.ModelDim)
 	}
 	return nil
+}
+
+func (m EmbeddingManifest) validatePostPoolTransformDeclaration() error {
+	switch m.PostPoolTransform {
+	case "", EmbeddingPostPoolTransformNone, EmbeddingPostPoolTransformAOQTGivens:
+		return nil
+	default:
+		return fmt.Errorf("unsupported post_pool_transform %q", m.PostPoolTransform)
+	}
 }
 
 // ValidateLegacyEmbeddingTrainerSupported rejects manifests that need

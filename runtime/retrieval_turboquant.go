@@ -172,7 +172,7 @@ func EvaluateTurboQuantRetrievalWithRerankStorage(ctx context.Context, model *Em
 		return TurboQuantRetrievalEvalMetrics{}, err
 	}
 
-	qrels, err := readBEIRQrels(cfg.QrelsPath)
+	qrels, qrelsSHA256, err := readBEIRQrelsWithSHA256(cfg.QrelsPath)
 	if err != nil {
 		return TurboQuantRetrievalEvalMetrics{}, err
 	}
@@ -214,6 +214,7 @@ func EvaluateTurboQuantRetrievalWithRerankStorage(ctx context.Context, model *Em
 	metrics.Inputs.CorpusPath = cfg.CorpusPath
 	metrics.Inputs.QueriesPath = cfg.QueriesPath
 	metrics.Inputs.QrelsPath = cfg.QrelsPath
+	metrics.Inputs.QrelsSHA256 = qrelsSHA256
 	metrics.SkippedCounts.QueriesWithoutText = skippedQueries
 	return metrics, nil
 }
@@ -256,7 +257,7 @@ func EvaluateTurboQuantVectorCacheRetrievalWithRerankStorage(ctx context.Context
 		return TurboQuantRetrievalEvalMetrics{}, err
 	}
 
-	qrels, err := readBEIRQrels(cfg.QrelsPath)
+	qrels, qrelsSHA256, err := readBEIRQrelsWithSHA256(cfg.QrelsPath)
 	if err != nil {
 		return TurboQuantRetrievalEvalMetrics{}, err
 	}
@@ -302,6 +303,7 @@ func EvaluateTurboQuantVectorCacheRetrievalWithRerankStorage(ctx context.Context
 	metrics.Inputs.CorpusPath = cfg.CorpusPath
 	metrics.Inputs.QueriesPath = cfg.QueriesPath
 	metrics.Inputs.QrelsPath = cfg.QrelsPath
+	metrics.Inputs.QrelsSHA256 = qrelsSHA256
 	metrics.Inputs.DocVectorPath = cfg.DocVectorPath
 	metrics.Inputs.QueryVectorPath = cfg.QueryVectorPath
 	metrics.SkippedCounts.QueriesWithoutText = skippedQueries

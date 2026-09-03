@@ -2,8 +2,10 @@ package eosruntime
 
 import (
 	"bufio"
+	"bytes"
 	"container/heap"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -89,6 +91,7 @@ type RetrievalEvalInputMetrics struct {
 	CorpusPath      string `json:"corpus_path,omitempty"`
 	QueriesPath     string `json:"queries_path,omitempty"`
 	QrelsPath       string `json:"qrels_path,omitempty"`
+	QrelsSHA256     string `json:"qrels_sha256,omitempty"`
 	LabelPath       string `json:"label_path,omitempty"`
 	HeadPath        string `json:"head_path,omitempty"`
 	DocVectorPath   string `json:"doc_vector_path,omitempty"`
@@ -234,7 +237,7 @@ func EvaluateEmbeddingRetrieval(ctx context.Context, model *EmbeddingModel, cfg 
 		return RetrievalEvalMetrics{}, fmt.Errorf("corpus, queries, and qrels paths are required")
 	}
 	start := time.Now()
-	qrels, err := readBEIRQrels(cfg.QrelsPath)
+	qrels, qrelsSHA256, err := readBEIRQrelsWithSHA256(cfg.QrelsPath)
 	if err != nil {
 		return RetrievalEvalMetrics{}, err
 	}
@@ -292,6 +295,7 @@ func EvaluateEmbeddingRetrieval(ctx context.Context, model *EmbeddingModel, cfg 
 			CorpusPath:    cfg.CorpusPath,
 			QueriesPath:   cfg.QueriesPath,
 			QrelsPath:     cfg.QrelsPath,
+			QrelsSHA256:   qrelsSHA256,
 			Documents:     len(docVectors),
 			Queries:       evaluatedQueries,
 			RelevantPairs: relevantPairs,
@@ -335,7 +339,7 @@ func EvaluateVectorCacheRetrieval(ctx context.Context, cfg RetrievalEvalConfig) 
 		cfg.BackendName = "vectors"
 	}
 	start := time.Now()
-	qrels, err := readBEIRQrels(cfg.QrelsPath)
+	qrels, qrelsSHA256, err := readBEIRQrelsWithSHA256(cfg.QrelsPath)
 	if err != nil {
 		return RetrievalEvalMetrics{}, err
 	}
@@ -398,6 +402,7 @@ func EvaluateVectorCacheRetrieval(ctx context.Context, cfg RetrievalEvalConfig) 
 			CorpusPath:      cfg.CorpusPath,
 			QueriesPath:     cfg.QueriesPath,
 			QrelsPath:       cfg.QrelsPath,
+			QrelsSHA256:     qrelsSHA256,
 			DocVectorPath:   cfg.DocVectorPath,
 			QueryVectorPath: cfg.QueryVectorPath,
 			Documents:       len(docVectors),
@@ -765,13 +770,26 @@ func firstRetrievalVector(record retrievalVectorJSONRecord) []float32 {
 }
 
 func readBEIRQrels(path string) (retrievalQrels, error) {
-	file, err := os.Open(path)
+	qrels, _, err := readBEIRQrelsWithSHA256(path)
+	return qrels, err
+}
+
+func readBEIRQrelsWithSHA256(path string) (retrievalQrels, string, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	defer file.Close()
+	qrels, err := parseBEIRQrelsBytes(path, data)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(data)
+	return qrels, fmt.Sprintf("%x", sum[:]), nil
+}
+
+func parseBEIRQrelsBytes(path string, data []byte) (retrievalQrels, error) {
 	qrels := retrievalQrels{}
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(bytes.NewReader(data))
 	lineNo := 0
 	for scanner.Scan() {
 		lineNo++

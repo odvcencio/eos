@@ -10,12 +10,13 @@ import (
 
 // EmbeddingPackagePaths names the files that make up a packaged embedding model.
 type EmbeddingPackagePaths struct {
-	ArtifactPath        string
-	ManifestPath        string
-	TokenizerPath       string
-	WeightFilePath      string
-	MemoryPlanPath      string
-	PackageManifestPath string
+	ArtifactPath          string
+	ManifestPath          string
+	TokenizerPath         string
+	WeightFilePath        string
+	MemoryPlanPath        string
+	PackageManifestPath   string
+	PostPoolTransformPath string
 }
 
 // LoadEmbeddingPackage loads a packaged embedding model from sibling artifact, manifest, and weight files.
@@ -28,12 +29,13 @@ func (rt *Runtime) LoadEmbeddingPackage(ctx context.Context, artifactPath string
 	return rt.LoadEmbeddingPackageWithPaths(
 		ctx,
 		EmbeddingPackagePaths{
-			ArtifactPath:        artifactPath,
-			ManifestPath:        ResolveEmbeddingManifestPath(artifactPath),
-			TokenizerPath:       DefaultTokenizerPath(artifactPath),
-			WeightFilePath:      DefaultWeightFilePath(artifactPath),
-			MemoryPlanPath:      DefaultMemoryPlanPath(artifactPath),
-			PackageManifestPath: ResolvePackageManifestPath(artifactPath),
+			ArtifactPath:          artifactPath,
+			ManifestPath:          ResolveEmbeddingManifestPath(artifactPath),
+			TokenizerPath:         DefaultTokenizerPath(artifactPath),
+			WeightFilePath:        DefaultWeightFilePath(artifactPath),
+			MemoryPlanPath:        DefaultMemoryPlanPath(artifactPath),
+			PackageManifestPath:   ResolvePackageManifestPath(artifactPath),
+			PostPoolTransformPath: DefaultPostPoolTransformPath(artifactPath),
 		},
 	)
 }
@@ -77,7 +79,11 @@ func (rt *Runtime) tryLoadSealedEmbeddingPackage(ctx context.Context, path strin
 
 // LoadEmbeddingPackageWithPaths loads a packaged embedding model from explicit artifact, manifest, and weight files.
 func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths EmbeddingPackagePaths) (*EmbeddingModel, error) {
-	opts := make([]LoadOption, 0, 4)
+	opts := make([]LoadOption, 0, 5)
+	manifest, err := ReadEmbeddingManifestFile(paths.ManifestPath)
+	if err != nil {
+		return nil, err
+	}
 	if paths.PackageManifestPath != "" {
 		if _, err := os.Stat(paths.PackageManifestPath); err == nil {
 			packageManifest, err := ReadPackageManifestFile(paths.PackageManifestPath)
@@ -87,12 +93,20 @@ func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths Embe
 			if err := rejectResearchOnlyRestrictedEmbeddingPackage(packageManifest); err != nil {
 				return nil, err
 			}
+			if manifest.requiresPostPoolTransform() && !packageManifest.HasFileRole(EmbeddingPostPoolTransformRole) {
+				return nil, fmt.Errorf("embedding manifest declares %q but package manifest does not list %q", manifest.PostPoolTransform, EmbeddingPostPoolTransformRole)
+			}
 			verifyPaths := map[string]string{
 				"artifact":           paths.ArtifactPath,
 				"embedding_manifest": paths.ManifestPath,
 				"tokenizer":          paths.TokenizerPath,
 				"weights":            paths.WeightFilePath,
 				"memory_plan":        paths.MemoryPlanPath,
+			}
+			if manifest.requiresPostPoolTransform() {
+				verifyPaths[EmbeddingPostPoolTransformRole] = paths.PostPoolTransformPath
+			} else if packageManifest.HasFileRole(EmbeddingPostPoolTransformRole) {
+				verifyPaths[EmbeddingPostPoolTransformRole] = paths.PostPoolTransformPath
 			}
 			if packageManifest.Kind == PackageTraining {
 				verifyPaths["train_manifest"] = DefaultEmbeddingTrainManifestPath(paths.ArtifactPath)
@@ -103,11 +117,18 @@ func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths Embe
 				return nil, err
 			}
 			opts = append(opts, WithPackageManifest(packageManifest))
+		} else if manifest.requiresPostPoolTransform() {
+			return nil, fmt.Errorf("embedding manifest declares %q but package manifest is missing", manifest.PostPoolTransform)
 		}
+	} else if manifest.requiresPostPoolTransform() {
+		return nil, fmt.Errorf("embedding manifest declares %q but package manifest path is required", manifest.PostPoolTransform)
 	}
-	manifest, err := ReadEmbeddingManifestFile(paths.ManifestPath)
-	if err != nil {
-		return nil, err
+	if manifest.requiresPostPoolTransform() {
+		transform, err := ReadAOQTGivensTransformFile(paths.PostPoolTransformPath)
+		if err != nil {
+			return nil, fmt.Errorf("read post-pool transform: %w", err)
+		}
+		opts = append(opts, WithPostPoolTransform(transform))
 	}
 	weightFile, err := ReadWeightFile(paths.WeightFilePath)
 	if err != nil {

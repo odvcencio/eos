@@ -23,6 +23,7 @@ type loadConfig struct {
 	candidateMetadata map[int64]map[string]string
 	memoryPlan        *MemoryPlan
 	packageManifest   *PackageManifest
+	postPoolTransform *AOQTGivensTransform
 	requireBackend    eosartifact.BackendKind
 }
 
@@ -259,6 +260,13 @@ func WithPackageManifest(manifest PackageManifest) LoadOption {
 	return func(cfg *loadConfig) {
 		cp := manifest
 		cfg.packageManifest = &cp
+	}
+}
+
+func WithPostPoolTransform(transform AOQTGivensTransform) LoadOption {
+	return func(cfg *loadConfig) {
+		cp := transform
+		cfg.postPoolTransform = &cp
 	}
 }
 

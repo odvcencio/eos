@@ -606,6 +606,7 @@ func siblingPackageFilesForKind(artifactPath string, kind PackageKind) (map[stri
 		return nil, err
 	}
 	addOptional("tokenizer", DefaultTokenizerPath(artifactPath))
+	addOptional(EmbeddingPostPoolTransformRole, DefaultPostPoolTransformPath(artifactPath))
 	switch kind {
 	case PackageEmbedding:
 		return paths, nil
@@ -687,6 +688,15 @@ func (m PackageManifest) VerifyFiles(paths map[string]string) error {
 		}
 	}
 	return nil
+}
+
+func (m PackageManifest) HasFileRole(role string) bool {
+	for _, item := range m.Files {
+		if item.Role == role {
+			return true
+		}
+	}
+	return false
 }
 
 func fileHash(path string) (string, int64, error) {

@@ -2,6 +2,7 @@ package eosruntime
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -2182,6 +2183,183 @@ func TestReadBEIRQrelsAcceptsTRECFormat(t *testing.T) {
 	if _, ok := qrels["q1"]["d2"]; ok {
 		t.Fatalf("non-positive qrel was retained: %+v", qrels)
 	}
+}
+
+func TestRetrievalMetricsBindQrelsSHA256ForDenseAndTurboQuant(t *testing.T) {
+	_, corpusPath, queriesPath, qrelsPath, docVectorsPath, queryVectorsPath := writeTinyVectorRetrievalDataset(t)
+	model := loadTinyQrelsBindingRetrievalModel(t)
+	qrelsBytes := []byte("query-id\tcorpus-id\tscore\nq1\td1\t1\n")
+	if err := os.WriteFile(qrelsPath, qrelsBytes, 0o644); err != nil {
+		t.Fatalf("write qrels: %v", err)
+	}
+	wantQrelsSHA256 := testSHA256Hex(qrelsBytes)
+
+	cfg := RetrievalEvalConfig{
+		DatasetName:     "tiny",
+		CorpusPath:      corpusPath,
+		QueriesPath:     queriesPath,
+		QrelsPath:       qrelsPath,
+		DocVectorPath:   docVectorsPath,
+		QueryVectorPath: queryVectorsPath,
+		TopK:            100,
+	}
+	denseA, err := EvaluateVectorCacheRetrieval(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("evaluate dense vectors A: %v", err)
+	}
+	denseB, err := EvaluateVectorCacheRetrieval(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("evaluate dense vectors B: %v", err)
+	}
+	if denseA.Inputs.QrelsSHA256 != wantQrelsSHA256 || denseB.Inputs.QrelsSHA256 != wantQrelsSHA256 {
+		t.Fatalf("dense qrels sha = %q / %q, want %q", denseA.Inputs.QrelsSHA256, denseB.Inputs.QrelsSHA256, wantQrelsSHA256)
+	}
+
+	turboA, err := EvaluateTurboQuantVectorCacheRetrieval(context.Background(), cfg, []int{8})
+	if err != nil {
+		t.Fatalf("evaluate turboquant vectors A: %v", err)
+	}
+	turboB, err := EvaluateTurboQuantVectorCacheRetrieval(context.Background(), cfg, []int{8})
+	if err != nil {
+		t.Fatalf("evaluate turboquant vectors B: %v", err)
+	}
+	if turboA.Inputs.QrelsSHA256 != wantQrelsSHA256 || turboB.Inputs.QrelsSHA256 != wantQrelsSHA256 {
+		t.Fatalf("turboquant qrels sha = %q / %q, want %q", turboA.Inputs.QrelsSHA256, turboB.Inputs.QrelsSHA256, wantQrelsSHA256)
+	}
+	modelCfg := RetrievalEvalConfig{
+		DatasetName: "tiny",
+		CorpusPath:  corpusPath,
+		QueriesPath: queriesPath,
+		QrelsPath:   qrelsPath,
+		BatchSize:   2,
+		TopK:        100,
+		RoleMode:    EmbeddingRoleModeRaw,
+	}
+	modelDenseA, err := EvaluateEmbeddingRetrieval(context.Background(), model, modelCfg)
+	if err != nil {
+		t.Fatalf("evaluate model dense A: %v", err)
+	}
+	modelDenseB, err := EvaluateEmbeddingRetrieval(context.Background(), model, modelCfg)
+	if err != nil {
+		t.Fatalf("evaluate model dense B: %v", err)
+	}
+	if modelDenseA.Inputs.QrelsSHA256 != wantQrelsSHA256 || modelDenseB.Inputs.QrelsSHA256 != wantQrelsSHA256 {
+		t.Fatalf("model dense qrels sha = %q / %q, want %q", modelDenseA.Inputs.QrelsSHA256, modelDenseB.Inputs.QrelsSHA256, wantQrelsSHA256)
+	}
+	modelTurboA, err := EvaluateTurboQuantRetrieval(context.Background(), model, modelCfg, []int{8})
+	if err != nil {
+		t.Fatalf("evaluate model turboquant A: %v", err)
+	}
+	modelTurboB, err := EvaluateTurboQuantRetrieval(context.Background(), model, modelCfg, []int{8})
+	if err != nil {
+		t.Fatalf("evaluate model turboquant B: %v", err)
+	}
+	if modelTurboA.Inputs.QrelsSHA256 != wantQrelsSHA256 || modelTurboB.Inputs.QrelsSHA256 != wantQrelsSHA256 {
+		t.Fatalf("model turboquant qrels sha = %q / %q, want %q", modelTurboA.Inputs.QrelsSHA256, modelTurboB.Inputs.QrelsSHA256, wantQrelsSHA256)
+	}
+
+	nextQrelsBytes := []byte("query-id\tcorpus-id\tscore\nq1\td2\t1\n")
+	if err := os.WriteFile(qrelsPath, nextQrelsBytes, 0o644); err != nil {
+		t.Fatalf("rewrite qrels: %v", err)
+	}
+	wantNextQrelsSHA256 := testSHA256Hex(nextQrelsBytes)
+	denseNext, err := EvaluateVectorCacheRetrieval(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("evaluate dense vectors after qrels change: %v", err)
+	}
+	turboNext, err := EvaluateTurboQuantVectorCacheRetrieval(context.Background(), cfg, []int{8})
+	if err != nil {
+		t.Fatalf("evaluate turboquant vectors after qrels change: %v", err)
+	}
+	if denseNext.Inputs.QrelsSHA256 != wantNextQrelsSHA256 || denseNext.Inputs.QrelsSHA256 == wantQrelsSHA256 {
+		t.Fatalf("dense changed qrels sha = %q, old %q want %q", denseNext.Inputs.QrelsSHA256, wantQrelsSHA256, wantNextQrelsSHA256)
+	}
+	if turboNext.Inputs.QrelsSHA256 != wantNextQrelsSHA256 || turboNext.Inputs.QrelsSHA256 == wantQrelsSHA256 {
+		t.Fatalf("turboquant changed qrels sha = %q, old %q want %q", turboNext.Inputs.QrelsSHA256, wantQrelsSHA256, wantNextQrelsSHA256)
+	}
+	modelDenseNext, err := EvaluateEmbeddingRetrieval(context.Background(), model, modelCfg)
+	if err != nil {
+		t.Fatalf("evaluate model dense after qrels change: %v", err)
+	}
+	modelTurboNext, err := EvaluateTurboQuantRetrieval(context.Background(), model, modelCfg, []int{8})
+	if err != nil {
+		t.Fatalf("evaluate model turboquant after qrels change: %v", err)
+	}
+	if modelDenseNext.Inputs.QrelsSHA256 != wantNextQrelsSHA256 || modelDenseNext.Inputs.QrelsSHA256 == wantQrelsSHA256 {
+		t.Fatalf("model dense changed qrels sha = %q, old %q want %q", modelDenseNext.Inputs.QrelsSHA256, wantQrelsSHA256, wantNextQrelsSHA256)
+	}
+	if modelTurboNext.Inputs.QrelsSHA256 != wantNextQrelsSHA256 || modelTurboNext.Inputs.QrelsSHA256 == wantQrelsSHA256 {
+		t.Fatalf("model turboquant changed qrels sha = %q, old %q want %q", modelTurboNext.Inputs.QrelsSHA256, wantQrelsSHA256, wantNextQrelsSHA256)
+	}
+
+	if err := os.Remove(qrelsPath); err != nil {
+		t.Fatalf("remove qrels: %v", err)
+	}
+	if _, err := EvaluateVectorCacheRetrieval(context.Background(), cfg); err == nil {
+		t.Fatalf("dense vectors succeeded after qrels source was removed")
+	}
+	if _, err := EvaluateTurboQuantVectorCacheRetrieval(context.Background(), cfg, []int{8}); err == nil {
+		t.Fatalf("turboquant vectors succeeded after qrels source was removed")
+	}
+	if _, err := EvaluateEmbeddingRetrieval(context.Background(), model, modelCfg); err == nil {
+		t.Fatalf("model dense succeeded after qrels source was removed")
+	}
+	if _, err := EvaluateTurboQuantRetrieval(context.Background(), model, modelCfg, []int{8}); err == nil {
+		t.Fatalf("model turboquant succeeded after qrels source was removed")
+	}
+}
+
+func testSHA256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func writeTinyVectorRetrievalDataset(t *testing.T) (dir, corpusPath, queriesPath, qrelsPath, docVectorsPath, queryVectorsPath string) {
+	t.Helper()
+	dir = t.TempDir()
+	datasetDir := filepath.Join(dir, "dataset")
+	if err := os.MkdirAll(filepath.Join(datasetDir, "qrels"), 0o755); err != nil {
+		t.Fatalf("mkdir qrels: %v", err)
+	}
+	corpusPath = filepath.Join(datasetDir, "corpus.jsonl")
+	queriesPath = filepath.Join(datasetDir, "queries.jsonl")
+	qrelsPath = filepath.Join(datasetDir, "qrels", "test.tsv")
+	docVectorsPath = filepath.Join(dir, "doc-vectors.jsonl")
+	queryVectorsPath = filepath.Join(dir, "query-vectors.jsonl")
+	if err := os.WriteFile(corpusPath, []byte(
+		`{"_id":"d1","text":"a"}`+"\n"+
+			`{"_id":"d2","text":"b"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write corpus: %v", err)
+	}
+	if err := os.WriteFile(queriesPath, []byte(`{"_id":"q1","text":"a"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write queries: %v", err)
+	}
+	if err := os.WriteFile(docVectorsPath, []byte(
+		`{"_id":"d1","embedding":[1,0,0,0,0,0,0,0]}`+"\n"+
+			`{"_id":"d2","embedding":[0,1,0,0,0,0,0,0]}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write doc vectors: %v", err)
+	}
+	if err := os.WriteFile(queryVectorsPath, []byte(`{"_id":"q1","embedding":[1,0,0,0,0,0,0,0]}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write query vectors: %v", err)
+	}
+	return dir, corpusPath, queriesPath, qrelsPath, docVectorsPath, queryVectorsPath
+}
+
+func loadTinyQrelsBindingRetrievalModel(t *testing.T) *EmbeddingModel {
+	t.Helper()
+	bundle, err := compiler.Build(nil, compiler.Options{ModuleName: "tiny_embed_masked_pooled", Preset: compiler.PresetTinyEmbedMaskedPooled})
+	if err != nil {
+		t.Fatalf("build tiny embedding model: %v", err)
+	}
+	rt := New(cuda.New(), metal.New())
+	model, err := rt.LoadEmbedding(context.Background(), bundle.Artifact, tinyMaskedEmbeddingManifest(), tinyEmbedWeights()...)
+	if err != nil {
+		t.Fatalf("load tiny embedding model: %v", err)
+	}
+	if err := model.attachTokenizer(tinyEmbeddingTokenizerFile()); err != nil {
+		t.Fatalf("attach tiny tokenizer: %v", err)
+	}
+	return model
 }
 
 func TestEvaluateBM25RetrievalRanksLexicalMatch(t *testing.T) {
