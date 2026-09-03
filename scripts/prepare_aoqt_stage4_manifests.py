@@ -25,6 +25,20 @@ if str(SCRIPT_DIR) not in sys.path:
 import build_aoqt_stage2_calibration as calibration  # noqa: E402
 
 RETRIEVAL_EXPORT_SCHEMA = "eos.aoqt_stage4.retrieval_export_manifest.v1"
+QID_ONLY_JSON_FIELDS = {
+    "selected_qids",
+    "qids",
+    "qids_by_dataset",
+    "name",
+    "schema",
+    "dataset",
+    "split",
+    "source_selected_qids",
+    "source_sha256",
+    "source_sha256_by_file",
+}
+QID_CARRIER_FIELDS = ("qids_by_dataset", "selected_qids", "qids")
+LEGACY_WRAPPER_SPLITS = {"train", "dev", "reserve", "official", "official-test", "test"}
 
 
 class ManifestError(ValueError):
@@ -145,6 +159,7 @@ def reject_forbidden_payload_keys(node: Any, label: str) -> None:
         "qrels",
         "score",
         "scores",
+        "text",
         "gain",
         "gains",
         "relevance",
@@ -177,6 +192,100 @@ def require_dataset(value: Any, label: str) -> str:
         raise ManifestError(str(exc)) from exc
 
 
+def require_wrapper_text(value: Any, label: str, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or re.search(r"[\x00-\x1f]", value):
+        raise ManifestError(f"{label}: {field} must be a non-empty string metadata value")
+    return value
+
+
+def require_wrapper_schema(value: Any, label: str) -> None:
+    schema = require_wrapper_text(value, label, "schema")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", schema):
+        raise ManifestError(f"{label}: schema must be a simple string identifier")
+
+
+def require_wrapper_name(value: Any, label: str) -> None:
+    name = require_wrapper_text(value, label, "name")
+    if re.search(r"\s", name):
+        raise ManifestError(f"{label}: name must not contain whitespace")
+
+
+def require_wrapper_split(value: Any, label: str) -> None:
+    split = require_wrapper_text(value, label, "split")
+    if split not in LEGACY_WRAPPER_SPLITS:
+        raise ManifestError(f"{label}: split must be one of {sorted(LEGACY_WRAPPER_SPLITS)}")
+
+
+def require_source_selected_qids(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        raise ManifestError(f"{label}: source_selected_qids must be a dataset-keyed string mapping")
+    unexpected = sorted(set(value) - set(calibration.ALLOWED_DATASETS))
+    missing = [dataset for dataset in calibration.ALLOWED_DATASETS if dataset not in value]
+    if unexpected:
+        raise ManifestError(f"{label}: source_selected_qids has unsupported datasets {unexpected}")
+    if missing:
+        raise ManifestError(f"{label}: source_selected_qids missing required dataset coverage {missing}")
+    for dataset in calibration.ALLOWED_DATASETS:
+        require_wrapper_text(value[dataset], label, f"source_selected_qids.{dataset}")
+
+
+def require_pathish_metadata_key(value: Any, label: str, field: str) -> str:
+    key = require_wrapper_text(value, label, f"{field} key")
+    parts = [part for part in key.split("/") if part]
+    if "\\" in key or not parts or any(part in {".", ".."} for part in parts):
+        raise ManifestError(f"{label}: {field} keys must be path/name strings")
+    if "/" not in key and "." not in key:
+        raise ManifestError(f"{label}: {field} keys must be path/name strings, not arbitrary fields")
+    return key
+
+
+def require_sha256_mapping(value: Any, label: str, field: str) -> None:
+    if not isinstance(value, dict) or not value:
+        raise ManifestError(f"{label}: {field} must be a non-empty sha256 mapping")
+    for key, item in value.items():
+        clean_key = require_pathish_metadata_key(key, label, field)
+        try:
+            calibration.require_sha256(item, label, f"{field}.{clean_key}")
+        except calibration.PlanError as exc:
+            raise ManifestError(str(exc)) from exc
+
+
+def validate_legacy_qid_wrapper(payload: dict[str, Any], label: str) -> list[dict[str, list[str]]]:
+    reject_forbidden_payload_keys(payload, label)
+    unexpected = sorted(set(payload) - QID_ONLY_JSON_FIELDS)
+    if unexpected:
+        raise ManifestError(f"{label}: qid-only JSON has unexpected fields {unexpected}")
+
+    if "schema" in payload:
+        require_wrapper_schema(payload["schema"], label)
+    if "name" in payload:
+        require_wrapper_name(payload["name"], label)
+    if "dataset" in payload:
+        require_dataset(payload["dataset"], label)
+    if "split" in payload:
+        require_wrapper_split(payload["split"], label)
+    if "source_selected_qids" in payload:
+        require_source_selected_qids(payload["source_selected_qids"], label)
+    if "source_sha256" in payload:
+        try:
+            calibration.require_sha256(payload["source_sha256"], label, "source_sha256")
+        except calibration.PlanError as exc:
+            raise ManifestError(str(exc)) from exc
+    if "source_sha256_by_file" in payload:
+        require_sha256_mapping(payload["source_sha256_by_file"], label, "source_sha256_by_file")
+
+    present = [field for field in QID_CARRIER_FIELDS if field in payload]
+    if not present:
+        raise ManifestError(f"{label}: expected selected_qids/qids mapping by dataset")
+    mappings = [qid_mapping_from_value(payload[field], f"{label}: {field}") for field in present]
+    first = {dataset: sorted(qids) for dataset, qids in mappings[0].items()}
+    for field, mapping in zip(present[1:], mappings[1:]):
+        comparable = {dataset: sorted(qids) for dataset, qids in mapping.items()}
+        if comparable != first:
+            raise ManifestError(f"{label}: qid carrier {field!r} does not match other qid carriers")
+    return mappings
+
+
 def infer_dataset_from_path(path: Path) -> str:
     label = display_path(path)
     compact = re.sub(r"[^a-z0-9]+", "", label.lower())
@@ -186,13 +295,17 @@ def infer_dataset_from_path(path: Path) -> str:
     return matches[0]
 
 
-def qid_mapping_from_value(value: Any, label: str, dataset: Any = None) -> dict[str, list[str]]:
+def qid_mapping_from_value(value: Any, label: str) -> dict[str, list[str]]:
     if isinstance(value, dict):
         unexpected = sorted(set(value) - set(calibration.ALLOWED_DATASETS))
         if unexpected:
             raise ManifestError(f"{label}: unsupported qid datasets {unexpected}")
+        missing = [dataset for dataset in calibration.ALLOWED_DATASETS if dataset not in value]
+        if missing:
+            raise ManifestError(f"{label}: missing required dataset coverage {missing}")
         out: dict[str, list[str]] = {}
-        for key, qids in value.items():
+        for key in calibration.ALLOWED_DATASETS:
+            qids = value[key]
             qid_list = [require_qid(item, f"{label}: {key}") for item in qids] if isinstance(qids, list) else None
             if qid_list is None or not qid_list:
                 raise ManifestError(f"{label}: {key} qids must be a non-empty list")
@@ -201,28 +314,15 @@ def qid_mapping_from_value(value: Any, label: str, dataset: Any = None) -> dict[
             out[require_dataset(key, label)] = qid_list
         return out
     if isinstance(value, list):
-        if dataset is None:
-            raise ManifestError(f"{label}: ambiguous legacy global qids require an explicit dataset mapping")
-        dataset_name = require_dataset(dataset, label)
-        qid_list = [require_qid(item, label) for item in value]
-        if not qid_list:
-            raise ManifestError(f"{label}: qids must be non-empty")
-        if len(qid_list) != len(set(qid_list)):
-            raise ManifestError(f"{label}: duplicate qids for dataset {dataset_name}")
-        return {dataset_name: qid_list}
+        raise ManifestError(f"{label}: ambiguous legacy global qids require an explicit dataset mapping")
     raise ManifestError(f"{label}: expected selected_qids/qids mapping by dataset")
 
 
 def selected_qids_from_json(path: Path) -> dict[str, list[str]]:
     payload = load_json(path)
     label = display_path(path)
-    reject_forbidden_payload_keys(payload, label)
-    allowed = {"selected_qids", "qids", "qids_by_dataset", "name", "schema", "dataset"}
-    unexpected = sorted(set(payload) - allowed)
-    if unexpected:
-        raise ManifestError(f"{label}: qid-only JSON has unexpected fields {unexpected}")
-    values = payload.get("qids_by_dataset", payload.get("selected_qids", payload.get("qids")))
-    return qid_mapping_from_value(values, label, payload.get("dataset"))
+    mappings = validate_legacy_qid_wrapper(payload, label)
+    return mappings[0]
 
 
 def selected_qids_from_qrels(path: Path) -> dict[str, list[str]]:

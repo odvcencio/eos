@@ -232,6 +232,113 @@ class PrepareAOQTStage4ManifestsTest(unittest.TestCase):
             with self.assertRaisesRegex(prep.ManifestError, "forbidden field"):
                 prep.build_manifest(args)
 
+    def test_normalize_exclusions_accepts_legacy_selected_qids_wrapper_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(
+                root / "selected.json",
+                {
+                    "schema": "legacy.selected_qids.v1",
+                    "name": "dev4-selected-qids",
+                    "split": "dev",
+                    "selected_qids": {"fiqa": ["q2", "q1"], "nfcorpus": ["nf-q"], "scifact": ["sci-q"]},
+                    "source_selected_qids": {
+                        "fiqa": "legacy/dev/fiqa.selected_qids.json",
+                        "nfcorpus": "legacy/dev/nfcorpus.selected_qids.json",
+                        "scifact": "legacy/dev/scifact.selected_qids.json",
+                    },
+                    "source_sha256": fake_sha("selected-wrapper"),
+                    "source_sha256_by_file": {"legacy/dev/fiqa.selected_qids.json": fake_sha("fiqa-selected")},
+                },
+            )
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            payload = prep.build_manifest(args)
+
+        self.assertEqual(payload["qids_by_dataset"], {"fiqa": ["q1", "q2"], "nfcorpus": ["nf-q"], "scifact": ["sci-q"]})
+        self.assertEqual(set(payload), {"schema", "name", "qids_by_dataset", "source_sha256", "source_sha256_by_file"})
+        serialized = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("legacy/dev/fiqa.selected_qids.json", serialized)
+        self.assertNotIn("dev4-selected-qids", serialized)
+
+    def test_normalize_exclusions_rejects_forbidden_payload_inside_legacy_wrapper_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(
+                root / "selected.json",
+                {
+                    "selected_qids": {"fiqa": ["q1"], "nfcorpus": ["q2"], "scifact": ["q3"]},
+                    "split": "dev",
+                    "source_selected_qids": {"docs": ["d1"]},
+                },
+            )
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            with self.assertRaisesRegex(prep.ManifestError, "forbidden field 'docs'"):
+                prep.build_manifest(args)
+
+    def test_normalize_exclusions_rejects_source_selected_qids_text_leakage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(
+                root / "selected.json",
+                {
+                    "selected_qids": {"fiqa": ["q1"], "nfcorpus": ["q2"], "scifact": ["q3"]},
+                    "source_selected_qids": {
+                        "fiqa": "legacy/dev/fiqa.selected_qids.json",
+                        "nfcorpus": "legacy/dev/nfcorpus.selected_qids.json",
+                        "scifact": "legacy/dev/scifact.selected_qids.json",
+                        "text": "query text must never ride along",
+                    },
+                },
+            )
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            with self.assertRaisesRegex(prep.ManifestError, "forbidden field 'text'"):
+                prep.build_manifest(args)
+
+    def test_normalize_exclusions_rejects_arbitrary_source_sha256_by_file_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(
+                root / "selected.json",
+                {
+                    "selected_qids": {"fiqa": ["q1"], "nfcorpus": ["q2"], "scifact": ["q3"]},
+                    "source_sha256_by_file": {"arbitrary": fake_sha("not-a-path")},
+                },
+            )
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            with self.assertRaisesRegex(prep.ManifestError, "path/name strings"):
+                prep.build_manifest(args)
+
+    def test_normalize_exclusions_rejects_unused_malformed_qid_carrier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = write_json(
+                root / "selected.json",
+                {
+                    "qids_by_dataset": {"fiqa": ["q1"], "nfcorpus": ["q2"], "scifact": ["q3"]},
+                    "selected_qids": {"fiqa": ["q1"]},
+                },
+            )
+            args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+            with self.assertRaisesRegex(prep.ManifestError, "selected_qids.*missing required dataset coverage"):
+                prep.build_manifest(args)
+
+    def test_normalize_exclusions_rejects_bad_legacy_wrapper_hash_shapes(self) -> None:
+        cases = [
+            {"source_sha256": "abc"},
+            {"source_sha256_by_file": {"legacy/dev/fiqa.selected_qids.json": "ABC"}},
+            {"split": {"name": "dev"}},
+        ]
+        for patch in cases:
+            with self.subTest(patch=patch):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    payload = {"selected_qids": {"fiqa": ["q1"], "nfcorpus": ["q2"], "scifact": ["q3"]}}
+                    payload.update(patch)
+                    legacy = write_json(root / "selected.json", payload)
+                    args = prep.parse_args(["normalize-exclusions", "--name", "dev4", "--legacy-selected-qids", str(legacy), "--output", str(root / "out.json")])
+                    with self.assertRaisesRegex(prep.ManifestError, "sha256|split must be"):
+                        prep.build_manifest(args)
+
     def test_normalize_exclusions_rejects_ambiguous_global_qids(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
