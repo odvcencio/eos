@@ -290,6 +290,63 @@ func TestAOQTStage2AAngleGradientMatchesFiniteDifference(t *testing.T) {
 	}
 }
 
+func TestAOQTStage2AAngleGradientStreamingMatchesSnapshotReference(t *testing.T) {
+	transform, err := NewAOQTGivensIdentityTopology(AOQTSidecarDim, AOQTSidecarStages, 62, AOQTSidecarDefaultAngleCap)
+	if err != nil {
+		t.Fatalf("topology: %v", err)
+	}
+	rng := rand.New(rand.NewSource(6201))
+	for si := range transform.Stages {
+		for ai := range transform.Stages[si].Angles {
+			transform.Stages[si].Angles[ai] = float32((rng.Float64()*2 - 1) * float64(AOQTSidecarDefaultAngleCap) * 0.75)
+		}
+	}
+	input := randomFloat32Vector(rng, AOQTSidecarDim)
+	upstream := randomFloat32Vector(rng, AOQTSidecarDim)
+	got := make([]float32, countAOQTAngles(transform))
+	if err := accumulateAOQTVectorAngleGrad(transform, input, upstream, got); err != nil {
+		t.Fatalf("streaming angle grad: %v", err)
+	}
+	want, err := snapshotAOQTVectorAngleGradReference(transform, input, upstream)
+	if err != nil {
+		t.Fatalf("snapshot reference angle grad: %v", err)
+	}
+	for i := range got {
+		if delta := math.Abs(float64(got[i] - want[i])); delta > 2e-5 {
+			t.Fatalf("angle grad[%d] delta = %.12g, got %.9g want %.9g", i, delta, got[i], want[i])
+		}
+	}
+}
+
+func TestAOQTStage2ATrainingHotPathAvoidsFullAuditPerVector(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 63)
+	trainer := newTinyAOQTTrainer(t, false, 63)
+	var validateCalls int
+	var orthogonalityCalls int
+	oldValidateHook := aoqtGivensValidateHookForTest
+	oldOrthogonalityHook := aoqtGivensOrthogonalityHookForTest
+	aoqtGivensValidateHookForTest = func() { validateCalls++ }
+	aoqtGivensOrthogonalityHookForTest = func() { orthogonalityCalls++ }
+	t.Cleanup(func() {
+		aoqtGivensValidateHookForTest = oldValidateHook
+		aoqtGivensOrthogonalityHookForTest = oldOrthogonalityHook
+	})
+
+	if _, _, _, _, err := trainer.lossAndAngleGrad(set.Rows, toyAOQTObjective{}); err != nil {
+		t.Fatalf("loss and angle grad: %v", err)
+	}
+	if validateCalls != 0 || orthogonalityCalls != 0 {
+		t.Fatalf("training hot path validation calls = validate:%d orthogonality:%d, want no full audit validation per vector", validateCalls, orthogonalityCalls)
+	}
+
+	if _, err := trainer.Transform().ApplyVector(set.Rows[0].QueryVector); err != nil {
+		t.Fatalf("strict public AOQT apply: %v", err)
+	}
+	if validateCalls == 0 || orthogonalityCalls == 0 {
+		t.Fatalf("test hooks did not observe strict public validation: validate:%d orthogonality:%d", validateCalls, orthogonalityCalls)
+	}
+}
+
 func TestAOQTStage2BPreparedIPObjectiveMatchesTurboQuantSurface(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 67)
 	row := set.Rows[0]
@@ -784,6 +841,54 @@ func (mutatingAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPrepared
 
 func tinyAOQTObjectiveConfig(seed int64) AOQTSidecarPreparedIPObjectiveConfig {
 	return AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: seed}
+}
+
+func snapshotAOQTVectorAngleGradReference(transform AOQTGivensTransform, input, outputGrad []float32) ([]float32, error) {
+	if err := validateAOQTGivensTrainingSnapshot(transform); err != nil {
+		return nil, err
+	}
+	if len(input) != transform.Dim || len(outputGrad) != transform.Dim {
+		return nil, fmt.Errorf("AOQT vector/grad dims must match transform dim")
+	}
+	if err := validateAOQTFiniteVector(input, "AOQT input"); err != nil {
+		return nil, err
+	}
+	if err := validateAOQTFiniteVector(outputGrad, "AOQT output grad"); err != nil {
+		return nil, err
+	}
+	vec := append([]float32(nil), input...)
+	activations := make([][]float32, 0, countAOQTAngles(transform))
+	for _, stage := range transform.Stages {
+		for i, pair := range stage.Pairs {
+			activations = append(activations, append([]float32(nil), vec...))
+			a, b := pair[0], pair[1]
+			theta := float64(stage.Angles[i])
+			c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
+			x, y := vec[a], vec[b]
+			vec[a] = c*x - s*y
+			vec[b] = s*x + c*y
+		}
+	}
+	angleGrad := make([]float32, countAOQTAngles(transform))
+	grad := append([]float32(nil), outputGrad...)
+	angleIndex := len(angleGrad)
+	for si := len(transform.Stages) - 1; si >= 0; si-- {
+		stage := transform.Stages[si]
+		for pi := len(stage.Pairs) - 1; pi >= 0; pi-- {
+			angleIndex--
+			pair := stage.Pairs[pi]
+			a, b := pair[0], pair[1]
+			x := activations[angleIndex][a]
+			y := activations[angleIndex][b]
+			theta := float64(stage.Angles[pi])
+			c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
+			ga, gb := grad[a], grad[b]
+			angleGrad[angleIndex] += ga*(-s*x-c*y) + gb*(c*x-s*y)
+			grad[a] = c*ga + s*gb
+			grad[b] = -s*ga + c*gb
+		}
+	}
+	return angleGrad, nil
 }
 
 func tinyAOQTSplitProof() AOQTSidecarTrainOnlySplitProof {

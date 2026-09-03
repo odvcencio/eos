@@ -520,14 +520,7 @@ func aoqtObjectiveContractsEqual(a, b AOQTSidecarObjectiveContract) bool {
 }
 
 func (t *AOQTSidecarTrainer) Transform() AOQTGivensTransform {
-	transform := t.topology
-	transform.Stages = append([]AOQTStage(nil), t.topology.Stages...)
-	offset := 0
-	for si := range transform.Stages {
-		transform.Stages[si].Pairs = append([][2]int(nil), t.topology.Stages[si].Pairs...)
-		transform.Stages[si].Angles = append([]float32(nil), t.angles[offset:offset+len(transform.Stages[si].Pairs)]...)
-		offset += len(transform.Stages[si].Pairs)
-	}
+	transform := t.trainingTransformSnapshot()
 	angles, err := transform.AnglesSHA256()
 	if err == nil {
 		transform.Audit.AnglesSHA256 = angles
@@ -535,6 +528,18 @@ func (t *AOQTSidecarTrainer) Transform() AOQTGivensTransform {
 	orth, err := transform.OrthogonalityFrobeniusPerDim()
 	if err == nil {
 		transform.Audit.Orthogonality = &orth
+	}
+	return transform
+}
+
+func (t *AOQTSidecarTrainer) trainingTransformSnapshot() AOQTGivensTransform {
+	transform := t.topology
+	transform.Stages = append([]AOQTStage(nil), t.topology.Stages...)
+	offset := 0
+	for si := range transform.Stages {
+		transform.Stages[si].Pairs = append([][2]int(nil), t.topology.Stages[si].Pairs...)
+		transform.Stages[si].Angles = append([]float32(nil), t.angles[offset:offset+len(transform.Stages[si].Pairs)]...)
+		offset += len(transform.Stages[si].Pairs)
 	}
 	return transform
 }
@@ -563,9 +568,13 @@ func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, 
 	totalLoss := float32(0)
 	var totalActivation AOQTSidecarObjectiveActivation
 	var totalComponents AOQTSidecarObjectiveComponents
-	transform := t.Transform()
+	transform := t.trainingTransformSnapshot()
+	runtime, err := newAOQTGivensTrainingRuntime(transform)
+	if err != nil {
+		return 0, nil, totalActivation, totalComponents, err
+	}
 	for _, row := range rows {
-		query, candidates, err := transformAOQTRow(transform, row)
+		query, candidates, err := transformAOQTRowWithRuntime(runtime, row)
 		if err != nil {
 			return 0, nil, totalActivation, totalComponents, err
 		}
@@ -586,8 +595,8 @@ func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, 
 		if err := validateAOQTLossMatchesComponents(result.Loss, result.Components, "AOQT objective"); err != nil {
 			return 0, nil, totalActivation, totalComponents, err
 		}
-		if len(result.QueryGrad) != transform.Dim {
-			return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective query grad dim = %d, want %d", len(result.QueryGrad), transform.Dim)
+		if len(result.QueryGrad) != runtime.dim {
+			return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective query grad dim = %d, want %d", len(result.QueryGrad), runtime.dim)
 		}
 		if len(result.CandidateGrads) != len(row.CandidateVectors) {
 			return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective candidate grad count = %d, want %d", len(result.CandidateGrads), len(row.CandidateVectors))
@@ -595,14 +604,14 @@ func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, 
 		totalLoss += result.Loss
 		totalActivation.Add(result.Activation)
 		totalComponents.Add(result.Components)
-		if err := accumulateAOQTVectorAngleGrad(transform, row.QueryVector, result.QueryGrad, totalGrad); err != nil {
+		if err := accumulateAOQTVectorAngleGradWithRuntime(runtime, row.QueryVector, result.QueryGrad, totalGrad); err != nil {
 			return 0, nil, totalActivation, totalComponents, err
 		}
 		for i, grad := range result.CandidateGrads {
-			if len(grad) != transform.Dim {
-				return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective candidate grad %d dim = %d, want %d", i, len(grad), transform.Dim)
+			if len(grad) != runtime.dim {
+				return 0, nil, totalActivation, totalComponents, fmt.Errorf("AOQT objective candidate grad %d dim = %d, want %d", i, len(grad), runtime.dim)
 			}
-			if err := accumulateAOQTVectorAngleGrad(transform, row.CandidateVectors[i], grad, totalGrad); err != nil {
+			if err := accumulateAOQTVectorAngleGradWithRuntime(runtime, row.CandidateVectors[i], grad, totalGrad); err != nil {
 				return 0, nil, totalActivation, totalComponents, err
 			}
 		}
@@ -669,13 +678,28 @@ func (t *AOQTSidecarTrainer) applyAdam(grad []float32) error {
 }
 
 func transformAOQTRow(transform AOQTGivensTransform, row AOQTSidecarCalibrationRow) ([]float32, [][]float32, error) {
-	query, err := transform.ApplyVector(row.QueryVector)
+	runtime, err := newValidatedAOQTGivensRuntime(transform)
+	if err != nil {
+		return nil, nil, err
+	}
+	return transformAOQTRowWithRuntime(runtime, row)
+}
+
+func newAOQTGivensTrainingRuntime(transform AOQTGivensTransform) (aoqtGivensRuntime, error) {
+	if err := validateAOQTGivensTrainingSnapshot(transform); err != nil {
+		return aoqtGivensRuntime{}, err
+	}
+	return newAOQTGivensRuntimeAfterValidation(transform), nil
+}
+
+func transformAOQTRowWithRuntime(runtime aoqtGivensRuntime, row AOQTSidecarCalibrationRow) ([]float32, [][]float32, error) {
+	query, err := runtime.applyVector(row.QueryVector)
 	if err != nil {
 		return nil, nil, err
 	}
 	candidates := make([][]float32, len(row.CandidateVectors))
 	for i := range row.CandidateVectors {
-		candidates[i], err = transform.ApplyVector(row.CandidateVectors[i])
+		candidates[i], err = runtime.applyVector(row.CandidateVectors[i])
 		if err != nil {
 			return nil, nil, fmt.Errorf("candidate %d: %w", i, err)
 		}
@@ -684,67 +708,57 @@ func transformAOQTRow(transform AOQTGivensTransform, row AOQTSidecarCalibrationR
 }
 
 func accumulateAOQTVectorAngleGrad(transform AOQTGivensTransform, input, outputGrad []float32, angleGrad []float32) error {
-	if len(input) != transform.Dim || len(outputGrad) != transform.Dim {
+	runtime, err := newAOQTGivensTrainingRuntime(transform)
+	if err != nil {
+		return err
+	}
+	return accumulateAOQTVectorAngleGradWithRuntime(runtime, input, outputGrad, angleGrad)
+}
+
+func accumulateAOQTVectorAngleGradWithRuntime(runtime aoqtGivensRuntime, input, outputGrad []float32, angleGrad []float32) error {
+	if len(input) != runtime.dim || len(outputGrad) != runtime.dim {
 		return fmt.Errorf("AOQT vector/grad dims must match transform dim")
 	}
 	if err := validateAOQTFiniteVector(outputGrad, "AOQT output grad"); err != nil {
 		return err
 	}
-	activations, err := aoqtForwardActivations(transform, input)
+	if len(angleGrad) != runtime.angleCount {
+		return fmt.Errorf("AOQT gradient count = %d, want %d", len(angleGrad), runtime.angleCount)
+	}
+	vec, err := runtime.applyFiniteVector(input, "AOQT input")
 	if err != nil {
 		return err
 	}
 	grad := append([]float32(nil), outputGrad...)
-	angleIndex := countAOQTAngles(transform)
-	for si := len(transform.Stages) - 1; si >= 0; si-- {
-		stage := transform.Stages[si]
-		for pi := len(stage.Pairs) - 1; pi >= 0; pi-- {
+	angleIndex := runtime.angleCount
+	for si := len(runtime.stages) - 1; si >= 0; si-- {
+		stage := runtime.stages[si]
+		for pi := len(stage.pairs) - 1; pi >= 0; pi-- {
 			angleIndex--
-			pair := stage.Pairs[pi]
+			pair := stage.pairs[pi]
 			a, b := pair[0], pair[1]
-			x := activations[angleIndex][a]
-			y := activations[angleIndex][b]
-			theta := float64(stage.Angles[pi])
-			c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
+			c, s := stage.cos[pi], stage.sin[pi]
+			pa, pb := vec[a], vec[b]
+			x := c*pa + s*pb
+			y := -s*pa + c*pb
 			ga, gb := grad[a], grad[b]
 			angleGrad[angleIndex] += ga*(-s*x-c*y) + gb*(c*x-s*y)
 			grad[a] = c*ga + s*gb
 			grad[b] = -s*ga + c*gb
+			vec[a], vec[b] = x, y
 		}
 	}
 	return nil
 }
 
-func aoqtForwardActivations(transform AOQTGivensTransform, input []float32) ([][]float32, error) {
-	if err := validateAOQTGivensTrainingSnapshot(transform); err != nil {
-		return nil, err
-	}
-	if len(input) != transform.Dim {
-		return nil, fmt.Errorf("AOQT input dim = %d, want %d", len(input), transform.Dim)
-	}
-	if err := validateAOQTFiniteVector(input, "AOQT input"); err != nil {
-		return nil, err
-	}
-	vec := append([]float32(nil), input...)
-	activations := make([][]float32, 0, countAOQTAngles(transform))
-	for _, stage := range transform.Stages {
-		for i, pair := range stage.Pairs {
-			activations = append(activations, append([]float32(nil), vec...))
-			a, b := pair[0], pair[1]
-			theta := float64(stage.Angles[i])
-			c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
-			x, y := vec[a], vec[b]
-			vec[a] = c*x - s*y
-			vec[b] = s*x + c*y
-		}
-	}
-	return activations, nil
-}
-
 func DenseInvariantMaxAbsDelta(transform AOQTGivensTransform, rows []AOQTSidecarCalibrationRow) (float64, error) {
+	runtime, err := newValidatedAOQTGivensRuntime(transform)
+	if err != nil {
+		return 0, err
+	}
 	var maxDelta float64
 	for _, row := range rows {
-		query, candidates, err := transformAOQTRow(transform, row)
+		query, candidates, err := transformAOQTRowWithRuntime(runtime, row)
 		if err != nil {
 			return 0, err
 		}
@@ -869,51 +883,7 @@ func aoqtObjectiveRowView(row AOQTSidecarCalibrationRow) AOQTSidecarCalibrationR
 }
 
 func validateAOQTGivensTrainingSnapshot(transform AOQTGivensTransform) error {
-	if transform.Version == "" {
-		return fmt.Errorf("AOQT transform version is required")
-	}
-	if transform.Version != AOQTTransformVersion {
-		return fmt.Errorf("AOQT transform version %q is not supported, want %q", transform.Version, AOQTTransformVersion)
-	}
-	if transform.Kind != EmbeddingPostPoolTransformAOQTGivens {
-		return fmt.Errorf("AOQT transform kind %q is not supported, want %q", transform.Kind, EmbeddingPostPoolTransformAOQTGivens)
-	}
-	if transform.Dim <= 0 {
-		return fmt.Errorf("AOQT transform dim must be positive")
-	}
-	if len(transform.Stages) == 0 {
-		return fmt.Errorf("AOQT transform must contain at least one stage")
-	}
-	for stageIndex, stage := range transform.Stages {
-		if len(stage.Pairs) == 0 {
-			return fmt.Errorf("AOQT stage %d has no pairs", stageIndex)
-		}
-		if len(stage.Angles) != len(stage.Pairs) {
-			return fmt.Errorf("AOQT stage %d angle count = %d, want %d", stageIndex, len(stage.Angles), len(stage.Pairs))
-		}
-		seen := map[int]bool{}
-		for pairIndex, pair := range stage.Pairs {
-			a, b := pair[0], pair[1]
-			if a < 0 || a >= transform.Dim || b < 0 || b >= transform.Dim {
-				return fmt.Errorf("AOQT stage %d pair %d = [%d %d] outside dim %d", stageIndex, pairIndex, a, b, transform.Dim)
-			}
-			if a == b {
-				return fmt.Errorf("AOQT stage %d pair %d repeats coordinate %d", stageIndex, pairIndex, a)
-			}
-			if seen[a] || seen[b] {
-				return fmt.Errorf("AOQT stage %d coordinate appears in more than one pair", stageIndex)
-			}
-			seen[a], seen[b] = true, true
-			angle := stage.Angles[pairIndex]
-			if math.IsNaN(float64(angle)) || math.IsInf(float64(angle), 0) {
-				return fmt.Errorf("AOQT stage %d angle %d is not finite", stageIndex, pairIndex)
-			}
-			if transform.AngleCap > 0 && float32(math.Abs(float64(angle))) > transform.AngleCap+1e-7 {
-				return fmt.Errorf("AOQT stage %d angle %d exceeds angle_cap", stageIndex, pairIndex)
-			}
-		}
-	}
-	return nil
+	return transform.validateStructure()
 }
 
 type aoqtPreparedIPSurface struct {

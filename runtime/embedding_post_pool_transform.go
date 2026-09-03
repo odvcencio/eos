@@ -43,6 +43,21 @@ type AOQTAuditInfo struct {
 	Orthogonality  *float64 `json:"orthogonality_frobenius_per_dim,omitempty"`
 }
 
+type aoqtGivensRuntime struct {
+	dim        int
+	stages     []aoqtGivensRuntimeStage
+	angleCount int
+}
+
+type aoqtGivensRuntimeStage struct {
+	pairs [][2]int
+	cos   []float32
+	sin   []float32
+}
+
+var aoqtGivensValidateHookForTest func()
+var aoqtGivensOrthogonalityHookForTest func()
+
 func DefaultPostPoolTransformPath(artifactPath string) string {
 	base := artifactPath
 	if ext := filepath.Ext(base); ext != "" {
@@ -111,6 +126,9 @@ func (t AOQTGivensTransform) WriteFile(path string) error {
 }
 
 func (t AOQTGivensTransform) Validate() error {
+	if aoqtGivensValidateHookForTest != nil {
+		aoqtGivensValidateHookForTest()
+	}
 	if err := t.validateStructure(); err != nil {
 		return err
 	}
@@ -203,8 +221,9 @@ func (t AOQTGivensTransform) ApplyVector(in []float32) ([]float32, error) {
 	if len(in) != t.Dim {
 		return nil, fmt.Errorf("AOQT vector dim = %d, want %d", len(in), t.Dim)
 	}
+	runtime := newAOQTGivensRuntimeAfterValidation(t)
 	out := append([]float32(nil), in...)
-	t.applyInPlace(out)
+	runtime.applyInPlace(out)
 	return out, nil
 }
 
@@ -215,6 +234,7 @@ func (t AOQTGivensTransform) ApplyTensor(tensor *backend.Tensor) (*backend.Tenso
 	if err := t.Validate(); err != nil {
 		return nil, err
 	}
+	runtime := newAOQTGivensRuntimeAfterValidation(t)
 	out := tensor.Clone()
 	switch len(out.Shape) {
 	case 1:
@@ -224,7 +244,7 @@ func (t AOQTGivensTransform) ApplyTensor(tensor *backend.Tensor) (*backend.Tenso
 		if len(out.F32) < t.Dim {
 			return nil, fmt.Errorf("AOQT tensor has %d values, want %d", len(out.F32), t.Dim)
 		}
-		t.applyInPlace(out.F32[:t.Dim])
+		runtime.applyInPlace(out.F32[:t.Dim])
 	case 2:
 		rows, cols := out.Shape[0], out.Shape[1]
 		if cols != t.Dim {
@@ -234,7 +254,7 @@ func (t AOQTGivensTransform) ApplyTensor(tensor *backend.Tensor) (*backend.Tenso
 			return nil, fmt.Errorf("AOQT tensor has %d values, want %d", len(out.F32), rows*cols)
 		}
 		for row := 0; row < rows; row++ {
-			t.applyInPlace(out.F32[row*cols : (row+1)*cols])
+			runtime.applyInPlace(out.F32[row*cols : (row+1)*cols])
 		}
 	default:
 		return nil, fmt.Errorf("AOQT tensor rank = %d, want 1 or 2", len(out.Shape))
@@ -242,12 +262,61 @@ func (t AOQTGivensTransform) ApplyTensor(tensor *backend.Tensor) (*backend.Tenso
 	return out, nil
 }
 
-func (t AOQTGivensTransform) applyInPlace(vec []float32) {
-	for _, stage := range t.Stages {
-		for i, pair := range stage.Pairs {
+func newAOQTGivensRuntimeAfterValidation(transform AOQTGivensTransform) aoqtGivensRuntime {
+	runtime := aoqtGivensRuntime{
+		dim:    transform.Dim,
+		stages: make([]aoqtGivensRuntimeStage, len(transform.Stages)),
+	}
+	for si, stage := range transform.Stages {
+		compiled := aoqtGivensRuntimeStage{
+			pairs: append([][2]int(nil), stage.Pairs...),
+			cos:   make([]float32, len(stage.Angles)),
+			sin:   make([]float32, len(stage.Angles)),
+		}
+		for i, angle := range stage.Angles {
+			theta := float64(angle)
+			compiled.cos[i] = float32(math.Cos(theta))
+			compiled.sin[i] = float32(math.Sin(theta))
+		}
+		runtime.angleCount += len(compiled.pairs)
+		runtime.stages[si] = compiled
+	}
+	return runtime
+}
+
+func newValidatedAOQTGivensRuntime(transform AOQTGivensTransform) (aoqtGivensRuntime, error) {
+	if err := transform.Validate(); err != nil {
+		return aoqtGivensRuntime{}, err
+	}
+	return newAOQTGivensRuntimeAfterValidation(transform), nil
+}
+
+func (r aoqtGivensRuntime) applyVector(in []float32) ([]float32, error) {
+	if len(in) != r.dim {
+		return nil, fmt.Errorf("AOQT vector dim = %d, want %d", len(in), r.dim)
+	}
+	out := append([]float32(nil), in...)
+	r.applyInPlace(out)
+	return out, nil
+}
+
+func (r aoqtGivensRuntime) applyFiniteVector(in []float32, name string) ([]float32, error) {
+	if len(in) != r.dim {
+		return nil, fmt.Errorf("AOQT vector dim = %d, want %d", len(in), r.dim)
+	}
+	if err := validateAOQTFiniteVector(in, name); err != nil {
+		return nil, err
+	}
+	out := append([]float32(nil), in...)
+	r.applyInPlace(out)
+	return out, nil
+}
+
+func (r aoqtGivensRuntime) applyInPlace(vec []float32) {
+	for _, stage := range r.stages {
+		for i, pair := range stage.pairs {
 			a, b := pair[0], pair[1]
-			theta := float64(stage.Angles[i])
-			c, s := float32(math.Cos(theta)), float32(math.Sin(theta))
+			c, s := stage.cos[i], stage.sin[i]
 			x, y := vec[a], vec[b]
 			vec[a] = c*x - s*y
 			vec[b] = s*x + c*y
@@ -256,14 +325,18 @@ func (t AOQTGivensTransform) applyInPlace(vec []float32) {
 }
 
 func (t AOQTGivensTransform) OrthogonalityFrobeniusPerDim() (float64, error) {
+	if aoqtGivensOrthogonalityHookForTest != nil {
+		aoqtGivensOrthogonalityHookForTest()
+	}
 	if err := t.validateStructure(); err != nil {
 		return 0, err
 	}
+	runtime := newAOQTGivensRuntimeAfterValidation(t)
 	matrix := make([]float64, t.Dim*t.Dim)
 	for i := 0; i < t.Dim; i++ {
 		basis := make([]float32, t.Dim)
 		basis[i] = 1
-		t.applyInPlace(basis)
+		runtime.applyInPlace(basis)
 		for r, v := range basis {
 			matrix[r*t.Dim+i] = float64(v)
 		}
