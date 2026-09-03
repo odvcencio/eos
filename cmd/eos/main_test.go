@@ -224,8 +224,29 @@ func TestRunDoctorReportsRuntimeFacts(t *testing.T) {
 
 func TestRunMaterializeAOQTSidecarRequiresFlags(t *testing.T) {
 	err := run([]string{"materialize-aoqt-sidecar"})
-	if err == nil || !strings.Contains(err.Error(), "requires --plan") {
-		t.Fatalf("error = %v, want required --plan failure", err)
+	if err == nil || !strings.Contains(err.Error(), "requires --exclusion-qids") {
+		t.Fatalf("error = %v, want required --exclusion-qids failure", err)
+	}
+}
+
+func TestRunMaterializeAOQTSidecarRejectsMalformedExclusionQIDsFlag(t *testing.T) {
+	err := runMaterializeAOQTSidecar([]string{"--exclusion-qids", "dev4.json,,official-test.json"})
+	if err == nil || !strings.Contains(err.Error(), "empty path") {
+		t.Fatalf("error = %v, want empty exclusion-qids path failure", err)
+	}
+}
+
+func TestRunMaterializeAOQTSidecarRequiresThreeExclusionQIDManifests(t *testing.T) {
+	err := runMaterializeAOQTSidecar([]string{"--exclusion-qids", "dev4.json,reserve4.json"})
+	if err == nil || !strings.Contains(err.Error(), "exactly 3 --exclusion-qids") {
+		t.Fatalf("error = %v, want exact exclusion-qids count failure", err)
+	}
+}
+
+func TestRunMaterializeAOQTSidecarRejectsDuplicateExclusionQIDManifests(t *testing.T) {
+	err := runMaterializeAOQTSidecar([]string{"--exclusion-qids", "dev4.json,reserve4.json,dev4.json"})
+	if err == nil || !strings.Contains(err.Error(), "duplicate --exclusion-qids") {
+		t.Fatalf("error = %v, want duplicate exclusion-qids failure", err)
 	}
 }
 

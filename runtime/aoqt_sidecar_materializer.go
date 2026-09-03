@@ -9,9 +9,11 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"m31labs.dev/turboquant"
 )
@@ -24,6 +26,7 @@ const (
 
 type AOQTSidecarMaterializeConfig struct {
 	PlanPath               string
+	ExclusionQIDPaths      []string
 	VectorPaths            []string
 	ScoreEvidencePaths     []string
 	QrelsPaths             []string
@@ -78,7 +81,7 @@ type aoqtMaterializePlan struct {
 		RequiredBits []int  `json:"required_bits"`
 		TopK         int    `json:"top_k"`
 	} `json:"turboquant"`
-	Topology aoqtMaterializeTopology `json:"topology"`
+	Topology   aoqtMaterializeTopology `json:"topology"`
 	LegalScope struct {
 		TrainAllowedForResearch bool `json:"train_allowed_for_research"`
 		ReleaseTrainAllowed     bool `json:"release_train_allowed"`
@@ -92,7 +95,9 @@ type aoqtMaterializePlan struct {
 		PackageSHA256  string `json:"package_sha256"`
 	} `json:"anchor"`
 	Exclusions struct {
-		Sets []aoqtMaterializeExclusionSet `json:"sets"`
+		Sets                        []aoqtMaterializeExclusionSet `json:"sets"`
+		ExcludedQIDCountByDataset   map[string]int                `json:"excluded_qid_count_by_dataset"`
+		ExcludedQIDsByDatasetSHA256 string                        `json:"excluded_qids_by_dataset_sha256"`
 	} `json:"exclusions"`
 	SelectionPolicy struct {
 		Split                 string   `json:"split"`
@@ -122,10 +127,27 @@ type aoqtMaterializeTopology struct {
 }
 
 type aoqtMaterializeExclusionSet struct {
-	Name           string `json:"name"`
-	Path           string `json:"path"`
-	QIDCount       int    `json:"qid_count"`
-	ManifestSHA256 string `json:"manifest_sha256"`
+	Name                string         `json:"name"`
+	Path                string         `json:"path"`
+	QIDCountByDataset   map[string]int `json:"qid_count_by_dataset"`
+	QIDsByDatasetSHA256 string         `json:"qids_by_dataset_sha256"`
+	ManifestSHA256      string         `json:"manifest_sha256"`
+	Provenance          map[string]any `json:"provenance"`
+}
+
+type aoqtMaterializeExclusionManifest struct {
+	SourcePath         string              `json:"-"`
+	SHA256             string              `json:"-"`
+	Schema             string              `json:"schema"`
+	Name               string              `json:"name"`
+	QIDsByDataset      map[string][]string `json:"qids_by_dataset"`
+	SourceSHA256       string              `json:"source_sha256,omitempty"`
+	SourceSHA256ByFile map[string]string   `json:"source_sha256_by_file,omitempty"`
+}
+
+type aoqtMaterializeExclusionValidation struct {
+	ExcludedQIDs map[string]map[string]bool
+	InputSHA256  map[string]string
 }
 
 type aoqtMaterializePlanRow struct {
@@ -204,10 +226,14 @@ func MaterializeAOQTSidecarCalibration(cfg AOQTSidecarMaterializeConfig) (AOQTSi
 	if plan.Seed != cfg.ExpectedTopologySeed {
 		return AOQTSidecarMaterializePreflight{}, fmt.Errorf("AOQT materializer plan seed = %d, want topology seed %d", plan.Seed, cfg.ExpectedTopologySeed)
 	}
-	if err := validateAOQTMaterializePlanBindings(plan, cfg); err != nil {
+	exclusions, err := validateAOQTMaterializePlanBindings(plan, cfg)
+	if err != nil {
 		return AOQTSidecarMaterializePreflight{}, err
 	}
 	inputHashes := map[string]string{cfg.PlanPath: planSHA}
+	for path, sum := range exclusions.InputSHA256 {
+		inputHashes[path] = sum
+	}
 	for _, path := range append(append([]string{}, cfg.VectorPaths...), append(cfg.ScoreEvidencePaths, cfg.QrelsPaths...)...) {
 		sum, err := sha256FileAOQT(path)
 		if err != nil {
@@ -382,24 +408,24 @@ func loadAOQTMaterializePlan(path string) (aoqtMaterializePlan, string, error) {
 	return plan, hex.EncodeToString(sum[:]), nil
 }
 
-func validateAOQTMaterializePlanBindings(plan aoqtMaterializePlan, cfg AOQTSidecarMaterializeConfig) error {
+func validateAOQTMaterializePlanBindings(plan aoqtMaterializePlan, cfg AOQTSidecarMaterializeConfig) (aoqtMaterializeExclusionValidation, error) {
 	if plan.Mode != "plan_only" {
-		return fmt.Errorf("AOQT materializer plan mode %q is not supported, want plan_only", plan.Mode)
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan mode %q is not supported, want plan_only", plan.Mode)
 	}
 	if plan.ActualCacheGenerationRan || plan.ActualTrainingRan || plan.ActualEvalRan {
-		return fmt.Errorf("AOQT materializer plan must not claim cache generation, training, or eval ran")
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan must not claim cache generation, training, or eval ran")
 	}
 	if plan.TopologySeed != cfg.ExpectedTopologySeed {
-		return fmt.Errorf("AOQT materializer plan topology_seed = %d, want %d", plan.TopologySeed, cfg.ExpectedTopologySeed)
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan topology_seed = %d, want %d", plan.TopologySeed, cfg.ExpectedTopologySeed)
 	}
 	if plan.TurboQuant.ScoreMode != "prepared_ip" || plan.TurboQuant.Seed != cfg.ExpectedTurboQuantSeed || plan.TurboQuant.TopK < 120 || !intSetEqualAOQT(plan.TurboQuant.RequiredBits, []int{3, 5}) {
-		return fmt.Errorf("AOQT materializer plan TurboQuant prepared-IP binding mismatch")
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan TurboQuant prepared-IP binding mismatch")
 	}
 	if err := validateAOQTMaterializeTopology(plan.Topology); err != nil {
-		return err
+		return aoqtMaterializeExclusionValidation{}, err
 	}
 	if !plan.LegalScope.TrainAllowedForResearch || plan.LegalScope.ReleaseTrainAllowed || plan.LegalScope.CommercialUseAllowed || plan.LegalScope.FreeOpenReleaseAllowed || plan.LegalScope.QualityClaim {
-		return fmt.Errorf("AOQT materializer plan legal_scope must be research-only with no release, commercial, free-open, or quality claim")
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan legal_scope must be research-only with no release, commercial, free-open, or quality claim")
 	}
 	if plan.SelectionPolicy.Split != "train" ||
 		plan.SelectionPolicy.ScoreMode != "prepared_ip" ||
@@ -407,30 +433,34 @@ func validateAOQTMaterializePlanBindings(plan aoqtMaterializePlan, cfg AOQTSidec
 		plan.SelectionPolicy.Top10GuardLimit != 10 ||
 		!intSetEqualAOQT(plan.SelectionPolicy.RequiredScoreBits, []int{3, 5}) ||
 		!intSliceEqualAOQT(plan.SelectionPolicy.NFBoundaryWindow, []int{80, 120}) ||
-		plan.SelectionPolicy.OfficialExclusionMode != "qid_only" {
-		return fmt.Errorf("AOQT materializer plan selection_policy binding mismatch")
+		plan.SelectionPolicy.OfficialExclusionMode != "dataset_scoped_qid_only" {
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan selection_policy binding mismatch")
 	}
-	if len(plan.SelectionPolicy.Datasets) == 0 {
-		return fmt.Errorf("AOQT materializer plan selection_policy datasets are required")
+	if !stringSetEqualAOQT(plan.SelectionPolicy.Datasets, requiredAOQTMaterializeExclusionDatasets()) {
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan selection_policy datasets must be exactly fiqa,nfcorpus,scifact")
 	}
 	if !stringSetIncludesAOQT(plan.SelectionPolicy.ForbiddenSplits, []string{"dev", "reserve", "official", "test", "eval", "heldout"}) {
-		return fmt.Errorf("AOQT materializer plan selection_policy forbidden split binding mismatch")
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan selection_policy forbidden split binding mismatch")
 	}
-	if err := validateAOQTMaterializePlanExclusions(plan.Exclusions.Sets); err != nil {
-		return err
+	exclusions, err := validateAOQTMaterializePlanExclusions(plan, cfg)
+	if err != nil {
+		return aoqtMaterializeExclusionValidation{}, err
 	}
-	if len(plan.Provenance.QrelsSHA256ByDataset) == 0 {
-		return fmt.Errorf("AOQT materializer plan provenance.qrels_sha256_by_dataset is required")
+	if !stringSetEqualAOQT(sortedStringMapKeysAOQT(plan.Provenance.QrelsSHA256ByDataset), requiredAOQTMaterializeExclusionDatasets()) {
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan provenance.qrels_sha256_by_dataset must be exactly fiqa,nfcorpus,scifact")
 	}
 	for dataset, sum := range plan.Provenance.QrelsSHA256ByDataset {
 		if strings.TrimSpace(dataset) == "" {
-			return fmt.Errorf("AOQT materializer plan qrels dataset is required")
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan qrels dataset is required")
 		}
 		if err := validateAOQTSHA256(sum, "AOQT materializer plan qrels sha256"); err != nil {
-			return err
+			return aoqtMaterializeExclusionValidation{}, err
 		}
 	}
-	return validateAOQTMaterializePlanRows(plan.Rows)
+	if err := validateAOQTMaterializePlanRows(plan.Rows, exclusions.ExcludedQIDs); err != nil {
+		return aoqtMaterializeExclusionValidation{}, err
+	}
+	return exclusions, nil
 }
 
 func validateAOQTMaterializeTopology(topology aoqtMaterializeTopology) error {
@@ -446,49 +476,251 @@ func validateAOQTMaterializeTopology(topology aoqtMaterializeTopology) error {
 	return nil
 }
 
-func validateAOQTMaterializePlanExclusions(sets []aoqtMaterializeExclusionSet) error {
+func validateAOQTMaterializePlanExclusions(plan aoqtMaterializePlan, cfg AOQTSidecarMaterializeConfig) (aoqtMaterializeExclusionValidation, error) {
+	sets := plan.Exclusions.Sets
 	if len(sets) == 0 {
-		return fmt.Errorf("AOQT materializer plan qid-only exclusions are required")
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan qid-only exclusions are required")
+	}
+	if err := validateAOQTMaterializeDatasetCounts(plan.Exclusions.ExcludedQIDCountByDataset, "AOQT materializer plan aggregate excluded_qid_count_by_dataset"); err != nil {
+		return aoqtMaterializeExclusionValidation{}, err
+	}
+	if err := validateAOQTSHA256(plan.Exclusions.ExcludedQIDsByDatasetSHA256, "AOQT materializer plan aggregate excluded_qids_by_dataset_sha256"); err != nil {
+		return aoqtMaterializeExclusionValidation{}, err
 	}
 	seen := map[string]bool{}
+	setsByName := map[string]aoqtMaterializeExclusionSet{}
 	for _, set := range sets {
-		if strings.TrimSpace(set.Name) == "" || strings.TrimSpace(set.Path) == "" || set.QIDCount <= 0 {
-			return fmt.Errorf("AOQT materializer plan invalid qid-only exclusion proof for %q", set.Name)
+		if strings.TrimSpace(set.Name) == "" || strings.TrimSpace(set.Path) == "" {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan invalid qid-only exclusion proof for %q", set.Name)
 		}
 		if err := validateAOQTSHA256(set.ManifestSHA256, "AOQT materializer exclusion manifest sha256"); err != nil {
-			return err
+			return aoqtMaterializeExclusionValidation{}, err
+		}
+		if err := validateAOQTSHA256(set.QIDsByDatasetSHA256, "AOQT materializer exclusion qids_by_dataset_sha256"); err != nil {
+			return aoqtMaterializeExclusionValidation{}, err
+		}
+		if err := validateAOQTMaterializeDatasetCounts(set.QIDCountByDataset, "AOQT materializer plan qid-only exclusion "+set.Name+" qid_count_by_dataset"); err != nil {
+			return aoqtMaterializeExclusionValidation{}, err
 		}
 		if seen[set.Name] {
-			return fmt.Errorf("AOQT materializer plan duplicate qid-only exclusion %q", set.Name)
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan duplicate qid-only exclusion %q", set.Name)
 		}
 		seen[set.Name] = true
+		setsByName[set.Name] = set
 	}
 	for _, required := range []string{"dev4", "reserve4", "official-test"} {
 		if !seen[required] {
-			return fmt.Errorf("AOQT materializer plan missing required qid-only exclusion %q", required)
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer plan missing required qid-only exclusion %q", required)
+		}
+	}
+	manifestPaths := cfg.ExclusionQIDPaths
+	if len(manifestPaths) == 0 {
+		for _, set := range sets {
+			manifestPaths = append(manifestPaths, resolveAOQTMaterializePlanPath(cfg.PlanPath, set.Path))
+		}
+	}
+	return validateAOQTMaterializeStrictExclusionManifests(manifestPaths, setsByName, plan.Exclusions.ExcludedQIDCountByDataset, plan.Exclusions.ExcludedQIDsByDatasetSHA256)
+}
+
+func validateAOQTMaterializeDatasetCounts(counts map[string]int, label string) error {
+	if !stringSetEqualAOQT(sortedIntMapKeysAOQT(counts), requiredAOQTMaterializeExclusionDatasets()) {
+		return fmt.Errorf("%s must cover exactly fiqa,nfcorpus,scifact", label)
+	}
+	for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		if counts[dataset] <= 0 {
+			return fmt.Errorf("%s has non-positive count for dataset %q", label, dataset)
 		}
 	}
 	return nil
 }
 
-func validateAOQTMaterializePlanRows(rows []aoqtMaterializePlanRow) error {
+func validateAOQTMaterializeStrictExclusionManifests(paths []string, setsByName map[string]aoqtMaterializeExclusionSet, aggregateCounts map[string]int, aggregateSHA string) (aoqtMaterializeExclusionValidation, error) {
+	if len(paths) == 0 {
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer requires strict exclusion manifest inputs")
+	}
+	inputSHA := map[string]string{}
+	excluded := map[string]map[string]bool{}
+	seen := map[string]bool{}
+	for _, path := range paths {
+		manifest, err := loadAOQTMaterializeExclusionManifest(path)
+		if err != nil {
+			return aoqtMaterializeExclusionValidation{}, err
+		}
+		inputSHA[path] = manifest.SHA256
+		set, ok := setsByName[manifest.Name]
+		if !ok {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer exclusion manifest %q is not present in plan audit", manifest.Name)
+		}
+		if seen[manifest.Name] {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer duplicate strict exclusion manifest %q", manifest.Name)
+		}
+		seen[manifest.Name] = true
+		if manifest.SHA256 != set.ManifestSHA256 {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer exclusion manifest %q sha256 mismatch: file %s plan %s", manifest.Name, manifest.SHA256, set.ManifestSHA256)
+		}
+		counts, err := validateAOQTMaterializeExclusionQIDsByDataset(manifest.Name, manifest.QIDsByDataset, excluded)
+		if err != nil {
+			return aoqtMaterializeExclusionValidation{}, err
+		}
+		if !intMapEqualAOQT(counts, set.QIDCountByDataset) {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer exclusion manifest %q qid_count_by_dataset mismatch", manifest.Name)
+		}
+		gotQIDSHA, err := sha256JSONAOQT(canonicalAOQTMaterializeQIDsByDataset(manifest.QIDsByDataset))
+		if err != nil {
+			return aoqtMaterializeExclusionValidation{}, err
+		}
+		if gotQIDSHA != set.QIDsByDatasetSHA256 {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer exclusion manifest %q qids_by_dataset_sha256 mismatch", manifest.Name)
+		}
+	}
+	for name := range setsByName {
+		if !seen[name] {
+			return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer missing strict exclusion manifest %q", name)
+		}
+	}
+	aggregate := boolExclusionMapToSortedQIDsAOQT(excluded)
+	if !intMapEqualAOQT(countAOQTMaterializeQIDsByDataset(aggregate), aggregateCounts) {
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer aggregate excluded_qid_count_by_dataset mismatch")
+	}
+	gotAggregateSHA, err := sha256JSONAOQT(aggregate)
+	if err != nil {
+		return aoqtMaterializeExclusionValidation{}, err
+	}
+	if gotAggregateSHA != aggregateSHA {
+		return aoqtMaterializeExclusionValidation{}, fmt.Errorf("AOQT materializer aggregate excluded_qids_by_dataset_sha256 mismatch")
+	}
+	return aoqtMaterializeExclusionValidation{ExcludedQIDs: excluded, InputSHA256: inputSHA}, nil
+}
+
+func loadAOQTMaterializeExclusionManifest(path string) (aoqtMaterializeExclusionManifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return aoqtMaterializeExclusionManifest{}, err
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: invalid exclusion manifest JSON: %w", path, err)
+	}
+	if _, exists := raw["qids"]; exists {
+		return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: ambiguous legacy global qids are not allowed; use qids_by_dataset", path)
+	}
+	allowed := map[string]bool{"schema": true, "name": true, "qids_by_dataset": true, "source_sha256": true, "source_sha256_by_file": true}
+	for key := range raw {
+		if !allowed[key] {
+			return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: exclusion manifest must be qid-only; unexpected field %q", path, key)
+		}
+	}
+	var manifest aoqtMaterializeExclusionManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: invalid exclusion manifest JSON: %w", path, err)
+	}
+	sum := sha256.Sum256(data)
+	manifest.SourcePath = path
+	manifest.SHA256 = hex.EncodeToString(sum[:])
+	if manifest.Schema != "eos.aoqt_stage2.exclusion_qids.v1" {
+		return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: exclusion manifest schema %q is not supported", path, manifest.Schema)
+	}
+	if strings.TrimSpace(manifest.Name) == "" {
+		return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: exclusion manifest name is required", path)
+	}
+	if manifest.SourceSHA256 == "" && len(manifest.SourceSHA256ByFile) == 0 {
+		return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: exclusion manifest source hash provenance is required", path)
+	}
+	if manifest.SourceSHA256 != "" {
+		if err := validateAOQTSHA256(manifest.SourceSHA256, path+" source_sha256"); err != nil {
+			return aoqtMaterializeExclusionManifest{}, err
+		}
+	}
+	for key, value := range manifest.SourceSHA256ByFile {
+		if strings.TrimSpace(key) == "" {
+			return aoqtMaterializeExclusionManifest{}, fmt.Errorf("%s: source_sha256_by_file has empty key", path)
+		}
+		if err := validateAOQTSHA256(value, path+" source_sha256_by_file"); err != nil {
+			return aoqtMaterializeExclusionManifest{}, err
+		}
+	}
+	if _, err := validateAOQTMaterializeExclusionQIDsByDataset(manifest.Name, manifest.QIDsByDataset, nil); err != nil {
+		return aoqtMaterializeExclusionManifest{}, err
+	}
+	return manifest, nil
+}
+
+func validateAOQTMaterializeExclusionQIDsByDataset(name string, qidsByDataset map[string][]string, excluded map[string]map[string]bool) (map[string]int, error) {
+	if len(qidsByDataset) == 0 {
+		return nil, fmt.Errorf("AOQT materializer qid-only exclusion %q requires qids_by_dataset", name)
+	}
+	counts := map[string]int{}
+	for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		qids, ok := qidsByDataset[dataset]
+		if !ok {
+			return nil, fmt.Errorf("AOQT materializer qid-only exclusion %q missing qids_by_dataset[%q]", name, dataset)
+		}
+		if len(qids) == 0 {
+			return nil, fmt.Errorf("AOQT materializer qid-only exclusion %q has empty qids_by_dataset[%q]", name, dataset)
+		}
+		counts[dataset] = len(qids)
+	}
+	for dataset, qids := range qidsByDataset {
+		if !stringInSetAOQT(dataset, requiredAOQTMaterializeExclusionDatasets()) {
+			return nil, fmt.Errorf("AOQT materializer qid-only exclusion %q has unsupported dataset %q", name, dataset)
+		}
+		seenQIDs := map[string]bool{}
+		for _, qid := range qids {
+			if err := validateAOQTMaterializeQID(qid); err != nil {
+				return nil, fmt.Errorf("AOQT materializer qid-only exclusion %q has invalid qid for dataset %q: %w", name, dataset, err)
+			}
+			if seenQIDs[qid] {
+				return nil, fmt.Errorf("AOQT materializer qid-only exclusion %q duplicate qid %q for dataset %q", name, qid, dataset)
+			}
+			seenQIDs[qid] = true
+			if excluded != nil && excluded[dataset] == nil {
+				excluded[dataset] = map[string]bool{}
+			}
+			if excluded != nil {
+				excluded[dataset][qid] = true
+			}
+		}
+	}
+	return counts, nil
+}
+
+func validateAOQTMaterializeQID(qid string) error {
+	if qid == "" || strings.ContainsFunc(qid, unicode.IsSpace) {
+		return fmt.Errorf("qids must be non-empty strings without whitespace")
+	}
+	return nil
+}
+
+func requiredAOQTMaterializeExclusionDatasets() []string {
+	return []string{"fiqa", "nfcorpus", "scifact"}
+}
+
+func validateAOQTMaterializePlanRows(rows []aoqtMaterializePlanRow, excludedQIDs map[string]map[string]bool) error {
 	if len(rows) == 0 {
 		return fmt.Errorf("AOQT materializer plan rows are required")
 	}
 	seenRows := map[string]bool{}
+	rowDatasets := map[string]bool{}
+	guardCoverage := map[string]bool{}
 	for _, row := range rows {
 		if strings.TrimSpace(row.RowID) == "" || strings.TrimSpace(row.Dataset) == "" || strings.TrimSpace(row.QID) == "" {
 			return fmt.Errorf("AOQT materializer plan row identity fields are required")
+		}
+		if !stringInSetAOQT(row.Dataset, requiredAOQTMaterializeExclusionDatasets()) {
+			return fmt.Errorf("AOQT materializer plan row %q has unsupported dataset %q", row.RowID, row.Dataset)
 		}
 		if seenRows[row.RowID] {
 			return fmt.Errorf("AOQT materializer plan duplicate row_id %q", row.RowID)
 		}
 		seenRows[row.RowID] = true
-		source, err := aoqtMaterializePlanRowSource(row)
-		if err != nil {
+		rowDatasets[row.Dataset] = true
+		if excludedQIDs[row.Dataset][row.QID] {
+			return fmt.Errorf("AOQT materializer plan row %q qid %q is excluded for dataset %q", row.RowID, row.QID, row.Dataset)
+		}
+		if _, err := aoqtMaterializePlanRowSource(row); err != nil {
 			return err
 		}
-		_ = source
+		guardCoverage[row.Dataset+"\x00"+fmt.Sprint(row.Bits)+"\x00"+row.Bucket] = true
 		if len(row.CandidateDocIDs) != row.RankWindow[1]-row.RankWindow[0]+1 {
 			return fmt.Errorf("AOQT materializer plan row %q candidate count does not match rank_window", row.RowID)
 		}
@@ -502,6 +734,22 @@ func validateAOQTMaterializePlanRows(rows []aoqtMaterializePlanRow) error {
 			}
 			seenDocs[docID] = true
 		}
+	}
+	if !stringSetEqualAOQT(sortedBoolMapKeysAOQT(rowDatasets), requiredAOQTMaterializeExclusionDatasets()) {
+		return fmt.Errorf("AOQT materializer plan rows must cover exactly fiqa,nfcorpus,scifact")
+	}
+	for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		for _, bits := range []int{3, 5} {
+			if !guardCoverage[dataset+"\x00"+fmt.Sprint(bits)+"\x00top10_guard"] {
+				return fmt.Errorf("AOQT materializer plan rows missing top10 guard coverage for %s q%d", dataset, bits)
+			}
+		}
+	}
+	if !guardCoverage["nfcorpus\x003\x00nf_boundary80_120_guard"] {
+		return fmt.Errorf("AOQT materializer plan rows missing NFCorpus q3 boundary rank 80..120 coverage")
+	}
+	if guardCoverage["nfcorpus\x005\x00nf_boundary80_120_guard"] {
+		return fmt.Errorf("AOQT materializer plan rows must not include NFCorpus q5 boundary coverage")
 	}
 	return nil
 }
@@ -522,6 +770,9 @@ func aoqtMaterializePlanRowSource(row aoqtMaterializePlanRow) (string, error) {
 func validateAOQTMaterializeQrelsBinding(plan aoqtMaterializePlan, qrelsByDataset map[string]string) error {
 	if len(plan.Provenance.QrelsSHA256ByDataset) != len(qrelsByDataset) {
 		return fmt.Errorf("AOQT qrels sha256 dataset coverage mismatch: plan has %d datasets, inputs have %d", len(plan.Provenance.QrelsSHA256ByDataset), len(qrelsByDataset))
+	}
+	if !stringSetEqualAOQT(sortedStringMapKeysAOQT(qrelsByDataset), requiredAOQTMaterializeExclusionDatasets()) {
+		return fmt.Errorf("AOQT qrels inputs must cover exactly fiqa,nfcorpus,scifact")
 	}
 	for dataset, want := range plan.Provenance.QrelsSHA256ByDataset {
 		got := qrelsByDataset[dataset]
@@ -967,14 +1218,75 @@ func aoqtMaterializeSplitProof(plan aoqtMaterializePlan) AOQTSidecarTrainOnlySpl
 	sets := append([]aoqtMaterializeExclusionSet(nil), plan.Exclusions.Sets...)
 	sort.Slice(sets, func(i, j int) bool { return sets[i].Name < sets[j].Name })
 	for _, set := range sets {
-		identities = append(identities, "qid-only:"+set.Name+":"+set.ManifestSHA256+":"+fmt.Sprint(set.QIDCount))
+		identities = append(identities, aoqtMaterializeExclusionIdentity(set))
 	}
+	identities = append(identities, "dataset-scoped-qid-only:aggregate:"+plan.Exclusions.ExcludedQIDsByDatasetSHA256+":"+mustSHA256JSONAOQT(plan.Exclusions.ExcludedQIDCountByDataset))
 	return AOQTSidecarTrainOnlySplitProof{
 		Split:               "train",
 		TrainOnly:           true,
 		ProofSHA256:         sha256StringsAOQT(identities),
 		ExclusionIdentities: identities,
 	}
+}
+
+func aoqtMaterializeExclusionIdentity(set aoqtMaterializeExclusionSet) string {
+	return "dataset-scoped-qid-only:" + set.Name + ":" + set.ManifestSHA256 + ":counts:" + mustSHA256JSONAOQT(set.QIDCountByDataset) + ":qids_by_dataset:" + set.QIDsByDatasetSHA256
+}
+
+func resolveAOQTMaterializePlanPath(planPath, path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path
+	}
+	return filepath.Join(filepath.Dir(planPath), path)
+}
+
+func canonicalAOQTMaterializeQIDsByDataset(qidsByDataset map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		qids := append([]string(nil), qidsByDataset[dataset]...)
+		sort.Strings(qids)
+		out[dataset] = qids
+	}
+	return out
+}
+
+func boolExclusionMapToSortedQIDsAOQT(excluded map[string]map[string]bool) map[string][]string {
+	out := map[string][]string{}
+	for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		for qid := range excluded[dataset] {
+			out[dataset] = append(out[dataset], qid)
+		}
+		sort.Strings(out[dataset])
+	}
+	return out
+}
+
+func countAOQTMaterializeQIDsByDataset(qidsByDataset map[string][]string) map[string]int {
+	out := map[string]int{}
+	for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		out[dataset] = len(qidsByDataset[dataset])
+	}
+	return out
+}
+
+func sha256JSONAOQT(value any) (string, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func mustSHA256JSONAOQT(value any) string {
+	sum, err := sha256JSONAOQT(value)
+	if err != nil {
+		panic(err)
+	}
+	return sum
 }
 
 func aoqtMaterializeSourceArtifactHash(planSHA, scoreSHA string, row aoqtMaterializePlanRow) string {
@@ -1047,6 +1359,70 @@ func stringSetIncludesAOQT(values, required []string) bool {
 		}
 	}
 	return true
+}
+
+func stringSetEqualAOQT(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]string(nil), a...)
+	right := append([]string(nil), b...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func intMapEqualAOQT(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key, value := range a {
+		if b[key] != value {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedStringMapKeysAOQT(values map[string]string) []string {
+	out := make([]string, 0, len(values))
+	for key := range values {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedIntMapKeysAOQT(values map[string]int) []string {
+	out := make([]string, 0, len(values))
+	for key := range values {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedBoolMapKeysAOQT(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for key := range values {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func stringInSetAOQT(value string, set []string) bool {
+	for _, item := range set {
+		if value == item {
+			return true
+		}
+	}
+	return false
 }
 
 func sortedKeysAOQT(values map[string]bool) []string {

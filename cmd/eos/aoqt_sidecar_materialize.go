@@ -15,9 +15,11 @@ func runMaterializeAOQTSidecar(args []string) error {
 	vectorPaths := stringListFlag{}
 	scoreEvidencePaths := stringListFlag{}
 	qrelsPaths := stringListFlag{}
+	exclusionQIDPaths := commaStringListFlag{}
 	fs.Var(&vectorPaths, "vectors", "AOQT vector JSONL input; repeat for query/doc files")
 	fs.Var(&scoreEvidencePaths, "score-evidence", "AOQT q3/q5 top120 score evidence JSON; repeat per dataset/bit")
 	fs.Var(&qrelsPaths, "qrels", "train qrels JSONL or TREC file; repeat per dataset")
+	fs.Var(&exclusionQIDPaths, "exclusion-qids", "dataset-scoped AOQT qid-only exclusion manifest JSON; repeat or comma-separate exactly dev4,reserve4,official-test")
 	rowsPath := fs.String("rows-jsonl", "", "output AOQT calibration rows JSONL")
 	manifestPath := fs.String("manifest-json", "", "output AOQT calibration manifest JSON")
 	preflightPath := fs.String("preflight-json", "", "output AOQT materializer preflight JSON")
@@ -35,8 +37,12 @@ func runMaterializeAOQTSidecar(args []string) error {
 	if fs.NArg() != 0 {
 		return fmt.Errorf("usage: eos materialize-aoqt-sidecar [flags]")
 	}
+	if err := validateMaterializeAOQTExclusionQIDPaths(exclusionQIDPaths); err != nil {
+		return err
+	}
 	preflight, err := eosruntime.MaterializeAOQTSidecarCalibration(eosruntime.AOQTSidecarMaterializeConfig{
 		PlanPath:               *planPath,
+		ExclusionQIDPaths:      exclusionQIDPaths,
 		VectorPaths:            vectorPaths,
 		ScoreEvidencePaths:     scoreEvidencePaths,
 		QrelsPaths:             qrelsPaths,
@@ -72,5 +78,45 @@ func (f *stringListFlag) Set(value string) error {
 		return fmt.Errorf("empty path")
 	}
 	*f = append(*f, value)
+	return nil
+}
+
+type commaStringListFlag []string
+
+func (f *commaStringListFlag) String() string {
+	return strings.Join(*f, ",")
+}
+
+func (f *commaStringListFlag) Set(value string) error {
+	if strings.TrimSpace(value) == "" {
+		return fmt.Errorf("empty path")
+	}
+	for _, part := range strings.Split(value, ",") {
+		path := strings.TrimSpace(part)
+		if path == "" {
+			return fmt.Errorf("empty path")
+		}
+		*f = append(*f, path)
+	}
+	return nil
+}
+
+func validateMaterializeAOQTExclusionQIDPaths(paths []string) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("AOQT materializer requires --exclusion-qids exactly 3 times or comma-separated with dev4,reserve4,official-test manifests")
+	}
+	if len(paths) != 3 {
+		return fmt.Errorf("AOQT materializer requires exactly 3 --exclusion-qids manifest paths, got %d", len(paths))
+	}
+	seen := map[string]bool{}
+	for _, path := range paths {
+		if strings.TrimSpace(path) == "" {
+			return fmt.Errorf("AOQT materializer --exclusion-qids contains an empty path")
+		}
+		if seen[path] {
+			return fmt.Errorf("AOQT materializer duplicate --exclusion-qids path %q", path)
+		}
+		seen[path] = true
+	}
 	return nil
 }

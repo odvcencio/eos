@@ -2,9 +2,12 @@ package eosruntime
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -67,11 +70,11 @@ func TestAOQTMaterializerRanksAreDeterministicPermutations(t *testing.T) {
 		QrelsSHA256ByDataset: map[string]string{row.Dataset: row.QrelsSHA256},
 		SplitProof:           row.SplitProof,
 		SourceArtifactHashes: []string{row.SourceArtifactHash},
-		VectorCacheHashes:    []string{hex64("cache")},
+		VectorCacheHashes:    []string{hex64AOQTMaterializerTest("cache")},
 		RowCount:             1,
 		RowIDSHA256:          aoqtRowIDSHA256([]string{row.RowID}),
 		CompatibilityDigest:  row.CompatibilityDigest,
-		LegalGates:           aoqtResearchOnlyGates(),
+		LegalGates:           AOQTSidecarLegalGates{ResearchTrainAllowed: true},
 		ObjectiveContract: AOQTSidecarPreparedIPObjectiveConfig{
 			TurboQuantSeed:   AOQTSidecarMaterializerQuantSeed,
 			NFBoundarySource: "nf_boundary80_120",
@@ -88,7 +91,7 @@ func TestAOQTMaterializerRejectsExcludedCandidateOutsidePlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	updated := strings.Replace(string(data), `"d080"`, `"outside-plan"`, 1)
+	updated := strings.Replace(string(data), `"fiqa-d001"`, `"outside-plan"`, 1)
 	if err := os.WriteFile(cfg.PlanPath, []byte(updated), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +109,7 @@ func TestAOQTMaterializerRejectsMissingVector(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	filtered := lines[:0]
 	for _, line := range lines {
-		if !strings.Contains(line, `"id":"d080"`) {
+		if !strings.Contains(line, `"id":"fiqa-d001"`) {
 			filtered = append(filtered, line)
 		}
 	}
@@ -141,10 +144,10 @@ func TestAOQTMaterializerRejectsQrelsCoverageMismatch(t *testing.T) {
 	cfg := writeTinyAOQTMaterializerFixture(t)
 	plan := readAOQTPlanMap(t, cfg.PlanPath)
 	provenance := plan["provenance"].(map[string]any)
-	provenance["qrels_sha256_by_dataset"] = map[string]any{"nfcorpus": hex64("wrong-qrels")}
+	provenance["qrels_sha256_by_dataset"] = map[string]any{"nfcorpus": hex64AOQTMaterializerTest("wrong-qrels")}
 	writeAOQTPlanMap(t, cfg.PlanPath, plan)
-	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), "AOQT qrels sha256 mismatch") {
-		t.Fatalf("error = %v, want qrels mismatch rejection", err)
+	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), "qrels_sha256_by_dataset must be exactly") {
+		t.Fatalf("error = %v, want qrels coverage rejection", err)
 	}
 }
 
@@ -152,10 +155,88 @@ func TestAOQTMaterializerRejectsMissingOfficialTestExclusion(t *testing.T) {
 	cfg := writeTinyAOQTMaterializerFixture(t)
 	plan := readAOQTPlanMap(t, cfg.PlanPath)
 	exclusions := plan["exclusions"].(map[string]any)
-	exclusions["sets"] = exclusions["sets"].([]any)[:2]
+	sets := exclusions["sets"].([]any)
+	filtered := sets[:0]
+	for _, item := range sets {
+		if item.(map[string]any)["name"] != "official-test" {
+			filtered = append(filtered, item)
+		}
+	}
+	exclusions["sets"] = filtered
 	writeAOQTPlanMap(t, cfg.PlanPath, plan)
 	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), `missing required qid-only exclusion "official-test"`) {
 		t.Fatalf("error = %v, want missing official-test exclusion rejection", err)
+	}
+}
+
+func TestAOQTMaterializerAllowsSameQIDAcrossDifferentExcludedDataset(t *testing.T) {
+	cfg := writeTinyAOQTMaterializerFixtureWithExclusionMutator(t, func(qids map[string]map[string][]string) {
+		qids["dev4"]["fiqa"] = []string{"nfcorpus-q1"}
+	})
+	if _, err := MaterializeAOQTSidecarCalibration(cfg); err != nil {
+		t.Fatalf("materialize with nfcorpus-q1 excluded for different dataset: %v", err)
+	}
+}
+
+func TestAOQTMaterializerRejectsSameDatasetExcludedQID(t *testing.T) {
+	cfg := writeTinyAOQTMaterializerFixture(t)
+	rewriteStrictExclusionManifestAndPlanAuditAOQT(t, cfg, "dev4", "nfcorpus", []string{"nfcorpus-q1"})
+	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), `qid "nfcorpus-q1" is excluded for dataset "nfcorpus"`) {
+		t.Fatalf("error = %v, want same-dataset qid exclusion rejection", err)
+	}
+}
+
+func TestAOQTMaterializerRejectsWhitespaceExclusionQIDs(t *testing.T) {
+	for name, qid := range map[string]string{
+		"ascii-space":   "dev4-fiqa qid",
+		"ascii-tab":     "dev4-fiqa\tqid",
+		"unicode-space": "dev4-fiqa\u00a0qid",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := writeTinyAOQTMaterializerFixture(t)
+			rewriteStrictExclusionManifestAndPlanAuditAOQT(t, cfg, "dev4", "fiqa", []string{qid})
+			if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), "qids must be non-empty strings without whitespace") {
+				t.Fatalf("error = %v, want whitespace qid rejection", err)
+			}
+		})
+	}
+}
+
+func TestAOQTMaterializerRejectsMissingExclusionDatasetCoverage(t *testing.T) {
+	cfg := writeTinyAOQTMaterializerFixture(t)
+	plan := readAOQTPlanMap(t, cfg.PlanPath)
+	exclusions := plan["exclusions"].(map[string]any)
+	sets := exclusions["sets"].([]any)
+	official := sets[2].(map[string]any)
+	counts := official["qid_count_by_dataset"].(map[string]any)
+	delete(counts, "scifact")
+	writeAOQTPlanMap(t, cfg.PlanPath, plan)
+	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), `must cover exactly fiqa,nfcorpus,scifact`) {
+		t.Fatalf("error = %v, want missing dataset-scoped qid coverage rejection", err)
+	}
+}
+
+func TestAOQTMaterializerRejectsStalePerSetExclusionQIDsByDatasetHash(t *testing.T) {
+	cfg := writeTinyAOQTMaterializerFixture(t)
+	plan := readAOQTPlanMap(t, cfg.PlanPath)
+	exclusions := plan["exclusions"].(map[string]any)
+	sets := exclusions["sets"].([]any)
+	dev4 := sets[0].(map[string]any)
+	dev4["qids_by_dataset_sha256"] = hex64AOQTMaterializerTest("stale-per-set-qids-by-dataset")
+	writeAOQTPlanMap(t, cfg.PlanPath, plan)
+	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), `exclusion manifest "dev4" qids_by_dataset_sha256 mismatch`) {
+		t.Fatalf("error = %v, want stale per-set qids_by_dataset hash rejection", err)
+	}
+}
+
+func TestAOQTMaterializerRejectsStaleAggregateExclusionQIDsByDatasetHash(t *testing.T) {
+	cfg := writeTinyAOQTMaterializerFixture(t)
+	plan := readAOQTPlanMap(t, cfg.PlanPath)
+	exclusions := plan["exclusions"].(map[string]any)
+	exclusions["excluded_qids_by_dataset_sha256"] = hex64AOQTMaterializerTest("stale-aggregate-qids-by-dataset")
+	writeAOQTPlanMap(t, cfg.PlanPath, plan)
+	if _, err := MaterializeAOQTSidecarCalibration(cfg); err == nil || !strings.Contains(err.Error(), "aggregate excluded_qids_by_dataset_sha256 mismatch") {
+		t.Fatalf("error = %v, want stale aggregate qids_by_dataset hash rejection", err)
 	}
 }
 
@@ -275,8 +356,11 @@ func TestAOQTMaterializerBindsRowSourceHashToPlanAndScoreEvidence(t *testing.T) 
 
 func TestAOQTMaterializerIsDeterministic(t *testing.T) {
 	cfgA := writeTinyAOQTMaterializerFixture(t)
-	cfgB := writeTinyAOQTMaterializerFixture(t)
-	cfgB.CreatedAtUTC = cfgA.CreatedAtUTC
+	dir := filepath.Dir(cfgA.RowJSONLPath)
+	cfgB := cfgA
+	cfgB.RowJSONLPath = filepath.Join(dir, "rows-b.jsonl")
+	cfgB.ManifestJSONPath = filepath.Join(dir, "manifest-b.json")
+	cfgB.PreflightJSONPath = filepath.Join(dir, "preflight-b.json")
 	if _, err := MaterializeAOQTSidecarCalibration(cfgA); err != nil {
 		t.Fatalf("materialize A: %v", err)
 	}
@@ -393,100 +477,148 @@ func writeAOQTPlanMap(t *testing.T, path string, plan map[string]any) {
 }
 
 func writeTinyAOQTMaterializerFixture(t *testing.T) AOQTSidecarMaterializeConfig {
+	return writeTinyAOQTMaterializerFixtureWithExclusionMutator(t, nil)
+}
+
+func writeTinyAOQTMaterializerFixtureWithExclusionMutator(t *testing.T, mutate func(map[string]map[string][]string)) AOQTSidecarMaterializeConfig {
 	t.Helper()
 	dir := t.TempDir()
 	space := "eos-d384-anchor-test"
 	planPath := filepath.Join(dir, "plan.json")
 	vectorsPath := filepath.Join(dir, "vectors.jsonl")
-	qrelsPath := filepath.Join(dir, "qrels.jsonl")
-	q3Path := filepath.Join(dir, "q3.json")
-	q5Path := filepath.Join(dir, "q5.json")
-	query := unitVecAtAOQT(0)
+	anchorPath := filepath.Join(dir, "anchor.json")
+	exclusionDir := filepath.Join(dir, "exclusions")
+	vectorManifestDir := filepath.Join(dir, "vector-manifests")
+	scoreDir := filepath.Join(dir, "scores")
+	qrelsDir := filepath.Join(dir, "qrels")
+	for _, path := range []string{exclusionDir, vectorManifestDir, scoreDir, qrelsDir} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	anchor := map[string]any{
+		"schema":         "eos.aoqt_stage2.anchor_manifest.v1",
+		"package_path":   "anchor.mll",
+		"package_sha256": hex64AOQTMaterializerTest("anchor"),
+		"embedding_dim":  AOQTSidecarDim,
+		"topology":       map[string]any{"id": "aoqt_givens_v1", "dim": AOQTSidecarDim, "stages": AOQTSidecarStages, "pairs_per_stage": AOQTSidecarPairsPerStage, "angle_count": AOQTSidecarAngleCount, "angle_cap_default": AOQTSidecarDefaultAngleCap, "angle_cap_hard": AOQTSidecarHardMaxAngleCap},
+		"legal_scope":    map[string]any{"train_allowed_for_research": true, "release_train_allowed": false, "commercial_use_allowed": false, "free_open_release_allowed": false, "quality_claim": false},
+	}
+	if err := writeJSONFileAOQT(anchorPath, anchor); err != nil {
+		t.Fatal(err)
+	}
+	anchorManifestSHA, err := sha256FileAOQT(anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	vectorFile, err := os.Create(vectorsPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeJSONLineAOQT(t, vectorFile, aoqtMaterializeVectorRecord{Dataset: "nfcorpus", Role: "query", ID: "q1", VectorID: "qv1", EmbeddingSpaceID: space, Vector: query})
-	for i := 1; i <= 120; i++ {
-		id := fmtDocIDAOQT(i)
-		vec := unitVecAtAOQT(i % AOQTSidecarDim)
-		if i == 80 {
-			vec = unitVecAtAOQT(0)
+	var qrelsPaths []string
+	var vectorManifestPaths []string
+	var scorePaths []string
+	for datasetIndex, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+		queryIDs := []string{dataset + "-q1", dataset + "-q2"}
+		docIDs := make([]string, 0, 120)
+		qrelsPath := filepath.Join(qrelsDir, dataset+".qrels.jsonl")
+		qrelsFile, err := os.Create(qrelsPath)
+		if err != nil {
+			t.Fatal(err)
 		}
-		writeJSONLineAOQT(t, vectorFile, aoqtMaterializeVectorRecord{Dataset: "nfcorpus", Role: "doc", ID: id, VectorID: "vec-" + id, EmbeddingSpaceID: space, Vector: vec})
+		for _, qid := range queryIDs {
+			writeJSONLineAOQT(t, vectorFile, aoqtMaterializeVectorRecord{Dataset: dataset, Role: "query", ID: qid, VectorID: "vec-" + qid, EmbeddingSpaceID: space, Vector: unitVecAtAOQT(datasetIndex)})
+			writeJSONLineAOQT(t, qrelsFile, map[string]any{"dataset": dataset, "qid": qid, "doc_id": dataset + "-d001", "gain": 1})
+			if dataset == "nfcorpus" {
+				writeJSONLineAOQT(t, qrelsFile, map[string]any{"dataset": dataset, "qid": qid, "doc_id": dataset + "-d080", "gain": 1})
+			}
+		}
+		if err := qrelsFile.Close(); err != nil {
+			t.Fatal(err)
+		}
+		qrelsSHA, err := sha256FileAOQT(qrelsPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		qrelsPaths = append(qrelsPaths, qrelsPath)
+		for i := 1; i <= 120; i++ {
+			id := dataset + "-" + fmtDocIDAOQT(i)
+			docIDs = append(docIDs, id)
+			vec := unitVecAtAOQT((datasetIndex + i) % AOQTSidecarDim)
+			if i == 1 || (dataset == "nfcorpus" && i == 80) {
+				vec = unitVecAtAOQT(datasetIndex)
+			}
+			writeJSONLineAOQT(t, vectorFile, aoqtMaterializeVectorRecord{Dataset: dataset, Role: "doc", ID: id, VectorID: "vec-" + id, EmbeddingSpaceID: space, Vector: vec})
+		}
+		for _, role := range []string{"query", "doc"} {
+			ids := queryIDs
+			component := "query_vector"
+			if role == "doc" {
+				ids = docIDs
+				component = "doc_vector"
+			}
+			manifestPath := filepath.Join(vectorManifestDir, dataset+"."+role+".json")
+			payload := aoqtBuilderCacheManifestAOQT(dataset, role, anchorManifestSHA, anchor, qrelsSHA, hex64AOQTMaterializerTest(dataset+"-"+component+"-source"))
+			payload["ids"] = ids
+			payload["cache_sha256"] = hex64AOQTMaterializerTest(dataset + "-" + role + "-cache")
+			if err := writeJSONFileAOQT(manifestPath, payload); err != nil {
+				t.Fatal(err)
+			}
+			vectorManifestPaths = append(vectorManifestPaths, manifestPath)
+		}
+		for _, bits := range []int{3, 5} {
+			scorePath := filepath.Join(scoreDir, dataset+".q"+strconv.Itoa(bits)+".json")
+			writeEvidenceAOQT(t, scorePath, dataset, bits, queryIDs, docIDs, anchorManifestSHA, anchor, qrelsSHA, vectorManifestDir)
+			scorePaths = append(scorePaths, scorePath)
+		}
 	}
 	if err := vectorFile.Close(); err != nil {
 		t.Fatal(err)
 	}
-	qrelsFile, err := os.Create(qrelsPath)
-	if err != nil {
-		t.Fatal(err)
+	exclusionQIDs := map[string]map[string][]string{}
+	for _, name := range []string{"dev4", "reserve4", "official-test"} {
+		exclusionQIDs[name] = map[string][]string{}
+		for _, dataset := range requiredAOQTMaterializeExclusionDatasets() {
+			exclusionQIDs[name][dataset] = []string{name + "-" + dataset + "-qid"}
+		}
 	}
-	writeJSONLineAOQT(t, qrelsFile, map[string]any{"dataset": "nfcorpus", "qid": "q1", "doc_id": "d080", "gain": 1})
-	if err := qrelsFile.Close(); err != nil {
-		t.Fatal(err)
+	if mutate != nil {
+		mutate(exclusionQIDs)
 	}
-	writeEvidenceAOQT(t, q3Path, 3)
-	writeEvidenceAOQT(t, q5Path, 5)
-	candidates := make([]string, 0, 61)
-	for i := 80; i <= 120; i++ {
-		candidates = append(candidates, fmtDocIDAOQT(i))
+	var exclusionPaths []string
+	for _, name := range []string{"dev4", "reserve4", "official-test"} {
+		path := filepath.Join(exclusionDir, name+".json")
+		if err := writeJSONFileAOQT(path, map[string]any{
+			"schema":          "eos.aoqt_stage2.exclusion_qids.v1",
+			"name":            name,
+			"qids_by_dataset": exclusionQIDs[name],
+			"source_sha256":   hex64AOQTMaterializerTest(name + "-source"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		exclusionPaths = append(exclusionPaths, path)
 	}
-	qrelsSHA, err := sha256FileAOQT(qrelsPath)
-	if err != nil {
-		t.Fatal(err)
+	args := []string{"scripts/build_aoqt_stage2_calibration.py", "--anchor-manifest", anchorPath, "--output-plan", planPath}
+	for _, path := range exclusionPaths {
+		args = append(args, "--exclusion-qids", path)
 	}
-	plan := map[string]any{
-		"schema":                      "eos.aoqt_stage2_calibration_plan.v1",
-		"mode":                        "plan_only",
-		"actual_cache_generation_ran": false,
-		"actual_training_ran":         false,
-		"actual_eval_ran":             false,
-		"seed":                        AOQTSidecarMaterializerTopologySeed,
-		"topology_seed":               AOQTSidecarMaterializerTopologySeed,
-		"turboquant":                  map[string]any{"score_mode": "prepared_ip", "seed": AOQTSidecarMaterializerQuantSeed, "required_bits": []int{3, 5}, "top_k": 120},
-		"topology":                    map[string]any{"id": "aoqt_givens_v1", "dim": AOQTSidecarDim, "stages": AOQTSidecarStages, "pairs_per_stage": AOQTSidecarPairsPerStage, "angle_count": AOQTSidecarAngleCount, "angle_cap_default": AOQTSidecarDefaultAngleCap, "angle_cap_hard": AOQTSidecarHardMaxAngleCap},
-		"legal_scope":                 map[string]any{"train_allowed_for_research": true, "release_train_allowed": false, "commercial_use_allowed": false, "free_open_release_allowed": false, "quality_claim": false},
-		"anchor": map[string]any{
-			"path":            "anchor.mll",
-			"manifest_sha256": hex64("pkg-manifest"),
-			"package_sha256":  hex64("anchor"),
-		},
-		"exclusions": map[string]any{"sets": []map[string]any{
-			{"name": "dev4", "path": "dev4.exclusion.json", "qid_count": 4, "manifest_sha256": hex64("dev4")},
-			{"name": "reserve4", "path": "reserve4.exclusion.json", "qid_count": 4, "manifest_sha256": hex64("reserve4")},
-			{"name": "official-test", "path": "official-test.exclusion.json", "qid_count": 4, "manifest_sha256": hex64("official-test")},
-		}},
-		"selection_policy": map[string]any{
-			"split":                   "train",
-			"datasets":                []string{"nfcorpus"},
-			"required_score_bits":     []int{3, 5},
-			"score_mode":              "prepared_ip",
-			"turboquant_seed":         AOQTSidecarMaterializerQuantSeed,
-			"top10_guard_limit":       10,
-			"nf_boundary_window":      []int{80, 120},
-			"official_exclusion_mode": "qid_only",
-			"forbidden_splits":        []string{"dev", "reserve", "official", "test", "eval", "heldout"},
-		},
-		"rows": []map[string]any{{
-			"row_id":            "nfcorpus.q3.nf80_120.q1",
-			"dataset":           "nfcorpus",
-			"bits":              3,
-			"bucket":            "nf_boundary80_120_guard",
-			"qid":               "q1",
-			"rank_window":       []int{80, 120},
-			"candidate_doc_ids": candidates,
-		}},
-		"provenance": map[string]any{"qrels_sha256_by_dataset": map[string]string{"nfcorpus": qrelsSHA}},
+	for _, path := range vectorManifestPaths {
+		args = append(args, "--vector-cache", path)
 	}
-	if err := writeJSONFileAOQT(planPath, plan); err != nil {
-		t.Fatal(err)
+	for _, path := range scorePaths {
+		args = append(args, "--score-cache", path)
+	}
+	cmd := exec.Command("python3", args...)
+	cmd.Dir = repoRootAOQTMaterializerTest(t)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build AOQT calibration plan: %v\n%s", err, out)
 	}
 	return AOQTSidecarMaterializeConfig{
 		PlanPath:               planPath,
+		ExclusionQIDPaths:      exclusionPaths,
 		VectorPaths:            []string{vectorsPath},
-		ScoreEvidencePaths:     []string{q3Path, q5Path},
-		QrelsPaths:             []string{qrelsPath},
+		ScoreEvidencePaths:     scorePaths,
+		QrelsPaths:             qrelsPaths,
 		RowJSONLPath:           filepath.Join(dir, "rows.jsonl"),
 		ManifestJSONPath:       filepath.Join(dir, "manifest.json"),
 		PreflightJSONPath:      filepath.Join(dir, "preflight.json"),
@@ -496,21 +628,100 @@ func writeTinyAOQTMaterializerFixture(t *testing.T) AOQTSidecarMaterializeConfig
 	}
 }
 
-func writeEvidenceAOQT(t *testing.T, path string, bits int) {
+func repoRootAOQTMaterializerTest(t *testing.T) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		next := filepath.Dir(dir)
+		if next == dir {
+			t.Fatal("repo root not found")
+		}
+		dir = next
+	}
+}
+
+func hex64AOQTMaterializerTest(label string) string {
+	sum := sha256.Sum256([]byte(label))
+	return hex.EncodeToString(sum[:])
+}
+
+func aoqtBuilderCacheManifestAOQT(dataset, role, anchorManifestSHA string, anchor map[string]any, qrelsSHA, sourceSHA string) map[string]any {
+	return map[string]any{
+		"schema":        "eos.aoqt_stage2.vector_cache_manifest.v1",
+		"dataset":       dataset,
+		"split":         "train",
+		"role":          role,
+		"anchor":        map[string]any{"package_sha256": anchor["package_sha256"], "manifest_sha256": anchorManifestSHA},
+		"topology":      map[string]any{"id": "aoqt_givens_v1", "sha256": mustSHA256JSONAOQT(anchor["topology"])},
+		"legal_scope":   anchor["legal_scope"],
+		"source_sha256": sourceSHA,
+		"qrels_sha256":  qrelsSHA,
+		"dataset_source_provenance": map[string]string{
+			role + "_vector": sourceSHA,
+		},
+		"dataset_source_provenance_sha256": mustSHA256JSONAOQT(map[string]string{role + "_vector": sourceSHA}),
+	}
+}
+
+func writeEvidenceAOQT(t *testing.T, path, dataset string, bits int, queryIDs, docIDs []string, anchorManifestSHA string, anchor map[string]any, qrelsSHA, vectorManifestDir string) {
 	t.Helper()
 	docs := make([]map[string]any, 0, 120)
-	for i := 1; i <= 120; i++ {
-		docs = append(docs, map[string]any{"doc_id": fmtDocIDAOQT(i), "rank": i, "gain": 0, "score": -999})
+	for i, docID := range docIDs {
+		rank := i + 1
+		gain := 0
+		if rank == 1 || (dataset == "nfcorpus" && rank == 80) {
+			gain = 1
+		}
+		docs = append(docs, map[string]any{"doc_id": docID, "rank": rank, "gain": gain})
+	}
+	queryManifestSHA, err := sha256FileAOQT(filepath.Join(vectorManifestDir, dataset+".query.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	docManifestSHA, err := sha256FileAOQT(filepath.Join(vectorManifestDir, dataset+".doc.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	querySource := hex64AOQTMaterializerTest(dataset + "-query_vector-source")
+	docSource := hex64AOQTMaterializerTest(dataset + "-doc_vector-source")
+	scoreSource := hex64AOQTMaterializerTest(dataset + "-q" + strconv.Itoa(bits) + "_score-source")
+	datasetSource := map[string]string{
+		"query_vector":                      querySource,
+		"doc_vector":                        docSource,
+		"q" + strconv.Itoa(bits) + "_score": scoreSource,
+	}
+	rows := make([]map[string]any, 0, len(queryIDs))
+	for _, qid := range queryIDs {
+		rows = append(rows, map[string]any{"qid": qid, "docs": docs})
 	}
 	payload := map[string]any{
-		"schema":     "eos.aoqt_stage2.score_cache_manifest.v1",
-		"dataset":    "nfcorpus",
-		"bits":       bits,
-		"split":      "train",
-		"score_mode": "prepared_ip",
-		"top_k":      120,
-		"turboquant": map[string]any{"score_mode": "prepared_ip", "bits": bits, "seed": AOQTSidecarMaterializerQuantSeed},
-		"rows":       []map[string]any{{"qid": "q1", "docs": docs}},
+		"schema":                           "eos.aoqt_stage2.score_cache_manifest.v1",
+		"dataset":                          dataset,
+		"bits":                             bits,
+		"split":                            "train",
+		"score_mode":                       "prepared_ip",
+		"top_k":                            120,
+		"turboquant":                       map[string]any{"score_mode": "prepared_ip", "bits": bits, "seed": AOQTSidecarMaterializerQuantSeed},
+		"anchor":                           map[string]any{"package_sha256": anchor["package_sha256"], "manifest_sha256": anchorManifestSHA},
+		"topology":                         map[string]any{"id": "aoqt_givens_v1", "sha256": mustSHA256JSONAOQT(anchor["topology"])},
+		"legal_scope":                      anchor["legal_scope"],
+		"source_sha256":                    scoreSource,
+		"qrels_sha256":                     qrelsSHA,
+		"dataset_source_provenance":        datasetSource,
+		"dataset_source_provenance_sha256": mustSHA256JSONAOQT(datasetSource),
+		"vector_cache": map[string]any{
+			"query_manifest_sha256": queryManifestSHA,
+			"query_cache_sha256":    hex64AOQTMaterializerTest(dataset + "-query-cache"),
+			"doc_manifest_sha256":   docManifestSHA,
+			"doc_cache_sha256":      hex64AOQTMaterializerTest(dataset + "-doc-cache"),
+		},
+		"rows": rows,
 	}
 	if err := writeJSONFileAOQT(path, payload); err != nil {
 		t.Fatal(err)
@@ -532,10 +743,99 @@ func readOneAOQTRow(t *testing.T, path string) AOQTSidecarCalibrationRow {
 	if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
 		t.Fatal(err)
 	}
-	if scanner.Scan() {
-		t.Fatalf("expected one row")
-	}
 	return row
+}
+
+func rewriteStrictExclusionManifestAndPlanAuditAOQT(t *testing.T, cfg AOQTSidecarMaterializeConfig, name, dataset string, qids []string) {
+	t.Helper()
+	var targetPath string
+	for _, path := range cfg.ExclusionQIDPaths {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var manifest map[string]any
+		if err := json.Unmarshal(data, &manifest); err != nil {
+			t.Fatal(err)
+		}
+		if manifest["name"] == name {
+			targetPath = path
+			qidsByDataset := manifest["qids_by_dataset"].(map[string]any)
+			qidsByDataset[dataset] = stringsToAnyAOQTMaterializerTest(qids)
+			if err := writeJSONFileAOQT(path, manifest); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+	if targetPath == "" {
+		t.Fatalf("missing exclusion manifest %q", name)
+	}
+	manifestSHA, err := sha256FileAOQT(targetPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := readAOQTPlanMap(t, cfg.PlanPath)
+	exclusions := plan["exclusions"].(map[string]any)
+	sets := exclusions["sets"].([]any)
+	for _, item := range sets {
+		set := item.(map[string]any)
+		if set["name"] != name {
+			continue
+		}
+		qidsByDataset, counts := readStrictExclusionQIDsByDatasetAOQT(t, targetPath)
+		set["manifest_sha256"] = manifestSHA
+		set["qid_count_by_dataset"] = intMapToAnyAOQTMaterializerTest(counts)
+		set["qids_by_dataset_sha256"] = mustSHA256JSONAOQT(qidsByDataset)
+	}
+	aggregate := map[string]map[string]bool{}
+	for _, path := range cfg.ExclusionQIDPaths {
+		qidsByDataset, _ := readStrictExclusionQIDsByDatasetAOQT(t, path)
+		for dataset, qids := range qidsByDataset {
+			if aggregate[dataset] == nil {
+				aggregate[dataset] = map[string]bool{}
+			}
+			for _, qid := range qids {
+				aggregate[dataset][qid] = true
+			}
+		}
+	}
+	aggregateQIDs := boolExclusionMapToSortedQIDsAOQT(aggregate)
+	exclusions["excluded_qid_count_by_dataset"] = intMapToAnyAOQTMaterializerTest(countAOQTMaterializeQIDsByDataset(aggregateQIDs))
+	exclusions["excluded_qids_by_dataset_sha256"] = mustSHA256JSONAOQT(aggregateQIDs)
+	writeAOQTPlanMap(t, cfg.PlanPath, plan)
+}
+
+func readStrictExclusionQIDsByDatasetAOQT(t *testing.T, path string) (map[string][]string, map[string]int) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		QIDsByDataset map[string][]string `json:"qids_by_dataset"`
+	}
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	qidsByDataset := canonicalAOQTMaterializeQIDsByDataset(manifest.QIDsByDataset)
+	return qidsByDataset, countAOQTMaterializeQIDsByDataset(qidsByDataset)
+}
+
+func stringsToAnyAOQTMaterializerTest(values []string) []any {
+	out := make([]any, 0, len(values))
+	for _, value := range values {
+		out = append(out, value)
+	}
+	return out
+}
+
+func intMapToAnyAOQTMaterializerTest(values map[string]int) map[string]any {
+	out := map[string]any{}
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 func unitVecAtAOQT(index int) []float32 {
