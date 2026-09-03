@@ -222,6 +222,13 @@ func TestRunDoctorReportsRuntimeFacts(t *testing.T) {
 	}
 }
 
+func TestRunMaterializeAOQTSidecarRequiresFlags(t *testing.T) {
+	err := run([]string{"materialize-aoqt-sidecar"})
+	if err == nil || !strings.Contains(err.Error(), "requires --plan") {
+		t.Fatalf("error = %v, want required --plan failure", err)
+	}
+}
+
 func TestExportSparseTokenPoolVectorsAcceptsResumeProgressFlags(t *testing.T) {
 	err := runExportSparseTokenPoolVectors([]string{"--resume", "--progress-every", "7", "--tokenizer-max-seq", "4096"})
 	if err == nil {
