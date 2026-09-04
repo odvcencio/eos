@@ -40,6 +40,25 @@ func (rt *Runtime) LoadEmbeddingPackage(ctx context.Context, artifactPath string
 	)
 }
 
+// LoadAOQTResearchEmbeddingPackage loads a native sibling AOQT candidate while
+// explicitly permitting research-only package lineage. Unlike
+// LoadEmbeddingPackage, this method never falls back to sealed-package loading.
+func (rt *Runtime) LoadAOQTResearchEmbeddingPackage(ctx context.Context, artifactPath string) (*EmbeddingModel, error) {
+	return rt.loadEmbeddingPackageWithPaths(
+		ctx,
+		EmbeddingPackagePaths{
+			ArtifactPath:          artifactPath,
+			ManifestPath:          ResolveEmbeddingManifestPath(artifactPath),
+			TokenizerPath:         DefaultTokenizerPath(artifactPath),
+			WeightFilePath:        DefaultWeightFilePath(artifactPath),
+			MemoryPlanPath:        DefaultMemoryPlanPath(artifactPath),
+			PackageManifestPath:   ResolvePackageManifestPath(artifactPath),
+			PostPoolTransformPath: DefaultPostPoolTransformPath(artifactPath),
+		},
+		true,
+	)
+}
+
 func (rt *Runtime) tryLoadSealedEmbeddingPackage(ctx context.Context, path string) (*EmbeddingModel, bool, error) {
 	reader, meta, err := readSealedEosMLL(path)
 	if err != nil {
@@ -79,7 +98,22 @@ func (rt *Runtime) tryLoadSealedEmbeddingPackage(ctx context.Context, path strin
 
 // LoadEmbeddingPackageWithPaths loads a packaged embedding model from explicit artifact, manifest, and weight files.
 func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths EmbeddingPackagePaths) (*EmbeddingModel, error) {
+	return rt.loadEmbeddingPackageWithPaths(ctx, paths, false)
+}
+
+func (rt *Runtime) loadEmbeddingPackageWithPaths(ctx context.Context, paths EmbeddingPackagePaths, allowResearchOnlyAOQT bool) (*EmbeddingModel, error) {
 	opts := make([]LoadOption, 0, 5)
+	if allowResearchOnlyAOQT {
+		if paths.PackageManifestPath == "" {
+			return nil, fmt.Errorf("AOQT research embedding package requires a native package manifest")
+		}
+		if _, err := os.Stat(paths.PackageManifestPath); err != nil {
+			if os.IsNotExist(err) {
+				return nil, fmt.Errorf("AOQT research embedding package requires a native package manifest")
+			}
+			return nil, fmt.Errorf("stat AOQT research embedding package manifest: %w", err)
+		}
+	}
 	manifest, err := ReadEmbeddingManifestFile(paths.ManifestPath)
 	if err != nil {
 		return nil, err
@@ -91,7 +125,11 @@ func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths Embe
 			if err != nil {
 				return nil, err
 			}
-			if err := rejectResearchOnlyRestrictedEmbeddingPackage(packageManifest); err != nil {
+			if allowResearchOnlyAOQT {
+				if err := validateAOQTResearchEmbeddingPackage(packageManifest, manifest); err != nil {
+					return nil, err
+				}
+			} else if err := rejectResearchOnlyRestrictedEmbeddingPackage(packageManifest); err != nil {
 				return nil, err
 			}
 			if manifest.requiresPostPoolTransform() && !packageManifest.HasFileRole(EmbeddingPostPoolTransformRole) {
@@ -119,6 +157,15 @@ func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths Embe
 			}
 			if err := packageManifest.VerifyFiles(verifyPaths); err != nil {
 				return nil, err
+			}
+			if allowResearchOnlyAOQT {
+				artifactSHA, _, err := fileHash(paths.ArtifactPath)
+				if err != nil {
+					return nil, fmt.Errorf("hash AOQT research package artifact: %w", err)
+				}
+				if artifactSHA != packageManifest.AOQTTransform.AnchorArtifactSHA256 {
+					return nil, fmt.Errorf("AOQT research package anchor artifact sha256 mismatch")
+				}
 			}
 			loadedPackageManifest = &packageManifest
 			opts = append(opts, WithPackageManifest(packageManifest))
@@ -171,6 +218,25 @@ func (rt *Runtime) LoadEmbeddingPackageWithPaths(ctx context.Context, paths Embe
 		}
 	}
 	return model, nil
+}
+
+func validateAOQTResearchEmbeddingPackage(packageManifest PackageManifest, manifest EmbeddingManifest) error {
+	if packageManifest.Kind != PackageEmbedding {
+		return fmt.Errorf("AOQT research embedding package kind = %q, want %q", packageManifest.Kind, PackageEmbedding)
+	}
+	if !packageManifest.AOQTTransform.Enabled {
+		return fmt.Errorf("AOQT research embedding package requires enabled AOQT transform policy")
+	}
+	if err := packageManifest.AOQTTransform.Validate(); err != nil {
+		return fmt.Errorf("AOQT research embedding package policy: %w", err)
+	}
+	if manifest.PostPoolTransform != EmbeddingPostPoolTransformAOQTGivens {
+		return fmt.Errorf("AOQT research embedding package requires embedding manifest post_pool_transform %q", EmbeddingPostPoolTransformAOQTGivens)
+	}
+	if !packageManifest.HasFileRole(EmbeddingPostPoolTransformRole) {
+		return fmt.Errorf("AOQT research embedding package requires package file role %q", EmbeddingPostPoolTransformRole)
+	}
+	return nil
 }
 
 func verifyAOQTTransformPolicyBinding(packageManifest PackageManifest, paths EmbeddingPackagePaths, transform AOQTGivensTransform) error {
