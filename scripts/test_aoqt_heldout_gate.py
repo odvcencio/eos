@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import stat
 import sys
@@ -40,6 +41,7 @@ def record(path: Path) -> dict[str, object]:
 
 
 MOCK_EVALUATOR = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import math
 import os
@@ -48,6 +50,8 @@ import sys
 from pathlib import Path
 
 MODE = os.environ.get("MOCK_MODE", "normal")
+RUNTIME_SCHEMA = "eos.aoqt.native_eval_runtime_binding.v1"
+RUNTIME_PRODUCER = "eos-native-runtime-resolved-inputs"
 
 def arg(name):
     try:
@@ -55,9 +59,18 @@ def arg(name):
     except (ValueError, IndexError):
         raise SystemExit("missing " + name)
 
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+def digest(value):
+    return hashlib.sha256(canonical(value)).hexdigest()
+
+def file_digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
 def qrels(path):
     out = {}
-    for raw in Path(path).read_text().splitlines():
+    for raw in path.read_text().splitlines():
         if not raw.strip() or raw.lower().startswith("query-id"):
             continue
         p = raw.split("\t")
@@ -69,10 +82,11 @@ def qrels(path):
     return out
 
 def quality(ranking, rels):
+    # EOS retrieval_eval.go uses linear positive relevance gains.
     positive = [v for v in rels.values() if v > 0]
     ideal = sorted(positive, reverse=True)[:10]
-    idcg = sum((2.0 ** rel - 1.0) / math.log2(i + 2) for i, rel in enumerate(ideal))
-    dcg = sum((2.0 ** rel - 1.0) / math.log2(rank + 1) for rank, _d, rel in ranking if rank <= 10 and rel > 0)
+    idcg = sum(rel / math.log2(i + 2) for i, rel in enumerate(ideal))
+    dcg = sum(rel / math.log2(rank + 1) for rank, _d, rel in ranking if rank <= 10 and rel > 0)
     hit = sum(1 for rank, d, rel in ranking if rank <= 100 and rel > 0 and d in rels)
     return {"ndcg_at_10": dcg / idcg if idcg else 0.0, "recall_at_100": hit / len(positive) if positive else 0.0}
 
@@ -80,18 +94,52 @@ def ranking(qid, rels, relevant_rank, short=False):
     n = 119 if short else 120
     docs = [f"doc-{qid}-{i}" for i in range(1, n + 1)]
     rel_doc = next(d for d, v in rels.items() if v > 0)
-    # Replace a slot rather than inserting a new document.  This keeps the
-    # normal fixture exactly top-k=120 and makes the short NF fixture truly
-    # top-k=119, so the production parser must exercise its boundary guard.
     if rel_doc in docs:
         docs.remove(rel_doc)
         docs.append(f"filler-{qid}")
-    if len(docs) != n:
-        raise SystemExit("fixture ranking length drift")
-    if not 1 <= relevant_rank <= n:
-        raise SystemExit("fixture relevant rank outside top-k")
+    if len(docs) != n or not 1 <= relevant_rank <= n:
+        raise SystemExit("fixture ranking length/rank drift")
     docs[relevant_rank - 1] = rel_doc
     return [(i + 1, d, float(rels.get(d, 0.0))) for i, d in enumerate(docs)]
+
+def runtime_binding(binding, frozen, package, dataset_dir, qpath, outputs):
+    role = binding["role"]
+    domain = binding["domain"]
+    dataset_dir = dataset_dir.resolve()
+    package = package.resolve()
+    qpath = qpath.resolve()
+    rels_by_qid = qrels(qpath)
+    frozen_workload = frozen["workload"]
+    frozen_approved = frozen["approved_workload"]
+    descriptor = frozen_approved["descriptor"]
+    corpus = dataset_dir / "corpus.jsonl"
+    queries = dataset_dir / "queries.jsonl"
+    runtime = {
+        "schema": RUNTIME_SCHEMA,
+        "producer": RUNTIME_PRODUCER,
+        "gate_id": binding["gate_id"],
+        "role": role,
+        "domain": domain,
+        "split": "test",
+        "nonce": os.environ["EOS_AOQT_GATE_NONCE"],
+        "frozen_manifest_sha256": os.environ["EOS_AOQT_FROZEN_MANIFEST_SHA256"],
+        "binary_path": Path(sys.argv[0]).resolve().as_posix(),
+        "binary_sha256": file_digest(Path(sys.argv[0]).resolve()),
+        "argv": [str(Path(sys.argv[0]).resolve()), *sys.argv[1:]],
+        "argv_sha256": digest([str(Path(sys.argv[0]).resolve()), *sys.argv[1:]]),
+        "cwd": Path.cwd().resolve().as_posix(),
+        "dimension": 384,
+        "score_mode": "turboquant_ip_prepared",
+        "package_mode": "native_mll_sibling",
+        "package": {"artifact_path": package.as_posix(), "artifact_sha256": file_digest(package), "package_manifest_path": None, "package_manifest_sha256": None, "roles": [], "roles_sha256": digest([])},
+        "dataset": {"dataset_id": domain, "dataset_dir": dataset_dir.as_posix(), "manifest_path": (dataset_dir / "manifest.json").as_posix(), "manifest_sha256": file_digest(dataset_dir / "manifest.json"), "corpus_path": corpus.as_posix(), "corpus_sha256": file_digest(corpus), "queries_path": queries.as_posix(), "queries_sha256": file_digest(queries)},
+        "qrels": {"path": qpath.as_posix(), "sha256": file_digest(qpath), "qid_set_sha256": digest(sorted(rels_by_qid)), "query_count": len(rels_by_qid), "qrels_pair_count": sum(len(rels) for rels in rels_by_qid.values()), "relevant_pair_count": sum(1 for rels in rels_by_qid.values() for value in rels.values() if value > 0)},
+        "workload": {"path": str(Path(frozen_workload["path"]).resolve()), "sha256": frozen_workload["sha256"], "descriptor_sha256": frozen_approved["sha256"], "qid_set_sha256_by_domain": descriptor["qid_set_sha256_by_domain"], "query_count_by_domain": descriptor["query_count_by_domain"]},
+        "config": {"dimension": 384, "bits": [3, 5], "seed": 5581486560434873699, "top_k": 120, "per_query_top_k": 120, "batch_size": 64, "max_docs": 0, "max_queries": 0, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "rerank_overfetch": [], "rerank_bits": 0},
+        "outputs": {key: str(outputs[key].resolve()) for key in ("metrics", "metrics_tsv", "per_query")},
+    }
+    runtime["binding_sha256"] = digest(runtime)
+    return runtime
 
 def main():
     metrics = Path(arg("--metrics-json"))
@@ -102,6 +150,7 @@ def main():
     package = Path(sys.argv[-2])
     dataset_dir = Path(sys.argv[-1])
     binding = json.loads(os.environ["EOS_AOQT_GATE_BINDING_JSON"])
+    frozen = json.loads(Path(os.environ["EOS_AOQT_FROZEN_MANIFEST_PATH"]).read_text())
     rels_by_qid = qrels(qpath)
     if MODE == "copy-old":
         old = Path(os.environ["MOCK_COPY_FROM"])
@@ -118,11 +167,23 @@ def main():
     bad_nf = MODE == "missing-nf" and domain == "nfcorpus"
     candidate = binding["role"] == "candidate"
     regression = MODE == "regression" and candidate
+    boundary_regression = MODE == "boundary-regression" and candidate and domain == "nfcorpus"
+    outputs = {"metrics": metrics, "metrics_tsv": tsv, "per_query": perq}
+    runtime = runtime_binding(binding, frozen, package, dataset_dir, qpath, outputs)
+    if MODE == "echo-gate-binding":
+        runtime = binding
+    elif MODE == "bad-runtime-binding":
+        runtime["binary_sha256"] = "0" * 64
     rows = []
     aggregates = {3: [], 5: []}
     dense_values = []
     for qid, rels in sorted(rels_by_qid.items()):
-        q3_rank = 1 if candidate and qid.endswith("-q0") else 2
+        if domain == "nfcorpus" and qid.endswith("-q0"):
+            q3_rank = 1 if candidate else 90
+            if boundary_regression:
+                q3_rank = 110
+        else:
+            q3_rank = 1 if candidate and qid.endswith("-q0") else 2
         if regression:
             q3_rank = 3
         q5_rank = 1
@@ -138,23 +199,16 @@ def main():
         aggregates[5].append(q5)
         for bits, compact, q in ((3, compact3, q3), (5, compact5, q5)):
             row = {
-                "schema": "manta.embedding_turboquant_retrieval_per_query.v1",
-                "dataset": domain,
-                "query_id": qid,
-                "method": f"turboquant_ip_b{bits}",
-                "bits": bits,
-                "scoring_surface": "turboquant_ip_prepared",
-                "quantizer_seed": 5581486560434873699,
-                "relevant_count": sum(1 for v in rels.values() if v > 0),
-                "first_relevant_rank": next(rank for rank, d, _r in compact if d in rels),
-                "quality": q,
-                "dense_quality": dq,
-                "top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in compact],
-                "dense_top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in dense],
-                "gate_binding": binding,
+                "schema": "manta.embedding_turboquant_retrieval_per_query.v1", "dataset": domain, "query_id": qid, "method": f"turboquant_ip_b{bits}", "bits": bits, "scoring_surface": "turboquant_ip_prepared", "quantizer_seed": 5581486560434873699, "relevant_count": sum(1 for v in rels.values() if v > 0), "first_relevant_rank": next(rank for rank, d, _r in compact if d in rels), "quality": q, "dense_quality": dq,
+                "top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in compact], "dense_top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in dense], "gate_binding": binding, "runtime_binding": runtime,
             }
+            if MODE != "omit-boundary" and not bad_nf and domain == "nfcorpus" and qid in frozen["approved_workload"]["descriptor"]["nfcorpus_boundary_qids"]:
+                compact_fingerprint = [{"rank": r, "doc_id": d, "score": float(1.0 / r)} for r, d, _rel in compact]
+                dense_fingerprint = [{"rank": r, "doc_id": d, "score": float(1.0 / r)} for r, d, _rel in dense]
+                row["boundary_evidence"] = {"schema": "eos.aoqt.nfcorpus_boundary_evidence.v1", "qid": qid, "rank_window": [80, 120], "candidate_count": len(compact), "exit_rank": len(compact), "substitution_count": 0, "margin_to_exit": 1.0, "compact_top_k_sha256": digest(compact_fingerprint), "dense_top_k_sha256": digest(dense_fingerprint), "window": [{"rank": rank, "doc_id": compact[rank - 1][1], "score": float(1.0 / rank)} for rank in (80, 120)], "boundary_complete": True}
             if MODE == "omit-binding":
                 row.pop("gate_binding")
+                row.pop("runtime_binding")
             rows.append(row)
     def avg(values, key):
         return sum(item[key] for item in values) / len(values)
@@ -163,30 +217,18 @@ def main():
     for bits in (3, 5):
         q = {"ndcg_at_10": avg(aggregates[bits], "ndcg_at_10"), "recall_at_100": avg(aggregates[bits], "recall_at_100")}
         native_rows.append({"bits": bits, "method": f"turboquant_ip_b{bits}", "quality": q, "ndcg_at_10_delta": 0.0, "recall_at_100_delta": 0.0})
+    corpus_count = sum(1 for line in (dataset_dir / "corpus.jsonl").read_text().splitlines() if line.strip())
     payload = {
-        "schema": "manta.embedding_turboquant_retrieval_metrics.v1",
-        "dataset": domain,
-        "artifact": str(package),
-        "backend": "mock-native",
-        "inputs": {
-            "corpus_path": str((dataset_dir / "corpus.jsonl").resolve()),
-            "queries_path": str((dataset_dir / "queries.jsonl").resolve()),
-            "qrels_path": str(qpath.resolve()),
-            "qrels_sha256": __import__("hashlib").sha256(qpath.read_bytes()).hexdigest(),
-            "documents": 120,
-            "queries": len(rels_by_qid),
-            "relevant_pairs": sum(1 for rels in rels_by_qid.values() for v in rels.values() if v > 0),
-            "scored_pairs": 120 * len(rels_by_qid),
-        },
-        "config": {"batch_size": 64, "top_k": 120, "bits": [3, 5], "quantizer_seed": 5581486560434873699},
-        "dense": {"quality": dense},
-        "rows": native_rows,
-        "gate_binding": binding,
+        "schema": "manta.embedding_turboquant_retrieval_metrics.v1", "dataset": domain, "artifact": str(package.resolve()), "backend": "mock-native",
+        "inputs": {"corpus_path": str((dataset_dir / "corpus.jsonl").resolve()), "corpus_sha256": file_digest(dataset_dir / "corpus.jsonl"), "queries_path": str((dataset_dir / "queries.jsonl").resolve()), "queries_sha256": file_digest(dataset_dir / "queries.jsonl"), "qrels_path": str(qpath.resolve()), "qrels_sha256": file_digest(qpath), "workload_sha256": frozen["workload"]["sha256"], "approved_workload_sha256": frozen["approved_workload"]["sha256"], "documents": corpus_count, "queries": len(rels_by_qid), "relevant_pairs": sum(len(rels) for rels in rels_by_qid.values()), "scored_pairs": 120 * len(rels_by_qid)},
+        "config": {"dimension": 384, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "batch_size": 64, "top_k": 120, "per_query_top_k": 120, "bits": [3, 5], "quantizer_seed": 5581486560434873699, "max_docs": 0, "max_queries": 0, "rerank_overfetch": [], "rerank_bits": 0},
+        "dense": {"quality": dense}, "rows": native_rows, "gate_binding": binding, "runtime_binding": runtime,
     }
     if MODE == "bad-qrels-binding":
         payload["inputs"]["qrels_sha256"] = "0" * 64
     if MODE == "omit-binding":
         payload.pop("gate_binding")
+        payload.pop("runtime_binding")
     metrics.write_text(json.dumps(payload, sort_keys=True) + "\n")
     tsv.write_text("dataset\trow\tbits\tmethod\tplaceholder\n" + f"{domain}\tdense\t\tfloat32\n" + f"{domain}\tquantized\t3\tturboquant_ip_b3\n" + f"{domain}\tquantized\t5\tturboquant_ip_b5\n")
     perq.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n")
@@ -203,8 +245,10 @@ class Fixture:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.inputs = self.root / "inputs"
+        self.workload_root = self.root / "workload-root"
         self.output_root = self.root / "gate-runs"
         self.inputs.mkdir(parents=True)
+        self.workload_root.mkdir()
         self.output_root.mkdir()
         self.plan_path = self.root / "gate-plan.json"
         self.frozen_path = self.root / "frozen.json"
@@ -247,12 +291,17 @@ class Fixture:
         write_json(self.source_manifest, {"schema": "fixture.source.v1", "source_id": "mock-native"})
         for domain in gate.DOMAINS:
             dataset = self.datasets[domain]
-            write_raw(dataset / "corpus.jsonl", '{"_id":"doc"}\n')
+            corpus_ids = []
+            for qid in self.qids[domain]:
+                corpus_ids.extend([f"doc-{qid}-{index}" for index in range(1, 121)])
+                corpus_ids.append(f"filler-{qid}")
+                corpus_ids.append(f"rel-{qid}")
+            write_raw(dataset / "corpus.jsonl", "".join(json.dumps({"_id": doc_id}) + "\n" for doc_id in corpus_ids))
             write_raw(dataset / "queries.jsonl", '{"_id":"q"}\n')
-            write_json(dataset / "manifest.json", {"schema": gate.DATASET_SCHEMA, "domain": domain, "dataset_id": f"fixture-{domain}", "split": gate.HELDOUT_SPLIT, "corpus_sha256": gate.sha256_file(dataset / "corpus.jsonl"), "queries_sha256": gate.sha256_file(dataset / "queries.jsonl")})
+            write_json(dataset / "manifest.json", {"schema": gate.DATASET_SCHEMA, "domain": domain, "dataset_id": domain, "split": gate.HELDOUT_SPLIT, "corpus_sha256": gate.sha256_file(dataset / "corpus.jsonl"), "queries_sha256": gate.sha256_file(dataset / "queries.jsonl")})
             write_raw(self.qrels[domain], "query-id\tcorpus-id\tscore\n" + "\n".join(f"{qid}\trel-{qid}\t1" for qid in self.qids[domain]) + "\n")
         qrels_records = {domain: record(path) for domain, path in self.qrels.items()}
-        dataset_records = {domain: {"dataset_id": f"fixture-{domain}", "dataset_dir": str(self.datasets[domain]), "corpus": record(self.datasets[domain] / "corpus.jsonl"), "queries": record(self.datasets[domain] / "queries.jsonl"), "manifest": record(self.datasets[domain] / "manifest.json")} for domain in gate.DOMAINS}
+        dataset_records = {domain: {"dataset_id": domain, "dataset_dir": str(self.datasets[domain]), "corpus": record(self.datasets[domain] / "corpus.jsonl"), "queries": record(self.datasets[domain] / "queries.jsonl"), "manifest": record(self.datasets[domain] / "manifest.json")} for domain in gate.DOMAINS}
         compatibility = gate.sha256_bytes(b"fixture-compatibility")
         approved_payload = {"schema": gate.APPROVED_WORKLOAD_SCHEMA, "gate_id": "fixture-gate", "descriptor_id": "fixture-approved", "split": gate.HELDOUT_SPLIT, "dimension": gate.DIMENSION, "domains": list(gate.DOMAINS), "query_ids_by_domain": copy.deepcopy(self.qids), "qid_set_sha256_by_domain": gate.qids_sha256_by_domain(self.qids), "query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}, "qrels_query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "relevant_pair_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "compatibility_digest": compatibility, "nfcorpus_boundary_qids": [self.qids["nfcorpus"][0]], "nfcorpus_boundary_qids_sha256": gate.sha256_json([self.qids["nfcorpus"][0]]), "nfcorpus_boundary_rank_window": [80, 120], "metric_surfaces": list(gate.SURFACES), "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100}, "turboquant": {"q3_bits": 3, "q5_bits": 5, "seed": gate.TURBOQUANT_SEED, "top_k": 120, "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling"}}
         write_json(self.approved, approved_payload)
@@ -284,12 +333,12 @@ class Fixture:
         candidate_siblings = self.entries([self.candidate_package, self.candidate_manifest, self.candidate_sidecar])
         anchor_record = {**record(self.anchor_package), "manifest": record(self.anchor_manifest), "attestation": record(self.anchor_attestation), "sibling_rollup_sha256": gate.sha256_json(anchor_siblings)}
         candidate_record = {**record(self.candidate_package), "manifest": record(self.candidate_manifest), "attestation": record(self.candidate_attestation), "sibling_rollup_sha256": gate.sha256_json(candidate_siblings)}
-        self.plan = {"schema": gate.PLAN_SCHEMA, "gate_id": "fixture-gate", "candidate_id": "fixture-candidate", "dimension": gate.DIMENSION, "thresholds": copy.deepcopy(gate.THRESHOLDS), "evaluation": {"executed": False, "official": False}, "anchor": {"id": "fixture-anchor", "package": anchor_record}, "candidate": {"id": "fixture-candidate", "package": candidate_record}, "source": {"manifest": record(self.source_manifest), "binary": record(self.binary), "cwd": str(self.root), "dataset_by_domain": dataset_records, "workload": workload_record, "approved_workload": approved_record}, "approved_workload": approved_record, "qrels": qrels_records, "exclusions": [{"kind": "qid_only", "name": name, "manifest": record(self.exclusions[name])} for name in gate.EXCLUSION_NAMES], "workload_root": str(self.inputs), "output_root": str(self.output_root)}
+        self.plan = {"schema": gate.PLAN_SCHEMA, "gate_id": "fixture-gate", "candidate_id": "fixture-candidate", "dimension": gate.DIMENSION, "thresholds": copy.deepcopy(gate.THRESHOLDS), "evaluation": {"executed": False, "official": False}, "anchor": {"id": "fixture-anchor", "package": anchor_record}, "candidate": {"id": "fixture-candidate", "package": candidate_record}, "source": {"manifest": record(self.source_manifest), "binary": record(self.binary), "cwd": str(self.root), "dataset_by_domain": dataset_records, "workload": workload_record, "approved_workload": approved_record}, "approved_workload": approved_record, "qrels": qrels_records, "exclusions": [{"kind": "qid_only", "name": name, "manifest": record(self.exclusions[name])} for name in gate.EXCLUSION_NAMES], "workload_root": str(self.workload_root), "output_root": str(self.output_root)}
         write_json(self.plan_path, self.plan)
         return self
 
     def freeze(self) -> dict:
-        return gate.freeze_manifest(self.plan_path, self.frozen_path, test_mode=True)
+        return gate._freeze_manifest_for_tests(self.plan_path, self.frozen_path)
 
     def run_kwargs(self, frozen: dict) -> dict:
         return {"expected_frozen_manifest_sha256": frozen["file_sha256"], "expected_workload_manifest_sha256": frozen["manifest"]["approved_workload"]["sha256"], "expected_binary_sha256": frozen["manifest"]["provenance"]["binary_sha256"], "expected_anchor_package_sha256": frozen["manifest"]["expected_anchor_identity"]["artifact_sha256"], "expected_anchor_manifest_sha256": frozen["manifest"]["expected_anchor_identity"]["package_manifest_sha256"], "expected_anchor_embedding_space_id": frozen["manifest"]["expected_anchor_identity"]["embedding_space_id"], "test_mode": True, "timeout_seconds": 30}
@@ -333,10 +382,43 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateError, "not the pinned current D384 anchor"):
             gate.run_harness(f.frozen_path, **kwargs)
 
+    def test_production_rejects_coherent_alternate_workload_against_fixed_registry(self) -> None:
+        f = self.fixture()
+        approved = json.loads(f.approved.read_text())
+        workload = json.loads(f.workload.read_text())
+        qrel_records = {}
+        for domain, path in f.qrels.items():
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{domain}-q-extra\trel-{domain}-q-extra\t1\n")
+            parsed = gate.parse_qrels(path, f"test.{domain}.qrels")
+            qrel_records[domain] = record(path)
+            approved["query_ids_by_domain"][domain] = parsed["qids"]
+            approved["qid_set_sha256_by_domain"][domain] = parsed["qid_set_sha256"]
+            approved["query_count_by_domain"][domain] = parsed["query_count"]
+            approved["qrels_sha256_by_domain"][domain] = parsed["sha256"]
+            approved["qrels_query_count_by_domain"][domain] = parsed["query_count"]
+            approved["relevant_pair_count_by_domain"][domain] = parsed["relevant_pair_count"]
+            workload["query_ids_by_domain"][domain] = parsed["qids"]
+            workload["qid_set_sha256_by_domain"][domain] = parsed["qid_set_sha256"]
+            workload["query_count_by_domain"][domain] = parsed["query_count"]
+            workload["qrels_sha256_by_domain"][domain] = parsed["sha256"]
+        write_json(f.approved, approved)
+        approved_record = record(f.approved)
+        workload["descriptor_sha256"] = approved_record["sha256"]
+        write_json(f.workload, workload)
+        f.plan["qrels"] = qrel_records
+        f.plan["approved_workload"] = approved_record
+        f.plan["source"]["approved_workload"] = approved_record
+        f.plan["source"]["workload"] = record(f.workload)
+        write_json(f.plan_path, f.plan)
+        with mock.patch.object(gate, "require_elf_executable"):
+            with self.assertRaisesRegex(gate.GateError, "fixed trusted registry artifact|registry qrels identity/count mismatch"):
+                gate.validate_plan(f.plan_path, production=True)
+
     def test_production_rejects_synthetic_json_package_fallback(self) -> None:
         f = self.fixture()
         frozen = f.freeze()
-        with self.assertRaisesRegex(gate.GateError, "native MLL artifacts|JSON fallback"):
+        with self.assertRaisesRegex(gate.GateError, r"native MLL artifacts|JSON fallback|missing \['package_manifest'\]"):
             gate.normalize_package_record(
                 frozen["manifest"]["anchor"],
                 f.frozen_path.parent,
@@ -387,6 +469,34 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         with self.assertRaisesRegex(gate.GateError, "compatibility digest mismatch"):
             f.freeze()
 
+    def test_package_pair_allows_shared_anchor_artifact_with_distinct_xpkg(self) -> None:
+        anchor_identity = {
+            "artifact_sha256": "a" * 64,
+            "package_manifest_sha256": "b" * 64,
+            "embedding_space_id": "c" * 64,
+        }
+        candidate_identity = {
+            "artifact_sha256": "a" * 64,
+            "package_manifest_sha256": "d" * 64,
+            "embedding_space_id": "c" * 64,
+        }
+        gate.validate_package_pair(
+            {"package_identity": anchor_identity, "embedding_space_id": "c" * 64},
+            {"package_identity": candidate_identity, "anchor_identity": anchor_identity, "embedding_space_id": "c" * 64},
+        )
+
+    def test_package_pair_rejects_reused_xpkg_identity(self) -> None:
+        identity = {
+            "artifact_sha256": "a" * 64,
+            "package_manifest_sha256": "b" * 64,
+            "embedding_space_id": "c" * 64,
+        }
+        with self.assertRaisesRegex(gate.GateError, "package identities must be distinct"):
+            gate.validate_package_pair(
+                {"package_identity": identity, "embedding_space_id": "c" * 64},
+                {"package_identity": dict(identity), "anchor_identity": identity, "embedding_space_id": "c" * 64},
+            )
+
     def test_exclusion_source_rollup_digest_must_bind_files(self) -> None:
         f = self.fixture()
         payload = json.loads(f.exclusions["dev4"].read_text())
@@ -421,6 +531,32 @@ class AOQTHeldoutGateTest(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "native evaluator fields missing|gate binding"):
                 gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
+    def test_runtime_binding_cannot_echo_gate_binding(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "echo-gate-binding"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "native runtime binding mismatch"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_runtime_binding_hash_must_match_resolved_binary(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "bad-runtime-binding"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "native runtime binding mismatch"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_native_gate_binding_environment_uses_self_digest(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        info = gate.validate_frozen_manifest(f.frozen_path, expected_frozen_manifest_sha256=frozen["file_sha256"], production=False)
+        outputs = {"metrics": f.root / "m.json", "metrics_tsv": f.root / "m.tsv", "per_query": f.root / "m.jsonl"}
+        argv = gate.build_evaluator_argv(info, "candidate", "nfcorpus", outputs)
+        binding = gate._binding_for_run(info, "candidate", "nfcorpus", "a" * 32, argv, outputs)
+        env = gate._harness_environment(info, "a" * 32, binding, test_mode=True)
+        self.assertEqual(env["EOS_AOQT_GATE_BINDING_JSON"], gate.canonical_json(binding).decode("utf-8"))
+        self.assertEqual(env["EOS_AOQT_GATE_BINDING_SHA256"], binding["binding_sha256"])
+        self.assertNotEqual(env["EOS_AOQT_GATE_BINDING_SHA256"], gate.sha256_bytes(env["EOS_AOQT_GATE_BINDING_JSON"].encode("utf-8")))
+
     def test_native_qrels_binding_mismatch_is_rejected(self) -> None:
         f = self.fixture()
         frozen = f.freeze()
@@ -452,13 +588,102 @@ class AOQTHeldoutGateTest(unittest.TestCase):
             with self.assertRaisesRegex(gate.GateError, "boundary coverage|boundary ranks|exactly top-k=120"):
                 gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
+    def test_nf_boundary_is_derived_from_bound_native_top120_when_receipt_omitted(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "omit-boundary"}, clear=False):
+            report = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+        self.assertTrue(report["gate_pass"])
+        self.assertEqual(report["domains"]["nfcorpus"]["boundary"]["rank_window"], [80, 120])
+
     def test_native_per_query_regression_fails_quality_gate(self) -> None:
         f = self.fixture()
         frozen = f.freeze()
         with mock.patch.dict(os.environ, {"MOCK_MODE": "regression"}, clear=False):
             report = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
         self.assertFalse(report["gate_pass"])
-        self.assertTrue(any(item.startswith("query:fiqa") for item in report["failures"]))
+        self.assertTrue(any(item.startswith("domain:fiqa") or item.startswith("macro:") for item in report["failures"]))
+
+    def test_fixed_nf_boundary_safety_is_not_an_unconditional_pass(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "boundary-regression"}, clear=False):
+            report = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+        self.assertFalse(report["gate_pass"])
+        self.assertIn("domain:nfcorpus:nfcorpus_boundary_safety", report["failures"])
+        boundary = report["domains"]["nfcorpus"]["boundary"]
+        self.assertEqual(boundary["rank_window"], [80, 120])
+        self.assertEqual(boundary["evaluable_qid_count"], 1)
+        self.assertLess(boundary["candidate_recall_at_100"], boundary["anchor_recall_at_100"])
+
+    def test_linear_graded_ndcg_matches_eos_convention(self) -> None:
+        rels = {"graded-a": 3.0, "graded-b": 1.0}
+        top = [{"rank": 1, "doc_id": "graded-b", "score": 1.0, "relevance": 1.0}, {"rank": 2, "doc_id": "graded-a", "score": 0.5, "relevance": 3.0}]
+        for rank in range(3, gate.TOP_K + 1):
+            top.append({"rank": rank, "doc_id": f"graded-filler-{rank}", "score": 1.0 / rank, "relevance": 0.0})
+        metrics = gate._rank_metrics(top, rels, {item["doc_id"] for item in top}, "graded")
+        expected = (1.0 / 1.0 + 3.0 / math.log2(3.0)) / (3.0 / 1.0 + 1.0 / math.log2(3.0))
+        self.assertAlmostEqual(metrics["ndcg_at_10"], expected)
+
+    def test_native_aoqt_json_uses_xpkg_policy_and_allows_optional_orthogonality(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "candidate.aoqt.json"
+            stages = []
+            for _stage in range(gate.AOQT_TOPOLOGY["stages"]):
+                stages.append(
+                    {
+                        "pairs": [[2 * index, 2 * index + 1] for index in range(gate.AOQT_TOPOLOGY["pairs_per_stage"])],
+                        "angles": [0.001] * gate.AOQT_TOPOLOGY["pairs_per_stage"],
+                    }
+                )
+            payload = {"version": "eos/aoqt-givens-transform/v1", "kind": gate.AOQT_TOPOLOGY["id"], "dim": gate.DIMENSION, "seed": 191, "angle_cap": 0.04, "stages": stages, "audit": {}}
+            payload["audit"] = {"pairings_sha256": gate._transform_pairings_sha256(stages, "fixture"), "angles_sha256": gate._transform_angles_sha256(stages, "fixture"), "orthogonality_frobenius_per_dim": 0.0}
+            write_json(path, payload)
+            expected_policy = {
+                "transform_sha256": gate.sha256_file(path),
+                "pairings_sha256": payload["audit"]["pairings_sha256"],
+                "angles_sha256": payload["audit"]["angles_sha256"],
+                "anchor_artifact_sha256": "a" * 64,
+                "anchor_package_manifest_sha256": "b" * 64,
+                "anchor_embedding_space_id": "c" * 64,
+            }
+            parsed = gate._parse_actual_aoqt_transform(path, expected_anchor={"artifact_sha256": "a" * 64, "package_manifest_sha256": "b" * 64, "embedding_space_id": "c" * 64}, expected_policy=expected_policy, label="fixture.sidecar")
+            self.assertEqual(parsed["angle_count"], 1536)
+            self.assertEqual(parsed["angles_sha256"], payload["audit"]["angles_sha256"])
+            self.assertEqual(parsed["orthogonality_frobenius_per_dim"], 0.0)
+
+    def test_native_aoqt_json_rejects_training_policy_hash_substitution(self) -> None:
+        head = {
+            "aoqt_transform_enabled": True,
+            "aoqt_transform_research_only": True,
+            "aoqt_transform_research_train_allowed": True,
+            "aoqt_transform_release_train_allowed": False,
+            "aoqt_transform_commercial_use_allowed": False,
+            "aoqt_transform_free_open_release_allowed": False,
+            "aoqt_transform_quality_claim": False,
+            "aoqt_transform_schema": "eos.aoqt_transform_policy.v1",
+            "aoqt_transform_anchor_artifact_sha256": "a" * 64,
+            "aoqt_transform_anchor_package_manifest_sha256": "b" * 64,
+            "aoqt_transform_anchor_embedding_space_id": "c" * 64,
+            "aoqt_transform_dataset_manifest_sha256": gate.AOQT_TRAIN_PROVENANCE["dataset_manifest_sha256"],
+            "aoqt_transform_qrels_sha256_by_dataset": "\n".join(f"{domain}={digest}" for domain, digest in gate.AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"].items()),
+            "aoqt_transform_compatibility_digest": gate.AOQT_TRAIN_PROVENANCE["compatibility_digest"],
+            "aoqt_transform_transform_sha256": "d" * 64,
+            "aoqt_transform_pairings_sha256": "e" * 64,
+            "aoqt_transform_angles_sha256": "f" * 64,
+        }
+        policy = gate._parse_xpkg_aoqt_policy(head, "candidate", "fixture")
+        self.assertIsNotNone(policy)
+        head["aoqt_transform_qrels_sha256_by_dataset"] = "\n".join(f"{domain}={'0' * 64 if domain == 'fiqa' else digest}" for domain, digest in gate.AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"].items())
+        with self.assertRaisesRegex(gate.GateError, "raw-v4 training provenance"):
+            gate._parse_xpkg_aoqt_policy(head, "candidate", "fixture")
+
+    def test_workload_output_root_collision_is_rejected(self) -> None:
+        f = self.fixture()
+        f.plan["output_root"] = str(f.datasets["fiqa"])
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "dataset directories|input/package artifacts"):
+            f.freeze()
 
     def test_argv_is_constructed_with_all_pinned_semantics(self) -> None:
         f = self.fixture()
