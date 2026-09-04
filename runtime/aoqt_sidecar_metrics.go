@@ -410,6 +410,9 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 			return fmt.Errorf("AOQT optimizer diagnostics optimizer-path rejected proposal accounting mismatch")
 		}
 		if diagnostics.CoordinateProposalAttempts > 0 {
+			if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyQ3GainPrimary {
+				return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyQ3GainPrimary)
+			}
 			if diagnostics.CoordinateTopAngles <= 0 || diagnostics.CoordinateTopAngles > aoqtTransactionalCoordinateTopAngles {
 				return fmt.Errorf("AOQT optimizer diagnostics coordinate_top_angles = %d outside expected range", diagnostics.CoordinateTopAngles)
 			}

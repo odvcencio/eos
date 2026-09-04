@@ -677,7 +677,7 @@ func TestAOQTTransactionalStepRollsBackExactStateWhenUnsafe(t *testing.T) {
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
 	}
 
-	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
 		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
 	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
 	if err != nil {
@@ -717,7 +717,7 @@ func TestAOQTTransactionalStepAcceptsSmallerScale(t *testing.T) {
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
 	}
 
-	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
 		if math.Abs(float64(trainer.angles[0])) > 0.0075 {
 			return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
 		}
@@ -754,7 +754,7 @@ func TestAOQTTransactionalStepFallsBackToCoordinateAfterAdamRejection(t *testing
 	}
 	var observedAngles []float32
 
-	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
 		angle := trainer.angles[0]
 		observedAngles = append(observedAngles, angle)
 		if angle > 0 {
@@ -812,7 +812,7 @@ func TestAOQTTransactionalStepTriesSafeTopCoordinateBlock(t *testing.T) {
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
 	}
 
-	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
 		for i := 0; i < aoqtTransactionalCoordinateTopAngles; i++ {
 			if trainer.angles[i] >= -0.0099 {
 				return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
@@ -848,6 +848,54 @@ func TestAOQTTransactionalStepTriesSafeTopCoordinateBlock(t *testing.T) {
 	}
 }
 
+func TestAOQTTransactionalCoordinateFallbackUsesQ3GainPrimaryGradient(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 87)
+	trainer := newTinyAOQTTrainer(t, false, 87)
+	aggregateGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	aggregateGrad[0] = 100
+	q3GainGrad[1] = -3
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+	var observedAngles []float32
+
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		observedAngles = append(observedAngles, trainer.angles[1])
+		if trainer.angles[1] > 0 && trainer.angles[0] == 0 {
+			return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
+		}
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
+	if err != nil {
+		t.Fatalf("transactional step: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("coordinate fallback did not follow q3_gain-primary gradient")
+	}
+	if len(observedAngles) != 5 {
+		t.Fatalf("observed %d proposals %v, want 4 aggregate Adam rejects then first q3 coordinate acceptance", len(observedAngles), observedAngles)
+	}
+	for i, angle := range observedAngles[:4] {
+		if angle != 0 {
+			t.Fatalf("Adam proposal %d moved q3-only coordinate angle = %.9g, want untouched", i, angle)
+		}
+	}
+	if observedAngles[4] <= 0 {
+		t.Fatalf("accepted q3-primary coordinate angle = %.9g, want positive q3 direction", observedAngles[4])
+	}
+	if trainer.angles[0] != 0 {
+		t.Fatalf("aggregate-only angle = %.9g, want restored before q3 coordinate acceptance", trainer.angles[0])
+	}
+	if diagnostics.CoordinateProposalAttempts != 1 || diagnostics.CoordinateAcceptedProposals != 1 || diagnostics.CoordinateRejectedProposals != 0 {
+		t.Fatalf("coordinate diagnostics = %+v, want first q3 coordinate accepted", diagnostics)
+	}
+	if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyQ3GainPrimary {
+		t.Fatalf("coordinate search strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyQ3GainPrimary)
+	}
+}
+
 func TestAOQTTransactionalStepRejectsNoOpSafeCandidate(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 82)
 	trainer := newTinyAOQTTrainer(t, false, 82)
@@ -858,7 +906,7 @@ func TestAOQTTransactionalStepRejectsNoOpSafeCandidate(t *testing.T) {
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
 	}
 
-	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
 		return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
 	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
 	if err != nil {
@@ -928,7 +976,7 @@ func TestAOQTTransactionalRejectionDiagnosticsClassifyGates(t *testing.T) {
 				MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
 			}
 
-			accepted, err := trainer.acceptTransactionalAdamStep(grad, tc.baseline, func() (aoqtStepEvaluation, error) {
+			accepted, err := trainer.acceptTransactionalAdamStep(grad, grad, tc.baseline, func() (aoqtStepEvaluation, error) {
 				return tc.candidate, nil
 			}, weights, &diagnostics)
 			if err != nil {
@@ -954,13 +1002,15 @@ func TestAOQTTransactionalRejectionDiagnosticsClassifyGates(t *testing.T) {
 }
 
 func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
-	grad := make([]float32, 8)
-	grad[0] = 1
-	grad[1] = -3
-	grad[2] = 1
-	grad[4] = -2
-	grad[5] = 2
-	order, err := rankedAOQTCoordinateSearchAngles(grad)
+	q3GainGrad := make([]float32, 8)
+	aggregateGrad := make([]float32, 8)
+	q3GainGrad[0] = 1
+	q3GainGrad[1] = -3
+	q3GainGrad[2] = 1
+	q3GainGrad[4] = -2
+	q3GainGrad[5] = 2
+	copy(aggregateGrad, q3GainGrad)
+	order, err := rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad)
 	if err != nil {
 		t.Fatalf("rank coordinates: %v", err)
 	}
@@ -976,14 +1026,15 @@ func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("coordinate order = %v, want abs-desc/index-stable %v", got, want)
 	}
-	if dirs := aoqtCoordinateSearchDirections(grad[1]); dirs != [2]float32{1, -1} {
+	if dirs := aoqtCoordinateSearchDirections(q3GainGrad[1]); dirs != [2]float32{1, -1} {
 		t.Fatalf("negative-gradient directions = %v, want positive then negative", dirs)
 	}
-	if dirs := aoqtCoordinateSearchDirections(grad[0]); dirs != [2]float32{-1, 1} {
+	if dirs := aoqtCoordinateSearchDirections(q3GainGrad[0]); dirs != [2]float32{-1, 1} {
 		t.Fatalf("positive-gradient directions = %v, want negative then positive", dirs)
 	}
 	magnitudes := []float32{0.01, 0.005}
 	plan := aoqtCoordinateSearchPlan{
+		Strategy:   aoqtCoordinateSearchStrategyQ3GainPrimary,
 		Order:      order[:top],
 		Magnitudes: magnitudes,
 		BlockSizes: aoqtCoordinateSearchBlockSizes(top),
@@ -1004,6 +1055,49 @@ func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
 	}
 	if err := validateAOQTSHA256(ha, "coordinate ordering hash"); err != nil {
 		t.Fatalf("ordering hash invalid: %v", err)
+	}
+}
+
+func TestAOQTCoordinateSearchOrderingUsesQ3GainPrimaryTieBreaks(t *testing.T) {
+	q3GainGrad := []float32{0, 2, -2, 2, -2, 1}
+	aggregateGrad := []float32{100, 0.25, -10, -50, -5, 200}
+	order, err := rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad)
+	if err != nil {
+		t.Fatalf("rank coordinates: %v", err)
+	}
+	var got []int
+	for _, item := range order {
+		got = append(got, item.index)
+	}
+	want := []int{2, 4, 1, 3, 5}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("coordinate order = %v, want q3-abs then non-conflict/aggregate/index tie-breaks %v", got, want)
+	}
+	if !order[3].guardConflict {
+		t.Fatalf("rank for index 3 should record aggregate/q3 guard conflict")
+	}
+	if order[0].aggregateAbs != 10 {
+		t.Fatalf("rank aggregate abs = %.9g, want plan hash to bind aggregate tie-break", order[0].aggregateAbs)
+	}
+}
+
+func TestAOQTQ3GainOnlyAngleGradMatchesAggregateForQ3OnlyObjective(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 88)
+	for i := range set.Rows {
+		set.Rows[i].Weights = AOQTSidecarRowWeights{Q3Gain: set.Rows[i].Weights.Q3Gain}
+	}
+	set.Manifest.ObjectiveContract = tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed).ObjectiveContract(sumAOQTRowWeights(set.Rows))
+	trainer := newTinyAOQTTrainer(t, false, 88)
+	_, aggregateGrad, _, _, err := trainer.lossAndAngleGrad(set.Rows, toyAOQTObjective{})
+	if err != nil {
+		t.Fatalf("aggregate q3-only grad: %v", err)
+	}
+	q3GainGrad, err := trainer.q3GainOnlyAngleGrad(set.Rows, toyAOQTObjective{})
+	if err != nil {
+		t.Fatalf("q3-only grad: %v", err)
+	}
+	if !float32SlicesEqual(aggregateGrad, q3GainGrad) {
+		t.Fatalf("q3-only gradient differs from aggregate gradient for q3-only objective")
 	}
 }
 
