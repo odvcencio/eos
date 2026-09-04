@@ -616,13 +616,15 @@ type aoqtOptimizerState struct {
 }
 
 const (
-	aoqtTransactionalMaxAttemptsPerStep        = 80
-	aoqtTransactionalAdamMaxAttemptsPerStep    = 4
-	aoqtTransactionalCoordinateTopAngles       = 8
-	aoqtTransactionalCoordinateMagnitudeCount  = 4
-	aoqtCoordinateSearchStrategyQ3GainPrimary  = "q3_gain_primary_v1"
-	aoqtTransactionalLossEpsilon               = float32(1e-7)
-	aoqtTransactionalQ3ImprovementMinMagnitude = float32(0)
+	aoqtTransactionalMaxAttemptsPerStep              = 80
+	aoqtTransactionalAdamMaxAttemptsPerStep          = 4
+	aoqtTransactionalCoordinateTopAngles             = 8
+	aoqtTransactionalCoordinateMagnitudeCount        = 6
+	aoqtTransactionalCoordinateBlockMagnitudeCount   = 4
+	aoqtTransactionalCoordinateReverseMagnitudeCount = 2
+	aoqtCoordinateSearchStrategyQ3GainPrimary        = "q3_gain_primary_fine_tail_v1"
+	aoqtTransactionalLossEpsilon                     = float32(1e-7)
+	aoqtTransactionalQ3ImprovementMinMagnitude       = float32(0)
 )
 
 var aoqtTransactionalCoordinateBlockSizes = []int{2, 4, 8}
@@ -1009,7 +1011,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 		diagnostics.Backtracks++
 		return false, nil
 	}
-	for _, magnitude := range plan.Magnitudes {
+	for _, magnitude := range plan.BlockMagnitudes {
 		for _, blockSize := range plan.BlockSizes {
 			accepted, err := tryProposal(func() {
 				for _, ranked := range plan.Order[:blockSize] {
@@ -1022,19 +1024,32 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 		}
 	}
 	for _, ranked := range plan.Order {
-		directions := aoqtCoordinateSearchDirections(q3GainGrad[ranked.index])
-		for _, direction := range directions {
-			for _, magnitude := range plan.Magnitudes {
-				accepted, err := tryProposal(func() {
-					t.angles[ranked.index] += direction * magnitude
-				})
-				if err != nil || accepted {
-					return accepted, err
-				}
-				if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
-					t.restoreOptimizerState(state)
-					return false, nil
-				}
+		direction := aoqtCoordinateSearchPrimaryDirection(q3GainGrad[ranked.index])
+		for _, magnitude := range plan.Magnitudes {
+			accepted, err := tryProposal(func() {
+				t.angles[ranked.index] += direction * magnitude
+			})
+			if err != nil || accepted {
+				return accepted, err
+			}
+			if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
+				t.restoreOptimizerState(state)
+				return false, nil
+			}
+		}
+	}
+	for _, ranked := range plan.Order {
+		direction := -aoqtCoordinateSearchPrimaryDirection(q3GainGrad[ranked.index])
+		for _, magnitude := range plan.ReverseMagnitudes {
+			accepted, err := tryProposal(func() {
+				t.angles[ranked.index] += direction * magnitude
+			})
+			if err != nil || accepted {
+				return accepted, err
+			}
+			if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
+				t.restoreOptimizerState(state)
+				return false, nil
 			}
 		}
 	}
@@ -1111,10 +1126,12 @@ type aoqtCoordinateSearchRank struct {
 }
 
 type aoqtCoordinateSearchPlan struct {
-	Strategy   string
-	Order      []aoqtCoordinateSearchRank
-	Magnitudes []float32
-	BlockSizes []int
+	Strategy          string
+	Order             []aoqtCoordinateSearchRank
+	Magnitudes        []float32
+	BlockMagnitudes   []float32
+	ReverseMagnitudes []float32
+	BlockSizes        []int
 }
 
 func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRate float32) (aoqtCoordinateSearchPlan, error) {
@@ -1132,10 +1149,12 @@ func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRa
 		return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT coordinate search requires at least one finite positive magnitude")
 	}
 	return aoqtCoordinateSearchPlan{
-		Strategy:   aoqtCoordinateSearchStrategyQ3GainPrimary,
-		Order:      order,
-		Magnitudes: magnitudes,
-		BlockSizes: aoqtCoordinateSearchBlockSizes(top),
+		Strategy:          aoqtCoordinateSearchStrategyQ3GainPrimary,
+		Order:             order,
+		Magnitudes:        magnitudes,
+		BlockMagnitudes:   aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateBlockMagnitudeCount),
+		ReverseMagnitudes: aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateReverseMagnitudeCount),
+		BlockSizes:        aoqtCoordinateSearchBlockSizes(top),
 	}, nil
 }
 
@@ -1202,6 +1221,16 @@ func aoqtCoordinateSearchMagnitudes(learningRate float32) []float32 {
 	return magnitudes
 }
 
+func aoqtCoordinateSearchMagnitudePrefix(magnitudes []float32, count int) []float32 {
+	if count > len(magnitudes) {
+		count = len(magnitudes)
+	}
+	if count <= 0 {
+		return nil
+	}
+	return append([]float32(nil), magnitudes[:count]...)
+}
+
 func aoqtCoordinateSearchBlockSizes(top int) []int {
 	blockSizes := make([]int, 0, len(aoqtTransactionalCoordinateBlockSizes))
 	for _, size := range aoqtTransactionalCoordinateBlockSizes {
@@ -1221,8 +1250,10 @@ func (plan aoqtCoordinateSearchPlan) SHA256() (string, error) {
 			GuardConflict bool    `json:"guard_conflict"`
 			AggregateAbs  float32 `json:"aggregate_abs"`
 		} `json:"order"`
-		Magnitudes []float32 `json:"magnitudes"`
-		BlockSizes []int     `json:"block_sizes"`
+		Magnitudes        []float32 `json:"magnitudes"`
+		BlockMagnitudes   []float32 `json:"block_magnitudes"`
+		ReverseMagnitudes []float32 `json:"reverse_magnitudes"`
+		BlockSizes        []int     `json:"block_sizes"`
 	}{
 		Strategy: plan.Strategy,
 		Order: make([]struct {
@@ -1231,8 +1262,10 @@ func (plan aoqtCoordinateSearchPlan) SHA256() (string, error) {
 			GuardConflict bool    `json:"guard_conflict"`
 			AggregateAbs  float32 `json:"aggregate_abs"`
 		}, len(plan.Order)),
-		Magnitudes: append([]float32(nil), plan.Magnitudes...),
-		BlockSizes: append([]int(nil), plan.BlockSizes...),
+		Magnitudes:        append([]float32(nil), plan.Magnitudes...),
+		BlockMagnitudes:   append([]float32(nil), plan.BlockMagnitudes...),
+		ReverseMagnitudes: append([]float32(nil), plan.ReverseMagnitudes...),
+		BlockSizes:        append([]int(nil), plan.BlockSizes...),
 	}
 	for i, item := range plan.Order {
 		payload.Order[i].Index = item.index
