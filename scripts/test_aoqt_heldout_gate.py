@@ -1,9 +1,9 @@
-"""Synthetic contract tests for :mod:`aoqt_heldout_gate`.
+"""Synthetic, local-only tests for :mod:`aoqt_heldout_gate`.
 
-The fixtures are deliberately local and fake: they contain no qrels results,
-vectors, evaluator invocation, or official metric values. Every test exercises
-one of the gate's provenance, binding, freshness, or quality fail-closed
-contracts.
+The evaluator used here is a tiny executable written into a temporary
+directory.  It is never the EOS binary and it consumes only synthetic qrels,
+corpus, and query files.  No official qrels result or official evaluator is
+read by this test module.
 """
 
 from __future__ import annotations
@@ -11,11 +11,12 @@ from __future__ import annotations
 import copy
 import json
 import os
+import stat
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -27,514 +28,474 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def write_raw(path: Path, text: str) -> None:
+def write_raw(path: Path, text: str, *, executable: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+    if executable:
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
 def record(path: Path) -> dict[str, object]:
     return {"path": str(path.resolve()), "sha256": gate.sha256_file(path), "bytes": path.stat().st_size}
 
 
+MOCK_EVALUATOR = r'''#!/usr/bin/env python3
+import json
+import math
+import os
+import shutil
+import sys
+from pathlib import Path
+
+MODE = os.environ.get("MOCK_MODE", "normal")
+
+def arg(name):
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        raise SystemExit("missing " + name)
+
+def qrels(path):
+    out = {}
+    for raw in Path(path).read_text().splitlines():
+        if not raw.strip() or raw.lower().startswith("query-id"):
+            continue
+        p = raw.split("\t")
+        if len(p) == 3:
+            q, d, rel = p
+        else:
+            q, _, d, rel = p
+        out.setdefault(q, {})[d] = float(rel)
+    return out
+
+def quality(ranking, rels):
+    positive = [v for v in rels.values() if v > 0]
+    ideal = sorted(positive, reverse=True)[:10]
+    idcg = sum((2.0 ** rel - 1.0) / math.log2(i + 2) for i, rel in enumerate(ideal))
+    dcg = sum((2.0 ** rel - 1.0) / math.log2(rank + 1) for rank, _d, rel in ranking if rank <= 10 and rel > 0)
+    hit = sum(1 for rank, d, rel in ranking if rank <= 100 and rel > 0 and d in rels)
+    return {"ndcg_at_10": dcg / idcg if idcg else 0.0, "recall_at_100": hit / len(positive) if positive else 0.0}
+
+def ranking(qid, rels, relevant_rank, short=False):
+    n = 119 if short else 120
+    docs = [f"doc-{qid}-{i}" for i in range(1, n + 1)]
+    rel_doc = next(d for d, v in rels.items() if v > 0)
+    # Replace a slot rather than inserting a new document.  This keeps the
+    # normal fixture exactly top-k=120 and makes the short NF fixture truly
+    # top-k=119, so the production parser must exercise its boundary guard.
+    if rel_doc in docs:
+        docs.remove(rel_doc)
+        docs.append(f"filler-{qid}")
+    if len(docs) != n:
+        raise SystemExit("fixture ranking length drift")
+    if not 1 <= relevant_rank <= n:
+        raise SystemExit("fixture relevant rank outside top-k")
+    docs[relevant_rank - 1] = rel_doc
+    return [(i + 1, d, float(rels.get(d, 0.0))) for i, d in enumerate(docs)]
+
+def main():
+    metrics = Path(arg("--metrics-json"))
+    tsv = Path(arg("--metrics-tsv"))
+    perq = Path(arg("--per-query-jsonl"))
+    qpath = Path(arg("--qrels"))
+    domain = arg("--dataset")
+    package = Path(sys.argv[-2])
+    dataset_dir = Path(sys.argv[-1])
+    binding = json.loads(os.environ["EOS_AOQT_GATE_BINDING_JSON"])
+    rels_by_qid = qrels(qpath)
+    if MODE == "copy-old":
+        old = Path(os.environ["MOCK_COPY_FROM"])
+        stem = f"{binding['role']}.{domain}"
+        shutil.copy2(old / f"{stem}.metrics.json", metrics)
+        shutil.copy2(old / f"{stem}.metrics.tsv", tsv)
+        shutil.copy2(old / f"{stem}.per-query.jsonl", perq)
+        return
+    if MODE == "forged":
+        metrics.write_text(json.dumps({"schema": "manta.embedding_turboquant_retrieval_metrics.v1", "dataset": domain}) + "\n")
+        tsv.write_text("not-native\n")
+        perq.write_text("{}\n")
+        return
+    bad_nf = MODE == "missing-nf" and domain == "nfcorpus"
+    candidate = binding["role"] == "candidate"
+    regression = MODE == "regression" and candidate
+    rows = []
+    aggregates = {3: [], 5: []}
+    dense_values = []
+    for qid, rels in sorted(rels_by_qid.items()):
+        q3_rank = 1 if candidate and qid.endswith("-q0") else 2
+        if regression:
+            q3_rank = 3
+        q5_rank = 1
+        dense_rank = 1
+        compact3 = ranking(qid, rels, q3_rank, short=bad_nf)
+        compact5 = ranking(qid, rels, q5_rank, short=bad_nf)
+        dense = ranking(qid, rels, dense_rank, short=bad_nf)
+        q3 = quality(compact3, rels)
+        q5 = quality(compact5, rels)
+        dq = quality(dense, rels)
+        dense_values.append(dq)
+        aggregates[3].append(q3)
+        aggregates[5].append(q5)
+        for bits, compact, q in ((3, compact3, q3), (5, compact5, q5)):
+            row = {
+                "schema": "manta.embedding_turboquant_retrieval_per_query.v1",
+                "dataset": domain,
+                "query_id": qid,
+                "method": f"turboquant_ip_b{bits}",
+                "bits": bits,
+                "scoring_surface": "turboquant_ip_prepared",
+                "quantizer_seed": 5581486560434873699,
+                "relevant_count": sum(1 for v in rels.values() if v > 0),
+                "first_relevant_rank": next(rank for rank, d, _r in compact if d in rels),
+                "quality": q,
+                "dense_quality": dq,
+                "top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in compact],
+                "dense_top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in dense],
+                "gate_binding": binding,
+            }
+            if MODE == "omit-binding":
+                row.pop("gate_binding")
+            rows.append(row)
+    def avg(values, key):
+        return sum(item[key] for item in values) / len(values)
+    dense = {"ndcg_at_10": avg(dense_values, "ndcg_at_10"), "recall_at_100": avg(dense_values, "recall_at_100")}
+    native_rows = []
+    for bits in (3, 5):
+        q = {"ndcg_at_10": avg(aggregates[bits], "ndcg_at_10"), "recall_at_100": avg(aggregates[bits], "recall_at_100")}
+        native_rows.append({"bits": bits, "method": f"turboquant_ip_b{bits}", "quality": q, "ndcg_at_10_delta": 0.0, "recall_at_100_delta": 0.0})
+    payload = {
+        "schema": "manta.embedding_turboquant_retrieval_metrics.v1",
+        "dataset": domain,
+        "artifact": str(package),
+        "backend": "mock-native",
+        "inputs": {
+            "corpus_path": str((dataset_dir / "corpus.jsonl").resolve()),
+            "queries_path": str((dataset_dir / "queries.jsonl").resolve()),
+            "qrels_path": str(qpath.resolve()),
+            "qrels_sha256": __import__("hashlib").sha256(qpath.read_bytes()).hexdigest(),
+            "documents": 120,
+            "queries": len(rels_by_qid),
+            "relevant_pairs": sum(1 for rels in rels_by_qid.values() for v in rels.values() if v > 0),
+            "scored_pairs": 120 * len(rels_by_qid),
+        },
+        "config": {"batch_size": 64, "top_k": 120, "bits": [3, 5], "quantizer_seed": 5581486560434873699},
+        "dense": {"quality": dense},
+        "rows": native_rows,
+        "gate_binding": binding,
+    }
+    if MODE == "bad-qrels-binding":
+        payload["inputs"]["qrels_sha256"] = "0" * 64
+    if MODE == "omit-binding":
+        payload.pop("gate_binding")
+    metrics.write_text(json.dumps(payload, sort_keys=True) + "\n")
+    tsv.write_text("dataset\trow\tbits\tmethod\tplaceholder\n" + f"{domain}\tdense\t\tfloat32\n" + f"{domain}\tquantized\t3\tturboquant_ip_b3\n" + f"{domain}\tquantized\t5\tturboquant_ip_b5\n")
+    perq.write_text("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n")
+    if MODE == "mutate-qrels":
+        with qpath.open("a") as handle:
+            handle.write("mutated-qid\tmutated-doc\t1\n")
+
+if __name__ == "__main__":
+    main()
+'''
+
+
 class Fixture:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.inputs = self.root / "inputs"
-        self.outputs = self.root / "retrieval-outputs"
+        self.output_root = self.root / "gate-runs"
         self.inputs.mkdir(parents=True)
-        self.outputs.mkdir()
+        self.output_root.mkdir()
         self.plan_path = self.root / "gate-plan.json"
         self.frozen_path = self.root / "frozen.json"
-        self.attestation_path = self.root / "attestation.json"
-
-        self.binary = self.inputs / "eos-native-evaluator"
-        self.source_manifest = self.inputs / "source-manifest.json"
-        self.dataset = self.inputs / "heldout-dataset-manifest.json"
-        self.approved_workload = self.inputs / "approved-workload.json"
-        self.workload = self.inputs / "evaluator-workload.json"
-        self.qrels = {domain: self.inputs / f"{domain}.qrels" for domain in gate.DOMAINS}
-        self.exclusions = {name: self.inputs / f"{name}.exclusion.json" for name in gate.EXCLUSION_NAMES}
-
-        self.anchor_package = self.inputs / "anchor/d384-anchor.mll"
-        self.anchor_manifest = self.inputs / "anchor/d384-anchor.package.json"
-        self.anchor_attestation = self.inputs / "anchor/d384-anchor.attestation.json"
-        self.candidate_package = self.inputs / "candidate/d384-candidate.mll"
-        self.candidate_manifest = self.inputs / "candidate/d384-candidate.package.json"
-        self.candidate_attestation = self.inputs / "candidate/d384-candidate.attestation.json"
-        self.candidate_sidecar = self.inputs / "candidate/d384-candidate.sidecar.json"
-
+        self.binary = self.inputs / "mock-eos"
+        self.source_manifest = self.inputs / "source.json"
+        self.approved = self.inputs / "approved-workload.json"
+        self.workload = self.inputs / "workload.json"
+        self.qrels = {domain: self.inputs / domain / "qrels.tsv" for domain in gate.DOMAINS}
+        self.datasets = {domain: self.inputs / domain for domain in gate.DOMAINS}
+        self.exclusions = {name: self.inputs / f"{name}.json" for name in gate.EXCLUSION_NAMES}
+        self.exclusion_sources = {name: self.inputs / f"{name}.source.json" for name in gate.EXCLUSION_NAMES}
+        self.anchor_package = self.inputs / "anchor" / "d384-anchor.mll"
+        self.anchor_manifest = self.inputs / "anchor" / "d384-anchor.package.json"
+        self.anchor_attestation = self.inputs / "anchor" / "d384-anchor.attestation.json"
+        self.candidate_package = self.inputs / "candidate" / "d384-candidate.mll"
+        self.candidate_manifest = self.inputs / "candidate" / "d384-candidate.package.json"
+        self.candidate_attestation = self.inputs / "candidate" / "d384-candidate.attestation.json"
+        self.candidate_sidecar = self.inputs / "candidate" / "d384-candidate.sidecar.json"
         self.plan: dict = {}
+        self.qids = {domain: [f"{domain}-q0", f"{domain}-q1"] for domain in gate.DOMAINS}
 
-    def _transform(self) -> dict:
-        return {
-            "id": gate.AOQT_TOPOLOGY["id"],
-            "dim": gate.DIMENSION,
-            "stages": gate.AOQT_TOPOLOGY["stages"],
-            "pairs_per_stage": gate.AOQT_TOPOLOGY["pairs_per_stage"],
-            "angle_count": gate.AOQT_TOPOLOGY["angle_count"],
-            "pairings_sha256": gate.sha256_bytes(b"fixture-pairings"),
-            "angles_sha256": gate.sha256_bytes(b"fixture-angles"),
-            "angle_cap": 0.01,
-            "max_angle_cap": gate.AOQT_TOPOLOGY["angle_cap_hard"],
-        }
+    def transform(self) -> dict:
+        return {"id": gate.AOQT_TOPOLOGY["id"], "dim": gate.DIMENSION, "stages": 8, "pairs_per_stage": 192, "angle_count": 1536, "pairings_sha256": gate.sha256_bytes(b"pairings"), "angles_sha256": gate.sha256_bytes(b"angles"), "angle_cap": 0.04, "max_angle_cap": 0.08}
 
-    def _manifest_policy(self, *, role: str, package: Path, anchor: dict | None, sidecar_sha: str | None, transform: dict | None) -> dict:
-        return {
-            "schema": gate.PACKAGE_MANIFEST_SCHEMA,
-            "role": role,
-            "package_sha256": gate.sha256_file(package),
-            "dimension": gate.DIMENSION,
-            "embedding_space_id": "fixture-space",
-            "post_pool_transform": "none" if role == "anchor" else "aoqt_givens_v1",
-            "research_only": role == "candidate",
-            "topology": copy.deepcopy(gate.AOQT_TOPOLOGY),
-            "transform": copy.deepcopy(transform),
-            "anchor": copy.deepcopy(anchor),
-            "legal_scope": copy.deepcopy(gate.AOQT_LEGAL_SCOPE),
-            "sidecar_sha256": sidecar_sha,
-        }
+    def package_manifest(self, role: str, package: Path, *, anchor: dict | None, sidecar_sha: str | None, transform: dict | None, embedding_space: str) -> dict:
+        anchor_view = None if anchor is None else {"package_sha256": anchor["artifact_sha256"], "manifest_sha256": anchor["package_manifest_sha256"], "embedding_space_id": anchor["embedding_space_id"]}
+        return {"schema": gate.PACKAGE_MANIFEST_SCHEMA, "role": role, "package_sha256": gate.sha256_file(package), "dimension": gate.DIMENSION, "embedding_space_id": embedding_space, "post_pool_transform": "none" if role == "anchor" else gate.AOQT_TOPOLOGY["id"], "research_only": role == "candidate", "topology": copy.deepcopy(gate.AOQT_TOPOLOGY), "transform": copy.deepcopy(transform), "anchor": anchor_view, "legal_scope": copy.deepcopy(gate.AOQT_LEGAL_SCOPE), "sidecar_sha256": sidecar_sha}
 
-    def _sibling_entries(self, paths: list[Path]) -> list[dict]:
+    def entries(self, paths: list[Path]) -> list[dict]:
         return sorted(({"name": path.name, **record(path)} for path in paths), key=lambda item: item["name"])
 
-    def _attestation_policy(self, *, role: str, package: Path, manifest: Path, anchor: dict, sidecar: Path | None, sibling_entries: list[dict], transform: dict | None) -> dict:
-        sidecar_policy = record(sidecar) if sidecar is not None else None
-        return {
-            "schema": gate.PACKAGE_ATTESTATION_SCHEMA,
-            "role": role,
-            "package_sha256": gate.sha256_file(package),
-            "manifest_sha256": gate.sha256_file(manifest),
-            "dimension": gate.DIMENSION,
-            "embedding_space_id": "fixture-space",
-            "post_pool_transform": "none" if role == "anchor" else "aoqt_givens_v1",
-            "research_only": role == "candidate",
-            "topology": copy.deepcopy(gate.AOQT_TOPOLOGY),
-            "transform": copy.deepcopy(transform),
-            "anchor": copy.deepcopy(anchor),
-            "legal_scope": copy.deepcopy(gate.AOQT_LEGAL_SCOPE),
-            "sidecar": sidecar_policy,
-            "sibling_rollup": {"entries": sibling_entries, "sha256": gate.sha256_json(sibling_entries)},
-        }
+    def attestation(self, role: str, package: Path, manifest: Path, *, embedding_space: str, anchor: dict, sidecar: Path | None, transform: dict | None, dataset_binding: dict) -> dict:
+        sidecar_record = record(sidecar) if sidecar else None
+        siblings = self.entries([package, manifest] + ([sidecar] if sidecar else []))
+        anchor_view = {"package_sha256": anchor["artifact_sha256"], "manifest_sha256": anchor["package_manifest_sha256"], "embedding_space_id": anchor["embedding_space_id"]}
+        return {"schema": gate.PACKAGE_ATTESTATION_SCHEMA, "role": role, "package_sha256": gate.sha256_file(package), "manifest_sha256": gate.sha256_file(manifest), "dimension": gate.DIMENSION, "embedding_space_id": embedding_space, "post_pool_transform": "none" if role == "anchor" else gate.AOQT_TOPOLOGY["id"], "research_only": role == "candidate", "topology": copy.deepcopy(gate.AOQT_TOPOLOGY), "transform": copy.deepcopy(transform), "anchor": anchor_view, "legal_scope": copy.deepcopy(gate.AOQT_LEGAL_SCOPE), "sidecar": sidecar_record, "sibling_rollup": {"entries": siblings, "sha256": gate.sha256_json(siblings)}, "dataset_binding": copy.deepcopy(dataset_binding), "compatibility_digest": gate.sha256_bytes(b"fixture-compatibility"), "identity": {"artifact_sha256": gate.sha256_file(package), "package_manifest_sha256": gate.sha256_file(manifest), "embedding_space_id": embedding_space}}
 
     def build(self) -> "Fixture":
-        self.binary.write_bytes(b"synthetic-native-evaluator-binary")
-        write_json(self.source_manifest, {"schema": "fixture.source.v2", "source_id": "synthetic-native"})
-        write_json(self.dataset, {"schema": "fixture.dataset-manifest.v1", "dataset_id": "synthetic-heldout", "split": "heldout", "domains": list(gate.DOMAINS)})
-        for domain, path in self.qrels.items():
-            path.write_text(f"synthetic-{domain}-qrels\n", encoding="utf-8")
-
+        write_raw(self.binary, MOCK_EVALUATOR, executable=True)
+        write_json(self.source_manifest, {"schema": "fixture.source.v1", "source_id": "mock-native"})
+        for domain in gate.DOMAINS:
+            dataset = self.datasets[domain]
+            write_raw(dataset / "corpus.jsonl", '{"_id":"doc"}\n')
+            write_raw(dataset / "queries.jsonl", '{"_id":"q"}\n')
+            write_json(dataset / "manifest.json", {"schema": gate.DATASET_SCHEMA, "domain": domain, "dataset_id": f"fixture-{domain}", "split": gate.HELDOUT_SPLIT, "corpus_sha256": gate.sha256_file(dataset / "corpus.jsonl"), "queries_sha256": gate.sha256_file(dataset / "queries.jsonl")})
+            write_raw(self.qrels[domain], "query-id\tcorpus-id\tscore\n" + "\n".join(f"{qid}\trel-{qid}\t1" for qid in self.qids[domain]) + "\n")
+        qrels_records = {domain: record(path) for domain, path in self.qrels.items()}
+        dataset_records = {domain: {"dataset_id": f"fixture-{domain}", "dataset_dir": str(self.datasets[domain]), "corpus": record(self.datasets[domain] / "corpus.jsonl"), "queries": record(self.datasets[domain] / "queries.jsonl"), "manifest": record(self.datasets[domain] / "manifest.json")} for domain in gate.DOMAINS}
+        compatibility = gate.sha256_bytes(b"fixture-compatibility")
+        approved_payload = {"schema": gate.APPROVED_WORKLOAD_SCHEMA, "gate_id": "fixture-gate", "descriptor_id": "fixture-approved", "split": gate.HELDOUT_SPLIT, "dimension": gate.DIMENSION, "domains": list(gate.DOMAINS), "query_ids_by_domain": copy.deepcopy(self.qids), "qid_set_sha256_by_domain": gate.qids_sha256_by_domain(self.qids), "query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}, "qrels_query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "relevant_pair_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "compatibility_digest": compatibility, "nfcorpus_boundary_qids": [self.qids["nfcorpus"][0]], "nfcorpus_boundary_qids_sha256": gate.sha256_json([self.qids["nfcorpus"][0]]), "nfcorpus_boundary_rank_window": [80, 120], "metric_surfaces": list(gate.SURFACES), "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100}, "turboquant": {"q3_bits": 3, "q5_bits": 5, "seed": gate.TURBOQUANT_SEED, "top_k": 120, "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling"}}
+        write_json(self.approved, approved_payload)
+        approved_record = record(self.approved)
+        workload_payload = {"schema": gate.WORKLOAD_SCHEMA, "gate_id": "fixture-gate", "workload_id": "fixture-workload", "descriptor_sha256": approved_record["sha256"], "split": gate.HELDOUT_SPLIT, "dimension": gate.DIMENSION, "query_ids_by_domain": copy.deepcopy(self.qids), "qid_set_sha256_by_domain": gate.qids_sha256_by_domain(self.qids), "query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}, "dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "compatibility_digest": compatibility}
+        write_json(self.workload, workload_payload)
+        workload_record = record(self.workload)
+        for name in gate.EXCLUSION_NAMES:
+            source = self.exclusion_sources[name]
+            write_json(source, {"source": name, "fixture": True})
+            source_map = {str(source.resolve()): gate.sha256_file(source)}
+            write_json(self.exclusions[name], {"schema": "eos.aoqt_stage2.exclusion_qids.v1", "name": name, "qids_by_dataset": {domain: [f"excluded-{name}-{domain}"] for domain in gate.DOMAINS}, "source_sha256": gate.sha256_json(source_map), "source_sha256_by_file": source_map})
+        anchor_space = gate.sha256_bytes(b"fixture-anchor-space")
+        candidate_space = gate.sha256_bytes(b"fixture-candidate-space")
         self.anchor_package.parent.mkdir(parents=True, exist_ok=True)
         self.candidate_package.parent.mkdir(parents=True, exist_ok=True)
-        self.anchor_package.write_bytes(b"synthetic-anchor-package")
-        self.candidate_package.write_bytes(b"synthetic-candidate-package")
-
-        anchor_binding = {"package_sha256": gate.sha256_file(self.anchor_package), "manifest_sha256": "0" * 64}
-        anchor_manifest_policy = self._manifest_policy(role="anchor", package=self.anchor_package, anchor=None, sidecar_sha=None, transform=None)
-        write_json(self.anchor_manifest, anchor_manifest_policy)
-        anchor_binding["manifest_sha256"] = gate.sha256_file(self.anchor_manifest)
-
-        transform = self._transform()
-        sidecar_payload = {
-            "schema": gate.SIDECAR_SCHEMA,
-            "topology": copy.deepcopy(gate.AOQT_TOPOLOGY),
-            "anchor": copy.deepcopy(anchor_binding),
-            "pairings_sha256": transform["pairings_sha256"],
-            "angles_sha256": transform["angles_sha256"],
-            "legal_scope": copy.deepcopy(gate.AOQT_LEGAL_SCOPE),
-        }
-        write_json(self.candidate_sidecar, sidecar_payload)
-        candidate_manifest_policy = self._manifest_policy(role="candidate", package=self.candidate_package, anchor=anchor_binding, sidecar_sha=gate.sha256_file(self.candidate_sidecar), transform=transform)
-        write_json(self.candidate_manifest, candidate_manifest_policy)
-
-        anchor_entries = self._sibling_entries([self.anchor_package, self.anchor_manifest])
-        candidate_entries = self._sibling_entries([self.candidate_package, self.candidate_manifest, self.candidate_sidecar])
-        anchor_policy = self._attestation_policy(role="anchor", package=self.anchor_package, manifest=self.anchor_manifest, anchor=anchor_binding, sidecar=None, sibling_entries=anchor_entries, transform=None)
-        candidate_policy = self._attestation_policy(role="candidate", package=self.candidate_package, manifest=self.candidate_manifest, anchor=anchor_binding, sidecar=self.candidate_sidecar, sibling_entries=candidate_entries, transform=transform)
-        write_json(self.anchor_attestation, anchor_policy)
-        write_json(self.candidate_attestation, candidate_policy)
-
-        anchor_package_record = {
-            **record(self.anchor_package),
-            "manifest": record(self.anchor_manifest),
-            "attestation": record(self.anchor_attestation),
-            "sibling_rollup_sha256": anchor_policy["sibling_rollup"]["sha256"],
-        }
-        candidate_package_record = {
-            **record(self.candidate_package),
-            "manifest": record(self.candidate_manifest),
-            "attestation": record(self.candidate_attestation),
-            "sibling_rollup_sha256": candidate_policy["sibling_rollup"]["sha256"],
-        }
-
-        qrels = {domain: {**record(path), "query_count": 1, "relevant_count": 1} for domain, path in self.qrels.items()}
-        qids = {domain: [f"H-{domain}"] for domain in gate.DOMAINS}
-        approved_payload = {
-            "schema": gate.APPROVED_WORKLOAD_SCHEMA,
-            "workload_id": "fixture-approved-heldout-workload",
-            "gate_id": "fixture-aoqt-gate",
-            "split": "heldout",
-            "dimension": gate.DIMENSION,
-            "domains": list(gate.DOMAINS),
-            "query_ids_by_domain": qids,
-            "qid_set_sha256_by_domain": {domain: gate.sha256_json(qids[domain]) for domain in gate.DOMAINS},
-            "query_count_by_domain": {domain: 1 for domain in gate.DOMAINS},
-            "qrels_by_domain": qrels,
-            "nfcorpus_boundary_qids": qids["nfcorpus"],
-            "nfcorpus_boundary_qids_sha256": gate.sha256_json(qids["nfcorpus"]),
-            "nfcorpus_boundary_rank_window": [80, 120],
-            "metric_surfaces": list(gate.SURFACES),
-            "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100},
-            "turboquant": {"q3_bits": gate.Q3_BITS, "q5_bits": gate.Q5_BITS, "seed": gate.TURBOQUANT_SEED, "top_k": gate.TOP_K},
-            "expected_result_artifact_count": gate.RESULT_OUTPUT_COUNT,
-        }
-        write_json(self.approved_workload, approved_payload)
-        workload_payload = {key: value for key, value in approved_payload.items() if key != "qrels_by_domain"}
-        workload_payload["schema"] = gate.WORKLOAD_SCHEMA
-        write_json(self.workload, workload_payload)
-
-        for name, path in self.exclusions.items():
-            exclusion_payload = {
-                "schema": "eos.aoqt.heldout_exclusion.v1",
-                "name": name,
-                "split": name,
-                "qids_by_domain": {domain: [f"E-{name}-{domain}"] for domain in gate.DOMAINS},
-                "source_sha256": gate.sha256_json({"fixture": name}),
-                "source_sha256_by_file": {f"{name}.source": gate.sha256_json({"source": name})},
-            }
-            write_json(path, exclusion_payload)
-
-        artifacts = {
-            role: {
-                domain: {"path": str(self.outputs / f"{role}.{domain}.json"), "receipt": {"path": str(self.outputs / f"{role}.{domain}.receipt.json")}}
-                for domain in gate.DOMAINS
-            }
-            for role in gate.ROLES
-        }
-        self.plan = {
-            "schema": gate.PLAN_SCHEMA,
-            "gate_id": "fixture-aoqt-gate",
-            "candidate_id": "fixture-candidate",
-            "dimension": gate.DIMENSION,
-            "thresholds": copy.deepcopy(gate.THRESHOLDS),
-            "evaluation": {"executed": False, "official": False},
-            "anchor": {"id": "fixture-anchor", "package": anchor_package_record},
-            "candidate": {"id": "fixture-candidate", "package": candidate_package_record},
-            "source": {
-                "manifest": record(self.source_manifest),
-                "binary": record(self.binary),
-                "dataset": record(self.dataset),
-                "cwd": str(self.root),
-                "argv": {
-                    "anchor": [str(self.binary), gate.NATIVE_EVAL_SUBCOMMAND, "--package", str(self.anchor_package)],
-                    "candidate": [str(self.binary), gate.NATIVE_EVAL_SUBCOMMAND, "--package", str(self.candidate_package)],
-                },
-                "workload": record(self.workload),
-                "approved_workload": record(self.approved_workload),
-            },
-            "approved_workload": record(self.approved_workload),
-            "qrels": qrels,
-            "exclusions": [{"kind": "qid_only", "name": name, **record(path)} for name, path in self.exclusions.items()],
-            "workload_root": str(self.inputs),
-            "output_root": str(self.outputs),
-            "artifacts": artifacts,
-            "attestation_path": str(self.attestation_path),
-        }
+        write_raw(self.anchor_package, "synthetic-anchor-package")
+        write_raw(self.candidate_package, "synthetic-candidate-package")
+        anchor_manifest = self.package_manifest("anchor", self.anchor_package, anchor=None, sidecar_sha=None, transform=None, embedding_space=anchor_space)
+        write_json(self.anchor_manifest, anchor_manifest)
+        anchor_identity = {"artifact_sha256": gate.sha256_file(self.anchor_package), "package_manifest_sha256": gate.sha256_file(self.anchor_manifest), "embedding_space_id": anchor_space}
+        transform = self.transform()
+        write_json(self.candidate_sidecar, {"schema": gate.SIDECAR_SCHEMA, "kind": gate.AOQT_TOPOLOGY["id"], "dim": 384, "stages": 8, "pairs_per_stage": 192, "angle_count": 1536, "angle_cap": 0.04, "max_angle_cap": 0.08, "pairings_sha256": transform["pairings_sha256"], "angles_sha256": transform["angles_sha256"], "anchor_package_sha256": anchor_identity["artifact_sha256"], "anchor_manifest_sha256": anchor_identity["package_manifest_sha256"], "anchor_embedding_space_id": anchor_space, "legal_scope": copy.deepcopy(gate.AOQT_LEGAL_SCOPE)})
+        write_json(self.candidate_manifest, self.package_manifest("candidate", self.candidate_package, anchor=anchor_identity, sidecar_sha=gate.sha256_file(self.candidate_sidecar), transform=transform, embedding_space=candidate_space))
+        data_binding = {"dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}}
+        write_json(self.anchor_attestation, self.attestation("anchor", self.anchor_package, self.anchor_manifest, embedding_space=anchor_space, anchor=anchor_identity, sidecar=None, transform=None, dataset_binding=data_binding))
+        write_json(self.candidate_attestation, self.attestation("candidate", self.candidate_package, self.candidate_manifest, embedding_space=candidate_space, anchor=anchor_identity, sidecar=self.candidate_sidecar, transform=transform, dataset_binding=data_binding))
+        anchor_siblings = self.entries([self.anchor_package, self.anchor_manifest])
+        candidate_siblings = self.entries([self.candidate_package, self.candidate_manifest, self.candidate_sidecar])
+        anchor_record = {**record(self.anchor_package), "manifest": record(self.anchor_manifest), "attestation": record(self.anchor_attestation), "sibling_rollup_sha256": gate.sha256_json(anchor_siblings)}
+        candidate_record = {**record(self.candidate_package), "manifest": record(self.candidate_manifest), "attestation": record(self.candidate_attestation), "sibling_rollup_sha256": gate.sha256_json(candidate_siblings)}
+        self.plan = {"schema": gate.PLAN_SCHEMA, "gate_id": "fixture-gate", "candidate_id": "fixture-candidate", "dimension": gate.DIMENSION, "thresholds": copy.deepcopy(gate.THRESHOLDS), "evaluation": {"executed": False, "official": False}, "anchor": {"id": "fixture-anchor", "package": anchor_record}, "candidate": {"id": "fixture-candidate", "package": candidate_record}, "source": {"manifest": record(self.source_manifest), "binary": record(self.binary), "cwd": str(self.root), "dataset_by_domain": dataset_records, "workload": workload_record, "approved_workload": approved_record}, "approved_workload": approved_record, "qrels": qrels_records, "exclusions": [{"kind": "qid_only", "name": name, "manifest": record(self.exclusions[name])} for name in gate.EXCLUSION_NAMES], "workload_root": str(self.inputs), "output_root": str(self.output_root)}
         write_json(self.plan_path, self.plan)
         return self
 
     def freeze(self) -> dict:
-        return gate.freeze_manifest(self.plan_path, self.frozen_path)
+        return gate.freeze_manifest(self.plan_path, self.frozen_path, test_mode=True)
 
-    def artifact_payload(self, role: str, domain: str, *, q3_ndcg: float = 0.5, dense_ndcg: float = 0.7, q5_ndcg: float = 0.6, q3_recall: float = 0.8, nonce: str | None = None) -> dict:
-        frozen = json.loads(self.frozen_path.read_text(encoding="utf-8"))
-        qid = frozen["workload"]["query_ids_by_domain"][domain][0]
-        metrics = {"dense": {"ndcg_at_10": dense_ndcg}, "q3": {"ndcg_at_10": q3_ndcg, "recall_at_100": q3_recall}, "q5": {"ndcg_at_10": q5_ndcg}}
-        if nonce is None:
-            nonce = f"fixture-{role}-{domain}-nonce01"
-        if domain == "nfcorpus":
-            boundary = {"schema": "eos.aoqt.nfcorpus_boundary_evidence.v1", "guard": "q3_recall_at_100", "rank_window": [80, 120], "qids": [qid], "qids_sha256": gate.sha256_json([qid])}
-        else:
-            boundary = {"schema": "eos.aoqt.no_boundary_evidence.v1", "guard": "none", "rank_window": None, "qids": [], "qids_sha256": gate.sha256_json([])}
-        rows = [{"query_id": qid, "metrics": metrics}]
-        return {
-            "schema": gate.ARTIFACT_SCHEMA,
-            "gate_id": frozen["gate_id"],
-            "artifact_path": str(self.outputs / f"{role}.{domain}.json"),
-            "role": role,
-            "domain": domain,
-            "split": "heldout",
-            "package": frozen[role]["package"],
-            "source": {"manifest": frozen["source"]["manifest"], "qrels": frozen["qrels"][domain], "binary": frozen["source"]["binary"], "cwd": frozen["source"]["cwd"], "argv": frozen["source"]["argv"][role], "dataset": frozen["source"]["dataset"], "workload": frozen["source"]["workload"], "approved_workload": frozen["source"]["approved_workload"]},
-            "receipt_path": str(self.outputs / f"{role}.{domain}.receipt.json"),
-            "frozen_manifest_sha256": frozen["manifest_sha256"],
-            "receipt_nonce": nonce,
-            "observed_workload": {"workload_id": frozen["workload"]["workload_id"], "query_count": 1, "qids_sha256": gate.sha256_json([qid]), "scored_query_count": 1},
-            "boundary_evidence": boundary,
-            "rows": rows,
-            "aggregate": metrics,
-        }
-
-    def receipt_payload(self, role: str, domain: str, artifact_path: Path, artifact_sha: str, nonce: str) -> dict:
-        frozen = json.loads(self.frozen_path.read_text(encoding="utf-8"))
-        argv = frozen["source"]["argv"][role]
-        payload = {
-            "schema": gate.RECEIPT_SCHEMA,
-            "gate_id": frozen["gate_id"],
-            "nonce": nonce,
-            "role": role,
-            "domain": domain,
-            "split": "heldout",
-            "official": False,
-            "native_evaluator": True,
-            "wrapper": False,
-            "exit_status": 0,
-            "executable": frozen["source"]["binary"],
-            "argv": argv,
-            "argv_sha256": gate.sha256_json(argv),
-            "cwd": frozen["source"]["cwd"],
-            "dataset_id": domain,
-            "dataset": frozen["source"]["dataset"],
-            "qrels": frozen["qrels"][domain],
-            "workload": frozen["source"]["workload"],
-            "approved_workload": frozen["source"]["approved_workload"],
-            "package": frozen[role]["package"],
-            "output": record(artifact_path),
-            "config": {"dimension": gate.DIMENSION, "bits": [gate.Q3_BITS, gate.Q5_BITS], "seed": gate.TURBOQUANT_SEED, "top_k": gate.TOP_K, "package_mode": "sibling", "surfaces": list(gate.SURFACES), "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100}},
-            "frozen_manifest": {"path": str(self.frozen_path), "file_sha256": gate.sha256_file(self.frozen_path), "manifest_sha256": frozen["manifest_sha256"]},
-            "artifact_sha256": artifact_sha,
-        }
-        payload["receipt_digest"] = gate.digest_without(payload, "receipt_digest")
-        return payload
-
-    def write_artifacts(self, candidate_q3: float = 0.5003, candidate_dense: float = 0.6998, candidate_q5: float = 0.5995, candidate_recall: float = 0.8, *, nonce_by_role_domain: dict[tuple[str, str], str] | None = None) -> None:
-        time.sleep(0.01)
-        nonce_by_role_domain = nonce_by_role_domain or {}
-        for role in gate.ROLES:
-            for domain in gate.DOMAINS:
-                nonce = nonce_by_role_domain.get((role, domain), f"fixture-{role}-{domain}-nonce01")
-                values = {} if role == "anchor" else {"q3_ndcg": candidate_q3, "dense_ndcg": candidate_dense, "q5_ndcg": candidate_q5, "q3_recall": candidate_recall}
-                artifact = self.artifact_payload(role, domain, nonce=nonce, **values)
-                artifact_path = self.outputs / f"{role}.{domain}.json"
-                write_json(artifact_path, artifact)
-                artifact_sha = gate.sha256_file(artifact_path)
-                receipt_path = self.outputs / f"{role}.{domain}.receipt.json"
-                write_json(receipt_path, self.receipt_payload(role, domain, artifact_path, artifact_sha, nonce))
-
-    def rebind_receipt(self, role: str, domain: str) -> None:
-        artifact_path = self.outputs / f"{role}.{domain}.json"
-        receipt_path = self.outputs / f"{role}.{domain}.receipt.json"
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        receipt["artifact_sha256"] = gate.sha256_file(artifact_path)
-        receipt["output"] = record(artifact_path)
-        receipt["receipt_digest"] = gate.digest_without(receipt, "receipt_digest")
-        write_json(receipt_path, receipt)
+    def run_kwargs(self, frozen: dict) -> dict:
+        return {"expected_frozen_manifest_sha256": frozen["file_sha256"], "expected_workload_manifest_sha256": frozen["manifest"]["approved_workload"]["sha256"], "expected_binary_sha256": frozen["manifest"]["provenance"]["binary_sha256"], "expected_anchor_package_sha256": frozen["manifest"]["expected_anchor_identity"]["artifact_sha256"], "expected_anchor_manifest_sha256": frozen["manifest"]["expected_anchor_identity"]["package_manifest_sha256"], "expected_anchor_embedding_space_id": frozen["manifest"]["expected_anchor_identity"]["embedding_space_id"], "test_mode": True, "timeout_seconds": 30}
 
 
 class AOQTHeldoutGateTest(unittest.TestCase):
-    def make_fixture(self) -> Fixture:
+    def fixture(self) -> Fixture:
         return Fixture(Path(tempfile.mkdtemp())).build()
 
-    def test_freeze_and_attest_passes_synthetic_thresholds(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        self.assertEqual(frozen["schema"], gate.FROZEN_SCHEMA)
-        self.assertEqual(len(frozen["outputs"]), gate.EXPECTED_OUTPUT_COUNT)
-        fixture.write_artifacts()
-        report = gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
+    def test_run_executes_fresh_native_harness_and_passes_thresholds(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "normal"}, clear=False):
+            report = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
         self.assertTrue(report["gate_pass"])
-        self.assertAlmostEqual(report["macro"]["q3_ndcg_at_10_delta"], 0.0003, places=12)
-        self.assertFalse(report["evaluation_invoked_by_gate"])
-        self.assertFalse(report["official_metric_values_read_by_gate"])
-        self.assertEqual(len(report["output_bindings"]), gate.RESULT_OUTPUT_COUNT)
-        self.assertEqual(report["output_bindings_sha256"], gate.sha256_json(report["output_bindings"]))
+        self.assertTrue(report["evaluation_invoked_by_gate"])
+        self.assertEqual(report["nonce"], Path(report["run_dir"]).name.removeprefix("aoqt-"))
+        self.assertGreaterEqual(report["macro"]["q3_ndcg_at_10_delta"], gate.THRESHOLDS["q3_macro_ndcg_at_10_delta_min"])
+        self.assertEqual(len(report["commands"]), gate.RESULT_OUTPUT_COUNT)
+        self.assertTrue(Path(report["attestation_path"]).is_file())
 
-    def test_attest_requires_external_frozen_manifest_sha(self) -> None:
-        fixture = self.make_fixture()
-        fixture.freeze()
-        with self.assertRaisesRegex(gate.GateError, "external expected frozen manifest sha256 is required"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path)
+    def test_legacy_attest_import_is_disabled(self) -> None:
+        with self.assertRaisesRegex(gate.GateError, "receipt import is disabled"):
+            gate.attest_manifest(Path("unused"), Path("unused"), expected_frozen_manifest_sha256="0" * 64)
 
-    def test_rewrite_and_rehash_frozen_manifest_rejected_by_external_anchor(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        rewritten = json.loads(fixture.frozen_path.read_text(encoding="utf-8"))
-        rewritten["candidate_id"] = "rewritten-candidate"
-        rewritten["manifest_sha256"] = gate.digest_without(rewritten, "manifest_sha256")
-        write_json(fixture.frozen_path, rewritten)
+    def test_external_frozen_hash_rejects_rewrite_and_rehash(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        payload = json.loads(f.frozen_path.read_text())
+        payload["candidate_id"] = "rewritten"
+        payload["manifest_sha256"] = gate.digest_without(payload, "manifest_sha256")
+        write_json(f.frozen_path, payload)
         with self.assertRaisesRegex(gate.GateError, "external frozen manifest sha256 trust-anchor mismatch"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
+            gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-    def test_freeze_rejects_arbitrary_small_approved_workload(self) -> None:
-        fixture = self.make_fixture()
-        approved = json.loads(fixture.approved_workload.read_text(encoding="utf-8"))
-        approved["query_ids_by_domain"]["fiqa"] = []
-        write_json(fixture.approved_workload, approved)
-        fixture.plan["approved_workload"] = record(fixture.approved_workload)
-        fixture.plan["source"]["approved_workload"] = record(fixture.approved_workload)
-        write_json(fixture.plan_path, fixture.plan)
-        with self.assertRaisesRegex(gate.GateError, "qid-set hash mismatch|must be non-empty"):
-            fixture.freeze()
+    def test_production_requires_known_anchor_identity(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        kwargs = f.run_kwargs(frozen)
+        kwargs.update({"expected_anchor_package_sha256": "0" * 64, "test_mode": False})
+        with self.assertRaisesRegex(gate.GateError, "not the pinned current D384 anchor"):
+            gate.run_harness(f.frozen_path, **kwargs)
 
-    def test_freeze_rejects_duplicate_json_keys(self) -> None:
-        fixture = self.make_fixture()
-        raw = fixture.workload.read_text(encoding="utf-8")
-        marker = '"schema": "eos.aoqt.heldout_workload.v2"'
-        write_raw(fixture.workload, raw.replace(marker, marker + ', "schema": "duplicate"', 1))
-        fixture.plan["source"]["workload"] = record(fixture.workload)
-        write_json(fixture.plan_path, fixture.plan)
-        with self.assertRaisesRegex(gate.GateError, "duplicate JSON key"):
-            fixture.freeze()
+    def test_production_rejects_synthetic_json_package_fallback(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with self.assertRaisesRegex(gate.GateError, "native MLL artifacts|JSON fallback"):
+            gate.normalize_package_record(
+                frozen["manifest"]["anchor"],
+                f.frozen_path.parent,
+                "frozen.anchor",
+                expected_role="anchor",
+                expected_anchor=frozen["manifest"]["expected_anchor_identity"],
+                data_binding=gate._data_binding(frozen["manifest"]["approved_workload"]["descriptor"]),
+                production=True,
+            )
 
-    def test_freeze_rejects_loose_or_intersecting_exclusion(self) -> None:
-        fixture = self.make_fixture()
-        fixture.plan["exclusions"][0]["name"] = "global"
-        write_json(fixture.plan_path, fixture.plan)
-        with self.assertRaisesRegex(gate.GateError, "exact qid-only exclusion identity"):
-            fixture.freeze()
+    def test_complete_qrels_rejects_self_approved_small_workload(self) -> None:
+        f = self.fixture()
+        approved = json.loads(f.approved.read_text())
+        approved["query_ids_by_domain"]["fiqa"] = [f.qids["fiqa"][0]]
+        approved["qid_set_sha256_by_domain"]["fiqa"] = gate.sha256_json(approved["query_ids_by_domain"]["fiqa"])
+        approved["query_count_by_domain"]["fiqa"] = 1
+        approved["qrels_query_count_by_domain"]["fiqa"] = 1
+        write_json(f.approved, approved)
+        f.plan["approved_workload"] = record(f.approved)
+        f.plan["source"]["approved_workload"] = record(f.approved)
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "approved qid allowlist does not equal complete"):
+            f.freeze()
 
-        fixture = self.make_fixture()
-        path = fixture.exclusions["dev4"]
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["qids_by_domain"]["fiqa"] = ["H-fiqa"]
-        write_json(path, payload)
-        for item in fixture.plan["exclusions"]:
-            if item["name"] == "dev4":
-                item.update(record(path))
-        write_json(fixture.plan_path, fixture.plan)
+    def test_qrels_changed_after_freeze_is_rejected(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with f.qrels["fiqa"].open("a") as handle:
+            handle.write("fiqa-q-extra\trel-fiqa-q-extra\t1\n")
+        with self.assertRaisesRegex(gate.GateError, "frozen qrels binding changed|sha256 mismatch"):
+            gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_frozen_plan_provenance_is_revalidated(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with f.plan_path.open("a") as handle:
+            handle.write("\n")
+        with self.assertRaisesRegex(gate.GateError, "provenance plan sha256 mismatch"):
+            gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_package_compatibility_digest_must_equal_approved_workload(self) -> None:
+        f = self.fixture()
+        payload = json.loads(f.candidate_attestation.read_text())
+        payload["compatibility_digest"] = gate.sha256_bytes(b"wrong-compatibility")
+        write_json(f.candidate_attestation, payload)
+        f.plan["candidate"]["package"]["attestation"] = record(f.candidate_attestation)
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "compatibility digest mismatch"):
+            f.freeze()
+
+    def test_exclusion_source_rollup_digest_must_bind_files(self) -> None:
+        f = self.fixture()
+        payload = json.loads(f.exclusions["dev4"].read_text())
+        payload["source_sha256"] = "0" * 64
+        write_json(f.exclusions["dev4"], payload)
+        f.plan["exclusions"][0]["manifest"] = record(f.exclusions["dev4"])
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "source_sha256 does not bind"):
+            f.freeze()
+
+    def test_exclusion_identity_source_hash_and_intersection_firewall(self) -> None:
+        f = self.fixture()
+        payload = json.loads(f.exclusions["dev4"].read_text())
+        payload["qids_by_dataset"]["fiqa"] = [f.qids["fiqa"][0]]
+        write_json(f.exclusions["dev4"], payload)
+        f.plan["exclusions"][0]["manifest"] = record(f.exclusions["dev4"])
+        write_json(f.plan_path, f.plan)
         with self.assertRaisesRegex(gate.GateError, "workload/exclusion qid intersection"):
-            fixture.freeze()
+            f.freeze()
 
-    def test_freeze_rejects_exclusion_metric_payload(self) -> None:
-        fixture = self.make_fixture()
-        path = fixture.exclusions["dev4"]
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["gains"] = {"H-fiqa": 1}
-        write_json(path, payload)
-        for item in fixture.plan["exclusions"]:
-            if item["name"] == "dev4":
-                item.update(record(path))
-        write_json(fixture.plan_path, fixture.plan)
-        with self.assertRaisesRegex(gate.GateError, "key set mismatch|forbidden gain/vector/score field"):
-            fixture.freeze()
+    def test_forged_metrics_without_harness_binding_are_rejected(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "forged"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "native evaluator fields missing|native metrics TSV"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-    def test_freeze_rejects_package_attestation_policy_drift(self) -> None:
-        fixture = self.make_fixture()
-        policy = json.loads(fixture.candidate_attestation.read_text(encoding="utf-8"))
-        policy["topology"]["stages"] = 7
-        write_json(fixture.candidate_attestation, policy)
-        fixture.plan["candidate"]["package"]["attestation"] = record(fixture.candidate_attestation)
-        write_json(fixture.plan_path, fixture.plan)
-        with self.assertRaisesRegex(gate.GateError, "AOQT topology/legal scope mismatch"):
-            fixture.freeze()
+    def test_native_outputs_without_binding_are_rejected(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "omit-binding"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "native evaluator fields missing|gate binding"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-    def test_package_pair_rejects_same_package_identity_even_on_different_path(self) -> None:
-        fixture = self.make_fixture()
-        anchor = gate.normalize_package_record(fixture.plan["anchor"]["package"], fixture.plan_path.parent, "test.anchor", expected_role="anchor")
-        candidate = gate.normalize_package_record(fixture.plan["candidate"]["package"], fixture.plan_path.parent, "test.candidate", expected_role="candidate")
-        candidate["sha256"] = anchor["sha256"]
-        with self.assertRaisesRegex(gate.GateError, "identities must be distinct"):
-            gate.validate_package_pair(anchor, candidate)
+    def test_native_qrels_binding_mismatch_is_rejected(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "bad-qrels-binding"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "dataset/qrels binding mismatch"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-    def test_freeze_rejects_wrapper_or_argv_token_substitution(self) -> None:
-        fixture = self.make_fixture()
-        fixture.plan["source"]["argv"]["candidate"] = ["/bin/sh", gate.NATIVE_EVAL_SUBCOMMAND, "-c", str(fixture.binary), str(fixture.candidate_package)]
-        write_json(fixture.plan_path, fixture.plan)
-        with self.assertRaisesRegex(gate.GateError, r"argv\[0\] must be the bound native executable"):
-            fixture.freeze()
+    def test_copied_old_outputs_are_rejected_by_nonce_binding(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "normal"}, clear=False):
+            first = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+            old_dir = first["run_dir"]
+            with mock.patch.dict(os.environ, {"MOCK_MODE": "copy-old", "MOCK_COPY_FROM": old_dir}, clear=False):
+                with self.assertRaisesRegex(gate.GateError, "gate binding mismatch"):
+                    gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-    def test_attest_rejects_receipt_config_or_artifact_substitution(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        receipt_path = fixture.outputs / "candidate.fiqa.receipt.json"
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        receipt["config"]["top_k"] = 119
-        receipt["receipt_digest"] = gate.digest_without(receipt, "receipt_digest")
-        write_json(receipt_path, receipt)
-        with self.assertRaisesRegex(gate.GateError, "native evaluator config mismatch"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
+    def test_evaluator_mutating_frozen_input_is_rejected_after_subprocess(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "mutate-qrels"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "sha256 mismatch|frozen qrels binding changed"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        receipt_path = fixture.outputs / "candidate.fiqa.receipt.json"
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        receipt["artifact_sha256"] = gate.sha256_file(fixture.outputs / "anchor.fiqa.json")
-        receipt["receipt_digest"] = gate.digest_without(receipt, "receipt_digest")
-        write_json(receipt_path, receipt)
-        with self.assertRaisesRegex(gate.GateError, "artifact hash binding mismatch"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
+    def test_missing_nf_boundary_evidence_fails_closed(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "missing-nf"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "boundary coverage|boundary ranks|exactly top-k=120"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
-    def test_attest_rejects_non_native_or_stale_receipts(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        receipt_path = fixture.outputs / "anchor.fiqa.receipt.json"
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        receipt["native_evaluator"] = False
-        receipt["receipt_digest"] = gate.digest_without(receipt, "receipt_digest")
-        write_json(receipt_path, receipt)
-        with self.assertRaisesRegex(gate.GateError, "producer flags mismatch"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
-
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        artifact_path = fixture.outputs / "anchor.fiqa.json"
-        os.utime(artifact_path, ns=(artifact_path.stat().st_mtime_ns, Path(fixture.frozen_path).stat().st_mtime_ns))
-        with self.assertRaisesRegex(gate.GateError, "stale anchor/fiqa metrics output"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
-
-    def test_attest_rejects_duplicate_receipt_nonce(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        candidate_artifact_path = fixture.outputs / "candidate.fiqa.json"
-        candidate = json.loads(candidate_artifact_path.read_text(encoding="utf-8"))
-        candidate["receipt_nonce"] = "fixture-anchor-fiqa-nonce01"
-        write_json(candidate_artifact_path, candidate)
-        receipt_path = fixture.outputs / "candidate.fiqa.receipt.json"
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        receipt["nonce"] = candidate["receipt_nonce"]
-        write_json(receipt_path, receipt)
-        fixture.rebind_receipt("candidate", "fiqa")
-        with self.assertRaisesRegex(gate.GateError, "duplicate native receipt nonce"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
-
-    def test_attest_rejects_boundary_evidence_substitution(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        path = fixture.outputs / "candidate.nfcorpus.json"
-        artifact = json.loads(path.read_text(encoding="utf-8"))
-        artifact["boundary_evidence"]["qids"] = []
-        write_json(path, artifact)
-        fixture.rebind_receipt("candidate", "nfcorpus")
-        with self.assertRaisesRegex(gate.GateError, "boundary guard evidence mismatch"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
-
-    def test_attest_rejects_per_query_quality_regression_fail_closed(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts(candidate_q3=0.5001, candidate_dense=0.6990, candidate_q5=0.5980, candidate_recall=0.79)
-        report = gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
+    def test_native_per_query_regression_fails_quality_gate(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "regression"}, clear=False):
+            report = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
         self.assertFalse(report["gate_pass"])
-        self.assertTrue(report["failures"])
-        self.assertIn("macro:q3_macro_ndcg_at_10", report["failures"])
-        self.assertIn("query:fiqa:H-fiqa:q3_recall_at_100_non_regressing", report["failures"])
-        self.assertIn("nfcorpus:boundary:q3_recall_at_100_non_regressing", report["failures"])
+        self.assertTrue(any(item.startswith("query:fiqa") for item in report["failures"]))
 
-    def test_attest_rejects_declared_aggregate_substitution(self) -> None:
-        fixture = self.make_fixture()
-        frozen = fixture.freeze()
-        fixture.write_artifacts()
-        path = fixture.outputs / "anchor.fiqa.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["aggregate"]["q3"]["ndcg_at_10"] = 0.99
-        write_json(path, payload)
-        fixture.rebind_receipt("anchor", "fiqa")
-        with self.assertRaisesRegex(gate.GateError, "declared aggregate mismatch"):
-            gate.attest_manifest(fixture.frozen_path, fixture.attestation_path, expected_frozen_manifest_sha256=frozen["file_sha256"])
+    def test_argv_is_constructed_with_all_pinned_semantics(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        info = gate.validate_frozen_manifest(f.frozen_path, expected_frozen_manifest_sha256=frozen["file_sha256"], production=False)
+        outputs = {"metrics": f.root / "m.json", "metrics_tsv": f.root / "m.tsv", "per_query": f.root / "m.jsonl"}
+        argv = gate.build_evaluator_argv(info, "candidate", "nfcorpus", outputs)
+        self.assertEqual(argv[0], str(f.binary.resolve()))
+        self.assertEqual(argv[1], gate.NATIVE_EVAL_SUBCOMMAND)
+        self.assertEqual(argv[argv.index("--bits") + 1], "3,5")
+        self.assertEqual(argv[argv.index("--quantizer-seed") + 1], str(gate.TURBOQUANT_SEED))
+        self.assertEqual(argv[argv.index("--batch-size") + 1], str(gate.BATCH_SIZE))
+        self.assertEqual(argv[argv.index("--top-k") + 1], "120")
+        self.assertEqual(argv[-1], str(f.datasets["nfcorpus"].resolve()))
+
+    def test_harness_rejects_internal_argv_semantics_drift(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        original = gate.build_evaluator_argv
+
+        def drifted_builder(info, role, domain, outputs):
+            argv = original(info, role, domain, outputs)
+            argv[argv.index("--max-queries") + 1] = "1"
+            return argv
+
+        with mock.patch.object(gate, "build_evaluator_argv", side_effect=drifted_builder):
+            with self.assertRaisesRegex(gate.GateError, "exact pinned command"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_duplicate_json_keys_are_rejected(self) -> None:
+        f = self.fixture()
+        raw = f.workload.read_text()
+        f.workload.write_text(raw.replace('"schema": "eos.aoqt.heldout_workload.v3"', '"schema": "eos.aoqt.heldout_workload.v3", "schema": "forged"', 1))
+        f.plan["source"]["workload"] = record(f.workload)
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "duplicate JSON key"):
+            f.freeze()
 
 
 if __name__ == "__main__":

@@ -1,32 +1,33 @@
 #!/usr/bin/env python3
-"""Freeze and attest the D384 AOQT heldout retrieval quality gate.
+"""Fail-closed, two-phase D384 AOQT heldout quality gate.
 
-This is a two-phase, evaluator-independent gate.  ``freeze`` (also exposed as
-``preflight``) validates a plan and writes a deterministic frozen manifest;
-every metric artifact and native receipt path must be absent at that point.
-``attest`` (also exposed as ``aggregate``) requires a caller-supplied SHA-256
-trust anchor for that frozen manifest, validates six paired native-evaluator
-artifacts plus six adjacent receipts, recomputes metrics from per-query rows,
-and writes a hash-bound attestation.  The gate never launches an evaluator and
-never reads official metric values.
+``freeze`` is the plan-only phase.  It validates every input, parses the
+complete qrels files, resolves the three domain-scoped qid-only exclusion
+manifests, and writes an immutable manifest whose *external file SHA-256* is a
+trust anchor supplied to the next phase.
 
-The strict schemas are deliberately explicit.  A plan is
-``eos.aoqt.heldout_gate_plan.v2``.  It names D384 anchor/candidate packages,
-runtime MLL package manifests (or the strict synthetic manifest schema used by
-the tests), JSON package attestations, source/binary/cwd/argv/dataset/workload
-records, three domain qrels records with counts, three exact domain-scoped qid-only
-exclusions (``dev4``, ``reserve4``, ``official-test``), and six metric output
-paths with six receipt paths.  The separately approved workload manifest
-pins every query identity, per-domain count and qid-set digest, qrels counts,
-and the NFCorpus rank-80..120 boundary qids.
+``run`` is the only production quality-gate path.  It requires the external
+frozen-manifest SHA, the externally approved workload-descriptor SHA, the
+current pinned D384 anchor identity, and the expected EOS executable SHA.  The
+gate creates a fresh nonce-named run directory, constructs the complete EOS
+``eval-retrieval-turboquant`` argv itself, preflights all output paths, invokes
+the pinned executable, and accepts only native metrics/per-query files written
+by that invocation.  Native outputs must carry the harness binding extension
+(``gate_binding``); this deliberately makes the current evaluator fail closed
+until it emits that extension rather than allowing a copied or caller-authored
+metrics file to become evidence.
 
-Each result is ``eos.aoqt.heldout_retrieval_artifact.v2`` and has one row per
-approved query.  Dense and q5 report only nDCG@10; q3 reports nDCG@10 and
-recall@100.  Dense/q5 recall is intentionally absent because it is not a gate
-metric.  An adjacent ``eos.aoqt.native_eval_receipt.v2`` must bind the exact
-native executable, argv, cwd, package mode, qrels/workload/package/output
-paths, q3/q5 bits, seed, top-k, frozen-manifest digest, artifact hash, and a
-unique nonce.  Self-authored metric JSON without such a receipt is rejected.
+``attest``/``aggregate`` are intentionally disabled.  Importing receipts or
+metrics supplied by a caller is not a production gate.  The tests call the
+internal ``test_mode`` hooks with a local mock executable and synthetic files;
+the command-line interface has no synthetic-fixture escape hatch.
+
+The quality policy is immutable: q3 macro nDCG@10 must improve by at least
+0.0003, dense nDCG@10 may drop by at most 0.0005, q5 nDCG@10 may drop by at
+most 0.001, and q3 recall@100 may not regress.  Domain and per-query floors
+are also enforced.  Dense/q5 recall is intentionally not a gate metric;
+only q3 recall@100 is required.  NFCorpus boundary evidence requires native
+per-query rankings through ranks 80..120 for every frozen boundary qid.
 """
 
 from __future__ import annotations
@@ -36,25 +37,38 @@ import copy
 import hashlib
 import json
 import math
+import os
 import re
-import struct
+import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-PLAN_SCHEMA = "eos.aoqt.heldout_gate_plan.v2"
-FROZEN_SCHEMA = "eos.aoqt.heldout_gate_frozen.v2"
-APPROVED_WORKLOAD_SCHEMA = "eos.aoqt.approved_heldout_workload.v1"
-WORKLOAD_SCHEMA = "eos.aoqt.heldout_workload.v2"
-PACKAGE_ATTESTATION_SCHEMA = "eos.aoqt.package_attestation.v1"
-PACKAGE_MANIFEST_SCHEMA = "eos.aoqt.package_manifest.v1"
-SIDECAR_SCHEMA = "eos.aoqt.sidecar_attestation.v1"
-ARTIFACT_SCHEMA = "eos.aoqt.heldout_retrieval_artifact.v2"
-RECEIPT_SCHEMA = "eos.aoqt.native_eval_receipt.v2"
-ATTESTATION_SCHEMA = "eos.aoqt.heldout_gate_attestation.v2"
+# Schemas are versioned independently from the old caller-authored receipt
+# path.  The v3 plan is deliberately not accepted by the old attest code.
+PLAN_SCHEMA = "eos.aoqt.heldout_gate_plan.v3"
+FROZEN_SCHEMA = "eos.aoqt.heldout_gate_frozen.v3"
+APPROVED_WORKLOAD_SCHEMA = "eos.aoqt.approved_heldout_workload.v2"
+WORKLOAD_SCHEMA = "eos.aoqt.heldout_workload.v3"
+DATASET_SCHEMA = "eos.aoqt.heldout_dataset_manifest.v1"
+PACKAGE_ATTESTATION_SCHEMA = "eos.aoqt.native_package_attestation.v1"
+PACKAGE_MANIFEST_SCHEMA = "eos.aoqt.package_manifest.v1"  # synthetic tests only
+NATIVE_PACKAGE_MANIFEST_SCHEMA = "eos.aoqt.native_package_manifest.v1"
+SIDECAR_SCHEMA = "eos.aoqt.aoqt_sidecar_attestation.v1"
+NATIVE_METRICS_SCHEMA = "manta.embedding_turboquant_retrieval_metrics.v1"
+NATIVE_PER_QUERY_SCHEMA = "manta.embedding_turboquant_retrieval_per_query.v1"
+GATE_BINDING_SCHEMA = "eos.aoqt.native_eval_gate_binding.v1"
+EXECUTION_RECEIPT_SCHEMA = "eos.aoqt.native_eval_execution_receipt.v1"
+ATTESTATION_SCHEMA = "eos.aoqt.heldout_gate_attestation.v3"
+
+# Backward-compatible names are retained only for importers that inspect the
+# schema constants.  There is no backward-compatible production attest path.
+ARTIFACT_SCHEMA = NATIVE_METRICS_SCHEMA
+RECEIPT_SCHEMA = EXECUTION_RECEIPT_SCHEMA
 
 DOMAINS = ("fiqa", "nfcorpus", "scifact")
 ROLES = ("anchor", "candidate")
@@ -65,18 +79,28 @@ METRICS_BY_SURFACE = {
     "q5": ("ndcg_at_10",),
 }
 EXCLUSION_NAMES = ("dev4", "reserve4", "official-test")
+EXCLUSION_SEMANTIC = "qid_only_no_metric_payload"
 DIMENSION = 384
 Q3_BITS = 3
 Q5_BITS = 5
 TURBOQUANT_SEED = 5581486560434873699
 TOP_K = 120
-AOQT_TOPOLOGY_SEED = 191
-PACKAGE_MANIFEST_VERSION = "manta/package/v0alpha1"
-AOQT_TRANSFORM_VERSION = "eos/aoqt-givens-transform/v1"
+BATCH_SIZE = 64
+HELDOUT_SPLIT = "test"
 NATIVE_EVAL_SUBCOMMAND = "eval-retrieval-turboquant"
 RESULT_OUTPUT_COUNT = len(DOMAINS) * len(ROLES)
-EXPECTED_OUTPUT_COUNT = RESULT_OUTPUT_COUNT * 2  # metric artifact + native receipt
+EXPECTED_OUTPUT_COUNT = RESULT_OUTPUT_COUNT * 4  # metrics, TSV, per-query, receipt
 COMPARISON_EPSILON = 1e-12
+
+# These are the immutable current D384 pre-transform anchor identities from
+# the train-only artifact audit.  The path is not the trust anchor: all three
+# identities are required, and production additionally requires callers to
+# provide these same values on the ``run`` command line.
+D384_ANCHOR_PACKAGE_SHA256 = "188265db16992ab24be15e678c5f7e175bebad769e8d844e8b0f50ffc23bd5bf"
+D384_ANCHOR_MANIFEST_SHA256 = "e1e28316355590b5c9e55c9af7a44014dcfd810258da319c077a316a38fa7683"
+D384_ANCHOR_EMBEDDING_SPACE_ID = "99aa06139496a87ca3bd79598f99805d04d38df3398d9886ac386c4e8ca0b0db"
+D384_ANCHOR_ARTIFACT_ID = "d384-pre"
+D384_ANCHOR_PATH_SUFFIX = "runs/eos-wide384-projection-tail-seed191-repeat-v1-20260902T004753Z/packages/d384-pre.mll"
 
 AOQT_TOPOLOGY = {
     "id": "aoqt_givens_v1",
@@ -94,9 +118,6 @@ AOQT_LEGAL_SCOPE = {
     "free_open_release_allowed": False,
     "quality_claim": False,
 }
-
-# Quality policy is immutable.  Domain and per-query safety floors are
-# intentionally at least as strict as the macro acceptance surface.
 THRESHOLDS = {
     "q3_macro_ndcg_at_10_delta_min": 0.0003,
     "dense_macro_ndcg_at_10_delta_min": -0.0005,
@@ -114,7 +135,7 @@ THRESHOLDS = {
 
 SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 SAFE_ID_RE = re.compile(r"[A-Za-z0-9_.:-]+\Z")
-NONCE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{15,127}\Z")
+NONCE_RE = re.compile(r"[a-z0-9][a-z0-9-]{31,63}\Z")
 SHELL_MARKERS = (";", "&&", "|", ">", "<", "`", "$(")
 FORBIDDEN_PAYLOAD_KEYS = {
     "gain",
@@ -172,15 +193,22 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_json(path: Path, label: str) -> dict[str, Any]:
+def _strict_load(text: str, label: str) -> Any:
     try:
-        payload = json.loads(
-            path.read_text(encoding="utf-8"),
+        return json.loads(
+            text,
             object_pairs_hook=_reject_duplicate_pairs,
             parse_constant=_reject_json_constant,
         )
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise GateContractError(f"{label}: cannot read strict JSON: {exc}") from exc
+
+
+def read_json(path: Path, label: str) -> dict[str, Any]:
+    try:
+        payload = _strict_load(path.read_text(encoding="utf-8"), label)
+    except OSError as exc:
+        raise GateContractError(f"{label}: cannot read JSON: {exc}") from exc
     if not isinstance(payload, dict):
         raise GateContractError(f"{label}: JSON root must be an object")
     return payload
@@ -205,7 +233,7 @@ def require_exact_keys(value: dict[str, Any], expected: Iterable[str], label: st
     missing = sorted(expected_set - actual_set)
     extra = sorted(actual_set - expected_set)
     if missing or extra:
-        details = []
+        details: list[str] = []
         if missing:
             details.append(f"missing {missing}")
         if extra:
@@ -259,16 +287,31 @@ def resolve_path(value: Any, base_dir: Path, label: str) -> Path:
     if not candidate.is_absolute():
         candidate = base_dir / candidate
     try:
+        if candidate.is_symlink():
+            raise GateContractError(f"{label}: symlink paths are not accepted")
         return candidate.resolve(strict=False)
     except OSError as exc:
         raise GateContractError(f"{label}: cannot resolve path: {exc}") from exc
 
 
-def require_regular_file(path: Path, label: str) -> None:
-    if path.is_symlink():
-        raise GateContractError(f"{label}: symlinks are not allowed")
-    if not path.is_file():
-        raise GateContractError(f"{label}: regular file is required: {path}")
+def require_regular_file(path: Path, label: str, *, executable: bool = False) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise GateContractError(f"{label}: regular non-symlink file is required: {path}")
+    if executable and not os.access(path, os.X_OK):
+        raise GateContractError(f"{label}: executable permission is required: {path}")
+
+
+def require_elf_executable(path: Path, label: str) -> None:
+    """Reject script/wrapper launchers in the production EOS binary slot."""
+
+    require_regular_file(path, label, executable=True)
+    try:
+        with path.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError as exc:
+        raise GateContractError(f"{label}: cannot inspect executable format: {exc}") from exc
+    if magic != b"\x7fELF":
+        raise GateContractError(f"{label}: production evaluator must be a native ELF executable, not a wrapper")
 
 
 def require_directory(path: Path, label: str) -> None:
@@ -276,11 +319,18 @@ def require_directory(path: Path, label: str) -> None:
         raise GateContractError(f"{label}: existing non-symlink directory is required: {path}")
 
 
-def normalize_file_record(value: Any, base_dir: Path, label: str) -> dict[str, Any]:
+def path_within(path: Path, root: Path, label: str) -> None:
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise GateContractError(f"{label}: {path} escapes {root}") from exc
+
+
+def normalize_file_record(value: Any, base_dir: Path, label: str, *, executable: bool = False) -> dict[str, Any]:
     record = require_mapping(value, label)
     require_exact_keys(record, {"path", "sha256", "bytes"}, label)
     path = resolve_path(record["path"], base_dir, f"{label}.path")
-    require_regular_file(path, label)
+    require_regular_file(path, label, executable=executable)
     expected_sha = require_sha256(record["sha256"], f"{label}.sha256")
     actual_sha = sha256_file(path)
     if actual_sha != expected_sha:
@@ -295,13 +345,6 @@ def normalize_directory(value: Any, base_dir: Path, label: str) -> str:
     path = resolve_path(value, base_dir, label)
     require_directory(path, label)
     return str(path)
-
-
-def path_within(path: Path, root: Path, label: str) -> None:
-    try:
-        path.relative_to(root)
-    except ValueError as exc:
-        raise GateContractError(f"{label}: {path} escapes {root}") from exc
 
 
 def require_no_forbidden_payload_keys(node: Any, label: str) -> None:
@@ -337,1177 +380,1152 @@ def normalize_qids_by_domain(value: Any, label: str, *, require_nonempty: bool =
     return normalized
 
 
+def require_domain_mapping(value: Any, label: str) -> dict[str, Any]:
+    mapping = require_mapping(value, label)
+    if set(mapping) != set(DOMAINS):
+        raise GateContractError(f"{label}: exact domain coverage required")
+    return {domain: mapping[domain] for domain in DOMAINS}
+
+
 def qids_sha256_by_domain(qids_by_domain: dict[str, list[str]]) -> dict[str, str]:
     return {domain: sha256_json(qids_by_domain[domain]) for domain in DOMAINS}
 
 
+def parse_qrels(path: Path, label: str) -> dict[str, Any]:
+    """Parse a complete BEIR qrels TSV and derive, never trust, its workload."""
+
+    require_regular_file(path, label)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise GateContractError(f"{label}: cannot read qrels: {exc}") from exc
+    rels: dict[str, dict[str, float]] = {}
+    saw_data = False
+    for line_number, raw_line in enumerate(raw.splitlines(), 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        fields = raw_line.rstrip("\r\n").split("\t")
+        if len(fields) == 1:
+            fields = re.split(r"\s+", line)
+        if not saw_data and fields and fields[0].lower() in {"query-id", "qid", "query_id"}:
+            saw_data = True
+            continue
+        saw_data = True
+        if len(fields) == 4:
+            if fields[1] != "0":
+                raise GateContractError(f"{label}:{line_number}: four-column qrels must use a zero iteration field")
+            qid_raw, doc_raw, score_raw = fields[0], fields[2], fields[3]
+        elif len(fields) == 3:
+            qid_raw, doc_raw, score_raw = fields
+        else:
+            raise GateContractError(f"{label}:{line_number}: expected 3 or 4 qrels columns")
+        qid = require_qid(qid_raw, f"{label}:{line_number}.query_id")
+        doc_id = require_string(doc_raw, f"{label}:{line_number}.doc_id")
+        if any(char.isspace() for char in doc_id):
+            raise GateContractError(f"{label}:{line_number}: doc_id must not contain whitespace")
+        try:
+            relevance = float(score_raw)
+        except (TypeError, ValueError) as exc:
+            raise GateContractError(f"{label}:{line_number}: invalid relevance") from exc
+        if not math.isfinite(relevance) or relevance < 0:
+            raise GateContractError(f"{label}:{line_number}: relevance must be finite and non-negative")
+        if qid in rels and doc_id in rels[qid]:
+            raise GateContractError(f"{label}:{line_number}: duplicate qid/doc pair")
+        rels.setdefault(qid, {})[doc_id] = relevance
+    if not rels:
+        raise GateContractError(f"{label}: qrels are empty")
+    qids = sorted(rels)
+    positive_qids = [qid for qid in qids if any(value > 0 for value in rels[qid].values())]
+    if len(positive_qids) != len(qids):
+        raise GateContractError(f"{label}: every qid must have at least one positive relevance")
+    return {
+        "path": str(path.resolve()),
+        "sha256": sha256_file(path),
+        "bytes": path.stat().st_size,
+        "qids": qids,
+        "qid_set_sha256": sha256_json(qids),
+        "query_count": len(qids),
+        "qrels_pair_count": sum(len(rels[qid]) for qid in qids),
+        "relevant_pair_count": sum(1 for qid in qids for value in rels[qid].values() if value > 0),
+        "rels": rels,
+    }
+
+
 def normalize_qrels_record(value: Any, base_dir: Path, label: str) -> dict[str, Any]:
     record = require_mapping(value, label)
-    require_exact_keys(record, {"path", "sha256", "bytes", "query_count", "relevant_count"}, label)
-    result = normalize_file_record({key: record[key] for key in ("path", "sha256", "bytes")}, base_dir, label)
-    result["query_count"] = require_integer(record["query_count"], f"{label}.query_count", minimum=1)
-    result["relevant_count"] = require_integer(record["relevant_count"], f"{label}.relevant_count", minimum=0)
-    return result
+    # Counts and qid lists are deliberately absent from the input record; they
+    # are derived from the complete file by parse_qrels.
+    require_exact_keys(record, {"path", "sha256", "bytes"}, label)
+    file_record = normalize_file_record(record, base_dir, label)
+    parsed = parse_qrels(Path(file_record["path"]), label)
+    parsed.pop("rels")
+    return {**file_record, **parsed}
 
 
-def normalize_sibling_entries(value: Any, base_dir: Path, label: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not value:
-        raise GateContractError(f"{label}: non-empty sibling entry list is required")
-    entries: list[dict[str, Any]] = []
-    names: set[str] = set()
-    for index, item in enumerate(value):
-        record = require_mapping(item, f"{label}[{index}]")
-        require_exact_keys(record, {"name", "path", "sha256", "bytes"}, f"{label}[{index}]")
-        name = require_string(record["name"], f"{label}[{index}].name")
-        if Path(name).name != name or name in {".", ".."} or name in names:
-            raise GateContractError(f"{label}[{index}]: sibling names must be unique basenames")
-        path = resolve_path(record["path"], base_dir, f"{label}[{index}].path")
-        if path.name != name:
-            raise GateContractError(f"{label}[{index}]: name/path mismatch")
-        file_record = normalize_file_record({key: record[key] for key in ("path", "sha256", "bytes")}, base_dir, f"{label}[{index}]")
-        names.add(name)
-        entries.append({"name": name, **file_record})
-    return sorted(entries, key=lambda item: item["name"])
-
-
-def _unpack(fmt: str, data: bytes, offset: int, label: str) -> tuple[Any, int]:
-    size = struct.calcsize(fmt)
-    if offset < 0 or offset + size > len(data):
-        raise GateContractError(f"{label}: truncated binary metadata")
-    return struct.unpack_from(fmt, data, offset)[0], offset + size
-
-
-def read_mll_sections(path: Path, label: str) -> dict[bytes, bytes]:
-    """Read the bounded MLL directory used by runtime package manifests.
-
-    This intentionally verifies the container bounds and unique section tags;
-    the content SHA is still bound by the caller's file record.  Full MLL
-    digest verification remains the runtime helper's responsibility.
-    """
-    data = path.read_bytes()
-    if len(data) < 24 or data[:4] != b"MLL\0":
-        raise GateContractError(f"{label}: expected an MLL container")
-    section_count, _ = _unpack("<I", data, 16, f"{label}.header")
-    directory_end = 24 + section_count * 64
-    if section_count <= 0 or directory_end > len(data):
-        raise GateContractError(f"{label}: invalid MLL section directory")
-    sections: dict[bytes, bytes] = {}
-    intervals: list[tuple[int, int]] = []
-    for index in range(section_count):
-        offset = 24 + index * 64
-        entry = data[offset : offset + 64]
-        tag = entry[:4]
-        if tag in sections:
-            raise GateContractError(f"{label}: duplicate MLL section tag {tag!r}")
-        section_offset, _ = _unpack("<Q", entry, 4, f"{label}.directory[{index}]")
-        section_size, _ = _unpack("<Q", entry, 12, f"{label}.directory[{index}]")
-        section_end = section_offset + section_size
-        if section_offset < directory_end or section_end > len(data) or section_end < section_offset:
-            raise GateContractError(f"{label}: MLL section {tag!r} is out of bounds")
-        for old_start, old_end in intervals:
-            if section_offset < old_end and old_start < section_end:
-                raise GateContractError(f"{label}: overlapping MLL sections")
-        intervals.append((section_offset, section_end))
-        sections[tag] = data[section_offset:section_end]
-    return sections
-
-
-def parse_mll_strings(body: bytes, label: str) -> list[str]:
-    count, offset = _unpack("<I", body, 0, label)
-    strings: list[str] = []
-    for index in range(count):
-        length, offset = _unpack("<I", body, offset, f"{label}[{index}]")
-        if offset + length > len(body):
-            raise GateContractError(f"{label}[{index}]: truncated UTF-8 string")
-        try:
-            value = body[offset : offset + length].decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise GateContractError(f"{label}[{index}]: invalid UTF-8 string") from exc
-        strings.append(value)
-        offset += length
-    if offset != len(body):
-        raise GateContractError(f"{label}: trailing string-table bytes")
-    return strings
-
-
-def parse_mll_head(body: bytes, strings: list[str], label: str) -> dict[str, Any]:
-    # HEAD begins with name/description string indices and two uint64 fields,
-    # followed by backend/capability indices and typed metadata entries.  This
-    # mirrors the stable layout consumed by runtime/authored_manifest_mll.go.
-    if len(body) < 24:
-        raise GateContractError(f"{label}: HEAD is too short")
-    offset = 24
-    backends, offset = _unpack("<H", body, offset, label)
-    if offset + backends * 2 > len(body):
-        raise GateContractError(f"{label}: truncated backend list")
-    offset += backends * 2
-    capabilities, offset = _unpack("<H", body, offset, label)
-    if offset + capabilities * 4 > len(body):
-        raise GateContractError(f"{label}: truncated capability list")
-    offset += capabilities * 4
-    metadata_count, offset = _unpack("<H", body, offset, label)
-    metadata: dict[str, Any] = {}
-    for index in range(metadata_count):
-        key_index, offset = _unpack("<I", body, offset, f"{label}.metadata[{index}]")
-        kind, offset = _unpack("<B", body, offset, f"{label}.metadata[{index}]")
-        if key_index >= len(strings) or not strings[key_index]:
-            raise GateContractError(f"{label}.metadata[{index}]: invalid key index")
-        key = strings[key_index]
-        if key in metadata:
-            raise GateContractError(f"{label}: duplicate metadata key {key!r}")
-        if kind == 0:
-            value: Any = None
-        elif kind == 1:
-            raw, offset = _unpack("<?", body, offset, f"{label}.metadata[{index}]")
-            value = bool(raw)
-        elif kind == 2:
-            value, offset = _unpack("<q", body, offset, f"{label}.metadata[{index}]")
-        elif kind == 3:
-            value, offset = _unpack("<d", body, offset, f"{label}.metadata[{index}]")
-            if not math.isfinite(value):
-                raise GateContractError(f"{label}.metadata[{index}]: non-finite float")
-        elif kind == 4:
-            string_index, offset = _unpack("<I", body, offset, f"{label}.metadata[{index}]")
-            if string_index >= len(strings):
-                raise GateContractError(f"{label}.metadata[{index}]: invalid string index")
-            value = strings[string_index]
-        else:
-            raise GateContractError(f"{label}.metadata[{index}]: unknown value kind {kind}")
-        metadata[key] = value
-    if offset != len(body):
-        raise GateContractError(f"{label}: trailing HEAD bytes")
-    return metadata
-
-
-def _string_at(strings: list[str], index: int, label: str) -> str:
-    if index >= len(strings):
-        raise GateContractError(f"{label}: invalid string index")
-    return strings[index]
-
-
-def parse_runtime_authored_manifest(path: Path, label: str) -> dict[str, Any]:
-    sections = read_mll_sections(path, label)
-    if b"HEAD" not in sections or b"STRG" not in sections:
-        raise GateContractError(f"{label}: authored manifest missing HEAD/STRG")
-    strings = parse_mll_strings(sections[b"STRG"], f"{label}.STRG")
-    metadata = parse_mll_head(sections[b"HEAD"], strings, f"{label}.HEAD")
-    return {"format": "mll", "metadata": metadata}
-
-
-def parse_runtime_package_manifest(path: Path, package_path: Path, label: str) -> dict[str, Any]:
-    sections = read_mll_sections(path, label)
-    if b"HEAD" not in sections or b"STRG" not in sections or b"XPKG" not in sections:
-        raise GateContractError(f"{label}: package manifest missing HEAD/STRG/XPKG")
-    strings = parse_mll_strings(sections[b"STRG"], f"{label}.STRG")
-    metadata = parse_mll_head(sections[b"HEAD"], strings, f"{label}.HEAD")
-    required_metadata = ("manifest_version", "package_kind", "module_name", "artifact_version", "file_count")
-    if any(key not in metadata for key in required_metadata):
-        raise GateContractError(f"{label}: missing required package metadata")
-    if metadata["manifest_version"] != PACKAGE_MANIFEST_VERSION or metadata["package_kind"] != "embedding":
-        raise GateContractError(f"{label}: package manifest version/kind mismatch")
-    if not isinstance(metadata["module_name"], str) or not metadata["module_name"] or not isinstance(metadata["artifact_version"], str) or not metadata["artifact_version"]:
-        raise GateContractError(f"{label}: package module/artifact metadata must be non-empty strings")
-    file_count = metadata["file_count"]
-    if isinstance(file_count, bool) or not isinstance(file_count, int) or file_count <= 0:
-        raise GateContractError(f"{label}: invalid package file_count")
-    body = sections[b"XPKG"]
-    count, offset = _unpack("<I", body, 0, f"{label}.XPKG")
-    if count != file_count:
-        raise GateContractError(f"{label}: package file_count/XPKG count mismatch")
-    files: list[dict[str, Any]] = []
-    roles: set[str] = set()
-    for index in range(count):
-        role_index, offset = _unpack("<I", body, offset, f"{label}.XPKG[{index}]")
-        path_index, offset = _unpack("<I", body, offset, f"{label}.XPKG[{index}]")
-        byte_count, offset = _unpack("<q", body, offset, f"{label}.XPKG[{index}]")
-        if offset + 32 > len(body):
-            raise GateContractError(f"{label}.XPKG[{index}]: truncated SHA-256")
-        digest = body[offset : offset + 32].hex()
-        offset += 32
-        role = _string_at(strings, role_index, f"{label}.XPKG[{index}].role")
-        relative_name = _string_at(strings, path_index, f"{label}.XPKG[{index}].path")
-        if not role or not relative_name or Path(relative_name).name != relative_name or relative_name in roles:
-            raise GateContractError(f"{label}.XPKG[{index}]: invalid or duplicate file identity")
-        if byte_count < 0:
-            raise GateContractError(f"{label}.XPKG[{index}]: negative byte count")
-        roles.add(role)
-        files.append({"role": role, "path": relative_name, "sha256": digest, "bytes": byte_count})
-    if offset != len(body):
-        raise GateContractError(f"{label}.XPKG: trailing bytes")
-    for item in files:
-        file_path = (path.parent / item["path"]).resolve(strict=False)
-        path_within(file_path, path.parent, f"{label}.files.{item['role']}")
-        require_regular_file(file_path, f"{label}.files.{item['role']}")
-        if sha256_file(file_path) != item["sha256"] or file_path.stat().st_size != item["bytes"]:
-            raise GateContractError(f"{label}.files.{item['role']}: package manifest file hash/size mismatch")
-    artifact = next((item for item in files if item["role"] == "artifact"), None)
-    if artifact is None or (path.parent / artifact["path"]).resolve(strict=False) != package_path:
-        raise GateContractError(f"{label}: artifact file role does not bind package path")
-    return {"format": "mll", "metadata": metadata, "files": files}
-
-
-def runtime_policy_value(metadata: dict[str, Any], key: str, default: Any = None) -> Any:
-    return metadata.get(key, default)
-
-
-def runtime_bool(metadata: dict[str, Any], key: str, default: bool = False) -> bool:
-    value = runtime_policy_value(metadata, key, default)
-    if not isinstance(value, bool):
-        raise GateContractError(f"runtime package metadata {key!r} must be boolean")
-    return value
-
-
-def runtime_string(metadata: dict[str, Any], key: str, *, required: bool = False) -> str:
-    value = runtime_policy_value(metadata, key, "")
-    if not isinstance(value, str) or (required and not value):
-        raise GateContractError(f"runtime package metadata {key!r} must be a string")
-    return value
-
-
-def _runtime_transform_hashes(stages: list[dict[str, Any]], label: str) -> tuple[str, str]:
-    pairings = hashlib.sha256()
-    angles = hashlib.sha256()
-    for stage in stages:
-        for pair, angle in zip(stage["pairs"], stage["angles"]):
-            pairings.update(f"{pair[0]},{pair[1]}\n".encode("ascii"))
-            angles.update(f"{float(angle):.9g}\n".encode("ascii"))
-    return pairings.hexdigest(), angles.hexdigest()
-
-
-def validate_runtime_transform_payload(path: Path, payload: dict[str, Any], *, expected_anchor: dict[str, str] | None, label: str) -> dict[str, Any]:
-    required = {"version", "kind", "dim", "seed", "angle_cap", "stages", "audit"}
-    optional = {"seed", "angle_cap", "audit"}
-    if set(payload) - (required | optional) or not {"version", "kind", "dim", "stages"}.issubset(payload):
-        raise GateContractError(f"{label}: runtime AOQT sidecar key set mismatch")
-    if payload["version"] != AOQT_TRANSFORM_VERSION or payload["kind"] != "aoqt_givens_v1" or payload["dim"] != DIMENSION:
-        raise GateContractError(f"{label}: runtime AOQT sidecar version/kind/dimension mismatch")
-    seed = payload.get("seed", AOQT_TOPOLOGY_SEED)
-    if seed != AOQT_TOPOLOGY_SEED:
-        raise GateContractError(f"{label}: runtime AOQT sidecar seed mismatch")
-    angle_cap = require_finite_number(payload.get("angle_cap", AOQT_TOPOLOGY["angle_cap_default"]), f"{label}.angle_cap")
-    if angle_cap <= 0 or angle_cap > AOQT_TOPOLOGY["angle_cap_default"]:
-        raise GateContractError(f"{label}: runtime AOQT sidecar angle cap exceeds policy")
-    stages = payload["stages"]
-    if not isinstance(stages, list) or len(stages) != AOQT_TOPOLOGY["stages"]:
-        raise GateContractError(f"{label}: runtime AOQT sidecar stage count mismatch")
-    normalized_stages: list[dict[str, Any]] = []
-    for stage_index, raw_stage in enumerate(stages):
-        stage = require_mapping(raw_stage, f"{label}.stages[{stage_index}]")
-        require_exact_keys(stage, {"pairs", "angles"}, f"{label}.stages[{stage_index}]")
-        pairs = stage["pairs"]
-        angles = stage["angles"]
-        if not isinstance(pairs, list) or len(pairs) != AOQT_TOPOLOGY["pairs_per_stage"] or not isinstance(angles, list) or len(angles) != len(pairs):
-            raise GateContractError(f"{label}.stages[{stage_index}]: pair/angle count mismatch")
-        seen: set[int] = set()
-        normalized_pairs: list[list[int]] = []
-        normalized_angles: list[float] = []
-        for pair_index, raw_pair in enumerate(pairs):
-            if not isinstance(raw_pair, list) or len(raw_pair) != 2:
-                raise GateContractError(f"{label}.stages[{stage_index}].pairs[{pair_index}]: pair must have two coordinates")
-            a = require_integer(raw_pair[0], f"{label}.stages[{stage_index}].pairs[{pair_index}][0]", minimum=0)
-            b = require_integer(raw_pair[1], f"{label}.stages[{stage_index}].pairs[{pair_index}][1]", minimum=0)
-            if a >= DIMENSION or b >= DIMENSION or a == b or a in seen or b in seen:
-                raise GateContractError(f"{label}.stages[{stage_index}].pairs[{pair_index}]: coordinate topology mismatch")
-            seen.update((a, b))
-            angle = require_finite_number(angles[pair_index], f"{label}.stages[{stage_index}].angles[{pair_index}]")
-            if abs(angle) > angle_cap + 1e-7:
-                raise GateContractError(f"{label}.stages[{stage_index}].angles[{pair_index}]: exceeds angle cap")
-            normalized_pairs.append([a, b])
-            normalized_angles.append(angle)
-        if len(seen) != DIMENSION:
-            raise GateContractError(f"{label}.stages[{stage_index}]: every D384 coordinate must be paired exactly once")
-        normalized_stages.append({"pairs": normalized_pairs, "angles": normalized_angles})
-    pairings_sha, angles_sha = _runtime_transform_hashes(normalized_stages, label)
-    audit = payload.get("audit", {})
-    if audit is None:
-        audit = {}
-    audit = require_mapping(audit, f"{label}.audit")
-    unknown_audit = sorted(set(audit) - {"pairings_sha256", "angles_sha256", "orthogonality_frobenius_per_dim"})
-    if unknown_audit:
-        raise GateContractError(f"{label}.audit: unexpected keys {unknown_audit}")
-    if "pairings_sha256" in audit and require_sha256(audit["pairings_sha256"], f"{label}.audit.pairings_sha256") != pairings_sha:
-        raise GateContractError(f"{label}: runtime sidecar pairings hash mismatch")
-    if "angles_sha256" in audit and require_sha256(audit["angles_sha256"], f"{label}.audit.angles_sha256") != angles_sha:
-        raise GateContractError(f"{label}: runtime sidecar angles hash mismatch")
-    if "orthogonality_frobenius_per_dim" in audit:
-        require_finite_number(audit["orthogonality_frobenius_per_dim"], f"{label}.audit.orthogonality_frobenius_per_dim")
-    # A runtime transform has no package-level anchor field.  The candidate
-    # package attestation supplies that binding; the transform bytes themselves
-    # are bound by the sibling rollup and this computed content audit.
-    if expected_anchor is not None and not isinstance(expected_anchor, dict):
-        raise GateContractError(f"{label}: invalid expected anchor binding")
-    return {
-        "schema": SIDECAR_SCHEMA,
-        "source_schema": AOQT_TRANSFORM_VERSION,
-        "topology": copy.deepcopy(AOQT_TOPOLOGY),
-        "anchor": copy.deepcopy(expected_anchor),
-        "pairings_sha256": pairings_sha,
-        "angles_sha256": angles_sha,
-        "legal_scope": copy.deepcopy(AOQT_LEGAL_SCOPE),
-        "seed": seed,
-        "angle_cap": angle_cap,
-        "transform_sha256": sha256_file(path),
-    }
-
-
-def validate_sidecar(path: Path, *, expected_anchor: dict[str, str] | None, label: str) -> dict[str, Any]:
-    payload = read_json(path, label)
-    if payload.get("version") == AOQT_TRANSFORM_VERSION:
-        return validate_runtime_transform_payload(path, payload, expected_anchor=expected_anchor, label=label)
-    require_exact_keys(payload, {"schema", "topology", "anchor", "pairings_sha256", "angles_sha256", "legal_scope"}, label)
-    if payload["schema"] != SIDECAR_SCHEMA or payload["topology"] != AOQT_TOPOLOGY or payload["legal_scope"] != AOQT_LEGAL_SCOPE:
-        raise GateContractError(f"{label}: sidecar schema/topology/legal policy mismatch")
-    anchor = require_mapping(payload["anchor"], f"{label}.anchor")
-    require_exact_keys(anchor, {"package_sha256", "manifest_sha256"}, f"{label}.anchor")
-    anchor_binding = {
-        "package_sha256": require_sha256(anchor["package_sha256"], f"{label}.anchor.package_sha256"),
-        "manifest_sha256": require_sha256(anchor["manifest_sha256"], f"{label}.anchor.manifest_sha256"),
-    }
-    if expected_anchor is not None and anchor_binding != expected_anchor:
-        raise GateContractError(f"{label}: sidecar anchor binding mismatch")
-    return {
-        "schema": SIDECAR_SCHEMA,
-        "source_schema": SIDECAR_SCHEMA,
-        "topology": copy.deepcopy(AOQT_TOPOLOGY),
-        "anchor": anchor_binding,
-        "pairings_sha256": require_sha256(payload["pairings_sha256"], f"{label}.pairings_sha256"),
-        "angles_sha256": require_sha256(payload["angles_sha256"], f"{label}.angles_sha256"),
-        "legal_scope": copy.deepcopy(AOQT_LEGAL_SCOPE),
-        "seed": None,
-        "angle_cap": None,
-        "transform_sha256": sha256_file(path),
-    }
-
-
-def parse_runtime_hash_map(value: str, label: str) -> dict[str, str]:
-    if not value:
-        return {}
-    result: dict[str, str] = {}
-    for row in value.splitlines():
-        if not row or "=" not in row:
-            raise GateContractError(f"{label}: malformed hash map")
-        name, digest = row.split("=", 1)
-        if not name or name in result:
-            raise GateContractError(f"{label}: duplicate/empty hash-map key")
-        result[name] = require_sha256(digest, f"{label}.{name}")
-    return dict(sorted(result.items()))
-
-
-def validate_runtime_package_policy(native_manifest: dict[str, Any], *, package: dict[str, Any], role: str, policy: dict[str, Any], anchor_binding: dict[str, str], embedding_space_id: str, sidecar_record: dict[str, Any] | None, sidecar_policy: dict[str, Any] | None, label: str) -> None:
-    metadata = native_manifest["metadata"]
-    files = {item["role"]: item for item in native_manifest["files"]}
-    required_roles = {"artifact", "embedding_manifest", "weights", "memory_plan"}
-    if not required_roles.issubset(files):
-        raise GateContractError(f"{label}: runtime package omits required embedding file roles")
-    if role == "anchor":
-        if "post_pool_transform" in files or runtime_bool(metadata, "aoqt_transform_enabled"):
-            raise GateContractError(f"{label}: anchor runtime package must not carry an AOQT transform")
-    else:
-        if "post_pool_transform" not in files or not runtime_bool(metadata, "aoqt_transform_enabled"):
-            raise GateContractError(f"{label}: candidate runtime package must carry an enabled AOQT transform")
-    for key in ("score_spectrum_research_only", "listwise_geometry_research_only"):
-        if runtime_bool(metadata, key):
-            raise GateContractError(f"{label}: runtime package retains restricted {key} data")
-    authored_manifest_path = (Path(package["manifest"]["path"]).parent / files["embedding_manifest"]["path"]).resolve(strict=False)
-    authored = parse_runtime_authored_manifest(authored_manifest_path, f"{label}.embedding_manifest")
-    authored_meta = authored["metadata"]
-    output_dim = authored_meta.get("output_dim")
-    if output_dim != DIMENSION:
-        raise GateContractError(f"{label}: embedding manifest output_dim is not D384")
-    post_pool = runtime_string(authored_meta, "post_pool_transform")
-    expected_post_pool = "" if role == "anchor" else "aoqt_givens_v1"
-    if post_pool not in ({"", "none"} if role == "anchor" else {expected_post_pool}):
-        raise GateContractError(f"{label}: embedding manifest post_pool_transform mismatch")
-    enabled = runtime_bool(metadata, "aoqt_transform_enabled")
-    if enabled != (role == "candidate"):
-        raise GateContractError(f"{label}: runtime AOQT enabled flag mismatch")
-    if not enabled:
-        return
-    expected_bools = {
-        "aoqt_transform_research_only": True,
-        "aoqt_transform_research_train_allowed": True,
-        "aoqt_transform_release_train_allowed": False,
-        "aoqt_transform_commercial_use_allowed": False,
-        "aoqt_transform_free_open_release_allowed": False,
-        "aoqt_transform_quality_claim": False,
-    }
-    if any(runtime_bool(metadata, key) != expected for key, expected in expected_bools.items()):
-        raise GateContractError(f"{label}: runtime AOQT research-only legal flags mismatch")
-    if runtime_string(metadata, "aoqt_transform_schema", required=True) != "eos.aoqt_transform_policy.v1":
-        raise GateContractError(f"{label}: runtime AOQT policy schema mismatch")
-    if runtime_string(metadata, "aoqt_transform_anchor_artifact_sha256", required=True) != anchor_binding["package_sha256"] or runtime_string(metadata, "aoqt_transform_anchor_package_manifest_sha256", required=True) != anchor_binding["manifest_sha256"] or runtime_string(metadata, "aoqt_transform_anchor_embedding_space_id", required=True) != embedding_space_id:
-        raise GateContractError(f"{label}: runtime AOQT anchor binding mismatch")
-    if sidecar_record is None or sidecar_policy is None:
-        raise GateContractError(f"{label}: runtime AOQT sidecar record is missing")
-    if files["post_pool_transform"]["path"] != Path(sidecar_record["path"]).name or files["post_pool_transform"]["sha256"] != sidecar_record["sha256"] or runtime_string(metadata, "aoqt_transform_transform_sha256", required=True) != sidecar_record["sha256"]:
-        raise GateContractError(f"{label}: runtime AOQT transform file binding mismatch")
-    if runtime_string(metadata, "aoqt_transform_pairings_sha256", required=True) != sidecar_policy["pairings_sha256"] or runtime_string(metadata, "aoqt_transform_angles_sha256", required=True) != sidecar_policy["angles_sha256"]:
-        raise GateContractError(f"{label}: runtime AOQT pairings/angles binding mismatch")
-    qrels_map = parse_runtime_hash_map(runtime_string(metadata, "aoqt_transform_qrels_sha256_by_dataset"), f"{label}.runtime.qrels_sha256_by_dataset")
-    if set(qrels_map) != set(DOMAINS):
-        raise GateContractError(f"{label}: runtime AOQT qrels hash coverage mismatch")
-    for key in ("aoqt_transform_dataset_manifest_sha256", "aoqt_transform_compatibility_digest"):
-        require_sha256(runtime_string(metadata, key, required=True), f"{label}.{key}")
-
-
-def normalize_package_record(value: Any, base_dir: Path, label: str, *, expected_role: str | None = None) -> dict[str, Any]:
+def normalize_dataset_record(value: Any, base_dir: Path, domain: str, label: str) -> dict[str, Any]:
     record = require_mapping(value, label)
-    required_keys = {"path", "sha256", "bytes", "manifest", "attestation", "sibling_rollup_sha256"}
-    optional_canonical_keys = {"embedding_space_id", "sidecar", "sidecar_policy", "attestation_policy"}
-    missing = sorted(required_keys - set(record))
-    extra = sorted(set(record) - required_keys - optional_canonical_keys)
-    if missing or extra:
-        details = []
-        if missing:
-            details.append(f"missing {missing}")
-        if extra:
-            details.append(f"unexpected {extra}")
-        raise GateContractError(f"{label}: key set mismatch ({'; '.join(details)})")
-    package = normalize_file_record({key: record[key] for key in ("path", "sha256", "bytes")}, base_dir, label)
-    package["manifest"] = normalize_file_record(record["manifest"], base_dir, f"{label}.manifest")
-    package["attestation"] = normalize_file_record(record["attestation"], base_dir, f"{label}.attestation")
-    if len({package["path"], package["manifest"]["path"], package["attestation"]["path"]}) != 3:
-        raise GateContractError(f"{label}: package, manifest, and attestation paths must differ")
-    package["sibling_rollup_sha256"] = require_sha256(record["sibling_rollup_sha256"], f"{label}.sibling_rollup_sha256")
-    attestation_path = Path(package["attestation"]["path"])
-    policy = read_json(attestation_path, f"{label}.attestation")
-    require_exact_keys(
-        policy,
-        {"schema", "role", "package_sha256", "manifest_sha256", "dimension", "embedding_space_id", "post_pool_transform", "research_only", "topology", "transform", "anchor", "legal_scope", "sidecar", "sibling_rollup"},
-        f"{label}.attestation",
-    )
-    role = require_string(policy["role"], f"{label}.attestation.role", safe_id=True)
-    if role not in ROLES or (expected_role is not None and role != expected_role):
-        raise GateContractError(f"{label}: package attestation role mismatch")
-    if policy["schema"] != PACKAGE_ATTESTATION_SCHEMA or policy["dimension"] != DIMENSION or policy["research_only"] is not (role == "candidate"):
-        raise GateContractError(f"{label}: package attestation schema/dimension mismatch")
-    if policy["package_sha256"] != package["sha256"] or policy["manifest_sha256"] != package["manifest"]["sha256"]:
-        raise GateContractError(f"{label}: package attestation hash binding mismatch")
-    embedding_space_id = require_string(policy["embedding_space_id"], f"{label}.attestation.embedding_space_id", safe_id=True)
-    if policy["topology"] != AOQT_TOPOLOGY or policy["legal_scope"] != AOQT_LEGAL_SCOPE:
-        raise GateContractError(f"{label}: AOQT topology/legal scope mismatch")
-    anchor = require_mapping(policy["anchor"], f"{label}.attestation.anchor")
-    require_exact_keys(anchor, {"package_sha256", "manifest_sha256"}, f"{label}.attestation.anchor")
-    anchor_binding = {
-        "package_sha256": require_sha256(anchor["package_sha256"], f"{label}.attestation.anchor.package_sha256"),
-        "manifest_sha256": require_sha256(anchor["manifest_sha256"], f"{label}.attestation.anchor.manifest_sha256"),
-    }
-    manifest_path = Path(package["manifest"]["path"])
-    if manifest_path.read_bytes()[:4] == b"MLL\0":
-        manifest_policy = None
-        native_manifest = parse_runtime_package_manifest(manifest_path, Path(package["path"]), f"{label}.manifest")
-    else:
-        native_manifest = None
-        manifest_policy = read_json(manifest_path, f"{label}.manifest")
-        require_exact_keys(
-            manifest_policy,
-            {"schema", "role", "package_sha256", "dimension", "embedding_space_id", "post_pool_transform", "research_only", "topology", "transform", "anchor", "legal_scope", "sidecar_sha256"},
-            f"{label}.manifest",
-        )
-        if manifest_policy["schema"] != PACKAGE_MANIFEST_SCHEMA or manifest_policy["role"] != role or manifest_policy["package_sha256"] != package["sha256"] or manifest_policy["dimension"] != DIMENSION or manifest_policy["embedding_space_id"] != embedding_space_id or manifest_policy["research_only"] is not (role == "candidate") or manifest_policy["topology"] != AOQT_TOPOLOGY or manifest_policy["legal_scope"] != AOQT_LEGAL_SCOPE:
-            raise GateContractError(f"{label}: package manifest identity/policy mismatch")
-        expected_manifest_anchor = None if role == "anchor" else anchor_binding
-        if manifest_policy["post_pool_transform"] != policy["post_pool_transform"] or manifest_policy["transform"] != policy["transform"] or manifest_policy["anchor"] != expected_manifest_anchor:
-            raise GateContractError(f"{label}: package manifest transform/anchor mismatch")
-    manifest_sidecar_sha = manifest_policy["sidecar_sha256"] if manifest_policy is not None else None
-    if role == "anchor" and manifest_policy is not None and manifest_sidecar_sha is not None:
-        raise GateContractError(f"{label}: anchor package manifest must not declare a sidecar")
-    if role == "candidate" and manifest_policy is not None:
-        require_sha256(manifest_sidecar_sha, f"{label}.manifest.sidecar_sha256")
-    if role == "anchor":
-        if policy["post_pool_transform"] != "none" or policy["transform"] is not None or policy["sidecar"] is not None:
-            raise GateContractError(f"{label}: anchor must not declare an AOQT sidecar")
-        if anchor_binding != {"package_sha256": package["sha256"], "manifest_sha256": package["manifest"]["sha256"]}:
-            raise GateContractError(f"{label}: anchor self-identity binding mismatch")
-    else:
-        if policy["post_pool_transform"] != "aoqt_givens_v1":
-            raise GateContractError(f"{label}: candidate must declare AOQT post_pool_transform")
-        transform = require_mapping(policy["transform"], f"{label}.attestation.transform")
-        require_exact_keys(transform, {"id", "dim", "stages", "pairs_per_stage", "angle_count", "pairings_sha256", "angles_sha256", "angle_cap", "max_angle_cap"}, f"{label}.attestation.transform")
-        if transform["id"] != AOQT_TOPOLOGY["id"] or transform["dim"] != DIMENSION or transform["stages"] != AOQT_TOPOLOGY["stages"] or transform["pairs_per_stage"] != AOQT_TOPOLOGY["pairs_per_stage"] or transform["angle_count"] != AOQT_TOPOLOGY["angle_count"]:
-            raise GateContractError(f"{label}: candidate transform topology mismatch")
-        require_sha256(transform["pairings_sha256"], f"{label}.attestation.transform.pairings_sha256")
-        require_sha256(transform["angles_sha256"], f"{label}.attestation.transform.angles_sha256")
-        cap = require_finite_number(transform["angle_cap"], f"{label}.attestation.transform.angle_cap")
-        hard_cap = require_finite_number(transform["max_angle_cap"], f"{label}.attestation.transform.max_angle_cap")
-        if cap < 0 or cap > AOQT_TOPOLOGY["angle_cap_default"] or hard_cap != AOQT_TOPOLOGY["angle_cap_hard"] or cap > hard_cap:
-            raise GateContractError(f"{label}: candidate angle cap policy mismatch")
-        sidecar_record = normalize_file_record(policy["sidecar"], attestation_path.parent, f"{label}.attestation.sidecar")
-        sidecar_policy = validate_sidecar(Path(sidecar_record["path"]), expected_anchor=anchor_binding, label=f"{label}.sidecar")
-        if sidecar_policy["anchor"] != anchor_binding:
-            raise GateContractError(f"{label}: sidecar/attestation anchor mismatch")
-        if transform["pairings_sha256"] != sidecar_policy["pairings_sha256"] or transform["angles_sha256"] != sidecar_policy["angles_sha256"]:
-            raise GateContractError(f"{label}: transform/sidecar hash mismatch")
-        if manifest_policy is not None and manifest_sidecar_sha != sidecar_record["sha256"]:
-            raise GateContractError(f"{label}: package manifest sidecar hash mismatch")
-        package["sidecar"] = sidecar_record
-        package["sidecar_policy"] = sidecar_policy
-    sibling = require_mapping(policy["sibling_rollup"], f"{label}.attestation.sibling_rollup")
-    require_exact_keys(sibling, {"entries", "sha256"}, f"{label}.attestation.sibling_rollup")
-    entries = normalize_sibling_entries(sibling["entries"], attestation_path.parent, f"{label}.attestation.sibling_rollup.entries")
-    if sibling["sha256"] != sha256_json(entries) or package["sibling_rollup_sha256"] != sibling["sha256"]:
-        raise GateContractError(f"{label}: sibling rollup digest mismatch")
-    entry_names = {item["name"] for item in entries}
-    required_names = {Path(package["path"]).name, Path(package["manifest"]["path"]).name}
-    if role == "candidate":
-        required_names.add(Path(package["sidecar"]["path"]).name)
-    if not required_names.issubset(entry_names):
-        raise GateContractError(f"{label}: sibling rollup omits bound package files")
-    if native_manifest is not None:
-        native_names = {Path(item["path"]).name for item in native_manifest["files"]}
-        if not native_names.issubset(entry_names):
-            raise GateContractError(f"{label}: sibling rollup omits runtime package files")
-    if native_manifest is not None:
-        validate_runtime_package_policy(native_manifest, package=package, role=role, policy=policy, anchor_binding=anchor_binding, embedding_space_id=embedding_space_id, sidecar_record=package.get("sidecar"), sidecar_policy=package.get("sidecar_policy"), label=label)
-    package["embedding_space_id"] = embedding_space_id
-    package["attestation_policy"] = {
-        "schema": PACKAGE_ATTESTATION_SCHEMA,
-        "role": role,
-        "package_sha256": package["sha256"],
-        "manifest_sha256": package["manifest"]["sha256"],
-        "dimension": DIMENSION,
-        "embedding_space_id": embedding_space_id,
-        "post_pool_transform": policy["post_pool_transform"],
-        "research_only": policy["research_only"],
-        "topology": copy.deepcopy(AOQT_TOPOLOGY),
-        "transform": copy.deepcopy(policy["transform"]),
-        "anchor": anchor_binding,
-        "legal_scope": copy.deepcopy(AOQT_LEGAL_SCOPE),
-        "sidecar": package.get("sidecar"),
-        "sibling_rollup": {"entries": entries, "sha256": sibling["sha256"]},
-    }
-    if "embedding_space_id" in record and record["embedding_space_id"] != package["embedding_space_id"]:
-        raise GateContractError(f"{label}: embedding_space_id canonical binding mismatch")
-    if "sidecar" in record and record["sidecar"] != package.get("sidecar"):
-        raise GateContractError(f"{label}: sidecar canonical binding mismatch")
-    if "sidecar_policy" in record and record["sidecar_policy"] != package.get("sidecar_policy"):
-        raise GateContractError(f"{label}: sidecar policy canonical binding mismatch")
-    if "attestation_policy" in record and record["attestation_policy"] != package["attestation_policy"]:
-        raise GateContractError(f"{label}: package attestation policy canonical binding mismatch")
-    return package
+    require_exact_keys(record, {"dataset_id", "dataset_dir", "corpus", "queries", "manifest"}, label)
+    dataset_id = require_string(record["dataset_id"], f"{label}.dataset_id", safe_id=True)
+    dataset_dir = Path(normalize_directory(record["dataset_dir"], base_dir, f"{label}.dataset_dir"))
+    corpus = normalize_file_record(record["corpus"], base_dir, f"{label}.corpus")
+    queries = normalize_file_record(record["queries"], base_dir, f"{label}.queries")
+    manifest = normalize_file_record(record["manifest"], base_dir, f"{label}.manifest")
+    payload = read_json(Path(manifest["path"]), f"{label}.manifest")
+    require_exact_keys(payload, {"schema", "domain", "dataset_id", "split", "corpus_sha256", "queries_sha256"}, f"{label}.manifest")
+    if payload["schema"] != DATASET_SCHEMA or payload["domain"] != domain or payload["dataset_id"] != dataset_id or payload["split"] != HELDOUT_SPLIT:
+        raise GateContractError(f"{label}: dataset manifest identity mismatch")
+    if payload["corpus_sha256"] != corpus["sha256"] or payload["queries_sha256"] != queries["sha256"]:
+        raise GateContractError(f"{label}: dataset manifest content binding mismatch")
+    return {"dataset_id": dataset_id, "dataset_dir": str(dataset_dir), "corpus": corpus, "queries": queries, "manifest": manifest}
 
 
-def validate_package_pair(anchor: dict[str, Any], candidate: dict[str, Any]) -> None:
-    if anchor["sha256"] == candidate["sha256"] or anchor["manifest"]["sha256"] == candidate["manifest"]["sha256"] or anchor["attestation"]["sha256"] == candidate["attestation"]["sha256"]:
-        raise GateContractError("anchor and candidate package identities must be distinct, not merely different paths")
-    if anchor["embedding_space_id"] != candidate["embedding_space_id"]:
-        raise GateContractError("anchor/candidate embedding_space_id mismatch")
-    candidate_anchor = candidate["attestation_policy"]["anchor"]
-    if candidate_anchor != {"package_sha256": anchor["sha256"], "manifest_sha256": anchor["manifest"]["sha256"]}:
-        raise GateContractError("candidate AOQT sidecar anchor binding mismatch")
+def _resolve_source_file(raw_path: str, base_dir: Path, label: str) -> Path:
+    candidates = [base_dir / raw_path, REPO_ROOT / raw_path]
+    for candidate in candidates:
+        if candidate.is_symlink():
+            raise GateContractError(f"{label}: source manifest symlink is not accepted: {raw_path}")
+        resolved = candidate.resolve(strict=False)
+        if resolved.is_file() and not resolved.is_symlink():
+            return resolved
+    raise GateContractError(f"{label}: source manifest file does not resolve: {raw_path}")
 
 
-def validate_approved_workload(path: Path, *, gate_id: str, qrels: dict[str, dict[str, Any]], label: str) -> dict[str, Any]:
-    payload = read_json(path, label)
-    require_exact_keys(
-        payload,
-        {"schema", "workload_id", "gate_id", "split", "dimension", "domains", "query_ids_by_domain", "qid_set_sha256_by_domain", "query_count_by_domain", "qrels_by_domain", "nfcorpus_boundary_qids", "nfcorpus_boundary_qids_sha256", "nfcorpus_boundary_rank_window", "metric_surfaces", "cutoffs", "turboquant", "expected_result_artifact_count"},
-        label,
-    )
-    require_no_forbidden_payload_keys(payload, label)
-    if payload["schema"] != APPROVED_WORKLOAD_SCHEMA or payload["gate_id"] != gate_id or payload["split"] != "heldout" or payload["dimension"] != DIMENSION or payload["domains"] != list(DOMAINS):
-        raise GateContractError(f"{label}: approved workload identity mismatch")
-    workload_id = require_string(payload["workload_id"], f"{label}.workload_id", safe_id=True)
-    qids = normalize_qids_by_domain(payload["query_ids_by_domain"], f"{label}.query_ids_by_domain", require_nonempty=True)
-    qid_hashes = require_mapping(payload["qid_set_sha256_by_domain"], f"{label}.qid_set_sha256_by_domain")
-    require_exact_keys(qid_hashes, set(DOMAINS), f"{label}.qid_set_sha256_by_domain")
+def normalize_exclusion_record(value: Any, base_dir: Path, expected_name: str, workload_qids: dict[str, list[str]], label: str) -> dict[str, Any]:
+    record = require_mapping(value, label)
+    require_exact_keys(record, {"kind", "name", "manifest"}, label)
+    if record["kind"] != "qid_only" or record["name"] != expected_name:
+        raise GateContractError(f"{label}: exact qid-only exclusion identity is required")
+    manifest_record = normalize_file_record(record["manifest"], base_dir, f"{label}.manifest")
+    payload = read_json(Path(manifest_record["path"]), f"{label}.manifest")
+    require_no_forbidden_payload_keys(payload, f"{label}.manifest")
+    require_exact_keys(payload, {"schema", "name", "qids_by_dataset", "source_sha256", "source_sha256_by_file"}, f"{label}.manifest")
+    if payload["schema"] != "eos.aoqt_stage2.exclusion_qids.v1" or payload["name"] != expected_name:
+        raise GateContractError(f"{label}: exclusion schema/name mismatch")
+    qids = normalize_qids_by_domain(payload["qids_by_dataset"], f"{label}.manifest.qids_by_dataset")
+    source_sha = require_sha256(payload["source_sha256"], f"{label}.manifest.source_sha256")
+    source_map = require_mapping(payload["source_sha256_by_file"], f"{label}.manifest.source_sha256_by_file")
+    if not source_map:
+        raise GateContractError(f"{label}: source manifest map must be non-empty")
+    normalized_source: dict[str, str] = {}
+    resolved_sources: set[Path] = set()
+    for raw_path, expected_sha in sorted(source_map.items()):
+        source_name = require_string(raw_path, f"{label}.source.path")
+        source_path = _resolve_source_file(source_name, Path(manifest_record["path"]).parent, f"{label}.source")
+        if source_path in resolved_sources:
+            raise GateContractError(f"{label}: source manifest contains duplicate resolved files")
+        resolved_sources.add(source_path)
+        normalized_expected = require_sha256(expected_sha, f"{label}.source.sha256")
+        actual = sha256_file(source_path)
+        if actual != normalized_expected:
+            raise GateContractError(f"{label}: source manifest sha256 mismatch for {source_path}")
+        # Preserve the manifest's canonical path spelling in the frozen
+        # record.  The path is still resolved and hashed above; preserving it
+        # keeps source_sha256 (the canonical map digest used by the existing
+        # AOQT exclusion schema) stable across freeze/revalidation.
+        normalized_source[source_name] = actual
+    if sha256_json(dict(sorted(normalized_source.items()))) != source_sha:
+        raise GateContractError(f"{label}: source_sha256 does not bind source_sha256_by_file")
     for domain in DOMAINS:
-        if require_sha256(qid_hashes[domain], f"{label}.qid_set_sha256_by_domain.{domain}") != sha256_json(qids[domain]):
-            raise GateContractError(f"{label}: qid-set hash mismatch for {domain}")
-    counts = require_mapping(payload["query_count_by_domain"], f"{label}.query_count_by_domain")
-    require_exact_keys(counts, set(DOMAINS), f"{label}.query_count_by_domain")
-    count_by_domain = {domain: require_integer(counts[domain], f"{label}.query_count_by_domain.{domain}", minimum=1) for domain in DOMAINS}
-    if count_by_domain != {domain: len(qids[domain]) for domain in DOMAINS}:
-        raise GateContractError(f"{label}: approved workload count mismatch")
-    qrels_node = require_mapping(payload["qrels_by_domain"], f"{label}.qrels_by_domain")
-    require_exact_keys(qrels_node, set(DOMAINS), f"{label}.qrels_by_domain")
-    qrels_binding: dict[str, Any] = {}
-    for domain in DOMAINS:
-        item = require_mapping(qrels_node[domain], f"{label}.qrels_by_domain.{domain}")
-        require_exact_keys(item, {"path", "sha256", "bytes", "query_count", "relevant_count"}, f"{label}.qrels_by_domain.{domain}")
-        normalized = normalize_qrels_record(item, path.parent, f"{label}.qrels_by_domain.{domain}")
-        if normalized != qrels[domain]:
-            raise GateContractError(f"{label}: qrels binding mismatch for {domain}")
-        if normalized["query_count"] != count_by_domain[domain]:
-            raise GateContractError(f"{label}: qrels/query count mismatch for {domain}")
-        qrels_binding[domain] = normalized
-    if not isinstance(payload["nfcorpus_boundary_qids"], list):
-        raise GateContractError(f"{label}.nfcorpus_boundary_qids: expected qid list")
-    boundary = [require_qid(item, f"{label}.nfcorpus_boundary_qids") for item in payload["nfcorpus_boundary_qids"]]
-    if not boundary or boundary != sorted(set(boundary)) or not set(boundary).issubset(set(qids["nfcorpus"])):
-        raise GateContractError(f"{label}: NFCorpus boundary qids must be a non-empty sorted subset")
-    if require_sha256(payload["nfcorpus_boundary_qids_sha256"], f"{label}.nfcorpus_boundary_qids_sha256") != sha256_json(boundary):
-        raise GateContractError(f"{label}: NFCorpus boundary qid hash mismatch")
-    if payload["nfcorpus_boundary_rank_window"] != [80, 120]:
-        raise GateContractError(f"{label}: NFCorpus boundary window must be [80,120]")
-    if payload["metric_surfaces"] != list(SURFACES) or payload["cutoffs"] != {"ndcg_at_10": 10, "recall_at_100": 100}:
-        raise GateContractError(f"{label}: metric surface/cutoff mismatch")
-    turboquant = require_mapping(payload["turboquant"], f"{label}.turboquant")
-    require_exact_keys(turboquant, {"q3_bits", "q5_bits", "seed", "top_k"}, f"{label}.turboquant")
-    if turboquant != {"q3_bits": Q3_BITS, "q5_bits": Q5_BITS, "seed": TURBOQUANT_SEED, "top_k": TOP_K}:
-        raise GateContractError(f"{label}: TurboQuant config mismatch")
-    if payload["expected_result_artifact_count"] != RESULT_OUTPUT_COUNT:
-        raise GateContractError(f"{label}: expected result artifact count mismatch")
+        intersection = sorted(set(qids[domain]) & set(workload_qids[domain]))
+        if intersection:
+            raise GateContractError(f"{label}: workload/exclusion qid intersection in {domain}: {intersection[:4]}")
     return {
-        "schema": APPROVED_WORKLOAD_SCHEMA,
-        "workload_id": workload_id,
-        "gate_id": gate_id,
-        "split": "heldout",
-        "dimension": DIMENSION,
-        "domains": list(DOMAINS),
-        "query_ids_by_domain": qids,
-        "qid_set_sha256_by_domain": qids_sha256_by_domain(qids),
-        "query_count_by_domain": count_by_domain,
-        "qrels_by_domain": qrels_binding,
-        "nfcorpus_boundary_qids": boundary,
-        "nfcorpus_boundary_qids_sha256": sha256_json(boundary),
-        "nfcorpus_boundary_rank_window": [80, 120],
-        "metric_surfaces": list(SURFACES),
-        "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100},
-        "turboquant": {"q3_bits": Q3_BITS, "q5_bits": Q5_BITS, "seed": TURBOQUANT_SEED, "top_k": TOP_K},
-        "expected_result_artifact_count": RESULT_OUTPUT_COUNT,
+        "kind": "qid_only",
+        "semantic": EXCLUSION_SEMANTIC,
+        "name": expected_name,
+        "manifest": manifest_record,
+        "manifest_sha256": manifest_record["sha256"],
+        "source_sha256": source_sha,
+        "source_sha256_by_file": normalized_source,
+        "qids_by_domain": qids,
+        "qids_sha256_by_domain": qids_sha256_by_domain(qids),
     }
 
 
-def validate_workload(path: Path, *, gate_id: str, approved: dict[str, Any], label: str) -> dict[str, Any]:
-    payload = read_json(path, label)
-    required = {"schema", "workload_id", "gate_id", "split", "dimension", "domains", "query_ids_by_domain", "qid_set_sha256_by_domain", "query_count_by_domain", "nfcorpus_boundary_qids", "nfcorpus_boundary_qids_sha256", "nfcorpus_boundary_rank_window", "metric_surfaces", "cutoffs", "turboquant", "expected_result_artifact_count"}
-    require_exact_keys(payload, required, label)
-    require_no_forbidden_payload_keys(payload, label)
-    if payload["schema"] != WORKLOAD_SCHEMA:
-        raise GateContractError(f"{label}: workload schema mismatch")
-    if payload["workload_id"] != approved["workload_id"] or payload["gate_id"] != gate_id or payload["split"] != "heldout" or payload["dimension"] != DIMENSION or payload["domains"] != list(DOMAINS):
-        raise GateContractError(f"{label}: evaluator workload identity mismatch")
-    qids = normalize_qids_by_domain(payload["query_ids_by_domain"], f"{label}.query_ids_by_domain", require_nonempty=True)
-    qid_hashes = require_mapping(payload["qid_set_sha256_by_domain"], f"{label}.qid_set_sha256_by_domain")
-    require_exact_keys(qid_hashes, set(DOMAINS), f"{label}.qid_set_sha256_by_domain")
-    counts = require_mapping(payload["query_count_by_domain"], f"{label}.query_count_by_domain")
-    require_exact_keys(counts, set(DOMAINS), f"{label}.query_count_by_domain")
-    normalized_counts = {domain: require_integer(counts[domain], f"{label}.query_count_by_domain.{domain}", minimum=1) for domain in DOMAINS}
-    if not isinstance(payload["nfcorpus_boundary_qids"], list):
-        raise GateContractError(f"{label}.nfcorpus_boundary_qids: expected qid list")
-    boundary = [require_qid(item, f"{label}.nfcorpus_boundary_qids") for item in payload["nfcorpus_boundary_qids"]]
+def _validate_topology(value: Any, label: str) -> dict[str, Any]:
+    topology = require_mapping(value, label)
+    require_exact_keys(topology, set(AOQT_TOPOLOGY), label)
     normalized = {
-        "schema": WORKLOAD_SCHEMA,
-        "workload_id": payload["workload_id"],
-        "gate_id": gate_id,
-        "split": "heldout",
-        "dimension": DIMENSION,
-        "domains": list(DOMAINS),
-        "query_ids_by_domain": qids,
-        "qid_set_sha256_by_domain": qids_sha256_by_domain(qids),
-        "query_count_by_domain": normalized_counts,
-        "nfcorpus_boundary_qids": sorted(set(boundary)),
-        "nfcorpus_boundary_qids_sha256": sha256_json(sorted(set(boundary))),
-        "nfcorpus_boundary_rank_window": payload["nfcorpus_boundary_rank_window"],
-        "metric_surfaces": payload["metric_surfaces"],
-        "cutoffs": payload["cutoffs"],
-        "turboquant": payload["turboquant"],
-        "expected_result_artifact_count": payload["expected_result_artifact_count"],
+        "id": require_string(topology["id"], f"{label}.id", safe_id=True),
+        "dim": require_integer(topology["dim"], f"{label}.dim", minimum=1),
+        "stages": require_integer(topology["stages"], f"{label}.stages", minimum=1),
+        "pairs_per_stage": require_integer(topology["pairs_per_stage"], f"{label}.pairs_per_stage", minimum=1),
+        "angle_count": require_integer(topology["angle_count"], f"{label}.angle_count", minimum=1),
+        "angle_cap_default": require_finite_number(topology["angle_cap_default"], f"{label}.angle_cap_default"),
+        "angle_cap_hard": require_finite_number(topology["angle_cap_hard"], f"{label}.angle_cap_hard"),
     }
-    if normalized["qid_set_sha256_by_domain"] != qid_hashes or normalized["query_count_by_domain"] != {domain: len(qids[domain]) for domain in DOMAINS}:
-        raise GateContractError(f"{label}: workload qid hash/count mismatch")
-    if normalized["nfcorpus_boundary_rank_window"] != [80, 120] or not normalized["nfcorpus_boundary_qids"] or not set(normalized["nfcorpus_boundary_qids"]).issubset(set(qids["nfcorpus"])):
-        raise GateContractError(f"{label}: workload NFCorpus boundary mismatch")
-    if normalized["metric_surfaces"] != list(SURFACES) or normalized["cutoffs"] != {"ndcg_at_10": 10, "recall_at_100": 100} or normalized["turboquant"] != {"q3_bits": Q3_BITS, "q5_bits": Q5_BITS, "seed": TURBOQUANT_SEED, "top_k": TOP_K} or normalized["expected_result_artifact_count"] != RESULT_OUTPUT_COUNT:
-        raise GateContractError(f"{label}: workload metric/config mismatch")
-    approved_projection = {key: approved[key] for key in normalized if key in approved}
-    for key in ("workload_id", "gate_id", "dimension", "domains", "query_ids_by_domain", "qid_set_sha256_by_domain", "query_count_by_domain", "nfcorpus_boundary_qids", "nfcorpus_boundary_qids_sha256", "nfcorpus_boundary_rank_window", "metric_surfaces", "cutoffs", "turboquant", "expected_result_artifact_count"):
-        if normalized[key] != approved_projection.get(key):
-            raise GateContractError(f"{label}: approved workload binding mismatch at {key}")
+    if normalized != AOQT_TOPOLOGY:
+        raise GateContractError(f"{label}: AOQT topology mismatch")
     return normalized
 
 
-def normalize_exclusion_record(value: Any, base_dir: Path, label: str) -> dict[str, Any]:
+def _validate_legal_scope(value: Any, label: str) -> dict[str, Any]:
+    scope = require_mapping(value, label)
+    require_exact_keys(scope, set(AOQT_LEGAL_SCOPE), label)
+    for key in AOQT_LEGAL_SCOPE:
+        if not isinstance(scope[key], bool):
+            raise GateContractError(f"{label}.{key}: expected boolean")
+    normalized = {key: scope[key] for key in AOQT_LEGAL_SCOPE}
+    if normalized != AOQT_LEGAL_SCOPE:
+        raise GateContractError(f"{label}: AOQT legal scope mismatch")
+    return normalized
+
+
+def _native_mll_section_tags(path: Path, label: str) -> set[bytes]:
+    """Perform bounded MLL container validation without loading model tensors."""
+
+    try:
+        file_size = path.stat().st_size
+        with path.open("rb") as handle:
+            header = handle.read(24)
+    except OSError as exc:
+        raise GateContractError(f"{label}: cannot read MLL: {exc}") from exc
+    if file_size < 24 or len(header) != 24 or header[:4] != b"MLL\0":
+        raise GateContractError(f"{label}: production packages must be native MLL artifacts; JSON fallback is test-only")
+    section_count = int.from_bytes(header[16:20], "little")
+    if section_count <= 0 or section_count > 4096:
+        raise GateContractError(f"{label}: invalid MLL section directory")
+    directory_end = 24 + section_count * 64
+    if directory_end > file_size:
+        raise GateContractError(f"{label}: invalid MLL section directory")
+    try:
+        with path.open("rb") as handle:
+            handle.seek(24)
+            directory = handle.read(section_count * 64)
+    except OSError as exc:
+        raise GateContractError(f"{label}: cannot read MLL section directory: {exc}") from exc
+    if len(directory) != section_count * 64:
+        raise GateContractError(f"{label}: truncated MLL section directory")
+    tags: set[bytes] = set()
+    intervals: list[tuple[int, int]] = []
+    for index in range(section_count):
+        entry = directory[index * 64 : (index + 1) * 64]
+        tag = entry[:4]
+        if tag in tags:
+            raise GateContractError(f"{label}: duplicate MLL section tag {tag!r}")
+        start = int.from_bytes(entry[4:12], "little")
+        size = int.from_bytes(entry[12:20], "little")
+        end = start + size
+        if start < directory_end or end < start or end > file_size:
+            raise GateContractError(f"{label}: MLL section bounds invalid")
+        if any(start < old_end and old_start < end for old_start, old_end in intervals):
+            raise GateContractError(f"{label}: overlapping MLL sections")
+        tags.add(tag)
+        intervals.append((start, end))
+    if not {b"HEAD", b"STRG"}.issubset(tags):
+        raise GateContractError(f"{label}: native package missing HEAD/STRG sections")
+    return tags
+
+
+def _validate_manifest_file(path: Path, package_sha: str, role: str, label: str, *, production: bool) -> dict[str, Any] | None:
+    if path.read_bytes()[:4] == b"MLL\0":
+        _native_mll_section_tags(path, label)
+        return None
+    payload = read_json(path, label)
+    if production and payload.get("schema") != NATIVE_PACKAGE_MANIFEST_SCHEMA:
+        # The pinned current D384 anchor is accompanied by the train-only
+        # stage2 anchor manifest rather than an XPKG package-manifest section.
+        # It is admitted only by its exact immutable digest and exact audit
+        # fields; arbitrary JSON package metadata remains rejected.
+        if not (role == "anchor" and sha256_file(path) == D384_ANCHOR_MANIFEST_SHA256 and payload.get("schema") == "eos.aoqt_stage2.anchor_manifest.v1"):
+            raise GateContractError(f"{label}: arbitrary JSON package manifest fallback is test-only")
+        if payload.get("embedding_dim") != DIMENSION or payload.get("package_sha256") != package_sha:
+            raise GateContractError(f"{label}: pinned anchor manifest identity mismatch")
+        return None
+    require_exact_keys(payload, {"schema", "role", "package_sha256", "dimension", "embedding_space_id", "post_pool_transform", "research_only", "topology", "transform", "anchor", "legal_scope", "sidecar_sha256"}, label)
+    if payload["role"] != role or payload["package_sha256"] != package_sha or payload["dimension"] != DIMENSION:
+        raise GateContractError(f"{label}: package manifest identity mismatch")
+    return payload
+
+
+def _validate_transform(value: Any, role: str, label: str) -> dict[str, Any] | None:
+    if role == "anchor":
+        if value is not None:
+            raise GateContractError(f"{label}: anchor must not carry AOQT transform")
+        return None
+    transform = require_mapping(value, label)
+    require_exact_keys(transform, {"id", "dim", "stages", "pairs_per_stage", "angle_count", "pairings_sha256", "angles_sha256", "angle_cap", "max_angle_cap"}, label)
+    if transform["id"] != AOQT_TOPOLOGY["id"] or transform["dim"] != DIMENSION or transform["stages"] != AOQT_TOPOLOGY["stages"] or transform["pairs_per_stage"] != AOQT_TOPOLOGY["pairs_per_stage"] or transform["angle_count"] != AOQT_TOPOLOGY["angle_count"]:
+        raise GateContractError(f"{label}: AOQT transform topology mismatch")
+    pairings = require_sha256(transform["pairings_sha256"], f"{label}.pairings_sha256")
+    angles = require_sha256(transform["angles_sha256"], f"{label}.angles_sha256")
+    cap = require_finite_number(transform["angle_cap"], f"{label}.angle_cap")
+    hard_cap = require_finite_number(transform["max_angle_cap"], f"{label}.max_angle_cap")
+    if cap < 0 or hard_cap != AOQT_TOPOLOGY["angle_cap_hard"] or cap > hard_cap:
+        raise GateContractError(f"{label}: AOQT angle cap mismatch")
+    return {**{key: transform[key] for key in ("id", "dim", "stages", "pairs_per_stage", "angle_count")}, "pairings_sha256": pairings, "angles_sha256": angles, "angle_cap": cap, "max_angle_cap": hard_cap}
+
+
+def _validate_sidecar(path: Path, *, expected_anchor: dict[str, str], transform: dict[str, Any], label: str, production: bool) -> dict[str, Any]:
+    payload = read_json(path, label)
+    require_no_forbidden_payload_keys(payload, label)
+    require_exact_keys(payload, {"schema", "kind", "dim", "stages", "pairs_per_stage", "angle_count", "angle_cap", "max_angle_cap", "pairings_sha256", "angles_sha256", "anchor_package_sha256", "anchor_manifest_sha256", "anchor_embedding_space_id", "legal_scope"}, label)
+    if payload["schema"] != SIDECAR_SCHEMA or payload["kind"] != AOQT_TOPOLOGY["id"]:
+        raise GateContractError(f"{label}: AOQT sidecar schema/kind mismatch")
+    topology = {key: payload[key] for key in ("dim", "stages", "pairs_per_stage", "angle_count", "angle_cap", "max_angle_cap")}
+    _validate_transform({"id": payload["kind"], **topology, "pairings_sha256": payload["pairings_sha256"], "angles_sha256": payload["angles_sha256"]}, "candidate", "sidecar.transform")
+    if payload["anchor_package_sha256"] != expected_anchor["package_sha256"] or payload["anchor_manifest_sha256"] != expected_anchor["manifest_sha256"] or payload["anchor_embedding_space_id"] != expected_anchor["embedding_space_id"]:
+        raise GateContractError(f"{label}: sidecar anchor binding mismatch")
+    _validate_legal_scope(payload["legal_scope"], f"{label}.legal_scope")
+    if production and path.suffix.lower() != ".json":
+        raise GateContractError(f"{label}: native sidecar policy must be JSON")
+    return payload
+
+
+def _normalize_sibling_rollup(value: Any, package_record_base: Path, role: str, package_sha: str, manifest_sha: str, attestation_path: Path, sidecar_path: Path | None, label: str, *, production: bool) -> tuple[list[dict[str, Any]], str]:
+    rollup = require_mapping(value, label)
+    require_exact_keys(rollup, {"entries", "sha256"}, label)
+    entries_raw = rollup["entries"]
+    if not isinstance(entries_raw, list) or not entries_raw:
+        raise GateContractError(f"{label}: non-empty sibling rollup required")
+    entries: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    seen_hashes: set[str] = set()
+    seen_names: set[str] = set()
+    for index, item in enumerate(entries_raw):
+        entry = require_mapping(item, f"{label}.entries[{index}]")
+        require_exact_keys(entry, {"name", "path", "sha256", "bytes"}, f"{label}.entries[{index}]")
+        name = require_string(entry["name"], f"{label}.entries[{index}].name")
+        path = resolve_path(entry["path"], package_record_base, f"{label}.entries[{index}].path")
+        if path.name != name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise GateContractError(f"{label}.entries[{index}]: name/path mismatch")
+        normalized = normalize_file_record({"path": str(path), "sha256": entry["sha256"], "bytes": entry["bytes"]}, package_record_base, f"{label}.entries[{index}]")
+        if name in seen_names or str(path) in seen_paths or normalized["sha256"] in seen_hashes:
+            raise GateContractError(f"{label}: sibling entries must have distinct paths and content identities")
+        seen_names.add(name)
+        seen_paths.add(str(path))
+        seen_hashes.add(normalized["sha256"])
+        entries.append({"name": name, **normalized})
+    entries.sort(key=lambda item: item["name"])
+    rollup_sha = require_sha256(rollup["sha256"], f"{label}.sha256")
+    if rollup_sha != sha256_json(entries):
+        raise GateContractError(f"{label}: sibling rollup digest mismatch")
+    names = {entry["name"] for entry in entries}
+    if role == "candidate" and sidecar_path is not None and sidecar_path.name not in names:
+        raise GateContractError(f"{label}: candidate sidecar missing from sibling rollup")
+    if production and len(entries) < 3:
+        raise GateContractError(f"{label}: native package sibling rollup is incomplete")
+    return entries, rollup_sha
+
+
+def normalize_package_record(value: Any, base_dir: Path, label: str, *, expected_role: str | None = None, expected_anchor: dict[str, str] | None = None, data_binding: dict[str, Any] | None = None, expected_compatibility_digest: str | None = None, production: bool = True) -> dict[str, Any]:
     record = require_mapping(value, label)
-    require_exact_keys(record, {"kind", "name", "path", "sha256", "bytes"}, label)
-    if record["kind"] != "qid_only" or record["name"] not in EXCLUSION_NAMES:
-        raise GateContractError(f"{label}: exact qid-only exclusion identity required")
-    file_record = normalize_file_record({key: record[key] for key in ("path", "sha256", "bytes")}, base_dir, label)
-    payload = read_json(Path(file_record["path"]), f"{label}.payload")
-    require_exact_keys(payload, {"schema", "name", "split", "qids_by_domain", "source_sha256", "source_sha256_by_file"}, f"{label}.payload")
-    require_no_forbidden_payload_keys(payload, f"{label}.payload")
-    if payload["schema"] != "eos.aoqt.heldout_exclusion.v1" or payload["name"] != record["name"] or payload["split"] != record["name"]:
-        raise GateContractError(f"{label}: exclusion schema/name/split mismatch")
-    qids = normalize_qids_by_domain(payload["qids_by_domain"], f"{label}.qids_by_domain", require_nonempty=True)
-    source_sha = require_sha256(payload["source_sha256"], f"{label}.source_sha256")
-    source_map = require_mapping(payload["source_sha256_by_file"], f"{label}.source_sha256_by_file")
-    if not source_map:
-        raise GateContractError(f"{label}.source_sha256_by_file must be non-empty")
-    normalized_source_map = {}
-    for source_name, source_hash in source_map.items():
-        normalized_source_map[require_string(source_name, f"{label}.source_sha256_by_file key")] = require_sha256(source_hash, f"{label}.source_sha256_by_file.{source_name}")
+    require_exact_keys(record, {"path", "sha256", "bytes", "manifest", "attestation", "sibling_rollup_sha256"}, label)
+    package = normalize_file_record({key: record[key] for key in ("path", "sha256", "bytes")}, base_dir, f"{label}.package")
+    package_path = Path(package["path"])
+    if production:
+        _native_mll_section_tags(package_path, f"{label}.package")
+    manifest = normalize_file_record(record["manifest"], base_dir, f"{label}.manifest")
+    manifest_payload = _validate_manifest_file(Path(manifest["path"]), package["sha256"], expected_role or "", f"{label}.manifest", production=production)
+    attestation = normalize_file_record(record["attestation"], base_dir, f"{label}.attestation")
+    if len({package["path"], manifest["path"], attestation["path"]}) != 3:
+        raise GateContractError(f"{label}: package, manifest, and attestation paths must differ")
+    policy = read_json(Path(attestation["path"]), f"{label}.attestation")
+    require_exact_keys(policy, {"schema", "role", "package_sha256", "manifest_sha256", "dimension", "embedding_space_id", "post_pool_transform", "research_only", "topology", "transform", "anchor", "legal_scope", "sidecar", "sibling_rollup", "dataset_binding", "compatibility_digest", "identity"}, f"{label}.attestation")
+    if policy["schema"] != PACKAGE_ATTESTATION_SCHEMA:
+        raise GateContractError(f"{label}: native package attestation schema mismatch")
+    role = require_string(policy["role"], f"{label}.attestation.role", safe_id=True)
+    if expected_role is not None and role != expected_role:
+        raise GateContractError(f"{label}: package role mismatch")
+    if policy["package_sha256"] != package["sha256"] or policy["manifest_sha256"] != manifest["sha256"] or policy["dimension"] != DIMENSION:
+        raise GateContractError(f"{label}: package attestation hash/dimension binding mismatch")
+    embedding_space_id = require_sha256(policy["embedding_space_id"], f"{label}.attestation.embedding_space_id")
+    topology = _validate_topology(policy["topology"], f"{label}.attestation.topology")
+    legal_scope = _validate_legal_scope(policy["legal_scope"], f"{label}.attestation.legal_scope")
+    transform = _validate_transform(policy["transform"], role, f"{label}.attestation.transform")
+    if role == "anchor":
+        if policy["post_pool_transform"] != "none" or bool(policy["research_only"]):
+            raise GateContractError(f"{label}: anchor post-pool/research policy mismatch")
+    else:
+        if policy["post_pool_transform"] != AOQT_TOPOLOGY["id"] or policy["research_only"] is not True or transform is None:
+            raise GateContractError(f"{label}: candidate AOQT post-pool policy mismatch")
+    if role == "candidate":
+        sidecar_raw = require_mapping(policy["sidecar"], f"{label}.attestation.sidecar")
+        sidecar = normalize_file_record(sidecar_raw, Path(attestation["path"]).parent, f"{label}.attestation.sidecar")
+        sidecar_path: Path | None = Path(sidecar["path"])
+    else:
+        if policy["sidecar"] is not None:
+            raise GateContractError(f"{label}: anchor sidecar must be null")
+        sidecar = None
+        sidecar_path = None
+    if manifest_payload is not None:
+        if manifest_payload["embedding_space_id"] != embedding_space_id or manifest_payload["post_pool_transform"] != policy["post_pool_transform"] or manifest_payload["research_only"] != policy["research_only"]:
+            raise GateContractError(f"{label}: package manifest/attestation mismatch")
+        manifest_anchor_ok = manifest_payload["anchor"] == policy["anchor"] or (role == "anchor" and manifest_payload["anchor"] is None)
+        expected_sidecar_sha = None if sidecar is None else sidecar["sha256"]
+        if manifest_payload["sidecar_sha256"] != expected_sidecar_sha:
+            raise GateContractError(f"{label}: package manifest/sidecar hash mismatch")
+        if manifest_payload["topology"] != topology or manifest_payload["transform"] != transform or not manifest_anchor_ok or manifest_payload["legal_scope"] != legal_scope:
+            raise GateContractError(f"{label}: package manifest policy mismatch")
+    identity = require_mapping(policy["identity"], f"{label}.attestation.identity")
+    require_exact_keys(identity, {"artifact_sha256", "package_manifest_sha256", "embedding_space_id"}, f"{label}.attestation.identity")
+    identity = {"artifact_sha256": require_sha256(identity["artifact_sha256"], f"{label}.identity.artifact_sha256"), "package_manifest_sha256": require_sha256(identity["package_manifest_sha256"], f"{label}.identity.package_manifest_sha256"), "embedding_space_id": require_sha256(identity["embedding_space_id"], f"{label}.identity.embedding_space_id")}
+    if identity != {"artifact_sha256": package["sha256"], "package_manifest_sha256": manifest["sha256"], "embedding_space_id": embedding_space_id}:
+        raise GateContractError(f"{label}: package identity self-binding mismatch")
+    anchor_raw = require_mapping(policy["anchor"], f"{label}.attestation.anchor")
+    require_exact_keys(anchor_raw, {"package_sha256", "manifest_sha256", "embedding_space_id"}, f"{label}.attestation.anchor")
+    anchor_binding = {"package_sha256": require_sha256(anchor_raw["package_sha256"], f"{label}.anchor.package_sha256"), "manifest_sha256": require_sha256(anchor_raw["manifest_sha256"], f"{label}.anchor.manifest_sha256"), "embedding_space_id": require_sha256(anchor_raw["embedding_space_id"], f"{label}.anchor.embedding_space_id")}
+    anchor_identity_view = {"package_sha256": identity["artifact_sha256"], "manifest_sha256": identity["package_manifest_sha256"], "embedding_space_id": identity["embedding_space_id"]}
+    if role == "anchor" and anchor_binding != anchor_identity_view:
+        raise GateContractError(f"{label}: anchor must self-bind as its own anchor identity")
+    expected_anchor_view = None if expected_anchor is None else {"package_sha256": expected_anchor["artifact_sha256"], "manifest_sha256": expected_anchor["package_manifest_sha256"], "embedding_space_id": expected_anchor["embedding_space_id"]}
+    if role == "candidate" and expected_anchor_view is not None and anchor_binding != expected_anchor_view:
+        raise GateContractError(f"{label}: candidate anchor identity mismatch")
+    if role == "candidate":
+        sidecar_anchor = anchor_binding if expected_anchor is None else {"package_sha256": expected_anchor["artifact_sha256"], "manifest_sha256": expected_anchor["package_manifest_sha256"], "embedding_space_id": expected_anchor["embedding_space_id"]}
+        _validate_sidecar(Path(sidecar["path"]), expected_anchor=sidecar_anchor, transform=transform or {}, label=f"{label}.sidecar", production=production)
+    binding = require_mapping(policy["dataset_binding"], f"{label}.attestation.dataset_binding")
+    require_exact_keys(binding, {"dataset_manifest_sha256_by_domain", "corpus_sha256_by_domain", "queries_sha256_by_domain", "qrels_sha256_by_domain"}, f"{label}.attestation.dataset_binding")
+    dataset_manifest_binding = require_domain_mapping(binding["dataset_manifest_sha256_by_domain"], f"{label}.dataset_binding.dataset_manifest_sha256_by_domain")
+    corpus_binding = require_domain_mapping(binding["corpus_sha256_by_domain"], f"{label}.dataset_binding.corpus_sha256_by_domain")
+    queries_binding = require_domain_mapping(binding["queries_sha256_by_domain"], f"{label}.dataset_binding.queries_sha256_by_domain")
+    qrels_binding = require_domain_mapping(binding["qrels_sha256_by_domain"], f"{label}.dataset_binding.qrels_sha256_by_domain")
+    normalized_binding = {
+        "dataset_manifest_sha256_by_domain": {domain: require_sha256(dataset_manifest_binding[domain], f"{label}.dataset_binding.dataset_manifest_sha256_by_domain.{domain}") for domain in DOMAINS},
+        "corpus_sha256_by_domain": {domain: require_sha256(corpus_binding[domain], f"{label}.dataset_binding.corpus_sha256_by_domain.{domain}") for domain in DOMAINS},
+        "queries_sha256_by_domain": {domain: require_sha256(queries_binding[domain], f"{label}.dataset_binding.queries_sha256_by_domain.{domain}") for domain in DOMAINS},
+        "qrels_sha256_by_domain": {domain: require_sha256(qrels_binding[domain], f"{label}.dataset_binding.qrels_sha256_by_domain.{domain}") for domain in DOMAINS},
+    }
+    if data_binding is not None and normalized_binding != data_binding:
+        raise GateContractError(f"{label}: AOQT qrels/dataset binding mismatch")
+    compatibility_digest = require_sha256(policy["compatibility_digest"], f"{label}.attestation.compatibility_digest")
+    if expected_compatibility_digest is not None and compatibility_digest != expected_compatibility_digest:
+        raise GateContractError(f"{label}: AOQT compatibility digest mismatch")
+    sibling_entries, sibling_sha = _normalize_sibling_rollup(policy["sibling_rollup"], Path(attestation["path"]).parent, role, package["sha256"], manifest["sha256"], Path(attestation["path"]), sidecar_path, f"{label}.attestation.sibling_rollup", production=production)
+    bound_sibling_sha = require_sha256(record["sibling_rollup_sha256"], f"{label}.sibling_rollup_sha256")
+    if bound_sibling_sha != sibling_sha:
+        raise GateContractError(f"{label}: package sibling rollup binding mismatch")
+    sibling_paths = {entry["path"] for entry in sibling_entries}
+    # The attestation is the signed/canonical policy being validated and is
+    # intentionally outside its own rollup (including its own digest would
+    # create an impossible circular content hash).  Every package payload and
+    # sidecar, however, must be present in the sibling rollup.
+    if package["path"] not in sibling_paths or manifest["path"] not in sibling_paths or (sidecar is not None and sidecar["path"] not in sibling_paths):
+        raise GateContractError(f"{label}: sibling rollup omits a bound package component")
     return {
-        **file_record,
-        "kind": "qid_only",
-        "name": record["name"],
-        "semantic": "qid_only_exclusion",
-        "contains_metric_payload": False,
-        "schema": payload["schema"],
-        "split": payload["split"],
-        "qids_by_domain": qids,
-        "qids_sha256_by_domain": qids_sha256_by_domain(qids),
-        "source_sha256": source_sha,
-        "source_sha256_by_file": dict(sorted(normalized_source_map.items())),
+        **package,
+        "manifest": manifest,
+        "attestation": attestation,
+        "sibling_rollup_sha256": sibling_sha,
+        "role": role,
+        "embedding_space_id": embedding_space_id,
+        "package_identity": identity,
+        "anchor_identity": {"artifact_sha256": anchor_binding["package_sha256"], "package_manifest_sha256": anchor_binding["manifest_sha256"], "embedding_space_id": anchor_binding["embedding_space_id"]},
+        "topology": topology,
+        "transform": transform,
+        "legal_scope": legal_scope,
+        "compatibility_digest": compatibility_digest,
+        "sidecar": sidecar,
+        "sibling_entries": sibling_entries,
+        "attestation_policy": policy,
     }
 
 
-def validate_argv(argv: Any, *, binary: Path, package: Path, base_dir: Path, label: str) -> list[str]:
-    if not isinstance(argv, list) or not argv or any(not isinstance(part, str) or not part for part in argv):
-        raise GateContractError(f"{label}: argv must be a non-empty string list")
-    for index, part in enumerate(argv):
-        if any(marker in part for marker in SHELL_MARKERS) or any(ord(char) < 0x20 for char in part):
-            raise GateContractError(f"{label}[{index}]: shell/control token is forbidden")
-    if len(argv) < 2 or argv[1] != NATIVE_EVAL_SUBCOMMAND or NATIVE_EVAL_SUBCOMMAND in argv[2:]:
-        raise GateContractError(f"{label}: native evaluator subcommand/order mismatch")
-
-    def matches(part: str, target: Path) -> bool:
-        try:
-            path = Path(part)
-            if not path.is_absolute():
-                path = base_dir / path
-            return path.resolve(strict=False) == target
-        except OSError:
-            return False
-
-    binary_matches = [index for index, part in enumerate(argv) if matches(part, binary)]
-    package_matches = [index for index, part in enumerate(argv) if matches(part, package)]
-    target_strings = ((str(binary), binary_matches), (str(package), package_matches))
-    for target_string, matches_for_target in target_strings:
-        if any(target_string in part and index not in matches_for_target for index, part in enumerate(argv)):
-            raise GateContractError(f"{label}: executable/package path mention-count impostor")
-    if binary_matches != [0]:
-        raise GateContractError(f"{label}: argv[0] must be the bound native executable (wrappers rejected)")
-    if len(package_matches) != 1:
-        raise GateContractError(f"{label}: package must occur exactly once in argv")
-    return list(argv)
+def validate_package_pair(anchor: dict[str, Any], candidate: dict[str, Any]) -> None:
+    if anchor.get("package_identity") == candidate.get("package_identity") or anchor.get("package_identity", {}).get("artifact_sha256") == candidate.get("package_identity", {}).get("artifact_sha256") or anchor.get("package_identity", {}).get("package_manifest_sha256") == candidate.get("package_identity", {}).get("package_manifest_sha256"):
+        raise GateContractError("anchor and candidate package identities must be distinct")
+    if candidate.get("anchor_identity") != anchor.get("package_identity"):
+        raise GateContractError("candidate anchor identity does not equal the bound anchor")
+    if candidate.get("embedding_space_id") == anchor.get("embedding_space_id"):
+        raise GateContractError("anchor and candidate embedding-space identities must be distinct")
 
 
-def normalize_output_paths(value: Any, base_dir: Path, output_root: Path, label: str) -> list[dict[str, Any]]:
-    mapping = require_mapping(value, label)
-    unexpected = sorted(set(mapping) - set(DOMAINS))
-    missing = [domain for domain in DOMAINS if domain not in mapping]
-    if unexpected or missing:
-        raise GateContractError(f"{label}: exact domain output coverage required")
-    records: list[dict[str, Any]] = []
+def _public_package_record(package: dict[str, Any]) -> dict[str, Any]:
+    """Strip derived validator state before serializing a frozen manifest."""
+
+    return {
+        "path": package["path"],
+        "sha256": package["sha256"],
+        "bytes": package["bytes"],
+        "manifest": package["manifest"],
+        "attestation": package["attestation"],
+        "sibling_rollup_sha256": package["sibling_rollup_sha256"],
+    }
+
+
+APPROVED_DESCRIPTOR_KEYS = {
+    "schema", "gate_id", "descriptor_id", "split", "dimension", "domains", "query_ids_by_domain", "qid_set_sha256_by_domain", "query_count_by_domain", "qrels_sha256_by_domain", "qrels_query_count_by_domain", "relevant_pair_count_by_domain", "dataset_manifest_sha256_by_domain", "corpus_sha256_by_domain", "queries_sha256_by_domain", "compatibility_digest", "nfcorpus_boundary_qids", "nfcorpus_boundary_qids_sha256", "nfcorpus_boundary_rank_window", "metric_surfaces", "cutoffs", "turboquant"
+}
+
+
+def validate_approved_workload(path: Path, *, gate_id: str, qrels: dict[str, dict[str, Any]], datasets: dict[str, dict[str, Any]], label: str) -> dict[str, Any]:
+    payload = read_json(path, label)
+    require_exact_keys(payload, APPROVED_DESCRIPTOR_KEYS, label)
+    if payload["schema"] != APPROVED_WORKLOAD_SCHEMA or payload["gate_id"] != gate_id or payload["split"] != HELDOUT_SPLIT or payload["dimension"] != DIMENSION:
+        raise GateContractError(f"{label}: approved workload identity mismatch")
+    if payload["domains"] != list(DOMAINS):
+        raise GateContractError(f"{label}: approved workload domain order mismatch")
+    qids = normalize_qids_by_domain(payload["query_ids_by_domain"], f"{label}.query_ids_by_domain")
+    if payload["qid_set_sha256_by_domain"] != qids_sha256_by_domain(qids):
+        raise GateContractError(f"{label}: qid-set hash mismatch")
+    qrels_hashes = require_domain_mapping(payload["qrels_sha256_by_domain"], f"{label}.qrels_sha256_by_domain")
+    query_counts = require_domain_mapping(payload["query_count_by_domain"], f"{label}.query_count_by_domain")
+    qrel_counts = require_domain_mapping(payload["qrels_query_count_by_domain"], f"{label}.qrels_query_count_by_domain")
+    relevant_counts = require_domain_mapping(payload["relevant_pair_count_by_domain"], f"{label}.relevant_pair_count_by_domain")
+    dataset_hashes = require_domain_mapping(payload["dataset_manifest_sha256_by_domain"], f"{label}.dataset_manifest_sha256_by_domain")
+    corpus_hashes = require_domain_mapping(payload["corpus_sha256_by_domain"], f"{label}.corpus_sha256_by_domain")
+    queries_hashes = require_domain_mapping(payload["queries_sha256_by_domain"], f"{label}.queries_sha256_by_domain")
     for domain in DOMAINS:
-        item = require_mapping(mapping[domain], f"{label}.{domain}")
-        require_exact_keys(item, {"path", "receipt"}, f"{label}.{domain}")
-        metric_path = resolve_path(item["path"], base_dir, f"{label}.{domain}.path")
-        receipt_node = require_mapping(item["receipt"], f"{label}.{domain}.receipt")
-        require_exact_keys(receipt_node, {"path"}, f"{label}.{domain}.receipt")
-        receipt_path = resolve_path(receipt_node["path"], base_dir, f"{label}.{domain}.receipt.path")
-        for kind, path in (("metrics", metric_path), ("receipt", receipt_path)):
-            path_within(path, output_root, f"{label}.{domain}.{kind}")
-            if path == output_root or path.exists() or path.is_symlink():
-                raise GateContractError(f"{label}.{domain}.{kind}: expected output must be absent before evaluation")
-            records.append({"kind": kind, "role": label.rsplit(".", 1)[-1], "domain": domain, "path": str(path), "state": "must_be_absent"})
-    return records
+        actual = qrels[domain]
+        if qids[domain] != actual["qids"]:
+            raise GateContractError(f"{label}: approved qid allowlist does not equal complete {domain} qrels")
+        if require_sha256(qrels_hashes[domain], f"{label}.qrels_sha256_by_domain.{domain}") != actual["sha256"] or require_integer(query_counts[domain], f"{label}.query_count_by_domain.{domain}", minimum=1) != actual["query_count"] or require_integer(qrel_counts[domain], f"{label}.qrels_query_count_by_domain.{domain}", minimum=1) != actual["query_count"] or require_integer(relevant_counts[domain], f"{label}.relevant_pair_count_by_domain.{domain}", minimum=1) != actual["relevant_pair_count"]:
+            raise GateContractError(f"{label}: qrels content/count binding mismatch for {domain}")
+        if require_sha256(dataset_hashes[domain], f"{label}.dataset_manifest_sha256_by_domain.{domain}") != datasets[domain]["manifest"]["sha256"] or require_sha256(corpus_hashes[domain], f"{label}.corpus_sha256_by_domain.{domain}") != datasets[domain]["corpus"]["sha256"] or require_sha256(queries_hashes[domain], f"{label}.queries_sha256_by_domain.{domain}") != datasets[domain]["queries"]["sha256"]:
+            raise GateContractError(f"{label}: dataset identity binding mismatch for {domain}")
+    compatibility_digest = require_sha256(payload["compatibility_digest"], f"{label}.compatibility_digest")
+    boundary_qids = [require_qid(item, f"{label}.nfcorpus_boundary_qids") for item in payload["nfcorpus_boundary_qids"]] if isinstance(payload["nfcorpus_boundary_qids"], list) else None
+    if not boundary_qids or len(boundary_qids) != len(set(boundary_qids)) or not set(boundary_qids).issubset(set(qids["nfcorpus"])):
+        raise GateContractError(f"{label}: nonempty NFCorpus boundary qid allowlist is required")
+    if payload["nfcorpus_boundary_qids_sha256"] != sha256_json(sorted(boundary_qids)) or payload["nfcorpus_boundary_rank_window"] != [80, 120]:
+        raise GateContractError(f"{label}: NFCorpus boundary descriptor mismatch")
+    if payload["metric_surfaces"] != list(SURFACES) or payload["cutoffs"] != {"ndcg_at_10": 10, "recall_at_100": 100}:
+        raise GateContractError(f"{label}: metric surface/cutoff descriptor mismatch")
+    if payload["turboquant"] != {"q3_bits": Q3_BITS, "q5_bits": Q5_BITS, "seed": TURBOQUANT_SEED, "top_k": TOP_K, "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling"}:
+        raise GateContractError(f"{label}: TurboQuant descriptor mismatch")
+    return {
+        "schema": APPROVED_WORKLOAD_SCHEMA,
+        "gate_id": gate_id,
+        "descriptor_id": require_string(payload["descriptor_id"], f"{label}.descriptor_id", safe_id=True),
+        "split": HELDOUT_SPLIT,
+        "dimension": DIMENSION,
+        "domains": list(DOMAINS),
+        "query_ids_by_domain": qids,
+        "qid_set_sha256_by_domain": qids_sha256_by_domain(qids),
+        "query_count_by_domain": {domain: qrels[domain]["query_count"] for domain in DOMAINS},
+        "qrels_sha256_by_domain": {domain: qrels[domain]["sha256"] for domain in DOMAINS},
+        "qrels_query_count_by_domain": {domain: qrels[domain]["query_count"] for domain in DOMAINS},
+        "relevant_pair_count_by_domain": {domain: qrels[domain]["relevant_pair_count"] for domain in DOMAINS},
+        "dataset_manifest_sha256_by_domain": {domain: datasets[domain]["manifest"]["sha256"] for domain in DOMAINS},
+        "corpus_sha256_by_domain": {domain: datasets[domain]["corpus"]["sha256"] for domain in DOMAINS},
+        "queries_sha256_by_domain": {domain: datasets[domain]["queries"]["sha256"] for domain in DOMAINS},
+        "compatibility_digest": compatibility_digest,
+        "nfcorpus_boundary_qids": sorted(boundary_qids),
+        "nfcorpus_boundary_qids_sha256": sha256_json(sorted(boundary_qids)),
+        "nfcorpus_boundary_rank_window": [80, 120],
+        "metric_surfaces": list(SURFACES),
+        "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100},
+        "turboquant": {"q3_bits": Q3_BITS, "q5_bits": Q5_BITS, "seed": TURBOQUANT_SEED, "top_k": TOP_K, "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling"},
+    }
 
 
-def validate_plan(plan_path: Path) -> dict[str, Any]:
+def validate_workload(path: Path, *, gate_id: str, approved: dict[str, Any], descriptor_sha256: str, label: str) -> dict[str, Any]:
+    payload = read_json(path, label)
+    expected_keys = {"schema", "gate_id", "workload_id", "descriptor_sha256", "split", "dimension", "query_ids_by_domain", "qid_set_sha256_by_domain", "query_count_by_domain", "qrels_sha256_by_domain", "dataset_manifest_sha256_by_domain", "corpus_sha256_by_domain", "queries_sha256_by_domain", "compatibility_digest"}
+    require_exact_keys(payload, expected_keys, label)
+    if payload["schema"] != WORKLOAD_SCHEMA or payload["gate_id"] != gate_id or payload["descriptor_sha256"] != descriptor_sha256:
+        raise GateContractError(f"{label}: evaluator workload descriptor binding mismatch")
+    normalized_qids = normalize_qids_by_domain(payload["query_ids_by_domain"], f"{label}.query_ids_by_domain")
+    projection = {
+        "schema": WORKLOAD_SCHEMA,
+        "gate_id": gate_id,
+        "workload_id": require_string(payload["workload_id"], f"{label}.workload_id", safe_id=True),
+        "descriptor_sha256": descriptor_sha256,
+        "split": payload["split"],
+        "dimension": payload["dimension"],
+        "query_ids_by_domain": normalized_qids,
+        "qid_set_sha256_by_domain": payload["qid_set_sha256_by_domain"],
+        "query_count_by_domain": payload["query_count_by_domain"],
+        "qrels_sha256_by_domain": payload["qrels_sha256_by_domain"],
+        "dataset_manifest_sha256_by_domain": payload["dataset_manifest_sha256_by_domain"],
+        "corpus_sha256_by_domain": payload["corpus_sha256_by_domain"],
+        "queries_sha256_by_domain": payload["queries_sha256_by_domain"],
+        "compatibility_digest": payload["compatibility_digest"],
+    }
+    expected = {key: value for key, value in projection.items() if key not in {"schema", "workload_id"}}
+    approved_projection = {
+        "gate_id": approved["gate_id"], "descriptor_sha256": descriptor_sha256, "split": approved["split"], "dimension": approved["dimension"], "query_ids_by_domain": approved["query_ids_by_domain"], "qid_set_sha256_by_domain": approved["qid_set_sha256_by_domain"], "query_count_by_domain": approved["query_count_by_domain"], "qrels_sha256_by_domain": approved["qrels_sha256_by_domain"], "dataset_manifest_sha256_by_domain": approved["dataset_manifest_sha256_by_domain"], "corpus_sha256_by_domain": approved["corpus_sha256_by_domain"], "queries_sha256_by_domain": approved["queries_sha256_by_domain"], "compatibility_digest": approved["compatibility_digest"]
+    }
+    if expected != approved_projection:
+        raise GateContractError(f"{label}: workload does not equal approved full-qrels descriptor")
+    return projection
+
+
+def normalize_source(value: Any, base_dir: Path, label: str) -> dict[str, Any]:
+    source = require_mapping(value, label)
+    require_exact_keys(source, {"manifest", "binary", "cwd", "dataset_by_domain", "workload", "approved_workload"}, label)
+    manifest = normalize_file_record(source["manifest"], base_dir, f"{label}.manifest")
+    binary = normalize_file_record(source["binary"], base_dir, f"{label}.binary", executable=True)
+    cwd = normalize_directory(source["cwd"], base_dir, f"{label}.cwd")
+    dataset_map = require_mapping(source["dataset_by_domain"], f"{label}.dataset_by_domain")
+    if set(dataset_map) != set(DOMAINS):
+        raise GateContractError(f"{label}.dataset_by_domain: exact domain coverage required")
+    datasets = {domain: normalize_dataset_record(dataset_map[domain], base_dir, domain, f"{label}.dataset_by_domain.{domain}") for domain in DOMAINS}
+    workload = normalize_file_record(source["workload"], base_dir, f"{label}.workload")
+    approved_workload = normalize_file_record(source["approved_workload"], base_dir, f"{label}.approved_workload")
+    return {"manifest": manifest, "binary": binary, "cwd": cwd, "dataset_by_domain": datasets, "workload": workload, "approved_workload": approved_workload}
+
+
+def _data_binding(approved: dict[str, Any]) -> dict[str, Any]:
+    return {"dataset_manifest_sha256_by_domain": approved["dataset_manifest_sha256_by_domain"], "corpus_sha256_by_domain": approved["corpus_sha256_by_domain"], "queries_sha256_by_domain": approved["queries_sha256_by_domain"], "qrels_sha256_by_domain": approved["qrels_sha256_by_domain"]}
+
+
+PLAN_KEYS = {"schema", "gate_id", "candidate_id", "dimension", "thresholds", "evaluation", "anchor", "candidate", "source", "approved_workload", "qrels", "exclusions", "workload_root", "output_root"}
+
+
+def validate_plan(plan_path: Path, *, production: bool = True) -> dict[str, Any]:
     plan_path = plan_path.resolve(strict=False)
     plan = read_json(plan_path, "plan")
-    require_exact_keys(plan, {"schema", "gate_id", "candidate_id", "dimension", "thresholds", "evaluation", "anchor", "candidate", "source", "approved_workload", "qrels", "exclusions", "workload_root", "output_root", "artifacts", "attestation_path"}, "plan")
-    if plan["schema"] != PLAN_SCHEMA:
-        raise GateContractError("plan: schema mismatch")
+    require_exact_keys(plan, PLAN_KEYS, "plan")
+    if plan["schema"] != PLAN_SCHEMA or plan["dimension"] != DIMENSION:
+        raise GateContractError("plan: schema or D384 dimension mismatch")
     gate_id = require_string(plan["gate_id"], "plan.gate_id", safe_id=True)
     candidate_id = require_string(plan["candidate_id"], "plan.candidate_id", safe_id=True)
-    if plan["dimension"] != DIMENSION or plan["thresholds"] != THRESHOLDS:
-        raise GateContractError("plan: immutable D384/quality policy mismatch")
+    if plan["thresholds"] != THRESHOLDS:
+        raise GateContractError("plan: quality thresholds are immutable")
     if plan["evaluation"] != {"executed": False, "official": False}:
-        raise GateContractError("plan: evaluation must be unexecuted and non-official")
+        raise GateContractError("plan: evaluation must be an unexecuted non-official plan")
+    source = normalize_source(plan["source"], plan_path.parent, "plan.source")
+    if production:
+        require_elf_executable(Path(source["binary"]["path"]), "plan.source.binary")
+    if len({dataset["dataset_id"] for dataset in source["dataset_by_domain"].values()}) != len(DOMAINS):
+        raise GateContractError("plan.source.dataset_by_domain: dataset identities must be distinct")
+    for component in ("manifest", "corpus", "queries"):
+        if len({dataset[component]["path"] for dataset in source["dataset_by_domain"].values()}) != len(DOMAINS):
+            raise GateContractError(f"plan.source.dataset_by_domain: {component} paths must be distinct per domain")
+    source_workload = normalize_file_record(plan["source"]["workload"], plan_path.parent, "plan.source.workload")
+    source_approved = normalize_file_record(plan["source"]["approved_workload"], plan_path.parent, "plan.source.approved_workload")
+    if source_workload != source["workload"] or source_approved != source["approved_workload"]:
+        raise GateContractError("plan.source workload provenance changed during validation")
+    approved_record = normalize_file_record(plan["approved_workload"], plan_path.parent, "plan.approved_workload")
+    if approved_record != source_approved:
+        raise GateContractError("plan: approved workload record must equal source binding")
+    qrels_raw = require_mapping(plan["qrels"], "plan.qrels")
+    if set(qrels_raw) != set(DOMAINS):
+        raise GateContractError("plan.qrels: exact domain coverage required")
+    qrels = {domain: normalize_qrels_record(qrels_raw[domain], plan_path.parent, f"plan.qrels.{domain}") for domain in DOMAINS}
+    if len({qrels[domain]["path"] for domain in DOMAINS}) != len(DOMAINS):
+        raise GateContractError("plan.qrels: qrels paths must be distinct per domain")
+    approved = validate_approved_workload(Path(approved_record["path"]), gate_id=gate_id, qrels=qrels, datasets=source["dataset_by_domain"], label="plan.approved_workload")
+    workload = validate_workload(Path(source_workload["path"]), gate_id=gate_id, approved=approved, descriptor_sha256=approved_record["sha256"], label="plan.source.workload")
+    if source_workload["path"] == approved_record["path"]:
+        raise GateContractError("plan: workload and approved descriptor must be distinct files")
+    exclusions_raw = plan["exclusions"]
+    if not isinstance(exclusions_raw, list) or len(exclusions_raw) != len(EXCLUSION_NAMES):
+        raise GateContractError("plan.exclusions: exactly dev4/reserve4/official-test are required")
+    by_name: dict[str, dict[str, Any]] = {}
+    for item in exclusions_raw:
+        item_map = require_mapping(item, "plan.exclusions[]")
+        if item_map.get("name") in by_name:
+            raise GateContractError("plan.exclusions: duplicate exclusion identity")
+        name = require_string(item_map.get("name"), "plan.exclusions[].name", safe_id=False)
+        if name not in EXCLUSION_NAMES:
+            raise GateContractError("plan.exclusions: exact qid-only exclusion identity is required")
+        by_name[name] = normalize_exclusion_record(item_map, plan_path.parent, name, approved["query_ids_by_domain"], f"plan.exclusions.{name}")
+    if set(by_name) != set(EXCLUSION_NAMES):
+        raise GateContractError("plan.exclusions: exact dev4/reserve4/official-test coverage required")
+    expected_anchor_identity = {"artifact_sha256": D384_ANCHOR_PACKAGE_SHA256, "package_manifest_sha256": D384_ANCHOR_MANIFEST_SHA256, "embedding_space_id": D384_ANCHOR_EMBEDDING_SPACE_ID}
     anchor_node = require_mapping(plan["anchor"], "plan.anchor")
     candidate_node = require_mapping(plan["candidate"], "plan.candidate")
     require_exact_keys(anchor_node, {"id", "package"}, "plan.anchor")
     require_exact_keys(candidate_node, {"id", "package"}, "plan.candidate")
     anchor_id = require_string(anchor_node["id"], "plan.anchor.id", safe_id=True)
-    if candidate_node["id"] != candidate_id or anchor_id == candidate_id:
-        raise GateContractError("plan: anchor/candidate identity mismatch")
-    anchor_package = normalize_package_record(anchor_node["package"], plan_path.parent, "plan.anchor.package", expected_role="anchor")
-    candidate_package = normalize_package_record(candidate_node["package"], plan_path.parent, "plan.candidate.package", expected_role="candidate")
-    validate_package_pair(anchor_package, candidate_package)
-
-    source = require_mapping(plan["source"], "plan.source")
-    require_exact_keys(source, {"manifest", "binary", "cwd", "argv", "dataset", "workload", "approved_workload"}, "plan.source")
-    source_manifest = normalize_file_record(source["manifest"], plan_path.parent, "plan.source.manifest")
-    binary = normalize_file_record(source["binary"], plan_path.parent, "plan.source.binary")
-    dataset = normalize_file_record(source["dataset"], plan_path.parent, "plan.source.dataset")
-    cwd = normalize_directory(source["cwd"], plan_path.parent, "plan.source.cwd")
-    argv_node = require_mapping(source["argv"], "plan.source.argv")
-    require_exact_keys(argv_node, set(ROLES), "plan.source.argv")
-    argv = {
-        role: validate_argv(argv_node[role], binary=Path(binary["path"]), package=Path((anchor_package if role == "anchor" else candidate_package)["path"]), base_dir=plan_path.parent, label=f"plan.source.argv.{role}")
-        for role in ROLES
-    }
-    qrels_node = require_mapping(plan["qrels"], "plan.qrels")
-    require_exact_keys(qrels_node, set(DOMAINS), "plan.qrels")
-    qrels = {domain: normalize_qrels_record(qrels_node[domain], plan_path.parent, f"plan.qrels.{domain}") for domain in DOMAINS}
-    approved_record = normalize_file_record(plan["approved_workload"], plan_path.parent, "plan.approved_workload")
-    approved = validate_approved_workload(Path(approved_record["path"]), gate_id=gate_id, qrels=qrels, label="plan.approved_workload")
-    workload_record = normalize_file_record(source["workload"], plan_path.parent, "plan.source.workload")
-    source_approved_record = normalize_file_record(source["approved_workload"], plan_path.parent, "plan.source.approved_workload")
-    if source_approved_record != approved_record:
-        raise GateContractError("plan: source/approved workload record mismatch")
-    workload = validate_workload(Path(workload_record["path"]), gate_id=gate_id, approved=approved, label="plan.source.workload")
-
-    raw_exclusions = plan["exclusions"]
-    if not isinstance(raw_exclusions, list) or len(raw_exclusions) != len(EXCLUSION_NAMES):
-        raise GateContractError(f"plan.exclusions: exactly {len(EXCLUSION_NAMES)} domain-scoped exclusions are required")
-    exclusions = [normalize_exclusion_record(item, plan_path.parent, f"plan.exclusions[{index}]") for index, item in enumerate(raw_exclusions)]
-    if {item["name"] for item in exclusions} != set(EXCLUSION_NAMES):
-        raise GateContractError("plan.exclusions: dev4/reserve4/official-test are all required")
-    excluded_by_domain = {domain: set() for domain in DOMAINS}
-    for item in exclusions:
-        for domain, qids in item["qids_by_domain"].items():
-            overlap = excluded_by_domain[domain].intersection(qids)
-            if overlap:
-                raise GateContractError(f"plan.exclusions: duplicate qids in {domain}: {sorted(overlap)}")
-            workload_overlap = set(approved["query_ids_by_domain"][domain]).intersection(qids)
-            if workload_overlap:
-                raise GateContractError(f"plan.exclusions: workload/exclusion qid intersection in {domain}: {sorted(workload_overlap)}")
-            excluded_by_domain[domain].update(qids)
-
-    workload_root = resolve_path(plan["workload_root"], plan_path.parent, "plan.workload_root")
-    require_directory(workload_root, "plan.workload_root")
-    path_within(Path(workload_record["path"]), workload_root, "plan.source.workload")
-    path_within(Path(approved_record["path"]), workload_root, "plan.approved_workload")
-    output_root = resolve_path(plan["output_root"], plan_path.parent, "plan.output_root")
-    require_directory(output_root, "plan.output_root")
-    artifacts_node = require_mapping(plan["artifacts"], "plan.artifacts")
-    require_exact_keys(artifacts_node, set(ROLES), "plan.artifacts")
-    outputs: list[dict[str, Any]] = []
-    for role in ROLES:
-        role_outputs = normalize_output_paths(artifacts_node[role], plan_path.parent, output_root, f"plan.artifacts.{role}")
-        for record in role_outputs:
-            record["role"] = role
-        outputs.extend(role_outputs)
-    if len(outputs) != EXPECTED_OUTPUT_COUNT or len({item["path"] for item in outputs}) != EXPECTED_OUTPUT_COUNT:
-        raise GateContractError("plan.artifacts: exactly twelve unique absent outputs are required")
-    attestation_path = resolve_path(plan["attestation_path"], plan_path.parent, "plan.attestation_path")
-    if attestation_path.exists() or attestation_path.is_symlink() or attestation_path in {Path(item["path"]) for item in outputs}:
-        raise GateContractError("plan.attestation_path must be absent and distinct from retrieval outputs")
-    all_input_paths = {
-        Path(anchor_package["path"]), Path(candidate_package["path"]), Path(anchor_package["manifest"]["path"]), Path(candidate_package["manifest"]["path"]), Path(anchor_package["attestation"]["path"]), Path(candidate_package["attestation"]["path"]), Path(source_manifest["path"]), Path(binary["path"]), Path(dataset["path"]), Path(workload_record["path"]), Path(approved_record["path"]), *[Path(item["path"]) for item in qrels.values()], *[Path(item["path"]) for item in exclusions],
-    }
-    if len(all_input_paths) != 11 + len(DOMAINS) + len(exclusions):
-        raise GateContractError("plan source/package paths must be unique")
-    if any(Path(item["path"]) in all_input_paths for item in outputs) or attestation_path in all_input_paths:
-        raise GateContractError("plan output path collides with an input")
-    return {
-        "schema": PLAN_SCHEMA, "gate_id": gate_id, "candidate_id": candidate_id, "anchor_id": anchor_id, "dimension": DIMENSION, "thresholds": copy.deepcopy(THRESHOLDS), "evaluation": {"executed": False, "official": False},
-        "anchor": {"id": anchor_id, "package": anchor_package}, "candidate": {"id": candidate_id, "package": candidate_package},
-        "source": {"manifest": source_manifest, "binary": binary, "cwd": cwd, "argv": argv, "dataset": dataset, "workload": workload_record, "approved_workload": approved_record},
-        "approved_workload": {"record": approved_record, "payload": approved}, "workload": workload, "qrels": qrels, "exclusions": exclusions,
-        "workload_root": str(workload_root), "output_root": str(output_root), "outputs": outputs, "attestation_path": str(attestation_path), "plan_path": str(plan_path), "plan_sha256": sha256_file(plan_path),
-    }
+    if production and anchor_id != D384_ANCHOR_ARTIFACT_ID:
+        raise GateContractError("plan.anchor.id: current D384 anchor identity is pinned")
+    anchor = normalize_package_record(anchor_node["package"], plan_path.parent, "plan.anchor.package", expected_role="anchor", expected_anchor=expected_anchor_identity, data_binding=_data_binding(approved), expected_compatibility_digest=approved["compatibility_digest"], production=production)
+    if production:
+        if anchor["package_identity"] != expected_anchor_identity:
+            raise GateContractError("plan.anchor.package: current D384 anchor package/manifest/embedding identity mismatch")
+        if not str(Path(anchor["path"])).endswith(D384_ANCHOR_PATH_SUFFIX):
+            raise GateContractError("plan.anchor.package: current D384 anchor artifact path mismatch")
+    else:
+        # Synthetic fixtures deliberately use a local identity, but the
+        # identity is still frozen and must be supplied back to ``run_harness``
+        # by the test caller.  Production never reaches this branch.
+        expected_anchor_identity = anchor["package_identity"]
+    candidate = normalize_package_record(candidate_node["package"], plan_path.parent, "plan.candidate.package", expected_role="candidate", expected_anchor=anchor["package_identity"], data_binding=_data_binding(approved), expected_compatibility_digest=approved["compatibility_digest"], production=production)
+    validate_package_pair(anchor, candidate)
+    workload_root = Path(normalize_directory(plan["workload_root"], plan_path.parent, "plan.workload_root"))
+    output_root = Path(normalize_directory(plan["output_root"], plan_path.parent, "plan.output_root"))
+    if output_root == workload_root:
+        raise GateContractError("plan.output_root must be distinct from workload_root")
+    all_inputs = {Path(source["manifest"]["path"]), Path(source["binary"]["path"]), Path(source_workload["path"]), Path(approved_record["path"]), *[Path(item["path"]) for item in qrels.values()]}
+    all_inputs.update(Path(dataset[key]["path"]) for dataset in source["dataset_by_domain"].values() for key in ("manifest", "corpus", "queries"))
+    all_inputs.update(Path(item["manifest"]["path"]) for item in by_name.values())
+    all_package_files = {Path(item["path"]) for package in (anchor, candidate) for item in (package, package["manifest"], package["attestation"]) if isinstance(item, dict) and "path" in item}
+    all_package_files.update(Path(entry["path"]) for package in (anchor, candidate) for entry in package["sibling_entries"])
+    if output_root in all_inputs:
+        raise GateContractError("plan: output root must not be an input path")
+    return {"schema": PLAN_SCHEMA, "gate_id": gate_id, "candidate_id": candidate_id, "anchor_id": anchor_id, "dimension": DIMENSION, "thresholds": copy.deepcopy(THRESHOLDS), "evaluation": {"executed": False, "official": False}, "anchor": anchor, "candidate": candidate, "source": source, "approved_workload": {"path": approved_record["path"], "sha256": approved_record["sha256"], "bytes": approved_record["bytes"], "descriptor": approved}, "workload": {"path": source_workload["path"], "sha256": source_workload["sha256"], "bytes": source_workload["bytes"], "descriptor": workload}, "qrels": qrels, "exclusions": [by_name[name] for name in EXCLUSION_NAMES], "workload_root": str(workload_root), "output_root": str(output_root), "plan_path": str(plan_path), "plan_sha256": sha256_file(plan_path), "expected_anchor_identity": expected_anchor_identity, "input_paths": sorted(str(path) for path in all_inputs | all_package_files)}
 
 
 def digest_without(payload: dict[str, Any], field: str) -> str:
-    return sha256_json({key: value for key, value in payload.items() if key != field})
+    clone = copy.deepcopy(payload)
+    clone.pop(field, None)
+    return sha256_json(clone)
 
 
-def freeze_manifest(plan_path: Path, output_path: Path) -> dict[str, Any]:
-    plan = validate_plan(plan_path)
+OUTPUT_LAYOUT = {
+    "metrics": "{role}.{domain}.metrics.json",
+    "metrics_tsv": "{role}.{domain}.metrics.tsv",
+    "per_query": "{role}.{domain}.per-query.jsonl",
+    "receipt": "{role}.{domain}.execution-receipt.json",
+    "attestation": "gate-attestation.json",
+}
+
+
+def freeze_manifest(plan_path: Path, output_path: Path, *, test_mode: bool = False) -> dict[str, Any]:
+    """Validate a plan and freeze all immutable inputs before any evaluator run."""
+
+    info = validate_plan(plan_path, production=not test_mode)
+    gate_script = Path(__file__).resolve()
+    require_regular_file(gate_script, "gate script")
+    gate_script_record = {"path": str(gate_script), "sha256": sha256_file(gate_script), "bytes": gate_script.stat().st_size}
     output_path = output_path.resolve(strict=False)
     if output_path.exists() or output_path.is_symlink():
-        raise GateContractError(f"frozen manifest must be absent: {output_path}")
-    if output_path in {Path(item["path"]) for item in plan["outputs"]} or output_path == Path(plan["attestation_path"]):
-        raise GateContractError("frozen manifest path collides with a declared output")
-    try:
-        output_path.relative_to(Path(plan["output_root"]))
-    except ValueError:
-        pass
-    else:
-        raise GateContractError("frozen manifest must be outside retrieval output_root")
-    gate_script = Path(__file__).resolve()
+        raise GateContractError(f"frozen manifest output must be absent: {output_path}")
     frozen = {
-        "schema": FROZEN_SCHEMA, "gate_id": plan["gate_id"], "candidate_id": plan["candidate_id"], "anchor_id": plan["anchor_id"], "dimension": DIMENSION, "thresholds": copy.deepcopy(THRESHOLDS), "evaluation": {"executed": False, "official": False},
-        "external_trust_anchor": {"required": True, "algorithm": "sha256_file"}, "anchor": plan["anchor"], "candidate": plan["candidate"], "source": plan["source"], "approved_workload": plan["approved_workload"], "workload": plan["workload"], "qrels": plan["qrels"], "exclusions": plan["exclusions"], "output_root": plan["output_root"], "outputs": plan["outputs"], "attestation": {"path": plan["attestation_path"], "state": "must_be_absent"},
-        "provenance": {"plan": {"path": plan["plan_path"], "sha256": plan["plan_sha256"], "bytes": Path(plan["plan_path"]).stat().st_size}, "gate_script": {"path": str(gate_script), "sha256": sha256_file(gate_script), "bytes": gate_script.stat().st_size}, "argv_sha256": {role: sha256_json(plan["source"]["argv"][role]) for role in ROLES}, "approved_workload_sha256": plan["approved_workload"]["record"]["sha256"], "output_set_sha256": sha256_json(plan["outputs"])},
+        "schema": FROZEN_SCHEMA,
+        "gate_id": info["gate_id"],
+        "candidate_id": info["candidate_id"],
+        "anchor_id": info["anchor_id"],
+        "dimension": DIMENSION,
+        "thresholds": copy.deepcopy(THRESHOLDS),
+        "evaluation": {"executed": False, "official": False},
+        "external_trust_anchor": {"required": True, "algorithm": "sha256_file", "purpose": "caller-supplied immutable frozen-manifest identity"},
+        "expected_anchor_identity": info["expected_anchor_identity"],
+        "anchor": _public_package_record(info["anchor"]),
+        "candidate": _public_package_record(info["candidate"]),
+        "source": info["source"],
+        "approved_workload": info["approved_workload"],
+        "workload": info["workload"],
+        "qrels": info["qrels"],
+        "exclusions": info["exclusions"],
+        "workload_root": info["workload_root"],
+        "output_root": info["output_root"],
+        "output_layout": copy.deepcopy(OUTPUT_LAYOUT),
+        "provenance": {"plan_path": info["plan_path"], "plan_sha256": info["plan_sha256"], "gate_script": gate_script_record, "binary_sha256": info["source"]["binary"]["sha256"], "approved_workload_sha256": info["approved_workload"]["sha256"], "anchor_identity": info["expected_anchor_identity"]},
     }
     frozen["manifest_sha256"] = digest_without(frozen, "manifest_sha256")
     write_json_new(output_path, frozen)
-    frozen["file_sha256"] = sha256_file(output_path)
-    return frozen
+    return {"schema": FROZEN_SCHEMA, "manifest_sha256": frozen["manifest_sha256"], "file_sha256": sha256_file(output_path), "path": str(output_path), "manifest": frozen}
 
 
-def validate_frozen_manifest(frozen_path: Path, *, expected_frozen_manifest_sha256: str | None, require_outputs_absent: bool) -> dict[str, Any]:
+def _validate_frozen_files(frozen: dict[str, Any], frozen_path: Path, *, production: bool) -> dict[str, Any]:
+    base = frozen_path.parent
+    source = frozen["source"]
+    require_exact_keys(source, {"manifest", "binary", "cwd", "dataset_by_domain", "workload", "approved_workload"}, "frozen.source")
+    require_domain_mapping(source["dataset_by_domain"], "frozen.source.dataset_by_domain")
+    qrels_node = require_domain_mapping(frozen["qrels"], "frozen.qrels")
+    provenance = require_mapping(frozen["provenance"], "frozen.provenance")
+    require_exact_keys(provenance, {"plan_path", "plan_sha256", "gate_script", "binary_sha256", "approved_workload_sha256", "anchor_identity"}, "frozen.provenance")
+    plan_path = resolve_path(provenance["plan_path"], base, "frozen.provenance.plan_path")
+    require_regular_file(plan_path, "frozen.provenance.plan")
+    plan_sha = require_sha256(provenance["plan_sha256"], "frozen.provenance.plan_sha256")
+    if sha256_file(plan_path) != plan_sha:
+        raise GateContractError("frozen provenance plan sha256 mismatch")
+    gate_script = normalize_file_record(provenance["gate_script"], base, "frozen.provenance.gate_script")
+    if gate_script["path"] != str(Path(__file__).resolve()):
+        raise GateContractError("frozen provenance gate script path mismatch")
+    binary = normalize_file_record(source["binary"], base, "frozen.source.binary", executable=True)
+    if binary != source["binary"]:
+        raise GateContractError("frozen source binary changed after freeze")
+    if production:
+        require_elf_executable(Path(binary["path"]), "frozen.source.binary")
+    normalize_file_record(source["manifest"], base, "frozen.source.manifest")
+    require_directory(Path(source["cwd"]), "frozen.source.cwd")
+    datasets: dict[str, dict[str, Any]] = {}
+    for domain in DOMAINS:
+        datasets[domain] = normalize_dataset_record(source["dataset_by_domain"][domain], base, domain, f"frozen.source.dataset_by_domain.{domain}")
+        if datasets[domain] != source["dataset_by_domain"][domain]:
+            raise GateContractError(f"frozen dataset binding changed for {domain}")
+    qrels: dict[str, dict[str, Any]] = {}
+    for domain in DOMAINS:
+        require_exact_keys(qrels_node[domain], {"path", "sha256", "bytes", "qids", "qid_set_sha256", "query_count", "qrels_pair_count", "relevant_pair_count"}, f"frozen.qrels.{domain}")
+        current = normalize_qrels_record({key: qrels_node[domain][key] for key in ("path", "sha256", "bytes")}, base, f"frozen.qrels.{domain}")
+        full_qrels = parse_qrels(Path(current["path"]), f"frozen.qrels.{domain}")
+        for key in ("path", "sha256", "bytes", "qids", "qid_set_sha256", "query_count", "qrels_pair_count", "relevant_pair_count"):
+            if current[key] != qrels_node[domain][key]:
+                raise GateContractError(f"frozen qrels binding changed for {domain}")
+        qrels[domain] = {**current, "rels": full_qrels["rels"]}
+    approved_rec = normalize_file_record({key: frozen["approved_workload"][key] for key in ("path", "sha256", "bytes")}, base, "frozen.approved_workload")
+    workload_rec = normalize_file_record({key: frozen["workload"][key] for key in ("path", "sha256", "bytes")}, base, "frozen.workload")
+    if approved_rec != {key: frozen["approved_workload"][key] for key in ("path", "sha256", "bytes")}:
+        raise GateContractError("frozen approved workload descriptor changed")
+    if workload_rec != {key: frozen["workload"][key] for key in ("path", "sha256", "bytes")}:
+        raise GateContractError("frozen workload descriptor changed")
+    if provenance["binary_sha256"] != binary["sha256"] or provenance["approved_workload_sha256"] != approved_rec["sha256"]:
+        raise GateContractError("frozen provenance input hash binding mismatch")
+    provenance_anchor = require_mapping(provenance["anchor_identity"], "frozen.provenance.anchor_identity")
+    require_exact_keys(provenance_anchor, {"artifact_sha256", "package_manifest_sha256", "embedding_space_id"}, "frozen.provenance.anchor_identity")
+    if provenance_anchor != frozen["expected_anchor_identity"]:
+        raise GateContractError("frozen provenance anchor identity mismatch")
+    approved = validate_approved_workload(Path(approved_rec["path"]), gate_id=frozen["gate_id"], qrels=qrels, datasets=datasets, label="frozen.approved_workload")
+    if approved != frozen["approved_workload"]["descriptor"]:
+        raise GateContractError("frozen approved workload derived descriptor changed")
+    workload = validate_workload(Path(workload_rec["path"]), gate_id=frozen["gate_id"], approved=approved, descriptor_sha256=approved_rec["sha256"], label="frozen.workload")
+    if workload != frozen["workload"]["descriptor"]:
+        raise GateContractError("frozen workload descriptor changed")
+    expected_anchor = frozen["expected_anchor_identity"]
+    anchor = normalize_package_record(frozen["anchor"], base, "frozen.anchor", expected_role="anchor", expected_anchor=expected_anchor, data_binding=_data_binding(approved), expected_compatibility_digest=approved["compatibility_digest"], production=production)
+    if production and not str(Path(anchor["path"])).endswith(D384_ANCHOR_PATH_SUFFIX):
+        raise GateContractError("frozen.anchor.package: current D384 anchor artifact path mismatch")
+    candidate = normalize_package_record(frozen["candidate"], base, "frozen.candidate", expected_role="candidate", expected_anchor=anchor["package_identity"], data_binding=_data_binding(approved), expected_compatibility_digest=approved["compatibility_digest"], production=production)
+    validate_package_pair(anchor, candidate)
+    for name, item in zip(EXCLUSION_NAMES, frozen["exclusions"], strict=True):
+        current = normalize_exclusion_record({"kind": item["kind"], "name": item["name"], "manifest": item["manifest"]}, base, name, approved["query_ids_by_domain"], f"frozen.exclusions.{name}")
+        if current != item:
+            raise GateContractError(f"frozen exclusion binding changed for {name}")
+    workload_root_raw = require_string(frozen["workload_root"], "frozen.workload_root")
+    workload_root = resolve_path(workload_root_raw, base, "frozen.workload_root")
+    if str(workload_root) != workload_root_raw:
+        raise GateContractError("frozen.workload_root must be a canonical absolute path")
+    require_directory(workload_root, "frozen.workload_root")
+    output_root_raw = require_string(frozen["output_root"], "frozen.output_root")
+    output_root = resolve_path(output_root_raw, base, "frozen.output_root")
+    if str(output_root) != output_root_raw:
+        raise GateContractError("frozen.output_root must be a canonical absolute path")
+    require_directory(output_root, "frozen.output_root")
+    if output_root == workload_root or output_root == Path(source["cwd"]) or output_root in {Path(dataset["dataset_dir"]) for dataset in datasets.values()}:
+        raise GateContractError("frozen output_root must be distinct from all input roots")
+    return {"path": str(frozen_path), "file_sha256": sha256_file(frozen_path), "manifest": frozen, "anchor": anchor, "candidate": candidate, "source": {**source, "binary": binary, "dataset_by_domain": datasets}, "qrels": qrels, "approved_workload": {**approved_rec, "descriptor": approved}, "workload": {**workload_rec, "descriptor": workload}, "workload_root": workload_root, "output_root": output_root}
+
+
+def validate_frozen_manifest(frozen_path: Path, *, expected_frozen_manifest_sha256: str | None, require_outputs_absent: bool = False, run_dir: Path | None = None, production: bool = True) -> dict[str, Any]:
     if expected_frozen_manifest_sha256 is None:
         raise GateContractError("external expected frozen manifest sha256 is required")
-    expected_external = require_sha256(expected_frozen_manifest_sha256, "expected_frozen_manifest_sha256")
+    expected_external = require_sha256(expected_frozen_manifest_sha256, "expected frozen manifest sha256")
     frozen_path = frozen_path.resolve(strict=False)
     require_regular_file(frozen_path, "frozen manifest")
     actual_external = sha256_file(frozen_path)
     if actual_external != expected_external:
         raise GateContractError("external frozen manifest sha256 trust-anchor mismatch")
     frozen = read_json(frozen_path, "frozen manifest")
-    require_exact_keys(frozen, {"schema", "gate_id", "candidate_id", "anchor_id", "dimension", "thresholds", "evaluation", "external_trust_anchor", "anchor", "candidate", "source", "approved_workload", "workload", "qrels", "exclusions", "output_root", "outputs", "attestation", "provenance", "manifest_sha256"}, "frozen manifest")
-    if frozen["schema"] != FROZEN_SCHEMA or digest_without(frozen, "manifest_sha256") != require_sha256(frozen["manifest_sha256"], "frozen manifest.manifest_sha256"):
-        raise GateContractError("frozen manifest self-digest mismatch")
-    if frozen["external_trust_anchor"] != {"required": True, "algorithm": "sha256_file"} or frozen["dimension"] != DIMENSION or frozen["thresholds"] != THRESHOLDS or frozen["evaluation"] != {"executed": False, "official": False}:
+    required = {"schema", "gate_id", "candidate_id", "anchor_id", "dimension", "thresholds", "evaluation", "external_trust_anchor", "expected_anchor_identity", "anchor", "candidate", "source", "approved_workload", "workload", "qrels", "exclusions", "workload_root", "output_root", "output_layout", "provenance", "manifest_sha256"}
+    require_exact_keys(frozen, required, "frozen manifest")
+    require_string(frozen["gate_id"], "frozen.gate_id", safe_id=True)
+    require_string(frozen["candidate_id"], "frozen.candidate_id", safe_id=True)
+    require_string(frozen["anchor_id"], "frozen.anchor_id", safe_id=True)
+    if frozen["schema"] != FROZEN_SCHEMA or frozen["dimension"] != DIMENSION or frozen["thresholds"] != THRESHOLDS or frozen["evaluation"] != {"executed": False, "official": False}:
         raise GateContractError("frozen manifest immutable policy mismatch")
-    gate_id = require_string(frozen["gate_id"], "frozen manifest.gate_id", safe_id=True)
-    anchor_node = require_mapping(frozen["anchor"], "frozen manifest.anchor")
-    candidate_node = require_mapping(frozen["candidate"], "frozen manifest.candidate")
-    require_exact_keys(anchor_node, {"id", "package"}, "frozen manifest.anchor")
-    require_exact_keys(candidate_node, {"id", "package"}, "frozen manifest.candidate")
-    if anchor_node["id"] != frozen["anchor_id"] or candidate_node["id"] != frozen["candidate_id"] or anchor_node["id"] == candidate_node["id"]:
-        raise GateContractError("frozen manifest anchor/candidate identity mismatch")
-    anchor_package = normalize_package_record(anchor_node["package"], frozen_path.parent, "frozen manifest.anchor.package", expected_role="anchor")
-    candidate_package = normalize_package_record(candidate_node["package"], frozen_path.parent, "frozen manifest.candidate.package", expected_role="candidate")
-    if anchor_package != frozen["anchor"]["package"] or candidate_package != frozen["candidate"]["package"]:
-        raise GateContractError("frozen manifest package record is not canonical")
-    validate_package_pair(anchor_package, candidate_package)
-    source = require_mapping(frozen["source"], "frozen manifest.source")
-    require_exact_keys(source, {"manifest", "binary", "cwd", "argv", "dataset", "workload", "approved_workload"}, "frozen manifest.source")
-    source_manifest = normalize_file_record(source["manifest"], frozen_path.parent, "frozen manifest.source.manifest")
-    binary = normalize_file_record(source["binary"], frozen_path.parent, "frozen manifest.source.binary")
-    dataset = normalize_file_record(source["dataset"], frozen_path.parent, "frozen manifest.source.dataset")
-    cwd = normalize_directory(source["cwd"], frozen_path.parent, "frozen manifest.source.cwd")
-    if source_manifest != source["manifest"] or binary != source["binary"] or dataset != source["dataset"] or cwd != source["cwd"]:
-        raise GateContractError("frozen manifest source record is not canonical")
-    argv_node = require_mapping(source["argv"], "frozen manifest.source.argv")
-    require_exact_keys(argv_node, set(ROLES), "frozen manifest.source.argv")
-    for role in ROLES:
-        validate_argv(argv_node[role], binary=Path(binary["path"]), package=Path((anchor_package if role == "anchor" else candidate_package)["path"]), base_dir=frozen_path.parent, label=f"frozen manifest.source.argv.{role}")
-    qrels_node = require_mapping(frozen["qrels"], "frozen manifest.qrels")
-    require_exact_keys(qrels_node, set(DOMAINS), "frozen manifest.qrels")
-    qrels = {domain: normalize_qrels_record(qrels_node[domain], frozen_path.parent, f"frozen manifest.qrels.{domain}") for domain in DOMAINS}
-    if qrels != qrels_node:
-        raise GateContractError("frozen manifest qrels record is not canonical")
-    approved_record = normalize_file_record(frozen["approved_workload"]["record"], frozen_path.parent, "frozen manifest.approved_workload.record")
-    approved = validate_approved_workload(Path(approved_record["path"]), gate_id=gate_id, qrels=qrels, label="frozen manifest.approved_workload")
-    if frozen["approved_workload"] != {"record": approved_record, "payload": approved} or source["approved_workload"] != approved_record:
-        raise GateContractError("frozen manifest approved workload binding mismatch")
-    workload_record = normalize_file_record(source["workload"], frozen_path.parent, "frozen manifest.source.workload")
-    workload = validate_workload(Path(workload_record["path"]), gate_id=gate_id, approved=approved, label="frozen manifest.source.workload")
-    if isinstance(frozen["workload"], dict) and "record" in frozen["workload"]:
-        if workload_record != frozen["workload"]["record"]:
-            raise GateContractError("frozen manifest workload record mismatch")
-    # The frozen workload is the canonical normalized evaluator payload, not a
-    # mutable re-read of arbitrary caller fields.
-    if frozen["workload"] != workload:
-        raise GateContractError("frozen manifest workload payload drift")
-    exclusions_node = frozen["exclusions"]
-    if not isinstance(exclusions_node, list) or len(exclusions_node) != len(EXCLUSION_NAMES):
-        raise GateContractError("frozen manifest requires exactly three exclusions")
-    exclusions = []
-    excluded_by_domain = {domain: set() for domain in DOMAINS}
-    for index, item in enumerate(exclusions_node):
-        item_mapping = require_mapping(item, f"frozen manifest.exclusions[{index}]")
-        exclusions.append(normalize_exclusion_record({key: item_mapping[key] for key in ("kind", "name", "path", "sha256", "bytes")}, frozen_path.parent, f"frozen manifest.exclusions[{index}]"))
-    if exclusions != exclusions_node or {item["name"] for item in exclusions} != set(EXCLUSION_NAMES):
-        raise GateContractError("frozen manifest exclusion binding mismatch")
-    for item in exclusions:
-        for domain, qids in item["qids_by_domain"].items():
-            if excluded_by_domain[domain].intersection(qids) or set(approved["query_ids_by_domain"][domain]).intersection(qids):
-                raise GateContractError(f"frozen manifest workload/exclusion qid intersection in {domain}")
-            excluded_by_domain[domain].update(qids)
-    output_root = resolve_path(frozen["output_root"], frozen_path.parent, "frozen manifest.output_root")
-    if str(output_root) != frozen["output_root"]:
-        raise GateContractError("frozen manifest output_root is not canonical")
-    require_directory(output_root, "frozen manifest.output_root")
-    outputs = frozen["outputs"]
-    if not isinstance(outputs, list) or len(outputs) != EXPECTED_OUTPUT_COUNT:
-        raise GateContractError("frozen manifest requires exactly twelve outputs")
-    output_paths: set[Path] = set()
-    for index, item in enumerate(outputs):
-        record = require_mapping(item, f"frozen manifest.outputs[{index}]")
-        require_exact_keys(record, {"kind", "role", "domain", "path", "state"}, f"frozen manifest.outputs[{index}]")
-        if record["kind"] not in {"metrics", "receipt"} or record["role"] not in ROLES or record["domain"] not in DOMAINS or record["state"] != "must_be_absent":
-            raise GateContractError("frozen manifest output identity/state mismatch")
-        path = resolve_path(record["path"], frozen_path.parent, f"frozen manifest.outputs[{index}].path")
-        if str(path) != record["path"]:
-            raise GateContractError("frozen manifest output path is not canonical")
-        path_within(path, output_root, "frozen manifest.output")
-        if path in output_paths or (require_outputs_absent and (path.exists() or path.is_symlink())):
-            raise GateContractError(f"frozen manifest output is duplicate/present: {path}")
-        output_paths.add(path)
-    if {(item["kind"], item["role"], item["domain"]) for item in outputs} != {(kind, role, domain) for role in ROLES for domain in DOMAINS for kind in ("metrics", "receipt")}:
-        raise GateContractError("frozen manifest output coverage mismatch")
-    attestation = require_mapping(frozen["attestation"], "frozen manifest.attestation")
-    require_exact_keys(attestation, {"path", "state"}, "frozen manifest.attestation")
-    attestation_path = resolve_path(attestation["path"], frozen_path.parent, "frozen manifest.attestation.path")
-    if attestation != {"path": str(attestation_path), "state": "must_be_absent"} or attestation_path in output_paths or (require_outputs_absent and (attestation_path.exists() or attestation_path.is_symlink())):
-        raise GateContractError("frozen manifest attestation output binding mismatch/presence")
-    provenance = require_mapping(frozen["provenance"], "frozen manifest.provenance")
-    require_exact_keys(provenance, {"plan", "gate_script", "argv_sha256", "approved_workload_sha256", "output_set_sha256"}, "frozen manifest.provenance")
-    plan_record = normalize_file_record(provenance["plan"], frozen_path.parent, "frozen manifest.provenance.plan")
-    gate_record = normalize_file_record(provenance["gate_script"], frozen_path.parent, "frozen manifest.provenance.gate_script")
-    if plan_record != provenance["plan"] or gate_record != provenance["gate_script"] or Path(gate_record["path"]) != Path(__file__).resolve() or gate_record["sha256"] != sha256_file(Path(__file__).resolve()):
-        raise GateContractError("frozen manifest provenance file drift")
-    argv_hashes = require_mapping(provenance["argv_sha256"], "frozen manifest.provenance.argv_sha256")
-    require_exact_keys(argv_hashes, set(ROLES), "frozen manifest.provenance.argv_sha256")
-    if any(argv_hashes[role] != sha256_json(argv_node[role]) for role in ROLES) or provenance["approved_workload_sha256"] != approved_record["sha256"] or provenance["output_set_sha256"] != sha256_json(outputs):
-        raise GateContractError("frozen manifest provenance digest mismatch")
-    return {"path": str(frozen_path), "file_sha256": actual_external, "expected_external_sha256": expected_external, "manifest": frozen, "anchor": anchor_package, "candidate": candidate_package, "source": source, "qrels": qrels, "approved_workload": approved, "workload": workload, "outputs": outputs, "output_root": output_root, "attestation_path": attestation_path}
+    if production and frozen["anchor_id"] != D384_ANCHOR_ARTIFACT_ID:
+        raise GateContractError("frozen anchor id is not the pinned current D384 anchor")
+    anchor_identity = require_mapping(frozen["expected_anchor_identity"], "frozen.expected_anchor_identity")
+    require_exact_keys(anchor_identity, {"artifact_sha256", "package_manifest_sha256", "embedding_space_id"}, "frozen.expected_anchor_identity")
+    anchor_identity = {key: require_sha256(anchor_identity[key], f"frozen.expected_anchor_identity.{key}") for key in ("artifact_sha256", "package_manifest_sha256", "embedding_space_id")}
+    if production and anchor_identity != {"artifact_sha256": D384_ANCHOR_PACKAGE_SHA256, "package_manifest_sha256": D384_ANCHOR_MANIFEST_SHA256, "embedding_space_id": D384_ANCHOR_EMBEDDING_SPACE_ID}:
+        raise GateContractError("frozen anchor identity is not the pinned current D384 anchor")
+    require_exact_keys(frozen["approved_workload"], {"path", "sha256", "bytes", "descriptor"}, "frozen.approved_workload")
+    require_exact_keys(frozen["workload"], {"path", "sha256", "bytes", "descriptor"}, "frozen.workload")
+    require_domain_mapping(frozen["qrels"], "frozen.qrels")
+    if not isinstance(frozen["exclusions"], list) or len(frozen["exclusions"]) != len(EXCLUSION_NAMES):
+        raise GateContractError("frozen.exclusions: exact dev4/reserve4/official-test coverage required")
+    if digest_without(frozen, "manifest_sha256") != require_sha256(frozen["manifest_sha256"], "frozen manifest.manifest_sha256"):
+        raise GateContractError("frozen manifest self-digest mismatch")
+    if frozen["external_trust_anchor"] != {"required": True, "algorithm": "sha256_file", "purpose": "caller-supplied immutable frozen-manifest identity"}:
+        raise GateContractError("frozen external trust-anchor policy mismatch")
+    if frozen["output_layout"] != OUTPUT_LAYOUT:
+        raise GateContractError("frozen output layout mismatch")
+    info = _validate_frozen_files(frozen, frozen_path, production=production)
+    info["expected_external_sha256"] = expected_external
+    info["file_sha256"] = actual_external
+    if require_outputs_absent:
+        if run_dir is None:
+            raise GateContractError("run_dir is required for output absence preflight")
+        run_dir = run_dir.resolve(strict=False)
+        require_directory(run_dir, "evaluator run directory")
+        for path in _planned_output_paths(info, run_dir):
+            if path.exists() or path.is_symlink():
+                raise GateContractError(f"frozen output must be absent before evaluation: {path}")
+    return info
 
 
-def normalize_artifact_source(source: Any, artifact_path: Path, frozen_info: dict[str, Any], role: str, domain: str) -> dict[str, Any]:
-    node = require_mapping(source, f"{artifact_path}.source")
-    require_exact_keys(node, {"manifest", "qrels", "binary", "cwd", "argv", "dataset", "workload", "approved_workload"}, f"{artifact_path}.source")
-    base = artifact_path.parent
-    manifest = normalize_file_record(node["manifest"], base, f"{artifact_path}.source.manifest")
-    qrels = normalize_qrels_record(node["qrels"], base, f"{artifact_path}.source.qrels")
-    binary = normalize_file_record(node["binary"], base, f"{artifact_path}.source.binary")
-    dataset = normalize_file_record(node["dataset"], base, f"{artifact_path}.source.dataset")
-    cwd = normalize_directory(node["cwd"], base, f"{artifact_path}.source.cwd")
-    workload_record = normalize_file_record(node["workload"], base, f"{artifact_path}.source.workload")
-    approved_record = normalize_file_record(node["approved_workload"], base, f"{artifact_path}.source.approved_workload")
-    expected = frozen_info["source"]
-    if manifest != expected["manifest"] or qrels != frozen_info["qrels"][domain] or binary != expected["binary"] or dataset != expected["dataset"] or cwd != expected["cwd"] or workload_record != expected["workload"] or approved_record != expected["approved_workload"] or node["argv"] != expected["argv"][role]:
-        raise GateContractError(f"{artifact_path}: source/qrels/argv provenance mismatch")
-    validate_argv(node["argv"], binary=Path(binary["path"]), package=Path((frozen_info["anchor"] if role == "anchor" else frozen_info["candidate"])["path"]), base_dir=base, label=f"{artifact_path}.source.argv")
-    return {"manifest": manifest, "qrels": qrels, "binary": binary, "cwd": cwd, "argv": list(node["argv"]), "dataset": dataset, "workload": workload_record, "approved_workload": approved_record}
+def _planned_output_paths(info: dict[str, Any], run_dir: Path) -> list[Path]:
+    return [run_dir / OUTPUT_LAYOUT[key].format(role=role, domain=domain) for role in ROLES for domain in DOMAINS for key in ("metrics", "metrics_tsv", "per_query", "receipt")] + [run_dir / OUTPUT_LAYOUT["attestation"]]
 
 
-def aggregate_rows(rows: Any, expected_qids: list[str], label: str) -> dict[str, Any]:
-    if not isinstance(rows, list) or len(rows) != len(expected_qids):
-        raise GateContractError(f"{label}: row count mismatch")
-    normalized_rows: list[dict[str, Any]] = []
-    seen: list[str] = []
-    for index, item in enumerate(rows):
-        row = require_mapping(item, f"{label}[{index}]")
-        require_exact_keys(row, {"query_id", "metrics"}, f"{label}[{index}]")
-        qid = require_qid(row["query_id"], f"{label}[{index}].query_id")
-        seen.append(qid)
-        metrics_node = require_mapping(row["metrics"], f"{label}[{index}].metrics")
-        require_exact_keys(metrics_node, set(SURFACES), f"{label}[{index}].metrics")
-        metrics: dict[str, dict[str, float]] = {}
-        for surface in SURFACES:
-            surface_node = require_mapping(metrics_node[surface], f"{label}[{index}].metrics.{surface}")
-            require_exact_keys(surface_node, set(METRICS_BY_SURFACE[surface]), f"{label}[{index}].metrics.{surface}")
-            metrics[surface] = {metric: require_finite_number(surface_node[metric], f"{label}[{index}].metrics.{surface}.{metric}", bounded=True) for metric in METRICS_BY_SURFACE[surface]}
-        normalized_rows.append({"query_id": qid, "metrics": metrics})
-    if seen != expected_qids:
-        raise GateContractError(f"{label}: exact approved qid order/set required")
-    aggregate = {surface: {metric: math.fsum(row["metrics"][surface][metric] for row in normalized_rows) / len(normalized_rows) for metric in METRICS_BY_SURFACE[surface]} for surface in SURFACES}
-    return {"rows": normalized_rows, "rows_by_qid": {row["query_id"]: row for row in normalized_rows}, "aggregate": aggregate, "qids": seen}
+def _canonical_evaluator_argv(frozen_info: dict[str, Any], role: str, domain: str, outputs: dict[str, Path]) -> list[str]:
+    if role not in ROLES or domain not in DOMAINS:
+        raise GateContractError("invalid evaluator role/domain")
+    source = frozen_info["source"]
+    dataset = source["dataset_by_domain"][domain]
+    qrels = frozen_info["qrels"][domain]
+    package = frozen_info["anchor" if role == "anchor" else "candidate"]
+    argv = [
+        source["binary"]["path"],
+        NATIVE_EVAL_SUBCOMMAND,
+        "--dataset", domain,
+        "--split", HELDOUT_SPLIT,
+        "--qrels", qrels["path"],
+        "--batch-size", str(BATCH_SIZE),
+        "--top-k", str(TOP_K),
+        "--bits", f"{Q3_BITS},{Q5_BITS}",
+        "--quantizer-seed", str(TURBOQUANT_SEED),
+        "--max-docs", "0",
+        "--max-queries", "0",
+        "--per-query-top-k", str(TOP_K),
+        "--metrics-json", str(outputs["metrics"]),
+        "--metrics-tsv", str(outputs["metrics_tsv"]),
+        "--per-query-jsonl", str(outputs["per_query"]),
+        package["path"],
+        dataset["dataset_dir"],
+    ]
+    return argv
 
 
-def normalize_boundary_evidence(value: Any, *, domain: str, workload: dict[str, Any], label: str) -> dict[str, Any]:
+def _validate_evaluator_argv(argv: list[str], frozen_info: dict[str, Any], role: str, domain: str, outputs: dict[str, Path]) -> None:
+    expected = _canonical_evaluator_argv(frozen_info, role, domain, outputs)
+    if argv != expected:
+        raise GateContractError(f"{role}/{domain}: evaluator argv is not the exact pinned command")
+    if any(any(marker in token for marker in SHELL_MARKERS) for token in argv):
+        raise GateContractError("constructed argv contains shell metacharacters")
+    source = frozen_info["source"]
+    package = frozen_info["anchor" if role == "anchor" else "candidate"]
+    dataset = source["dataset_by_domain"][domain]
+    if argv[0] != source["binary"]["path"] or argv[1] != NATIVE_EVAL_SUBCOMMAND or argv[-2] != package["path"] or argv[-1] != dataset["dataset_dir"]:
+        raise GateContractError("constructed argv semantic binding mismatch")
+
+
+def build_evaluator_argv(frozen_info: dict[str, Any], role: str, domain: str, outputs: dict[str, Path]) -> list[str]:
+    argv = _canonical_evaluator_argv(frozen_info, role, domain, outputs)
+    _validate_evaluator_argv(argv, frozen_info, role, domain, outputs)
+    return argv
+
+
+def _binding_for_run(frozen_info: dict[str, Any], role: str, domain: str, nonce: str, argv: list[str], outputs: dict[str, Path]) -> dict[str, Any]:
+    frozen = frozen_info["manifest"]
+    source = frozen_info["source"]
+    package = frozen_info["anchor" if role == "anchor" else "candidate"]
+    dataset = source["dataset_by_domain"][domain]
+    binding: dict[str, Any] = {
+        "schema": GATE_BINDING_SCHEMA,
+        "gate_id": frozen["gate_id"],
+        "role": role,
+        "domain": domain,
+        "nonce": nonce,
+        "frozen_manifest_sha256": frozen_info["expected_external_sha256"],
+        "frozen_manifest_digest": frozen["manifest_sha256"],
+        "package_sha256": package["package_identity"]["artifact_sha256"],
+        "package_manifest_sha256": package["package_identity"]["package_manifest_sha256"],
+        "sibling_rollup_sha256": package["sibling_rollup_sha256"],
+        "sidecar_sha256": None if package["sidecar"] is None else package["sidecar"]["sha256"],
+        "embedding_space_id": package["embedding_space_id"],
+        "source_manifest_sha256": source["manifest"]["sha256"],
+        "gate_script_sha256": frozen["provenance"]["gate_script"]["sha256"],
+        "binary_sha256": source["binary"]["sha256"],
+        "argv": argv,
+        "argv_sha256": sha256_json(argv),
+        "cwd": source["cwd"],
+        "dataset_id": domain,
+        "dataset_manifest_sha256": dataset["manifest"]["sha256"],
+        "corpus_sha256": dataset["corpus"]["sha256"],
+        "queries_sha256": dataset["queries"]["sha256"],
+        "qrels_sha256": frozen_info["qrels"][domain]["sha256"],
+        "compatibility_digest": frozen["approved_workload"]["descriptor"]["compatibility_digest"],
+        "workload_sha256": frozen["workload"]["sha256"],
+        "approved_workload_sha256": frozen["approved_workload"]["sha256"],
+        "workload_qid_set_sha256_by_domain": frozen["approved_workload"]["descriptor"]["qid_set_sha256_by_domain"],
+        "workload_query_count_by_domain": frozen["approved_workload"]["descriptor"]["query_count_by_domain"],
+        "workload_qrels_sha256_by_domain": frozen["approved_workload"]["descriptor"]["qrels_sha256_by_domain"],
+        "config": {"dimension": DIMENSION, "bits": [Q3_BITS, Q5_BITS], "seed": TURBOQUANT_SEED, "top_k": TOP_K, "batch_size": BATCH_SIZE, "max_docs": 0, "max_queries": 0, "per_query_top_k": TOP_K, "rerank_overfetch": [], "package_mode": "native_mll_sibling", "score_mode": "turboquant_ip_prepared", "split": HELDOUT_SPLIT},
+        "outputs": {key: str(outputs[key]) for key in ("metrics", "metrics_tsv", "per_query")},
+        "nfcorpus_boundary_qids_sha256": frozen["approved_workload"]["descriptor"]["nfcorpus_boundary_qids_sha256"],
+        "nfcorpus_boundary_rank_window": [80, 120],
+    }
+    binding["binding_sha256"] = digest_without(binding, "binding_sha256")
+    return binding
+
+
+def _harness_environment(binding: dict[str, Any], frozen_info: dict[str, Any], nonce: str, *, test_mode: bool) -> dict[str, str]:
+    """Build a reproducible evaluator environment with no caller preload hooks."""
+
+    # The evaluator is launched by absolute path, so PATH is only retained
+    # for the synthetic test shebang.  In production, omitting LD_PRELOAD,
+    # LD_LIBRARY_PATH, PYTHONPATH, and similar ambient variables prevents a
+    # wrapper or preload from changing the pinned executable's behavior.
+    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin") if test_mode else "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+    if test_mode:
+        for key in ("MOCK_MODE", "MOCK_COPY_FROM"):
+            value = os.environ.get(key)
+            if value is not None:
+                env[key] = value
+    env.update({"EOS_AOQT_GATE_NONCE": nonce, "EOS_AOQT_FROZEN_MANIFEST_SHA256": frozen_info["expected_external_sha256"], "EOS_AOQT_GATE_BINDING_SHA256": binding["binding_sha256"], "EOS_AOQT_GATE_BINDING_JSON": canonical_json(binding).decode("utf-8")})
+    return env
+
+
+def _assert_run_directory(path: Path, identity: tuple[int, int], label: str) -> None:
+    require_directory(path, label)
+    try:
+        stat_result = path.stat()
+    except OSError as exc:
+        raise GateContractError(f"{label}: cannot stat fresh run directory: {exc}") from exc
+    if (stat_result.st_dev, stat_result.st_ino) != identity:
+        raise GateContractError(f"{label}: fresh run directory was replaced")
+
+
+def _require_binding(value: Any, expected: dict[str, Any], label: str) -> None:
+    binding = require_mapping(value, label)
+    if binding != expected:
+        raise GateContractError(f"{label}: native output gate binding mismatch (nonce/path/digest substitution)")
+    if digest_without(binding, "binding_sha256") != binding["binding_sha256"]:
+        raise GateContractError(f"{label}: native output gate binding self-digest mismatch")
+
+
+def _metric_value(node: dict[str, Any], key: str, label: str) -> float:
+    if key not in node:
+        raise GateContractError(f"{label}: missing {key}")
+    return require_finite_number(node[key], f"{label}.{key}", bounded=True)
+
+
+def _quality_pair(value: Any, label: str) -> dict[str, float]:
     node = require_mapping(value, label)
-    require_exact_keys(node, {"schema", "guard", "rank_window", "qids", "qids_sha256"}, label)
+    return {"ndcg_at_10": _metric_value(node, "ndcg_at_10", label), "recall_at_100": _metric_value(node, "recall_at_100", label)}
+
+
+def _rank_metrics(top_k: list[dict[str, Any]], rels: dict[str, float], label: str) -> dict[str, float]:
+    if len(top_k) != TOP_K:
+        raise GateContractError(f"{label}: native ranking must contain exactly top-k=120 entries")
+    ranks: list[tuple[int, str, float]] = []
+    seen_rank: set[int] = set()
+    seen_doc: set[str] = set()
+    for index, item in enumerate(top_k, 1):
+        node = require_mapping(item, f"{label}.top_k[{index - 1}]")
+        required = {"rank", "doc_id", "score", "relevance"}
+        if not required.issubset(node):
+            raise GateContractError(f"{label}.top_k[{index - 1}]: native ranking fields missing")
+        rank = require_integer(node["rank"], f"{label}.top_k[{index - 1}].rank", minimum=1)
+        doc_id = require_string(node["doc_id"], f"{label}.top_k[{index - 1}].doc_id")
+        if rank != index or rank in seen_rank or doc_id in seen_doc:
+            raise GateContractError(f"{label}: ranking ranks/doc IDs are not unique and ordered")
+        require_finite_number(node["score"], f"{label}.top_k[{index - 1}].score")
+        relevance = require_finite_number(node["relevance"], f"{label}.top_k[{index - 1}].relevance")
+        expected_relevance = rels.get(doc_id, 0.0)
+        if abs(relevance - expected_relevance) > COMPARISON_EPSILON:
+            raise GateContractError(f"{label}: output relevance disagrees with frozen qrels")
+        seen_rank.add(rank)
+        seen_doc.add(doc_id)
+        ranks.append((rank, doc_id, relevance))
+    positive_rels = [value for value in rels.values() if value > 0]
+    ideal = sorted(positive_rels, reverse=True)[:10]
+    idcg = sum((2.0**value - 1.0) / math.log2(index + 2) for index, value in enumerate(ideal))
+    dcg = sum((2.0**relevance - 1.0) / math.log2(rank + 1) for rank, _doc, relevance in ranks if rank <= 10 and relevance > 0)
+    ndcg = dcg / idcg if idcg else 0.0
+    hit = sum(1 for rank, doc_id, relevance in ranks if rank <= 100 and relevance > 0 and doc_id in rels)
+    recall = hit / len(positive_rels) if positive_rels else 0.0
+    return {"ndcg_at_10": ndcg, "recall_at_100": recall}
+
+
+def _parse_native_result(metrics_path: Path, tsv_path: Path, per_query_path: Path, *, frozen_info: dict[str, Any], role: str, domain: str, binding: dict[str, Any], production: bool) -> dict[str, Any]:
+    for path, label in ((metrics_path, "native metrics"), (tsv_path, "native metrics TSV"), (per_query_path, "native per-query output")):
+        require_regular_file(path, f"{role}/{domain} {label}")
+        if path.stat().st_size == 0:
+            raise GateContractError(f"{role}/{domain} {label}: empty output")
+    metrics = read_json(metrics_path, f"{role}/{domain} native metrics")
+    required_metrics = {"schema", "dataset", "artifact", "backend", "inputs", "config", "dense", "rows", "gate_binding"}
+    if not required_metrics.issubset(metrics):
+        raise GateContractError(f"{role}/{domain} native metrics: native evaluator fields missing")
+    if metrics["schema"] != NATIVE_METRICS_SCHEMA or metrics["dataset"] != domain:
+        raise GateContractError(f"{role}/{domain}: native metrics schema/dataset mismatch")
+    _require_binding(metrics["gate_binding"], binding, f"{role}/{domain} native metrics.gate_binding")
+    package = frozen_info["anchor" if role == "anchor" else "candidate"]
+    artifact_path = resolve_path(metrics["artifact"], metrics_path.parent, f"{role}/{domain}.native_metrics.artifact")
+    if artifact_path != Path(package["path"]):
+        raise GateContractError(f"{role}/{domain}: native metrics artifact/package substitution")
+    inputs = require_mapping(metrics["inputs"], f"{role}/{domain}.native_metrics.inputs")
+    if inputs.get("corpus_path") != frozen_info["source"]["dataset_by_domain"][domain]["corpus"]["path"] or inputs.get("queries_path") != frozen_info["source"]["dataset_by_domain"][domain]["queries"]["path"] or inputs.get("qrels_path") != frozen_info["qrels"][domain]["path"] or inputs.get("qrels_sha256") != frozen_info["qrels"][domain]["sha256"]:
+        raise GateContractError(f"{role}/{domain}: native metrics dataset/qrels binding mismatch")
+    if inputs.get("queries") != frozen_info["qrels"][domain]["query_count"] or inputs.get("relevant_pairs") != frozen_info["qrels"][domain]["qrels_pair_count"]:
+        raise GateContractError(f"{role}/{domain}: native metrics workload counts mismatch")
+    config = require_mapping(metrics["config"], f"{role}/{domain}.native_metrics.config")
+    if config.get("batch_size") != BATCH_SIZE or config.get("top_k") != TOP_K or config.get("bits") != [Q3_BITS, Q5_BITS] or config.get("quantizer_seed") != TURBOQUANT_SEED or config.get("max_docs", 0) != 0 or config.get("max_queries", 0) != 0 or config.get("rerank_overfetch", []) != [] or config.get("rerank_bits", 0) != 0:
+        raise GateContractError(f"{role}/{domain}: native evaluator config mismatch")
+    rows = metrics["rows"]
+    if not isinstance(rows, list) or len(rows) != 2:
+        raise GateContractError(f"{role}/{domain}: native metrics must contain exactly q3 and q5 rows")
+    row_by_bits: dict[int, dict[str, Any]] = {}
+    for index, row in enumerate(rows):
+        node = require_mapping(row, f"{role}/{domain}.native_metrics.rows[{index}]")
+        bits = require_integer(node.get("bits"), f"{role}/{domain}.native_metrics.rows[{index}].bits", minimum=1)
+        if bits in row_by_bits or bits not in {Q3_BITS, Q5_BITS}:
+            raise GateContractError(f"{role}/{domain}: unexpected/duplicate TurboQuant bits")
+        expected_method = f"turboquant_ip_b{bits}"
+        if node.get("method") != expected_method or node.get("rerank_overfetch", 0) != 0:
+            raise GateContractError(f"{role}/{domain}: scoring method/package-mode mismatch")
+        row_by_bits[bits] = node
+    if set(row_by_bits) != {Q3_BITS, Q5_BITS}:
+        raise GateContractError(f"{role}/{domain}: q3/q5 rows are incomplete")
+    dense_node = require_mapping(metrics["dense"], f"{role}/{domain}.native_metrics.dense")
+    dense_native = _quality_pair(dense_node.get("quality"), f"{role}/{domain}.native_metrics.dense.quality")
+    qrels = frozen_info["qrels"][domain]
+    per_query_rows: dict[int, dict[str, dict[str, Any]]] = {Q3_BITS: {}, Q5_BITS: {}}
+    try:
+        lines = per_query_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise GateContractError(f"{role}/{domain}: cannot read native per-query output: {exc}") from exc
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        payload = _strict_load(line, f"{role}/{domain}.per-query:{line_number}")
+        row = require_mapping(payload, f"{role}/{domain}.per-query:{line_number}")
+        required = {"schema", "dataset", "query_id", "method", "bits", "scoring_surface", "quantizer_seed", "relevant_count", "quality", "top_k", "dense_quality", "dense_top_k", "gate_binding"}
+        if not required.issubset(row):
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: native evidence fields missing")
+        _require_binding(row["gate_binding"], binding, f"{role}/{domain}.per-query:{line_number}.gate_binding")
+        if row["schema"] != NATIVE_PER_QUERY_SCHEMA or row["dataset"] != domain or row["scoring_surface"] != "turboquant_ip_prepared" or row["quantizer_seed"] != TURBOQUANT_SEED:
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: native per-query identity mismatch")
+        bits = require_integer(row["bits"], f"{role}/{domain}.per-query:{line_number}.bits", minimum=1)
+        if bits not in per_query_rows or row["method"] != f"turboquant_ip_b{bits}":
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: unexpected scoring method/bits")
+        qid = require_qid(row["query_id"], f"{role}/{domain}.per-query:{line_number}.query_id")
+        if qid not in qrels["rels"] or qid in per_query_rows[bits]:
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: qid set is not exactly the frozen workload")
+        rels = qrels["rels"][qid]
+        if row["relevant_count"] != len(rels):
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: relevant-count mismatch")
+        compact_top = row["top_k"]
+        dense_top = row["dense_top_k"]
+        if not isinstance(compact_top, list) or not isinstance(dense_top, list):
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: rankings must be arrays")
+        compact_metrics = _rank_metrics(compact_top, rels, f"{role}/{domain}.per-query:{line_number}.compact")
+        dense_metrics = _rank_metrics(dense_top, rels, f"{role}/{domain}.per-query:{line_number}.dense")
+        quality = _quality_pair(row["quality"], f"{role}/{domain}.per-query:{line_number}.quality")
+        dense_quality = _quality_pair(row["dense_quality"], f"{role}/{domain}.per-query:{line_number}.dense_quality")
+        if abs(quality["ndcg_at_10"] - compact_metrics["ndcg_at_10"]) > COMPARISON_EPSILON or abs(quality["recall_at_100"] - compact_metrics["recall_at_100"]) > COMPARISON_EPSILON:
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: q3/q5 quality is not recomputed from native ranking")
+        if abs(dense_quality["ndcg_at_10"] - dense_metrics["ndcg_at_10"]) > COMPARISON_EPSILON or abs(dense_quality["recall_at_100"] - dense_metrics["recall_at_100"]) > COMPARISON_EPSILON:
+            raise GateContractError(f"{role}/{domain}.per-query:{line_number}: dense quality is not recomputed from native ranking")
+        per_query_rows[bits][qid] = {"qid": qid, "q3": compact_metrics, "q5": compact_metrics, "dense": dense_metrics, "quality": quality, "dense_quality": dense_quality, "compact_top": compact_top, "dense_top": dense_top}
+    expected_qids = set(qrels["qids"])
+    if any(set(rows_by_qid) != expected_qids for rows_by_qid in per_query_rows.values()):
+        raise GateContractError(f"{role}/{domain}: native per-query qids do not equal complete frozen qrels workload")
+    for qid in qrels["qids"]:
+        q3_dense = per_query_rows[Q3_BITS][qid]
+        q5_dense = per_query_rows[Q5_BITS][qid]
+        if q3_dense["dense_top"] != q5_dense["dense_top"] or q3_dense["dense"] != q5_dense["dense"]:
+            raise GateContractError(f"{role}/{domain}: dense evidence differs between q3 and q5 rows for {qid}")
+    aggregates = {
+        "dense": {metric: math.fsum(per_query_rows[Q3_BITS][qid]["dense"][metric] for qid in qrels["qids"]) / len(qrels["qids"]) for metric in METRICS_BY_SURFACE["dense"]},
+        "q3": {metric: math.fsum(per_query_rows[Q3_BITS][qid]["q3"][metric] for qid in qrels["qids"]) / len(qrels["qids"]) for metric in METRICS_BY_SURFACE["q3"]},
+        "q5": {metric: math.fsum(per_query_rows[Q5_BITS][qid]["q5"][metric] for qid in qrels["qids"]) / len(qrels["qids"]) for metric in METRICS_BY_SURFACE["q5"]},
+    }
+    if abs(dense_native["ndcg_at_10"] - aggregates["dense"]["ndcg_at_10"]) > COMPARISON_EPSILON or abs(row_by_bits[Q3_BITS]["quality"]["ndcg_at_10"] - aggregates["q3"]["ndcg_at_10"]) > COMPARISON_EPSILON or abs(row_by_bits[Q3_BITS]["quality"]["recall_at_100"] - aggregates["q3"]["recall_at_100"]) > COMPARISON_EPSILON or abs(row_by_bits[Q5_BITS]["quality"]["ndcg_at_10"] - aggregates["q5"]["ndcg_at_10"]) > COMPARISON_EPSILON:
+        raise GateContractError(f"{role}/{domain}: native aggregate metrics disagree with recomputed per-query evidence")
     if domain == "nfcorpus":
-        expected_qids = workload["nfcorpus_boundary_qids"]
-        expected = {"schema": "eos.aoqt.nfcorpus_boundary_evidence.v1", "guard": "q3_recall_at_100", "rank_window": [80, 120], "qids": expected_qids, "qids_sha256": sha256_json(expected_qids)}
-    else:
-        expected = {"schema": "eos.aoqt.no_boundary_evidence.v1", "guard": "none", "rank_window": None, "qids": [], "qids_sha256": sha256_json([])}
-    if node != expected:
-        raise GateContractError(f"{label}: boundary guard evidence mismatch")
-    return expected
-
-
-def validate_receipt(path: Path, *, artifact_path: Path, artifact_sha256: str, frozen_info: dict[str, Any], role: str, domain: str, expected_nonce: str | None = None) -> dict[str, Any]:
-    payload = read_json(path, f"{role}/{domain} native receipt")
-    require_exact_keys(payload, {"schema", "gate_id", "nonce", "role", "domain", "split", "official", "native_evaluator", "wrapper", "exit_status", "executable", "argv", "argv_sha256", "cwd", "dataset_id", "dataset", "qrels", "workload", "approved_workload", "package", "output", "config", "frozen_manifest", "artifact_sha256", "receipt_digest"}, f"{role}/{domain} native receipt")
-    if payload["schema"] != RECEIPT_SCHEMA or digest_without(payload, "receipt_digest") != require_sha256(payload["receipt_digest"], f"{path}.receipt_digest"):
-        raise GateContractError(f"{path}: native receipt schema/self-digest mismatch")
-    nonce = require_string(payload["nonce"], f"{path}.nonce")
-    if not NONCE_RE.fullmatch(nonce) or (expected_nonce is not None and nonce != expected_nonce):
-        raise GateContractError(f"{path}: receipt nonce mismatch/invalid")
-    if payload["gate_id"] != frozen_info["manifest"]["gate_id"] or payload["role"] != role or payload["domain"] != domain or payload["split"] != "heldout" or payload["official"] is not False or payload["native_evaluator"] is not True or payload["wrapper"] is not False or payload["exit_status"] != 0 or payload["dataset_id"] != domain:
-        raise GateContractError(f"{path}: native receipt identity/producer flags mismatch")
-    frozen = frozen_info["manifest"]
-    executable = normalize_file_record(payload["executable"], path.parent, f"{path}.executable")
-    if executable != frozen["source"]["binary"]:
-        raise GateContractError(f"{path}: executable binding mismatch")
-    package = normalize_package_record(payload["package"], path.parent, f"{path}.package", expected_role=role)
-    if package != frozen_info["anchor" if role == "anchor" else "candidate"]:
-        raise GateContractError(f"{path}: package binding mismatch")
-    qrels = normalize_qrels_record(payload["qrels"], path.parent, f"{path}.qrels")
-    if qrels != frozen_info["qrels"][domain]:
-        raise GateContractError(f"{path}: qrels binding mismatch")
-    workload_record = normalize_file_record(payload["workload"], path.parent, f"{path}.workload")
-    approved_record = normalize_file_record(payload["approved_workload"], path.parent, f"{path}.approved_workload")
-    dataset_record = normalize_file_record(payload["dataset"], path.parent, f"{path}.dataset")
-    if dataset_record != frozen["source"]["dataset"] or workload_record != frozen["source"]["workload"] or approved_record != frozen["source"]["approved_workload"]:
-        raise GateContractError(f"{path}: workload binding mismatch")
-    cwd = normalize_directory(payload["cwd"], path.parent, f"{path}.cwd")
-    if cwd != frozen["source"]["cwd"]:
-        raise GateContractError(f"{path}: cwd binding mismatch")
-    validate_argv(payload["argv"], binary=Path(executable["path"]), package=Path(package["path"]), base_dir=path.parent, label=f"{path}.argv")
-    if payload["argv"] != frozen["source"]["argv"][role] or payload["argv_sha256"] != sha256_json(payload["argv"]):
-        raise GateContractError(f"{path}: exact argv binding mismatch")
-    config = require_mapping(payload["config"], f"{path}.config")
-    if config != {"dimension": DIMENSION, "bits": [Q3_BITS, Q5_BITS], "seed": TURBOQUANT_SEED, "top_k": TOP_K, "package_mode": "sibling", "surfaces": list(SURFACES), "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100}}:
-        raise GateContractError(f"{path}: native evaluator config mismatch")
-    output_record = normalize_file_record(payload["output"], path.parent, f"{path}.output")
-    if output_record != {"path": str(artifact_path), "sha256": artifact_sha256, "bytes": artifact_path.stat().st_size}:
-        raise GateContractError(f"{path}: output/artifact path binding mismatch")
-    frozen_binding = require_mapping(payload["frozen_manifest"], f"{path}.frozen_manifest")
-    require_exact_keys(frozen_binding, {"path", "file_sha256", "manifest_sha256"}, f"{path}.frozen_manifest")
-    if frozen_binding != {"path": frozen_info["path"], "file_sha256": frozen_info["expected_external_sha256"], "manifest_sha256": frozen["manifest_sha256"]}:
-        raise GateContractError(f"{path}: frozen manifest binding mismatch")
-    if payload["artifact_sha256"] != artifact_sha256:
-        raise GateContractError(f"{path}: artifact hash binding mismatch")
-    return {"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size, "nonce": nonce, "receipt": payload}
-
-
-def validate_artifact(path: Path, *, expected_metrics: dict[str, Any], expected_receipt: dict[str, Any], frozen_info: dict[str, Any], role: str, domain: str) -> dict[str, Any]:
-    path = path.resolve(strict=False)
-    require_regular_file(path, f"{role}/{domain} metrics artifact")
-    payload = read_json(path, f"{role}/{domain} metrics artifact")
-    require_exact_keys(payload, {"schema", "gate_id", "artifact_path", "role", "domain", "split", "package", "source", "receipt_path", "frozen_manifest_sha256", "receipt_nonce", "observed_workload", "boundary_evidence", "rows", "aggregate"}, f"{role}/{domain} metrics artifact")
-    frozen = frozen_info["manifest"]
-    if payload["schema"] != ARTIFACT_SCHEMA or payload["gate_id"] != frozen["gate_id"] or payload["role"] != role or payload["domain"] != domain or payload["split"] != "heldout":
-        raise GateContractError(f"{path}: artifact identity/schema mismatch")
-    artifact_path = resolve_path(payload["artifact_path"], path.parent, f"{path}.artifact_path")
-    if artifact_path != path or artifact_path != Path(expected_metrics["path"]):
-        raise GateContractError(f"{path}: artifact path substitution/mismatch")
-    package = normalize_package_record(payload["package"], path.parent, f"{path}.package", expected_role=role)
-    if package != frozen_info["anchor" if role == "anchor" else "candidate"]:
-        raise GateContractError(f"{path}: package provenance mismatch")
-    normalize_artifact_source(payload["source"], path, frozen_info, role, domain)
-    expected_qids = frozen_info["workload"]["query_ids_by_domain"][domain]
-    observed = require_mapping(payload["observed_workload"], f"{path}.observed_workload")
-    expected_observed = {"workload_id": frozen_info["workload"]["workload_id"], "query_count": len(expected_qids), "qids_sha256": sha256_json(expected_qids), "scored_query_count": len(expected_qids)}
-    if observed != expected_observed:
-        raise GateContractError(f"{path}: observed workload mismatch")
-    boundary = normalize_boundary_evidence(payload["boundary_evidence"], domain=domain, workload=frozen_info["workload"], label=f"{path}.boundary_evidence")
-    row_result = aggregate_rows(payload["rows"], expected_qids, f"{path}.rows")
-    aggregate_node = require_mapping(payload["aggregate"], f"{path}.aggregate")
-    require_exact_keys(aggregate_node, set(SURFACES), f"{path}.aggregate")
-    for surface in SURFACES:
-        surface_node = require_mapping(aggregate_node[surface], f"{path}.aggregate.{surface}")
-        require_exact_keys(surface_node, set(METRICS_BY_SURFACE[surface]), f"{path}.aggregate.{surface}")
-        for metric in METRICS_BY_SURFACE[surface]:
-            declared = require_finite_number(surface_node[metric], f"{path}.aggregate.{surface}.{metric}", bounded=True)
-            if abs(declared - row_result["aggregate"][surface][metric]) > COMPARISON_EPSILON:
-                raise GateContractError(f"{path}: declared aggregate mismatch for {surface}.{metric}")
-    receipt_path = resolve_path(payload["receipt_path"], path.parent, f"{path}.receipt_path")
-    if receipt_path != Path(expected_receipt["path"]):
-        raise GateContractError(f"{path}: receipt path substitution/mismatch")
-    if not receipt_path.is_file() or receipt_path.is_symlink():
-        raise GateContractError(f"{path}: receipt missing/substituted")
-    frozen_manifest_sha = require_sha256(payload["frozen_manifest_sha256"], f"{path}.frozen_manifest_sha256")
-    if frozen_manifest_sha != frozen["manifest_sha256"]:
-        raise GateContractError(f"{path}: frozen manifest digest binding mismatch")
-    nonce = require_string(payload["receipt_nonce"], f"{path}.receipt_nonce")
-    if not NONCE_RE.fullmatch(nonce):
-        raise GateContractError(f"{path}: invalid receipt nonce")
-    artifact_sha = sha256_file(path)
-    receipt = validate_receipt(receipt_path, artifact_path=path, artifact_sha256=artifact_sha, frozen_info=frozen_info, role=role, domain=domain, expected_nonce=nonce)
-    return {"path": str(path), "sha256": artifact_sha, "bytes": path.stat().st_size, "receipt": receipt, "role": role, "domain": domain, "aggregate": row_result["aggregate"], "rows_by_qid": row_result["rows_by_qid"], "qids": row_result["qids"], "boundary": boundary}
+        boundary_qids = frozen_info["approved_workload"]["descriptor"]["nfcorpus_boundary_qids"]
+        for qid in boundary_qids:
+            for bits in (Q3_BITS, Q5_BITS):
+                for surface in ("compact_top", "dense_top"):
+                    ranks = [item["rank"] for item in per_query_rows[bits][qid][surface]]
+                    if not set(range(80, 121)).issubset(set(ranks)):
+                        raise GateContractError(f"{role}/{domain}: missing native NF boundary ranks 80..120 for {qid}")
+    return {"role": role, "domain": domain, "metrics_path": str(metrics_path), "metrics_sha256": sha256_file(metrics_path), "metrics_tsv_path": str(tsv_path), "metrics_tsv_sha256": sha256_file(tsv_path), "per_query_path": str(per_query_path), "per_query_sha256": sha256_file(per_query_path), "aggregate": aggregates, "rows_by_qid": {qid: {"dense": per_query_rows[Q3_BITS][qid]["dense"], "q3": per_query_rows[Q3_BITS][qid]["q3"], "q5": per_query_rows[Q5_BITS][qid]["q5"]} for qid in qrels["qids"]}, "boundary_evidence": {"rank_window": [80, 120], "qids": frozen_info["approved_workload"]["descriptor"]["nfcorpus_boundary_qids"] if domain == "nfcorpus" else [], "source": "native_per_query_top_k"}}
 
 
 def at_least(value: float, threshold: float) -> bool:
     return value + COMPARISON_EPSILON >= threshold
 
 
-def aggregate_gate(artifacts: dict[tuple[str, str], dict[str, Any]], frozen_info: dict[str, Any]) -> dict[str, Any]:
+def aggregate_gate(results: dict[tuple[str, str], dict[str, Any]], frozen_info: dict[str, Any]) -> dict[str, Any]:
     failures: list[str] = []
     domain_reports: dict[str, Any] = {}
     for domain in DOMAINS:
-        anchor = artifacts[("anchor", domain)]
-        candidate = artifacts[("candidate", domain)]
+        anchor = results[("anchor", domain)]
+        candidate = results[("candidate", domain)]
         delta = {surface: {metric: candidate["aggregate"][surface][metric] - anchor["aggregate"][surface][metric] for metric in METRICS_BY_SURFACE[surface]} for surface in SURFACES}
         query_safety: dict[str, Any] = {}
-        for qid in frozen_info["workload"]["query_ids_by_domain"][domain]:
-            a = anchor["rows_by_qid"][qid]["metrics"]
-            c = candidate["rows_by_qid"][qid]["metrics"]
-            qdelta = {surface: {metric: c[surface][metric] - a[surface][metric] for metric in METRICS_BY_SURFACE[surface]} for surface in SURFACES}
+        for qid in frozen_info["approved_workload"]["descriptor"]["query_ids_by_domain"][domain]:
+            qdelta = {surface: {metric: candidate["rows_by_qid"][qid][surface][metric] - anchor["rows_by_qid"][qid][surface][metric] for metric in METRICS_BY_SURFACE[surface]} for surface in SURFACES}
             checks = {"q3_ndcg_at_10_non_regressing": at_least(qdelta["q3"]["ndcg_at_10"], THRESHOLDS["q3_query_ndcg_at_10_delta_min"]), "dense_ndcg_at_10_within_tolerance": at_least(qdelta["dense"]["ndcg_at_10"], THRESHOLDS["dense_query_ndcg_at_10_delta_min"]), "q5_ndcg_at_10_within_tolerance": at_least(qdelta["q5"]["ndcg_at_10"], THRESHOLDS["q5_query_ndcg_at_10_delta_min"]), "q3_recall_at_100_non_regressing": at_least(qdelta["q3"]["recall_at_100"], THRESHOLDS["q3_query_recall_at_100_delta_min"])}
             if not all(checks.values()):
                 failures.extend(f"query:{domain}:{qid}:{name}" for name, passed in checks.items() if not passed)
@@ -1516,64 +1534,204 @@ def aggregate_gate(artifacts: dict[tuple[str, str], dict[str, Any]], frozen_info
         failures.extend(f"domain:{domain}:{name}" for name, passed in safety.items() if not passed)
         boundary = None
         if domain == "nfcorpus":
-            boundary_qids = frozen_info["workload"]["nfcorpus_boundary_qids"]
-            boundary_checks = {qid: query_safety[qid]["checks"]["q3_recall_at_100_non_regressing"] for qid in boundary_qids}
-            boundary = {"rank_window": [80, 120], "qids": boundary_qids, "qids_sha256": sha256_json(boundary_qids), "q3_recall_at_100_non_regressing": boundary_checks, "pass": all(boundary_checks.values())}
-            if not boundary["pass"]:
-                failures.append("nfcorpus:boundary:q3_recall_at_100_non_regressing")
-        domain_reports[domain] = {"anchor": anchor["aggregate"], "candidate": candidate["aggregate"], "delta": delta, "query_safety": query_safety, "boundary": boundary, "safety": safety, "pass": all(safety.values()) and all(item["pass"] for item in query_safety.values()) and (boundary is None or boundary["pass"])}
+            boundary = {"rank_window": [80, 120], "qids": frozen_info["approved_workload"]["descriptor"]["nfcorpus_boundary_qids"], "pass": True}
+        domain_pass = all(safety.values()) and all(item["pass"] for item in query_safety.values()) and (boundary is None or boundary["pass"])
+        domain_reports[domain] = {"anchor": anchor["aggregate"], "candidate": candidate["aggregate"], "delta": delta, "query_safety": query_safety, "boundary": boundary, "safety": safety, "pass": domain_pass}
     macro_delta = {surface: {metric: math.fsum(domain_reports[domain]["delta"][surface][metric] for domain in DOMAINS) / len(DOMAINS) for metric in METRICS_BY_SURFACE[surface]} for surface in SURFACES}
-    macro_checks = {
-        "q3_macro_ndcg_at_10": at_least(macro_delta["q3"]["ndcg_at_10"], THRESHOLDS["q3_macro_ndcg_at_10_delta_min"]),
-        "dense_macro_ndcg_at_10": at_least(macro_delta["dense"]["ndcg_at_10"], THRESHOLDS["dense_macro_ndcg_at_10_delta_min"]),
-        "q5_macro_ndcg_at_10": at_least(macro_delta["q5"]["ndcg_at_10"], THRESHOLDS["q5_macro_ndcg_at_10_delta_min"]),
-        "q3_macro_recall_at_100": at_least(macro_delta["q3"]["recall_at_100"], THRESHOLDS["q3_macro_recall_at_100_delta_min"]),
-    }
+    macro_checks = {"q3_macro_ndcg_at_10": at_least(macro_delta["q3"]["ndcg_at_10"], THRESHOLDS["q3_macro_ndcg_at_10_delta_min"]), "dense_macro_ndcg_at_10": at_least(macro_delta["dense"]["ndcg_at_10"], THRESHOLDS["dense_macro_ndcg_at_10_delta_min"]), "q5_macro_ndcg_at_10": at_least(macro_delta["q5"]["ndcg_at_10"], THRESHOLDS["q5_macro_ndcg_at_10_delta_min"]), "q3_macro_recall_at_100": at_least(macro_delta["q3"]["recall_at_100"], THRESHOLDS["q3_macro_recall_at_100_delta_min"])}
     failures.extend(f"macro:{name}" for name, passed in macro_checks.items() if not passed)
     return {"domains": domain_reports, "macro": {"q3_ndcg_at_10_delta": macro_delta["q3"]["ndcg_at_10"], "dense_ndcg_at_10_delta": macro_delta["dense"]["ndcg_at_10"], "q5_ndcg_at_10_delta": macro_delta["q5"]["ndcg_at_10"], "q3_recall_at_100_delta": macro_delta["q3"]["recall_at_100"], "checks": macro_checks, "pass": all(macro_checks.values())}, "thresholds": copy.deepcopy(THRESHOLDS), "failures": failures, "gate_pass": not failures}
 
 
-def attest_manifest(frozen_path: Path, output_path: Path | None = None, *, expected_frozen_manifest_sha256: str | None = None) -> dict[str, Any]:
-    frozen_info = validate_frozen_manifest(frozen_path, expected_frozen_manifest_sha256=expected_frozen_manifest_sha256, require_outputs_absent=False)
-    frozen = frozen_info["manifest"]
-    expected_attestation = frozen_info["attestation_path"]
-    if output_path is None:
-        output_path = expected_attestation
-    output_path = output_path.resolve(strict=False)
-    if output_path != expected_attestation or output_path.exists() or output_path.is_symlink():
-        raise GateContractError("attestation output path must exactly match absent frozen binding")
-    metrics_outputs = {(item["role"], item["domain"]): item for item in frozen_info["outputs"] if item["kind"] == "metrics"}
-    receipt_outputs = {(item["role"], item["domain"]): item for item in frozen_info["outputs"] if item["kind"] == "receipt"}
-    artifacts: dict[tuple[str, str], dict[str, Any]] = {}
-    output_bindings: list[dict[str, Any]] = []
-    nonce_set: set[str] = set()
-    mtime_floor = Path(frozen_info["path"]).stat().st_mtime_ns
-    for role in ROLES:
-        for domain in DOMAINS:
-            metrics_expected = metrics_outputs[(role, domain)]
-            receipt_expected = receipt_outputs[(role, domain)]
-            metrics_path = Path(metrics_expected["path"])
-            receipt_path = Path(receipt_expected["path"])
-            for kind, path in (("metrics", metrics_path), ("receipt", receipt_path)):
-                if not path.is_file() or path.is_symlink():
-                    raise GateContractError(f"missing/substituted {role}/{domain} {kind} output: {path}")
-                if path.stat().st_mtime_ns <= mtime_floor:
-                    raise GateContractError(f"stale {role}/{domain} {kind} output predates frozen manifest")
-            artifact = validate_artifact(metrics_path, expected_metrics=metrics_expected, expected_receipt=receipt_expected, frozen_info=frozen_info, role=role, domain=domain)
-            nonce = artifact["receipt"]["nonce"]
-            if nonce in nonce_set:
-                raise GateContractError(f"duplicate native receipt nonce: {nonce}")
-            nonce_set.add(nonce)
-            artifacts[(role, domain)] = artifact
-            output_bindings.append({"kind": "metrics", "role": role, "domain": domain, "path": str(metrics_path), "sha256": artifact["sha256"], "bytes": artifact["bytes"], "receipt_path": str(receipt_path), "receipt_sha256": artifact["receipt"]["sha256"], "nonce": nonce, "package_sha256": frozen[role]["package"]["sha256"], "source_manifest_sha256": frozen["source"]["manifest"]["sha256"], "binary_sha256": frozen["source"]["binary"]["sha256"], "argv_sha256": sha256_json(frozen["source"]["argv"][role]), "cwd": frozen["source"]["cwd"], "dataset_sha256": frozen["source"]["dataset"]["sha256"], "workload_sha256": frozen["source"]["workload"]["sha256"], "approved_workload_sha256": frozen["source"]["approved_workload"]["sha256"]})
-    summary = aggregate_gate(artifacts, frozen_info)
-    report = {"schema": ATTESTATION_SCHEMA, "gate_id": frozen["gate_id"], "candidate_id": frozen["candidate_id"], "anchor_id": frozen["anchor_id"], "dimension": DIMENSION, "split": "heldout", "evaluation_executed": True, "evaluation_invoked_by_gate": False, "official_metric_values_read_by_gate": False, "frozen_manifest": {"path": frozen_info["path"], "expected_file_sha256": frozen_info["expected_external_sha256"], "actual_file_sha256": frozen_info["file_sha256"], "manifest_sha256": frozen["manifest_sha256"]}, "provenance": {"anchor_package": frozen["anchor"]["package"], "candidate_package": frozen["candidate"]["package"], "source_manifest": frozen["source"]["manifest"], "binary": frozen["source"]["binary"], "cwd": frozen["source"]["cwd"], "argv": frozen["source"]["argv"], "argv_sha256": frozen["provenance"]["argv_sha256"], "dataset": frozen["source"]["dataset"], "workload": frozen["source"]["workload"], "approved_workload": frozen["source"]["approved_workload"], "qrels": frozen["qrels"], "exclusions": [{"path": item["path"], "sha256": item["sha256"], "name": item["name"], "semantic": item["semantic"], "contains_metric_payload": item["contains_metric_payload"], "qids_sha256_by_domain": item["qids_sha256_by_domain"]} for item in frozen["exclusions"]]}, "output_bindings": output_bindings, "output_bindings_sha256": sha256_json(output_bindings), "domains": summary["domains"], "macro": summary["macro"], "thresholds": summary["thresholds"], "failures": summary["failures"], "gate_pass": summary["gate_pass"]}
-    report["attestation_sha256"] = digest_without(report, "attestation_sha256")
-    write_json_new(output_path, report)
-    return report
+def _validate_metrics_tsv(path: Path, domain: str, label: str) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise GateContractError(f"{label}: cannot read TSV: {exc}") from exc
+    if len(lines) < 3 or not lines[0].startswith("dataset\trow\tbits\tmethod\t"):
+        raise GateContractError(f"{label}: native metrics TSV header/rows missing")
+    seen: set[int] = set()
+    dense_seen = False
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        fields = line.split("\t")
+        if len(fields) < 4 or fields[0] != domain:
+            raise GateContractError(f"{label}: native TSV contains an unexpected row")
+        if fields[1] == "dense":
+            if dense_seen or fields[2] or fields[3] != "float32":
+                raise GateContractError(f"{label}: native dense TSV row is malformed or duplicated")
+            dense_seen = True
+        elif fields[1] == "quantized":
+            if fields[2] not in {str(Q3_BITS), str(Q5_BITS)} or fields[3] != f"turboquant_ip_b{fields[2]}":
+                raise GateContractError(f"{label}: native TSV q3/q5 row semantics mismatch")
+            bit = int(fields[2])
+            if bit in seen:
+                raise GateContractError(f"{label}: native TSV q3/q5 row duplicated")
+            seen.add(bit)
+        else:
+            raise GateContractError(f"{label}: native TSV row kind is not dense/quantized")
+    if not dense_seen or seen != {Q3_BITS, Q5_BITS}:
+        raise GateContractError(f"{label}: native TSV q3/q5 rows missing")
 
 
-# Explicit aliases keep the phase names discoverable for callers and reviews.
+def _write_execution_receipt(path: Path, *, frozen_info: dict[str, Any], role: str, domain: str, nonce: str, argv: list[str], binding: dict[str, Any], outputs: dict[str, Path], result: dict[str, Any], exit_status: int) -> dict[str, Any]:
+    source = frozen_info["source"]
+    package = frozen_info["anchor" if role == "anchor" else "candidate"]
+    dataset = source["dataset_by_domain"][domain]
+    receipt: dict[str, Any] = {
+        "schema": EXECUTION_RECEIPT_SCHEMA,
+        "gate_id": frozen_info["manifest"]["gate_id"],
+        "nonce": nonce,
+        "role": role,
+        "domain": domain,
+        "producer": "aoqt-heldout-gate-local-subprocess",
+        "native_evaluator": True,
+        "exit_status": exit_status,
+        "executable": source["binary"],
+        "binary_sha256": source["binary"]["sha256"],
+        "gate_script": frozen_info["manifest"]["provenance"]["gate_script"],
+        "argv": argv,
+        "argv_sha256": sha256_json(argv),
+        "cwd": source["cwd"],
+        "config": binding["config"],
+        "package": package,
+        "dataset": {"domain": domain, "dataset_id": dataset["dataset_id"], "dataset_dir": dataset["dataset_dir"], "manifest": dataset["manifest"], "corpus": dataset["corpus"], "queries": dataset["queries"]},
+        "qrels": frozen_info["qrels"][domain],
+        "workload": frozen_info["workload"],
+        "approved_workload": frozen_info["approved_workload"],
+        "frozen_manifest": {"path": frozen_info["path"], "file_sha256": frozen_info["expected_external_sha256"], "manifest_sha256": frozen_info["manifest"]["manifest_sha256"]},
+        "gate_binding": binding,
+        "outputs": {"metrics": {"path": str(outputs["metrics"]), "sha256": result["metrics_sha256"], "bytes": outputs["metrics"].stat().st_size}, "metrics_tsv": {"path": str(outputs["metrics_tsv"]), "sha256": result["metrics_tsv_sha256"], "bytes": outputs["metrics_tsv"].stat().st_size}, "per_query": {"path": str(outputs["per_query"]), "sha256": result["per_query_sha256"], "bytes": outputs["per_query"].stat().st_size}},
+        "boundary_evidence": result["boundary_evidence"],
+    }
+    receipt["receipt_sha256"] = digest_without(receipt, "receipt_sha256")
+    write_json_new(path, receipt)
+    return {"path": str(path), "sha256": sha256_file(path), "bytes": path.stat().st_size, "payload": receipt}
+
+
+def run_harness(frozen_path: Path, *, expected_frozen_manifest_sha256: str, expected_workload_manifest_sha256: str, expected_binary_sha256: str, expected_anchor_package_sha256: str, expected_anchor_manifest_sha256: str, expected_anchor_embedding_space_id: str, timeout_seconds: int = 3600, test_mode: bool = False) -> dict[str, Any]:
+    """Run the pinned evaluator and aggregate only its fresh bound outputs."""
+
+    if timeout_seconds <= 0:
+        raise GateContractError("timeout_seconds must be positive")
+    expected_binary = require_sha256(expected_binary_sha256, "expected EOS binary sha256")
+    expected_workload = require_sha256(expected_workload_manifest_sha256, "expected approved workload manifest sha256")
+    supplied_anchor = {"artifact_sha256": require_sha256(expected_anchor_package_sha256, "expected anchor package sha256"), "package_manifest_sha256": require_sha256(expected_anchor_manifest_sha256, "expected anchor manifest sha256"), "embedding_space_id": require_sha256(expected_anchor_embedding_space_id, "expected anchor embedding-space id")}
+    if not test_mode:
+        known = {"artifact_sha256": D384_ANCHOR_PACKAGE_SHA256, "package_manifest_sha256": D384_ANCHOR_MANIFEST_SHA256, "embedding_space_id": D384_ANCHOR_EMBEDDING_SPACE_ID}
+        if supplied_anchor != known:
+            raise GateContractError("caller-supplied anchor identity is not the pinned current D384 anchor")
+    # Check caller-provided immutable identities before opening the frozen
+    # manifest.  This keeps a weak-anchor attempt from being masked by an
+    # unrelated package-format failure in a production plan.
+    frozen_info = validate_frozen_manifest(frozen_path, expected_frozen_manifest_sha256=expected_frozen_manifest_sha256, production=not test_mode)
+    if frozen_info["source"]["binary"]["sha256"] != expected_binary:
+        raise GateContractError("expected EOS binary sha256 does not match frozen binary")
+    if frozen_info["approved_workload"]["sha256"] != expected_workload:
+        raise GateContractError("external approved workload manifest sha256 mismatch")
+    if frozen_info["anchor"]["package_identity"] != supplied_anchor:
+        raise GateContractError("frozen anchor identity does not equal caller-supplied immutable anchor identity")
+    source = frozen_info["source"]
+    binary_path = Path(source["binary"]["path"])
+    require_regular_file(binary_path, "frozen EOS executable", executable=True)
+    output_root = frozen_info["output_root"]
+    nonce = uuid.uuid4().hex
+    if not NONCE_RE.fullmatch(nonce):
+        raise GateContractError("internal nonce generation failed")
+    run_dir = output_root / f"aoqt-{nonce}"
+    if run_dir.exists() or run_dir.is_symlink():
+        raise GateContractError("fresh nonce run directory already exists")
+    run_dir.mkdir(mode=0o700)
+    run_dir_stat = run_dir.stat()
+    run_dir_identity = (run_dir_stat.st_dev, run_dir_stat.st_ino)
+    results: dict[tuple[str, str], dict[str, Any]] = {}
+    receipts: list[dict[str, Any]] = []
+    commands: list[dict[str, Any]] = []
+    try:
+        for role in ROLES:
+            for domain in DOMAINS:
+                _assert_run_directory(run_dir, run_dir_identity, "fresh evaluator run directory")
+                outputs = {"metrics": run_dir / OUTPUT_LAYOUT["metrics"].format(role=role, domain=domain), "metrics_tsv": run_dir / OUTPUT_LAYOUT["metrics_tsv"].format(role=role, domain=domain), "per_query": run_dir / OUTPUT_LAYOUT["per_query"].format(role=role, domain=domain)}
+                receipt_path = run_dir / OUTPUT_LAYOUT["receipt"].format(role=role, domain=domain)
+                for path in (*outputs.values(), receipt_path, run_dir / OUTPUT_LAYOUT["attestation"]):
+                    if path.exists() or path.is_symlink():
+                        raise GateContractError(f"output path was not absent before evaluator invocation: {path}")
+                    path_within(path, run_dir, "evaluator output")
+                argv = build_evaluator_argv(frozen_info, role, domain, outputs)
+                # Keep a second independent comparison in the execution
+                # path: tests can monkeypatch the builder, but production
+                # still refuses any argv that is not the canonical command.
+                _validate_evaluator_argv(argv, frozen_info, role, domain, outputs)
+                binding = _binding_for_run(frozen_info, role, domain, nonce, argv, outputs)
+                env = _harness_environment(binding, frozen_info, nonce, test_mode=test_mode)
+                try:
+                    completed = subprocess.run(argv, cwd=source["cwd"], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout_seconds, check=False)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    raise GateContractError(f"{role}/{domain}: evaluator invocation failed: {exc}") from exc
+                commands.append({"role": role, "domain": domain, "argv": argv, "argv_sha256": sha256_json(argv), "cwd": source["cwd"], "exit_status": completed.returncode, "stdout_sha256": sha256_bytes(completed.stdout.encode("utf-8")), "stderr_sha256": sha256_bytes(completed.stderr.encode("utf-8"))})
+                if completed.returncode != 0:
+                    raise GateContractError(f"{role}/{domain}: native evaluator exited {completed.returncode}: {completed.stderr[-500:]}")
+                _assert_run_directory(run_dir, run_dir_identity, "fresh evaluator run directory")
+                # The child is allowed to read frozen inputs but never to
+                # rewrite them.  Revalidate every bound file after each
+                # subprocess returns so a malicious/wrong evaluator cannot
+                # mutate the package, qrels, dataset, exclusions, or binary
+                # and still have its output accepted against the old digest.
+                validate_frozen_manifest(frozen_path, expected_frozen_manifest_sha256=frozen_info["expected_external_sha256"], production=not test_mode)
+                for path in outputs.values():
+                    require_regular_file(path, f"{role}/{domain} evaluator output")
+                _validate_metrics_tsv(outputs["metrics_tsv"], domain, f"{role}/{domain}.metrics_tsv")
+                result = _parse_native_result(outputs["metrics"], outputs["metrics_tsv"], outputs["per_query"], frozen_info=frozen_info, role=role, domain=domain, binding=binding, production=not test_mode)
+                receipt = _write_execution_receipt(receipt_path, frozen_info=frozen_info, role=role, domain=domain, nonce=nonce, argv=argv, binding=binding, outputs=outputs, result=result, exit_status=completed.returncode)
+                result["receipt"] = receipt
+                results[(role, domain)] = result
+                receipts.append(receipt)
+        summary = aggregate_gate(results, frozen_info)
+        _assert_run_directory(run_dir, run_dir_identity, "fresh evaluator run directory")
+        command_by_key = {(item["role"], item["domain"]): item for item in commands}
+        output_bindings = [{"role": role, "domain": domain, "metrics": results[(role, domain)]["metrics_sha256"], "metrics_tsv": results[(role, domain)]["metrics_tsv_sha256"], "per_query": results[(role, domain)]["per_query_sha256"], "receipt": results[(role, domain)]["receipt"]["sha256"], "nonce": nonce, "argv_sha256": command_by_key[(role, domain)]["argv_sha256"]} for role in ROLES for domain in DOMAINS]
+        report: dict[str, Any] = {
+            "schema": ATTESTATION_SCHEMA,
+            "gate_id": frozen_info["manifest"]["gate_id"],
+            "candidate_id": frozen_info["manifest"]["candidate_id"],
+            "anchor_id": frozen_info["manifest"]["anchor_id"],
+            "dimension": DIMENSION,
+            "split": HELDOUT_SPLIT,
+            "evaluation_executed": True,
+            "evaluation_invoked_by_gate": True,
+            "official_metric_values_read_by_gate": False,
+            "nonce": nonce,
+            "run_dir": str(run_dir),
+            "frozen_manifest": {"path": frozen_info["path"], "file_sha256": frozen_info["expected_external_sha256"], "manifest_sha256": frozen_info["manifest"]["manifest_sha256"]},
+            "approved_workload_sha256": frozen_info["approved_workload"]["sha256"],
+            "anchor_identity": supplied_anchor,
+            "gate_script_sha256": frozen_info["manifest"]["provenance"]["gate_script"]["sha256"],
+            "binary_sha256": source["binary"]["sha256"],
+            "commands": commands,
+            "receipts": receipts,
+            "output_bindings": output_bindings,
+            "output_bindings_sha256": sha256_json(output_bindings),
+            "domains": summary["domains"],
+            "macro": summary["macro"],
+            "thresholds": summary["thresholds"],
+            "failures": summary["failures"],
+            "gate_pass": summary["gate_pass"],
+        }
+        report_path = run_dir / OUTPUT_LAYOUT["attestation"]
+        report["attestation_sha256"] = digest_without(report, "attestation_sha256")
+        write_json_new(report_path, report)
+        return {**report, "attestation_path": str(report_path)}
+    except Exception:
+        # Leave the fresh run directory for forensic review, but never turn a
+        # partial invocation into a quality pass or overwrite its outputs.
+        raise
+
+
+def attest_manifest(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+    raise GateContractError("attest/aggregate receipt import is disabled; production quality gates must use run")
+
+
 preflight = freeze_manifest
 aggregate = attest_manifest
 
@@ -1581,15 +1739,20 @@ aggregate = attest_manifest
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("freeze", "preflight"):
-        command = sub.add_parser(name, help="validate plan and freeze absent output bindings")
-        command.add_argument("--plan", "--input-manifest", "--manifest", dest="input_manifest", required=True, type=Path)
-        command.add_argument("--output-manifest", "--output", dest="output_manifest", required=True, type=Path)
+    freeze = sub.add_parser("freeze", aliases=["preflight"], help="validate plan and freeze absent input/output bindings")
+    freeze.add_argument("--plan", "--input-manifest", "--manifest", dest="input_manifest", required=True, type=Path)
+    freeze.add_argument("--output-manifest", "--output", dest="output_manifest", required=True, type=Path)
+    run = sub.add_parser("run", help="execute the pinned native EOS evaluator and aggregate fresh outputs")
+    run.add_argument("--frozen-manifest", "--manifest", dest="frozen_manifest", required=True, type=Path)
+    run.add_argument("--expected-frozen-manifest-sha256", required=True)
+    run.add_argument("--expected-workload-manifest-sha256", "--expected-approved-workload-sha256", dest="expected_workload_manifest_sha256", required=True)
+    run.add_argument("--expected-binary-sha256", required=True)
+    run.add_argument("--expected-anchor-package-sha256", required=True)
+    run.add_argument("--expected-anchor-manifest-sha256", required=True)
+    run.add_argument("--expected-anchor-embedding-space-id", required=True)
+    run.add_argument("--timeout-seconds", type=int, default=3600)
     for name in ("attest", "aggregate"):
-        command = sub.add_parser(name, help="attest native receipts and aggregate paired metrics")
-        command.add_argument("--frozen-manifest", "--manifest", dest="frozen_manifest", required=True, type=Path)
-        command.add_argument("--expected-frozen-manifest-sha256", required=True)
-        command.add_argument("--output-attestation", "--output", dest="output_attestation", required=True, type=Path)
+        sub.add_parser(name, help=argparse.SUPPRESS)
     return parser.parse_args(argv)
 
 
@@ -1600,10 +1763,12 @@ def main(argv: list[str] | None = None) -> int:
             frozen = freeze_manifest(args.input_manifest, args.output_manifest)
             print(json.dumps({"ok": True, "mode": "freeze", "manifest_sha256": frozen["manifest_sha256"], "file_sha256": frozen["file_sha256"]}, sort_keys=True))
             return 0
-        report = attest_manifest(args.frozen_manifest, args.output_attestation, expected_frozen_manifest_sha256=args.expected_frozen_manifest_sha256)
-        print(json.dumps({"ok": report["gate_pass"], "mode": "attest", "gate_pass": report["gate_pass"], "attestation_sha256": report["attestation_sha256"]}, sort_keys=True))
-        return 0 if report["gate_pass"] else 1
-    except (GateError, OSError, TypeError, KeyError, struct.error) as exc:
+        if args.command == "run":
+            report = run_harness(args.frozen_manifest, expected_frozen_manifest_sha256=args.expected_frozen_manifest_sha256, expected_workload_manifest_sha256=args.expected_workload_manifest_sha256, expected_binary_sha256=args.expected_binary_sha256, expected_anchor_package_sha256=args.expected_anchor_package_sha256, expected_anchor_manifest_sha256=args.expected_anchor_manifest_sha256, expected_anchor_embedding_space_id=args.expected_anchor_embedding_space_id, timeout_seconds=args.timeout_seconds)
+            print(json.dumps({"ok": report["gate_pass"], "mode": "run", "gate_pass": report["gate_pass"], "attestation_sha256": report["attestation_sha256"], "attestation_path": report["attestation_path"]}, sort_keys=True))
+            return 0 if report["gate_pass"] else 1
+        raise GateContractError("attest/aggregate receipt import is disabled; use run")
+    except (GateError, OSError, TypeError, KeyError, subprocess.SubprocessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
