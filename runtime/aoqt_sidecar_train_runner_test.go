@@ -120,20 +120,13 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 	trainCfg.MaxSteps = 1
 	trainCfg.OutputArtifactPath = filepath.Join(t.TempDir(), "candidate.mll")
 	objectiveFactory := func(contract AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
-		return &statefulRejectingAOQTObjective{config: AOQTSidecarPreparedIPObjectiveConfig{
-			Dim:              contract.Dim,
-			TurboQuantSeed:   contract.TurboQuantSeed,
-			GainBit:          contract.GainBit,
-			Q3GuardBit:       contract.Q3GuardBit,
-			Q5GuardBit:       contract.Q5GuardBit,
-			GainCutoff:       contract.GainCutoff,
-			GainTau:          contract.GainTau,
-			GainMargin:       contract.GainMargin,
-			GuardTau:         contract.GuardTau,
-			GuardMargin:      contract.GuardMargin,
-			ScoreDistillTau:  contract.ScoreDistillTau,
-			NFBoundarySource: contract.NFBoundarySource,
-		}}, nil
+		objective, err := objectiveFromAOQTContract(contract)
+		if err != nil {
+			return nil, err
+		}
+		stateful := &statefulRejectingAOQTObjective{config: objective.AOQTPreparedIPObjectiveConfig()}
+		objective.workspace.evaluateOverride = stateful.EvaluateAOQT
+		return objective, nil
 	}
 
 	result, err := runAOQTSidecarTraining(trainCfg, objectiveFactory)
@@ -179,6 +172,22 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 	if optimizer := diagnostics.Summary.OptimizerDiagnostics; optimizer == nil || optimizer.CoordinateSearchPlanCount == 0 || optimizer.CoordinateSearchAudit == "" {
 		t.Fatalf("zero-safe fixture did not produce genuine protected coordinate audit: %+v", optimizer)
 	}
+	t.Run("v2-q3-only-contract-is-rejected", func(t *testing.T) {
+		tampered := diagnostics
+		q3Only := tampered.ObjectiveContract
+		q3Only.WeightSums = AOQTSidecarRowWeights{Q3Gain: q3Only.WeightSums.Q3Gain}
+		tampered.ObjectiveContract = q3Only
+		tampered.Summary.ObjectiveContract = q3Only
+		optimizer := *tampered.Summary.OptimizerDiagnostics
+		sha, err := optimizer.SHA256()
+		if err != nil {
+			t.Fatalf("recompute q3-only optimizer hash: %v", err)
+		}
+		tampered.Summary.OptimizerDiagnosticsSHA256 = sha
+		if err := tampered.Validate(); err == nil || !strings.Contains(err.Error(), "active protected objective component") {
+			t.Fatalf("q3-only fail-closed diagnostics error = %v, want active-protected rejection", err)
+		}
+	})
 	if !aoqtStringMapsEqual(diagnostics.Preflight.InputSHA256, result.Preflight.InputSHA256) || !aoqtStringMapsEqual(diagnostics.Preflight.QrelsSHA256ByDataset, result.Preflight.QrelsSHA256ByDataset) {
 		t.Fatalf("written diagnostics did not preserve preflight input/qrels hashes")
 	}
@@ -220,6 +229,9 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 		"preflight raw hash binding": func(tampered *AOQTSidecarFailClosedDiagnostics) {
 			tampered.PreflightSHA256 = strings.Repeat("a", 64)
 		},
+		"negative activation count": func(tampered *AOQTSidecarFailClosedDiagnostics) {
+			tampered.Summary.InitialObjectiveActivation.Q3GainEligiblePairs = -1
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			tampered := diagnostics
@@ -257,6 +269,24 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 		tampered.Summary.OptimizerDiagnosticsSHA256 = sha
 	}
 	for name, mutate := range map[string]func(*AOQTSidecarOptimizerDiagnostics){
+		"optimizer-path-strip": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.AdamProposalAttempts = 0
+			optimizer.AdamAcceptedProposals = 0
+			optimizer.AdamRejectedProposals = 0
+			optimizer.CoordinateProposalAttempts = 0
+			optimizer.CoordinateAcceptedProposals = 0
+			optimizer.CoordinateRejectedProposals = 0
+			optimizer.CoordinateSearchPlanCount = 0
+			optimizer.CoordinateTopAngles = 0
+			optimizer.CoordinateMagnitudeCount = 0
+			optimizer.CoordinateBlockCount = 0
+			optimizer.CoordinateSearchStrategy = ""
+			optimizer.CoordinateSearchOrderingHash = ""
+			optimizer.CoordinateSearchLearningRate = 0
+			optimizer.CoordinateSearchAudit = ""
+			optimizer.CoordinateSearchAuditChain = ""
+			optimizer.CoordinateSearchHashChain = ""
+		},
 		"coordinate-audit-chain": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
 			optimizer.CoordinateSearchAuditChain = "[]"
 		},
@@ -293,6 +323,18 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 				t.Fatalf("decode protected coordinate hash chain: %v", err)
 			}
 			optimizer.CoordinateSearchOrderingHash = hashes[len(hashes)-1]
+		},
+		"negative-adam-counter": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.AdamProposalAttempts = -1
+		},
+		"rejection-reason-count": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.RejectionDiagnostics.ReasonCounts.LossIncrease++
+		},
+		"rejection-component-count": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.RejectionDiagnostics.ComponentRegressionCounts.Q3ScoreDistill = 1
+		},
+		"rejection-delta-stats": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.RejectionDiagnostics.LossDelta.Sum = 2
 		},
 	} {
 		t.Run("protected-"+name, func(t *testing.T) {
@@ -345,6 +387,43 @@ func TestAOQTSidecarTrainRunnerRejectsCandidateSiblingPathCollisions(t *testing.
 				t.Fatalf("candidate sibling collision error = %v, want collision rejection", err)
 			}
 		})
+	}
+	inputDir := t.TempDir()
+	inputPaths := map[string]string{
+		"manifest-input":  filepath.Join(inputDir, "manifest.json"),
+		"rows-input":      filepath.Join(inputDir, "rows.jsonl"),
+		"preflight-input": filepath.Join(inputDir, "preflight.json"),
+	}
+	for role, inputPath := range inputPaths {
+		t.Run(role, func(t *testing.T) {
+			cfg := AOQTSidecarTrainRunnerConfig{
+				ManifestPath:       inputPaths["manifest-input"],
+				RowsJSONLPath:      inputPaths["rows-input"],
+				PreflightJSONPath:  inputPaths["preflight-input"],
+				MetricsJSONPath:    filepath.Join(inputDir, "metrics.json"),
+				OutputArtifactPath: inputPath,
+			}
+			if err := validateAOQTTrainRunnerOutputPathDistinctness(cfg); err == nil || !strings.Contains(err.Error(), "output path collision") {
+				t.Fatalf("output/input collision error = %v, want collision rejection", err)
+			}
+		})
+	}
+	resolvedOutput := filepath.Join(inputDir, "manifest.json")
+	aliasOutput := filepath.Join(inputDir, "candidate-alias.mll")
+	if err := os.WriteFile(resolvedOutput, []byte("placeholder\n"), 0o644); err != nil {
+		t.Fatalf("write output/input symlink target: %v", err)
+	}
+	if err := os.Symlink(resolvedOutput, aliasOutput); err != nil {
+		t.Fatalf("create output/input symlink alias: %v", err)
+	}
+	if err := validateAOQTTrainRunnerOutputPathDistinctness(AOQTSidecarTrainRunnerConfig{
+		ManifestPath:       resolvedOutput,
+		RowsJSONLPath:      inputPaths["rows-input"],
+		PreflightJSONPath:  inputPaths["preflight-input"],
+		MetricsJSONPath:    filepath.Join(inputDir, "metrics-alias.json"),
+		OutputArtifactPath: aliasOutput,
+	}); err == nil || !strings.Contains(err.Error(), "output path collision") {
+		t.Fatalf("symlink output/input collision error = %v, want canonical collision rejection", err)
 	}
 }
 
@@ -412,6 +491,115 @@ func TestAOQTSidecarTrainRunnerRejectsStaleFailClosedDiagnosticsBeforeSuccessOut
 	}
 	if !bytes.Equal(got, sentinel) {
 		t.Fatalf("stale fail-closed diagnostics changed: %q", got)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerRejectsPreexistingMetricsBeforeFailure(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OutputArtifactPath = filepath.Join(t.TempDir(), "candidate.mll")
+	sentinel := []byte("prior successful metrics\n")
+	if err := os.WriteFile(trainCfg.MetricsJSONPath, sentinel, 0o644); err != nil {
+		t.Fatalf("write metrics sentinel: %v", err)
+	}
+	called := false
+	_, err := runAOQTSidecarTraining(trainCfg, func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		called = true
+		return nil, fmt.Errorf("objective factory must not run with preexisting metrics")
+	})
+	if err == nil || !strings.Contains(err.Error(), "metrics output") || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("preexisting metrics error = %v, want stale-success rejection", err)
+	}
+	if called {
+		t.Fatalf("objective factory ran despite preexisting metrics sentinel")
+	}
+	got, err := os.ReadFile(trainCfg.MetricsJSONPath)
+	if err != nil {
+		t.Fatalf("read metrics sentinel: %v", err)
+	}
+	if !bytes.Equal(got, sentinel) {
+		t.Fatalf("metrics sentinel changed after rejected run: %q", got)
+	}
+	if _, err := os.Lstat(AOQTFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath)); !os.IsNotExist(err) {
+		t.Fatalf("fail-closed diagnostics state = %v, want absent", err)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerRollsBackMetricsAfterPackageFailure(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	anchor := writeTinyAOQTAnchorPackage(t)
+	anchorSHA, _, err := fileHash(anchor)
+	if err != nil {
+		t.Fatalf("hash tiny anchor: %v", err)
+	}
+	packageSHA, _, err := fileHash(DefaultPackageManifestPath(anchor))
+	if err != nil {
+		t.Fatalf("hash tiny anchor package manifest: %v", err)
+	}
+	materializerCfg.AnchorArtifactPath = anchor
+	materializerCfg.AnchorArtifactSHA256 = anchorSHA
+	materializerCfg.PackageManifestSHA256 = packageSHA
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OutputArtifactPath = filepath.Join(t.TempDir(), "candidate.mll")
+
+	oldWriter := writeAOQTCandidatePackageManifestExclusive
+	writeAOQTCandidatePackageManifestExclusive = func(manifest PackageManifest, path string, cleanup *aoqtCandidateCleanup) error {
+		data, err := encodePackageManifestMLL(manifest)
+		if err != nil {
+			return err
+		}
+		if err := writeAOQTExclusiveFile(path, data, 0o644, cleanup); err != nil {
+			return err
+		}
+		return fmt.Errorf("injected runner package publication failure")
+	}
+	defer func() { writeAOQTCandidatePackageManifestExclusive = oldWriter }()
+	if _, err := runAOQTSidecarTraining(trainCfg, aoqtRunnerObjectiveFromContract); err == nil || !strings.Contains(err.Error(), "injected runner package publication failure") {
+		t.Fatalf("injected package publication error = %v, want transactional rollback", err)
+	}
+	writeAOQTCandidatePackageManifestExclusive = oldWriter
+	for role, path := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(trainCfg.OutputArtifactPath, true)) {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("candidate %s residue after package failure at %s: %v", role, path, err)
+		}
+	}
+	if _, err := os.Lstat(trainCfg.MetricsJSONPath); !os.IsNotExist(err) {
+		t.Fatalf("metrics residue after package failure = %v, want absent", err)
+	}
+	if _, err := os.Lstat(AOQTFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath)); !os.IsNotExist(err) {
+		t.Fatalf("fail-closed residue after package failure = %v, want absent", err)
+	}
+
+	result, err := runAOQTSidecarTraining(trainCfg, aoqtRunnerObjectiveFromContract)
+	if err != nil {
+		t.Fatalf("fresh run after package failure: %v", err)
+	}
+	if result.PackageResult == nil {
+		t.Fatalf("fresh run after package failure returned no package result")
+	}
+	if _, err := os.Lstat(trainCfg.MetricsJSONPath); err != nil {
+		t.Fatalf("fresh run metrics output: %v", err)
+	}
+	for role, path := range aoqtCandidatePathMap(result.PackageResult.Paths) {
+		if path == "" {
+			continue
+		}
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("fresh run candidate %s output: %v", role, err)
+		}
 	}
 }
 

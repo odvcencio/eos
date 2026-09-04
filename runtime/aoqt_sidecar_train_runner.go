@@ -137,6 +137,10 @@ func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory a
 	if err != nil {
 		return AOQTSidecarTrainRunnerResult{}, err
 	}
+	expectedLearningRate := normalizedAOQTSidecarTrainConfig(AOQTSidecarTrainConfig{LearningRate: cfg.LearningRate}).LearningRate
+	if metrics.Plan.LearningRate != expectedLearningRate {
+		return AOQTSidecarTrainRunnerResult{}, fmt.Errorf("AOQT runner work plan learning_rate = %.9g, want configured learning_rate %.9g", metrics.Plan.LearningRate, expectedLearningRate)
+	}
 	if !cfg.PlanOnly {
 		if err := ValidateAOQTSidecarCandidateEligibility(metrics, AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true}); err != nil {
 			return AOQTSidecarTrainRunnerResult{}, err
@@ -159,7 +163,10 @@ func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory a
 			Transform:                           trainer.Transform(),
 		})
 		if err != nil {
-			return AOQTSidecarTrainRunnerResult{}, err
+			if removeErr := os.Remove(cfg.MetricsJSONPath); removeErr != nil && !os.IsNotExist(removeErr) {
+				return AOQTSidecarTrainRunnerResult{}, fmt.Errorf("%w; failed to roll back AOQT metrics output %q: %v", err, cfg.MetricsJSONPath, removeErr)
+			}
+			return AOQTSidecarTrainRunnerResult{}, fmt.Errorf("%w; rolled back AOQT metrics output %q", err, cfg.MetricsJSONPath)
 		}
 		result.PackageResult = &packageResult
 	}
@@ -201,6 +208,12 @@ func validateAOQTSidecarTrainRunnerConfig(cfg AOQTSidecarTrainRunnerConfig) erro
 	if err := ensureAOQTFailClosedDiagnosticsAbsent(cfg.MetricsJSONPath); err != nil {
 		return err
 	}
+	if err := ensureAOQTRunMetricsAbsent(cfg.MetricsJSONPath); err != nil {
+		return err
+	}
+	if err := validateAOQTTrainRunnerOutputPathDistinctness(cfg); err != nil {
+		return err
+	}
 	if cfg.PlanOnly {
 		if strings.TrimSpace(cfg.OutputArtifactPath) != "" {
 			return fmt.Errorf("AOQT sidecar plan-only writes metrics only; --output is not allowed")
@@ -214,9 +227,6 @@ func validateAOQTSidecarTrainRunnerConfig(cfg AOQTSidecarTrainRunnerConfig) erro
 		}
 		if cfg.MaxSteps <= 0 {
 			return fmt.Errorf("AOQT sidecar non-plan training requires positive --max-steps")
-		}
-		if err := validateAOQTTrainRunnerOutputPathDistinctness(cfg); err != nil {
-			return err
 		}
 		if err := ensureAOQTOutputArtifactAbsent(cfg.OutputArtifactPath); err != nil {
 			return err
@@ -309,9 +319,14 @@ func validateAOQTTrainRunnerOutputPathDistinctness(cfg AOQTSidecarTrainRunnerCon
 	paths := map[string]string{
 		"metrics":                 cfg.MetricsJSONPath,
 		"fail-closed diagnostics": AOQTFailClosedDiagnosticsPath(cfg.MetricsJSONPath),
+		"manifest input":          cfg.ManifestPath,
+		"rows input":              cfg.RowsJSONLPath,
+		"preflight input":         cfg.PreflightJSONPath,
 	}
-	for role, path := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(cfg.OutputArtifactPath, true)) {
-		paths[role] = path
+	if strings.TrimSpace(cfg.OutputArtifactPath) != "" {
+		for role, path := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(cfg.OutputArtifactPath, true)) {
+			paths[role] = path
+		}
 	}
 	roles := make([]string, 0, len(paths))
 	for role := range paths {
@@ -324,7 +339,7 @@ func validateAOQTTrainRunnerOutputPathDistinctness(cfg AOQTSidecarTrainRunnerCon
 		if strings.TrimSpace(path) == "" {
 			continue
 		}
-		canonical, err := filepath.Abs(filepath.Clean(path))
+		canonical, err := canonicalAOQTPath(path)
 		if err != nil {
 			return fmt.Errorf("resolve AOQT sidecar %s output path %q: %w", role, path, err)
 		}
@@ -334,6 +349,24 @@ func validateAOQTTrainRunnerOutputPathDistinctness(cfg AOQTSidecarTrainRunnerCon
 		seen[canonical] = role
 	}
 	return nil
+}
+
+// canonicalAOQTPath compares both lexical paths and symlink-resolved paths.
+// Output validation runs before candidate files exist, so resolve the nearest
+// existing parent when the complete path is not yet present.
+func canonicalAOQTPath(path string) (string, error) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	dir, base := filepath.Split(abs)
+	if resolvedDir, err := filepath.EvalSymlinks(filepath.Clean(dir)); err == nil {
+		return filepath.Join(resolvedDir, base), nil
+	}
+	return abs, nil
 }
 
 // NewAOQTSidecarFailClosedDiagnostics is retained for source compatibility,
@@ -439,11 +472,20 @@ func (d AOQTSidecarFailClosedDiagnostics) Validate() error {
 	if err := validateAOQTFailClosedObjectiveContract(d.ObjectiveContract, d.Topology); err != nil {
 		return err
 	}
+	if len(aoqtActiveProtectedComponentNames(d.ObjectiveContract.WeightSums)) == 0 {
+		return fmt.Errorf("AOQT fail-closed diagnostics v2 require at least one active protected objective component")
+	}
 	if err := validateAOQTResearchOnlyLegalGates(d.LegalGates, "AOQT fail-closed diagnostics"); err != nil {
 		return err
 	}
 	if d.Summary.OptimizerDiagnostics == nil {
 		return fmt.Errorf("AOQT fail-closed diagnostics optimizer diagnostics are required")
+	}
+	if err := validateAOQTObjectiveActivation(d.Summary.InitialObjectiveActivation, "AOQT fail-closed diagnostics summary.initial_objective_activation"); err != nil {
+		return err
+	}
+	if err := validateAOQTObjectiveActivation(d.Summary.FinalObjectiveActivation, "AOQT fail-closed diagnostics summary.final_objective_activation"); err != nil {
+		return err
 	}
 	optimizer := *d.Summary.OptimizerDiagnostics
 	if optimizer.PlannedSteps != d.Plan.StepCount {
@@ -538,6 +580,12 @@ func validateAOQTFailClosedPreflightRawBinding(preflight AOQTSidecarMaterializeP
 }
 
 func validateAOQTFailClosedOptimizerPathDiagnostics(plan AOQTSidecarWorkPlan, weights AOQTSidecarRowWeights, diagnostics AOQTSidecarOptimizerDiagnostics) error {
+	if len(aoqtActiveProtectedComponentNames(weights)) == 0 {
+		return fmt.Errorf("AOQT fail-closed diagnostics v2 require at least one active protected objective component")
+	}
+	if err := validateAOQTOptimizerPathDiagnostics(diagnostics, "AOQT fail-closed diagnostics"); err != nil {
+		return err
+	}
 	for _, item := range []struct {
 		name  string
 		value int
@@ -560,6 +608,9 @@ func validateAOQTFailClosedOptimizerPathDiagnostics(plan AOQTSidecarWorkPlan, we
 		diagnostics.CoordinateAcceptedProposals != 0 ||
 		diagnostics.CoordinateRejectedProposals != 0
 	if !hasPathDiagnostics {
+		if diagnostics.ProposalAttempts != 0 || diagnostics.AcceptedProposals != 0 || diagnostics.RejectedProposals != 0 || diagnostics.Backtracks != 0 {
+			return fmt.Errorf("AOQT fail-closed diagnostics top-level proposal accounting requires optimizer path diagnostics")
+		}
 		if diagnostics.CoordinateSearchPlanCount != 0 || diagnostics.CoordinateSearchStrategy != "" || diagnostics.CoordinateSearchOrderingHash != "" || diagnostics.CoordinateSearchLearningRate != 0 || diagnostics.CoordinateSearchAudit != "" || diagnostics.CoordinateSearchAuditChain != "" || diagnostics.CoordinateSearchHashChain != "" || diagnostics.CoordinateTopAngles != 0 || diagnostics.CoordinateMagnitudeCount != 0 || diagnostics.CoordinateBlockCount != 0 {
 			return fmt.Errorf("AOQT fail-closed diagnostics coordinate audit is present without optimizer path diagnostics")
 		}
@@ -873,6 +924,9 @@ func writeAOQTFailClosedDiagnosticsFile(path string, diagnostics AOQTSidecarFail
 }
 
 func writeAOQTRunMetricsFile(path string, metrics AOQTSidecarRunMetrics) error {
+	if err := metrics.Validate(); err != nil {
+		return err
+	}
 	data, err := json.MarshalIndent(metrics, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode AOQT metrics JSON: %w", err)
@@ -881,7 +935,31 @@ func writeAOQTRunMetricsFile(path string, metrics AOQTSidecarRunMetrics) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create AOQT metrics parent: %w", err)
 	}
-	return os.WriteFile(path, data, 0o644)
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("AOQT sidecar metrics output %q already exists", path)
+		}
+		return fmt.Errorf("create AOQT metrics output %q exclusively: %w", path, err)
+	}
+	removeOnFailure := true
+	defer func() {
+		_ = file.Close()
+		if removeOnFailure {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("write AOQT metrics output %q: %w", path, err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("sync AOQT metrics output %q: %w", path, err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close AOQT metrics output %q: %w", path, err)
+	}
+	removeOnFailure = false
+	return nil
 }
 
 func ensureAOQTOutputArtifactAbsent(path string) error {
@@ -902,6 +980,15 @@ func ensureAOQTFailClosedDiagnosticsAbsent(metricsPath string) error {
 	path := AOQTFailClosedDiagnosticsPath(metricsPath)
 	if _, err := os.Lstat(path); err == nil {
 		return fmt.Errorf("AOQT sidecar fail-closed diagnostics output %q already exists", path)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func ensureAOQTRunMetricsAbsent(path string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("AOQT sidecar metrics output %q already exists", path)
 	} else if !os.IsNotExist(err) {
 		return err
 	}

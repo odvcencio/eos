@@ -53,7 +53,8 @@ func TestAOQTStage2AOnlyAnglesMutateAndCapsProject(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 23)
 	trainer := newTinyAOQTTrainer(t, false, 23)
 	before := cloneAOQTCalibrationSet(set)
-	summary, err := trainer.Fit(set, toyAOQTObjective{})
+	objective := preparedAOQTObjectiveForSet(t, set)
+	summary, err := trainer.Fit(set, objective)
 	if err != nil {
 		t.Fatalf("fit: %v", err)
 	}
@@ -89,11 +90,13 @@ func TestAOQTStage2AReproducibleToyUpdate(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 31)
 	a := newTinyAOQTTrainer(t, false, 31)
 	b := newTinyAOQTTrainer(t, false, 31)
-	sa, err := a.Fit(set, toyAOQTObjective{})
+	objectiveA := preparedAOQTObjectiveForSet(t, set)
+	objectiveB := preparedAOQTObjectiveForSet(t, set)
+	sa, err := a.Fit(set, objectiveA)
 	if err != nil {
 		t.Fatalf("fit A: %v", err)
 	}
-	sb, err := b.Fit(set, toyAOQTObjective{})
+	sb, err := b.Fit(set, objectiveB)
 	if err != nil {
 		t.Fatalf("fit B: %v", err)
 	}
@@ -205,8 +208,8 @@ func TestAOQTStage2AObjectiveInputIsImmutableVectorFreeRowView(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 47)
 	before := cloneAOQTCalibrationSet(set)
 	trainer := newTinyAOQTTrainer(t, false, 47)
-	if _, err := trainer.Fit(set, mutatingAOQTObjective{}); err != nil {
-		t.Fatalf("fit mutating objective: %v", err)
+	if _, _, _, _, err := trainer.lossAndAngleGrad(set.Rows, mutatingAOQTObjective{}); err != nil {
+		t.Fatalf("evaluate mutating objective: %v", err)
 	}
 	if before.Rows[0].QueryVector[0] != set.Rows[0].QueryVector[0] || before.Rows[0].CandidateVectors[0][0] != set.Rows[0].CandidateVectors[0][0] {
 		t.Fatalf("mutating objective altered calibration vectors")
@@ -222,7 +225,7 @@ func TestAOQTStage2AObjectiveInputIsImmutableVectorFreeRowView(t *testing.T) {
 func TestAOQTStage2ARejectsObjectiveLossComponentMismatch(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 49)
 	trainer := newTinyAOQTTrainer(t, false, 49)
-	if _, err := trainer.Fit(set, unaccountedAOQTObjective{}); err == nil || !strings.Contains(err.Error(), "must equal component sum") {
+	if _, _, _, _, err := trainer.lossAndAngleGrad(set.Rows, unaccountedAOQTObjective{}); err == nil || !strings.Contains(err.Error(), "must equal component sum") {
 		t.Fatalf("unaccounted objective error = %v, want component accounting rejection", err)
 	}
 }
@@ -1320,9 +1323,16 @@ func TestAOQTCoordinateSearchPlanKeepsLegacyProvenanceWithoutProtectedSet(t *tes
 
 func TestAOQTProtectedConeMicroTailRequiresThreeFiniteMagnitudes(t *testing.T) {
 	protected := []aoqtProtectedAngleGradient{{Name: "q3_score_distill", Grad: []float32{-1}}}
-	_, err := newAOQTCoordinateSearchPlan([]float32{1}, []float32{1}, math.SmallestNonzeroFloat32, protected)
-	if err == nil || !strings.Contains(err.Error(), "exactly 3 finite positive micro-tail magnitudes") {
-		t.Fatalf("subnormal learning-rate plan error = %v, want exact protected micro-tail rejection", err)
+	for name, learningRate := range map[string]float32{
+		"smallest-subnormal":    math.SmallestNonzeroFloat32,
+		"three-value-subnormal": 4 * math.SmallestNonzeroFloat32,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := newAOQTCoordinateSearchPlan([]float32{1}, []float32{1}, learningRate, protected)
+			if err == nil || !strings.Contains(err.Error(), "full intended schedule of 6 finite positive magnitudes") {
+				t.Fatalf("subnormal learning-rate plan error = %v, want full protected schedule rejection", err)
+			}
+		})
 	}
 }
 
@@ -1623,6 +1633,48 @@ func TestAOQTPreparedIPProtectedBalancedBlockCanBeAccepted(t *testing.T) {
 	}
 }
 
+func TestAOQTProtectedCoordinateProjectionRejectsClippedActualDelta(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 103)
+	trainer := newTinyAOQTTrainer(t, false, 103)
+	angles := make([]float32, AOQTSidecarAngleCount)
+	angles[0] = AOQTSidecarDefaultAngleCap
+	if err := trainer.SetAnglesForTest(angles); err != nil {
+		t.Fatalf("set clipped starting angle: %v", err)
+	}
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = -1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)))
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: make([]float32, AOQTSidecarAngleCount)})
+	}
+	before := trainer.snapshotOptimizerState()
+	diagnostics := AOQTSidecarOptimizerDiagnostics{PlannedSteps: 1, MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep}
+	evaluateCalls := 0
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		evaluateCalls++
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+	if err != nil {
+		t.Fatalf("clipped protected coordinate fallback: %v", err)
+	}
+	if accepted {
+		t.Fatalf("clipped protected coordinate unexpectedly accepted")
+	}
+	if evaluateCalls != aoqtTransactionalAdamMaxAttemptsPerStep {
+		t.Fatalf("clipped fallback evaluate calls = %d, want only Adam evaluations; projected coordinate probes must be rejected before evaluation", evaluateCalls)
+	}
+	if diagnostics.CoordinateSearchPlanCount != 1 || diagnostics.CoordinateProposalAttempts != 0 {
+		t.Fatalf("clipped fallback diagnostics = %+v, want audited plan with zero applied coordinate proposals", diagnostics)
+	}
+	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
+		t.Fatalf("clipped protected fallback did not restore optimizer state")
+	}
+	if aoqtActualDirectionInProtectedCone(make([]float32, AOQTSidecarAngleCount), q3GainGrad, protected) {
+		t.Fatalf("zero projected delta was admitted to strict q3/protected cone")
+	}
+}
+
 func TestAOQTProtectedCoordinatePlanHistoryRetainsMultipleFallbacks(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 93)
 	trainer := newTinyAOQTTrainer(t, false, 93)
@@ -1683,6 +1735,137 @@ func TestAOQTProtectedCoordinatePlanHistoryRetainsMultipleFallbacks(t *testing.T
 	}
 }
 
+func TestAOQTProtectedCoordinatePlanHistoryRequiresFixedLearningRate(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 98)
+	trainer := newTinyAOQTTrainer(t, false, 98)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = 1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)))
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: make([]float32, AOQTSidecarAngleCount)})
+	}
+	diagnostics := AOQTSidecarOptimizerDiagnostics{PlannedSteps: 2, MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep}
+	baseline := aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums)
+	for step := 0; step < 2; step++ {
+		accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, baseline, func() (aoqtStepEvaluation, error) {
+			return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+		}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+		if err != nil {
+			t.Fatalf("fallback %d: %v", step, err)
+		}
+		if accepted {
+			t.Fatalf("fallback %d unexpectedly accepted unsafe candidate", step)
+		}
+	}
+	audits, err := decodeAOQTCoordinateSearchStringChain(diagnostics.CoordinateSearchAuditChain, "coordinate_search_audit_chain")
+	if err != nil {
+		t.Fatalf("audit history: %v", err)
+	}
+	setAuditLearningRate := func(raw string, learningRate float32) string {
+		t.Helper()
+		var payload aoqtCoordinateSearchAuditPayload
+		if err := strictUnmarshalAOQT([]byte(raw), &payload); err != nil {
+			t.Fatalf("decode learning-rate audit: %v", err)
+		}
+		payload.LearningRate = learningRate
+		magnitudes := aoqtCoordinateSearchMagnitudes(learningRate)
+		if len(magnitudes) != aoqtTransactionalCoordinateMagnitudeCount {
+			t.Fatalf("coherent tamper learning-rate schedule length = %d, want %d", len(magnitudes), aoqtTransactionalCoordinateMagnitudeCount)
+		}
+		tail := aoqtCoordinateSearchMicroTail(magnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+		payload.Magnitudes = append([]float32(nil), tail...)
+		payload.BlockMagnitudes = append([]float32(nil), tail...)
+		payload.MicroTailMagnitudes = append([]float32(nil), tail...)
+		data, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal coherent learning-rate tamper: %v", err)
+		}
+		return string(data)
+	}
+	firstRate := float32(0.02)
+	secondRate := float32(0.04)
+	audits[0] = setAuditLearningRate(audits[0], firstRate)
+	audits[1] = setAuditLearningRate(audits[1], secondRate)
+	auditChain := ""
+	hashChain := ""
+	for _, audit := range audits {
+		auditChain, err = appendAOQTCoordinateSearchAuditChain(auditChain, audit)
+		if err != nil {
+			t.Fatalf("rebuild audit chain: %v", err)
+		}
+		hashChain, err = appendAOQTCoordinateSearchHashChain(hashChain, audit)
+		if err != nil {
+			t.Fatalf("rebuild hash chain: %v", err)
+		}
+	}
+	var hashes []string
+	if err := strictUnmarshalAOQT([]byte(hashChain), &hashes); err != nil || len(hashes) != len(audits) {
+		t.Fatalf("rebuild hash chain decode: %v", err)
+	}
+	diagnostics.CoordinateSearchAuditChain = auditChain
+	diagnostics.CoordinateSearchHashChain = hashChain
+	diagnostics.CoordinateSearchOrderingHash = hashes[len(hashes)-1]
+	plan, err := trainer.Plan(set)
+	if err != nil {
+		t.Fatalf("history plan: %v", err)
+	}
+	chainPlan := plan
+	chainPlan.LearningRate = firstRate
+	if err := validateAOQTProtectedCoordinateSearchAudit(chainPlan, set.Manifest.ObjectiveContract.WeightSums, diagnostics); err == nil || !strings.Contains(err.Error(), "fixed chain learning_rate") {
+		t.Fatalf("coherent learning-rate drift error = %v, want cross-step fixed-rate rejection", err)
+	}
+	coherent := diagnostics
+	coherentAudits, err := decodeAOQTCoordinateSearchStringChain(coherent.CoordinateSearchAuditChain, "coordinate_search_audit_chain")
+	if err != nil {
+		t.Fatalf("decode coherent learning-rate history: %v", err)
+	}
+	const coherentLearningRate float32 = 0.02
+	for i, rawAudit := range coherentAudits {
+		var payload aoqtCoordinateSearchAuditPayload
+		if err := strictUnmarshalAOQT([]byte(rawAudit), &payload); err != nil {
+			t.Fatalf("decode coherent learning-rate audit[%d]: %v", i, err)
+		}
+		payload.LearningRate = coherentLearningRate
+		magnitudes := aoqtCoordinateSearchMagnitudes(coherentLearningRate)
+		if len(magnitudes) != aoqtTransactionalCoordinateMagnitudeCount {
+			t.Fatalf("coherent learning-rate schedule length = %d, want %d", len(magnitudes), aoqtTransactionalCoordinateMagnitudeCount)
+		}
+		tail := aoqtCoordinateSearchMicroTail(magnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+		payload.Magnitudes = append([]float32(nil), tail...)
+		payload.BlockMagnitudes = append([]float32(nil), tail...)
+		payload.MicroTailMagnitudes = append([]float32(nil), tail...)
+		data, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatalf("marshal coherent learning-rate audit[%d]: %v", i, err)
+		}
+		coherentAudits[i] = string(data)
+	}
+	auditChain, hashChain = "", ""
+	for i, audit := range coherentAudits {
+		auditChain, err = appendAOQTCoordinateSearchAuditChain(auditChain, audit)
+		if err != nil {
+			t.Fatalf("rebuild coherent audit chain[%d]: %v", i, err)
+		}
+		hashChain, err = appendAOQTCoordinateSearchHashChain(hashChain, audit)
+		if err != nil {
+			t.Fatalf("rebuild coherent hash chain[%d]: %v", i, err)
+		}
+	}
+	var coherentHashes []string
+	if err := strictUnmarshalAOQT([]byte(hashChain), &coherentHashes); err != nil || len(coherentHashes) != len(coherentAudits) {
+		t.Fatalf("decode coherent hash chain: %v", err)
+	}
+	coherent.CoordinateSearchAudit = coherentAudits[len(coherentAudits)-1]
+	coherent.CoordinateSearchAuditChain = auditChain
+	coherent.CoordinateSearchHashChain = hashChain
+	coherent.CoordinateSearchOrderingHash = coherentHashes[len(coherentHashes)-1]
+	coherent.CoordinateSearchLearningRate = coherentLearningRate
+	if err := validateAOQTProtectedCoordinateSearchAudit(plan, set.Manifest.ObjectiveContract.WeightSums, coherent); err == nil || !strings.Contains(err.Error(), "does not match work plan learning_rate") {
+		t.Fatalf("coherent all-entry learning-rate tamper error = %v, want work-plan binding rejection", err)
+	}
+}
+
 func TestAOQTQ3GainOnlyAngleGradMatchesAggregateForQ3OnlyObjective(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 88)
 	for i := range set.Rows {
@@ -1718,11 +1901,29 @@ func TestAOQTProtectedV2FitRejectsInactiveProtectedObjective(t *testing.T) {
 	}
 }
 
+func TestAOQTProtectedV2FitRejectsUntrustedObjective(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 102)
+	trainer := newTinyAOQTTrainer(t, false, 102)
+	if _, err := trainer.Fit(set, toyAOQTObjective{}); err == nil || !strings.Contains(err.Error(), "concrete prepared-IP masked-gradient objective") {
+		t.Fatalf("untrusted protected-v2 objective error = %v, want concrete objective rejection", err)
+	}
+}
+
+func TestAOQTProtectedV2FitRejectsEmbeddedPreparedObjectiveOverride(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 103)
+	trainer := newTinyAOQTTrainer(t, false, 103)
+	wrapped := deceptiveEmbeddedPreparedAOQTObjective{AOQTSidecarPreparedIPObjective: preparedAOQTObjectiveForSet(t, set)}
+	if _, err := trainer.Fit(set, wrapped); err == nil || !strings.Contains(err.Error(), "concrete prepared-IP masked-gradient objective") {
+		t.Fatalf("embedded prepared objective error = %v, want exact concrete-object rejection", err)
+	}
+}
+
 func TestAOQTTransactionalFitRejectsZeroAcceptedAndRestoresState(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 79)
 	trainer := newTinyAOQTTrainer(t, false, 79)
 	before := trainer.snapshotOptimizerState()
-	objective := &statefulRejectingAOQTObjective{config: tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed)}
+	stateful := &statefulRejectingAOQTObjective{config: tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed)}
+	objective := preparedAOQTObjectiveWithEvaluatorForSet(t, set, stateful.EvaluateAOQT)
 
 	summary, err := trainer.Fit(set, objective)
 	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") || !strings.Contains(err.Error(), "dominant_reason=loss_increase(") {
@@ -1744,11 +1945,13 @@ func TestAOQTTransactionalDiagnosticsHashIsDeterministic(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 80)
 	a := newTinyAOQTTrainer(t, false, 80)
 	b := newTinyAOQTTrainer(t, false, 80)
-	sa, err := a.Fit(set, toyAOQTObjective{})
+	objectiveA := preparedAOQTObjectiveForSet(t, set)
+	objectiveB := preparedAOQTObjectiveForSet(t, set)
+	sa, err := a.Fit(set, objectiveA)
 	if err != nil {
 		t.Fatalf("fit A: %v", err)
 	}
-	sb, err := b.Fit(set, toyAOQTObjective{})
+	sb, err := b.Fit(set, objectiveB)
 	if err != nil {
 		t.Fatalf("fit B: %v", err)
 	}
@@ -1767,6 +1970,17 @@ func TestAOQTTransactionalDiagnosticsHashIsDeterministic(t *testing.T) {
 }
 
 type toyAOQTObjective struct{}
+
+// deceptiveEmbeddedPreparedAOQTObjective demonstrates why a package-private
+// marker is not a sufficient trust boundary: embedding promotes the genuine
+// contract provider while this wrapper substitutes EvaluateAOQT.
+type deceptiveEmbeddedPreparedAOQTObjective struct {
+	AOQTSidecarPreparedIPObjective
+}
+
+func (deceptiveEmbeddedPreparedAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+	return (toyAOQTObjective{}).EvaluateAOQT(input)
+}
 
 type unaccountedAOQTObjective struct{}
 
@@ -1810,6 +2024,25 @@ func newTinyAOQTTrainer(t *testing.T, planOnly bool, seed int64) *AOQTSidecarTra
 		t.Fatalf("new trainer: %v", err)
 	}
 	return trainer
+}
+
+func preparedAOQTObjectiveForSet(t *testing.T, set AOQTSidecarCalibrationSet) AOQTSidecarPreparedIPObjective {
+	t.Helper()
+	objective, err := objectiveFromAOQTContract(set.Manifest.ObjectiveContract)
+	if err != nil {
+		t.Fatalf("prepared objective: %v", err)
+	}
+	return objective
+}
+
+func preparedAOQTObjectiveWithEvaluatorForSet(t *testing.T, set AOQTSidecarCalibrationSet, evaluator func(AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error)) AOQTSidecarPreparedIPObjective {
+	t.Helper()
+	if evaluator == nil {
+		t.Fatal("prepared objective evaluator is required")
+	}
+	objective := preparedAOQTObjectiveForSet(t, set)
+	objective.workspace.evaluateOverride = evaluator
+	return objective
 }
 
 func tinyAOQTCalibrationSet(t *testing.T, seed int64) AOQTSidecarCalibrationSet {

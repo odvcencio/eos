@@ -118,6 +118,12 @@ func (m AOQTSidecarRunMetrics) Validate() error {
 	if m.Plan.PairCount <= 0 {
 		return fmt.Errorf("AOQT metrics plan.pair_count must be positive")
 	}
+	if err := validateAOQTObjectiveActivation(m.Summary.InitialObjectiveActivation, "AOQT metrics summary.initial_objective_activation"); err != nil {
+		return err
+	}
+	if err := validateAOQTObjectiveActivation(m.Summary.FinalObjectiveActivation, "AOQT metrics summary.final_objective_activation"); err != nil {
+		return err
+	}
 	if m.Plan.PlanOnly {
 		if m.Plan.StepCount != 0 || m.Summary.Steps != 0 {
 			return fmt.Errorf("AOQT plan-only metrics must have zero planned and completed steps")
@@ -365,7 +371,41 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 	if summary.OptimizerDiagnostics == nil {
 		return fmt.Errorf("AOQT optimizer diagnostics are required for non-plan AOQT summaries")
 	}
+	if len(aoqtActiveProtectedComponentNames(summary.ObjectiveContract.WeightSums)) == 0 {
+		return fmt.Errorf("AOQT metrics v2 non-plan summaries require at least one active protected objective component")
+	}
 	diagnostics := *summary.OptimizerDiagnostics
+	if err := validateAOQTOptimizerPathDiagnostics(diagnostics, "AOQT optimizer diagnostics"); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		name  string
+		value int
+	}{
+		{"planned_steps", diagnostics.PlannedSteps},
+		{"attempted_steps", diagnostics.AttemptedSteps},
+		{"accepted_steps", diagnostics.AcceptedSteps},
+		{"proposal_attempts", diagnostics.ProposalAttempts},
+		{"accepted_proposals", diagnostics.AcceptedProposals},
+		{"rejected_proposals", diagnostics.RejectedProposals},
+		{"backtracks", diagnostics.Backtracks},
+		{"max_attempts_per_step", diagnostics.MaxAttemptsPerStep},
+		{"exhausted_steps", diagnostics.ExhaustedSteps},
+		{"adam_proposal_attempts", diagnostics.AdamProposalAttempts},
+		{"adam_accepted_proposals", diagnostics.AdamAcceptedProposals},
+		{"adam_rejected_proposals", diagnostics.AdamRejectedProposals},
+		{"coordinate_proposal_attempts", diagnostics.CoordinateProposalAttempts},
+		{"coordinate_accepted_proposals", diagnostics.CoordinateAcceptedProposals},
+		{"coordinate_rejected_proposals", diagnostics.CoordinateRejectedProposals},
+		{"coordinate_search_plan_count", diagnostics.CoordinateSearchPlanCount},
+		{"coordinate_top_angles", diagnostics.CoordinateTopAngles},
+		{"coordinate_magnitude_count", diagnostics.CoordinateMagnitudeCount},
+		{"coordinate_block_count", diagnostics.CoordinateBlockCount},
+	} {
+		if item.value < 0 {
+			return fmt.Errorf("AOQT optimizer diagnostics %s must be non-negative", item.name)
+		}
+	}
 	if diagnostics.PlannedSteps != plan.StepCount {
 		return fmt.Errorf("AOQT optimizer diagnostics planned_steps = %d, want plan step_count %d", diagnostics.PlannedSteps, plan.StepCount)
 	}
@@ -407,6 +447,9 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 	}
 	if diagnostics.CoordinateSearchPlanCount > 0 && !hasOptimizerPathDiagnostics {
 		return fmt.Errorf("AOQT optimizer diagnostics coordinate plan history is present without optimizer path diagnostics")
+	}
+	if !hasOptimizerPathDiagnostics && (diagnostics.ProposalAttempts != 0 || diagnostics.AcceptedProposals != 0 || diagnostics.RejectedProposals != 0 || diagnostics.Backtracks != 0) {
+		return fmt.Errorf("AOQT optimizer diagnostics top-level proposal accounting requires optimizer path diagnostics")
 	}
 	if hasOptimizerPathDiagnostics {
 		if diagnostics.AdamProposalAttempts != diagnostics.AdamAcceptedProposals+diagnostics.AdamRejectedProposals {
@@ -457,6 +500,9 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 	if diagnostics.ExhaustedSteps == 0 && diagnostics.AcceptedSteps != diagnostics.AttemptedSteps {
 		return fmt.Errorf("AOQT optimizer diagnostics accepted_steps = %d, want attempted_steps %d when no step exhausted", diagnostics.AcceptedSteps, diagnostics.AttemptedSteps)
 	}
+	if diagnostics.ExhaustedSteps == 0 && diagnostics.AttemptedSteps != diagnostics.PlannedSteps {
+		return fmt.Errorf("AOQT optimizer diagnostics attempted_steps = %d, want planned_steps %d when no step exhausted", diagnostics.AttemptedSteps, diagnostics.PlannedSteps)
+	}
 	if diagnostics.ExhaustedSteps == 1 && diagnostics.AcceptedSteps+1 != diagnostics.AttemptedSteps {
 		return fmt.Errorf("AOQT optimizer diagnostics attempted_steps must equal accepted_steps+1 when a step exhausts")
 	}
@@ -477,6 +523,9 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 }
 
 func validateAOQTProtectedCoordinateSearchAudit(plan AOQTSidecarWorkPlan, weights AOQTSidecarRowWeights, diagnostics AOQTSidecarOptimizerDiagnostics) error {
+	if !isFinite32(plan.LearningRate) || plan.LearningRate <= 0 {
+		return fmt.Errorf("AOQT optimizer diagnostics work plan learning_rate must be finite and positive")
+	}
 	audits, err := decodeAOQTCoordinateSearchStringChain(diagnostics.CoordinateSearchAuditChain, "coordinate_search_audit_chain")
 	if err != nil {
 		return err
@@ -492,6 +541,7 @@ func validateAOQTProtectedCoordinateSearchAudit(plan AOQTSidecarWorkPlan, weight
 		return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_plan_count = %d, audit chain length = %d", diagnostics.CoordinateSearchPlanCount, len(audits))
 	}
 	previousHash := ""
+	var chainLearningRate float32
 	for i, rawAudit := range audits {
 		var payload aoqtCoordinateSearchAuditPayload
 		if err := strictUnmarshalAOQT([]byte(rawAudit), &payload); err != nil {
@@ -504,7 +554,18 @@ func validateAOQTProtectedCoordinateSearchAudit(plan AOQTSidecarWorkPlan, weight
 		if string(canonical) != rawAudit {
 			return fmt.Errorf("AOQT optimizer diagnostics coordinate audit[%d] is not canonical JSON", i)
 		}
-		if err := validateAOQTProtectedCoordinateSearchAuditPayload(payload, plan.AngleCount, weights); err != nil {
+		// Check the immutable per-plan rate relation before the full payload
+		// verifier. This keeps multi-step history tampering distinguishable from
+		// a single-entry plan-rate mismatch while both remain fail-closed.
+		if !isFinite32(payload.LearningRate) || payload.LearningRate <= 0 {
+			return fmt.Errorf("AOQT optimizer diagnostics coordinate audit[%d] learning_rate must be finite and positive", i)
+		}
+		if i == 0 {
+			chainLearningRate = payload.LearningRate
+		} else if payload.LearningRate != chainLearningRate {
+			return fmt.Errorf("AOQT optimizer diagnostics coordinate audit[%d] learning_rate = %.9g differs from fixed chain learning_rate %.9g", i, payload.LearningRate, chainLearningRate)
+		}
+		if err := validateAOQTProtectedCoordinateSearchAuditPayload(payload, plan.AngleCount, plan.LearningRate, weights); err != nil {
 			return fmt.Errorf("AOQT optimizer diagnostics coordinate audit[%d]: %w", i, err)
 		}
 		wantHash := sha256AOQTCoordinateSearchChainEntry(previousHash, rawAudit)
@@ -559,12 +620,18 @@ func decodeAOQTCoordinateSearchStringChain(raw, label string) ([]string, error) 
 	return chain, nil
 }
 
-func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSearchAuditPayload, angleCount int, weights AOQTSidecarRowWeights) error {
+func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSearchAuditPayload, angleCount int, expectedLearningRate float32, weights AOQTSidecarRowWeights) error {
 	if payload.Strategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail {
 		return fmt.Errorf("strategy = %q, want protected strategy %q", payload.Strategy, aoqtCoordinateSearchStrategyProtectedConeMicroTail)
 	}
 	if !isFinite32(payload.LearningRate) || payload.LearningRate <= 0 {
 		return fmt.Errorf("learning_rate must be finite and positive")
+	}
+	if !isFinite32(expectedLearningRate) || expectedLearningRate <= 0 {
+		return fmt.Errorf("work plan learning_rate must be finite and positive")
+	}
+	if payload.LearningRate != expectedLearningRate {
+		return fmt.Errorf("learning_rate = %.9g does not match work plan learning_rate %.9g", payload.LearningRate, expectedLearningRate)
 	}
 	wantComponents := aoqtActiveProtectedComponentNames(weights)
 	if len(wantComponents) == 0 {
@@ -579,6 +646,22 @@ func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSea
 	if len(payload.FullOrder) < len(payload.Order) {
 		return fmt.Errorf("full order count = %d is smaller than top order count %d", len(payload.FullOrder), len(payload.Order))
 	}
+	if payload.FullRankSourceCount != angleCount {
+		return fmt.Errorf("full rank source count = %d, want complete angle count %d", payload.FullRankSourceCount, angleCount)
+	}
+	if err := validateAOQTSHA256(payload.FullRankSourceSHA256, "AOQT protected full rank source sha256"); err != nil {
+		return err
+	}
+	if len(payload.FullOrder) != payload.FullRankSourceCount {
+		return fmt.Errorf("full order count = %d, want complete full rank source count %d", len(payload.FullOrder), payload.FullRankSourceCount)
+	}
+	wantTopOrder := aoqtTransactionalCoordinateTopAngles
+	if len(payload.FullOrder) < wantTopOrder {
+		wantTopOrder = len(payload.FullOrder)
+	}
+	if len(payload.Order) != wantTopOrder {
+		return fmt.Errorf("order count = %d, want exact top-order count %d from full rank source", len(payload.Order), wantTopOrder)
+	}
 	fullOrderJSON, err := json.Marshal(payload.FullOrder)
 	if err != nil {
 		return err
@@ -587,7 +670,21 @@ func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSea
 	if payload.FullOrderSHA256 != hex.EncodeToString(fullOrderSum[:]) {
 		return fmt.Errorf("full order sha256 does not bind full rank source")
 	}
+	fullRanks, err := validateAOQTProtectedCoordinateSearchAuditOrder(payload.FullOrder, angleCount, wantComponents, true)
+	if err != nil {
+		return fmt.Errorf("full order: %w", err)
+	}
+	fullRankSource, err := aoqtCoordinateSearchRankSourceSHA256(fullRanks, wantComponents)
+	if err != nil {
+		return err
+	}
+	if payload.FullRankSourceSHA256 != fullRankSource {
+		return fmt.Errorf("full rank source sha256 does not bind complete rank source")
+	}
 	expectedMagnitudes := aoqtCoordinateSearchMagnitudes(payload.LearningRate)
+	if len(expectedMagnitudes) != aoqtTransactionalCoordinateMagnitudeCount {
+		return fmt.Errorf("protected learning_rate produces %d finite positive magnitudes, want full intended schedule of %d", len(expectedMagnitudes), aoqtTransactionalCoordinateMagnitudeCount)
+	}
 	expectedMicroTail := aoqtCoordinateSearchMicroTail(expectedMagnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
 	if len(expectedMicroTail) != aoqtTransactionalCoordinateMicroTailMagnitudeCount || !aoqtFloat32SlicesEqual(expectedMicroTail, payload.MicroTailMagnitudes) {
 		return fmt.Errorf("protected learning_rate does not bind the exact micro-tail schedule")
@@ -616,11 +713,7 @@ func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSea
 	if !aoqtIntSlicesEqual(payload.BlockSizes, wantBlockSizes) {
 		return fmt.Errorf("protected block sizes = %v, want %v", payload.BlockSizes, wantBlockSizes)
 	}
-	fullRanks, err := validateAOQTProtectedCoordinateSearchAuditOrder(payload.FullOrder, angleCount, wantComponents)
-	if err != nil {
-		return fmt.Errorf("full order: %w", err)
-	}
-	_, err = validateAOQTProtectedCoordinateSearchAuditOrder(payload.Order, angleCount, wantComponents)
+	_, err = validateAOQTProtectedCoordinateSearchAuditOrder(payload.Order, angleCount, wantComponents, true)
 	if err != nil {
 		return fmt.Errorf("top order: %w", err)
 	}
@@ -647,7 +740,7 @@ func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSea
 	return nil
 }
 
-func validateAOQTProtectedCoordinateSearchAuditOrder(items []aoqtCoordinateSearchAuditOrder, angleCount int, wantComponents []string) ([]aoqtCoordinateSearchRank, error) {
+func validateAOQTProtectedCoordinateSearchAuditOrder(items []aoqtCoordinateSearchAuditOrder, angleCount int, wantComponents []string, allowZero bool) ([]aoqtCoordinateSearchRank, error) {
 	if len(items) == 0 {
 		return nil, fmt.Errorf("order must be non-empty")
 	}
@@ -661,7 +754,10 @@ func validateAOQTProtectedCoordinateSearchAuditOrder(items []aoqtCoordinateSearc
 			return nil, fmt.Errorf("order[%d] repeats index %d", i, item.Index)
 		}
 		seen[item.Index] = struct{}{}
-		if !isFinite32(item.Abs) || item.Abs <= 0 {
+		if !isFinite32(item.Abs) || item.Abs < 0 {
+			return nil, fmt.Errorf("order[%d] abs must be finite and non-negative", i)
+		}
+		if item.Abs == 0 && !allowZero {
 			return nil, fmt.Errorf("order[%d] abs must be finite and positive", i)
 		}
 		if !isFinite32(item.AggregateAbs) || item.AggregateAbs < 0 {
@@ -673,8 +769,11 @@ func validateAOQTProtectedCoordinateSearchAuditOrder(items []aoqtCoordinateSearc
 		if item.AggregateAbs != float32(math.Abs(float64(item.AggregateGradient))) {
 			return nil, fmt.Errorf("order[%d] aggregate_abs = %.9g, want |aggregate_gradient| %.9g", i, item.AggregateAbs, math.Abs(float64(item.AggregateGradient)))
 		}
-		if item.PrimaryDirection != -1 && item.PrimaryDirection != 1 {
+		if item.Abs > 0 && item.PrimaryDirection != -1 && item.PrimaryDirection != 1 {
 			return nil, fmt.Errorf("order[%d] primary_direction = %.9g, want -1 or 1", i, item.PrimaryDirection)
+		}
+		if item.Abs == 0 && item.PrimaryDirection != 0 {
+			return nil, fmt.Errorf("order[%d] zero-abs primary_direction = %.9g, want 0", i, item.PrimaryDirection)
 		}
 		if len(item.ProtectedDirectionalDerivatives) != len(wantComponents) {
 			return nil, fmt.Errorf("order[%d] protected derivative count = %d, want %d", i, len(item.ProtectedDirectionalDerivatives), len(wantComponents))
@@ -697,6 +796,9 @@ func validateAOQTProtectedCoordinateSearchAuditOrder(items []aoqtCoordinateSearc
 		}
 		if item.ProtectedMaxDirectionalDerivative != maxAscent {
 			return nil, fmt.Errorf("order[%d] protected max derivative = %.9g, want %.9g", i, item.ProtectedMaxDirectionalDerivative, maxAscent)
+		}
+		if item.Abs == 0 && (item.ProtectedConflictCount != 0 || item.ProtectedMaxDirectionalDerivative != 0 || item.GuardConflict) {
+			return nil, fmt.Errorf("order[%d] zero-abs rank has non-zero conflict metadata", i)
 		}
 		q3Gradient := -item.PrimaryDirection * item.Abs
 		wantGuardConflict := q3Gradient*item.AggregateGradient < 0 || conflicts > 0
@@ -757,6 +859,9 @@ func validateAOQTMetricsPlanTopology(plan AOQTSidecarWorkPlan, topology AOQTSide
 	}
 	if plan.PairingSeed != topology.Seed {
 		return fmt.Errorf("AOQT plan pairing_seed = %d, want topology seed %d", plan.PairingSeed, topology.Seed)
+	}
+	if !isFinite32(plan.LearningRate) || plan.LearningRate <= 0 {
+		return fmt.Errorf("AOQT plan learning_rate must be finite and positive")
 	}
 	if plan.PairingsSHA256 != topology.PairingsSHA256 {
 		return fmt.Errorf("AOQT plan pairings_sha256 mismatch with topology")

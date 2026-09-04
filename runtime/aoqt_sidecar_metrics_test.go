@@ -1,6 +1,8 @@
 package eosruntime
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -186,6 +188,54 @@ func TestAOQTProtectedCoordinateDiagnosticsAreStrictlyBound(t *testing.T) {
 			want: "full order sha256",
 		},
 		{
+			name: "full-order-truncation-rebuilt",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				var payload aoqtCoordinateSearchAuditPayload
+				if err := strictUnmarshalAOQT([]byte(d.CoordinateSearchAudit), &payload); err != nil {
+					t.Fatalf("decode audit: %v", err)
+				}
+				payload.FullOrder = payload.FullOrder[:1]
+				fullOrderJSON, err := json.Marshal(payload.FullOrder)
+				if err != nil {
+					t.Fatalf("marshal truncated full order: %v", err)
+				}
+				sum := sha256.Sum256(fullOrderJSON)
+				payload.FullOrderSHA256 = hex.EncodeToString(sum[:])
+				bindAOQTCoordinateAuditForMetricsTest(t, d, payload)
+			},
+			want: "full order count",
+		},
+		{
+			name: "full-rank-source-binding",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				var payload aoqtCoordinateSearchAuditPayload
+				if err := strictUnmarshalAOQT([]byte(d.CoordinateSearchAudit), &payload); err != nil {
+					t.Fatalf("decode audit: %v", err)
+				}
+				payload.FullRankSourceSHA256 = hex64("tampered-rank-source")
+				bindAOQTCoordinateAuditForMetricsTest(t, d, payload)
+			},
+			want: "full rank source sha256",
+		},
+		{
+			name: "full-rank-source-recomputed-tamper",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				var payload aoqtCoordinateSearchAuditPayload
+				if err := strictUnmarshalAOQT([]byte(d.CoordinateSearchAudit), &payload); err != nil {
+					t.Fatalf("decode audit: %v", err)
+				}
+				payload.FullOrder[0].Abs *= 2
+				fullOrderJSON, err := json.Marshal(payload.FullOrder)
+				if err != nil {
+					t.Fatalf("marshal tampered full order: %v", err)
+				}
+				sum := sha256.Sum256(fullOrderJSON)
+				payload.FullOrderSHA256 = hex.EncodeToString(sum[:])
+				bindAOQTCoordinateAuditForMetricsTest(t, d, payload)
+			},
+			want: "full rank source sha256",
+		},
+		{
 			name: "learning-rate-binding",
 			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
 				var payload aoqtCoordinateSearchAuditPayload
@@ -196,6 +246,61 @@ func TestAOQTProtectedCoordinateDiagnosticsAreStrictlyBound(t *testing.T) {
 				bindAOQTCoordinateAuditForMetricsTest(t, d, payload)
 			},
 			want: "learning_rate",
+		},
+		{
+			name: "top-order-truncation",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				var payload aoqtCoordinateSearchAuditPayload
+				if err := strictUnmarshalAOQT([]byte(d.CoordinateSearchAudit), &payload); err != nil {
+					t.Fatalf("decode audit: %v", err)
+				}
+				payload.Order = payload.Order[:1]
+				payload.BlockSizes = nil
+				d.CoordinateTopAngles = 1
+				d.CoordinateBlockCount = 0
+				bindAOQTCoordinateAuditForMetricsTest(t, d, payload)
+			},
+			want: "exact top-order count",
+		},
+		{
+			name: "empty-blocks",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				var payload aoqtCoordinateSearchAuditPayload
+				if err := strictUnmarshalAOQT([]byte(d.CoordinateSearchAudit), &payload); err != nil {
+					t.Fatalf("decode audit: %v", err)
+				}
+				payload.BlockSizes = nil
+				bindAOQTCoordinateAuditForMetricsTest(t, d, payload)
+			},
+			want: "protected block sizes",
+		},
+		{
+			name: "rejection-reason-count",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				d.RejectionDiagnostics.ReasonCounts.LossIncrease++
+			},
+			want: "reason_counts sum",
+		},
+		{
+			name: "rejection-component-count",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				d.RejectionDiagnostics.ComponentRegressionCounts.Q3ScoreDistill = 1
+			},
+			want: "component_regression_counts are non-zero",
+		},
+		{
+			name: "rejection-delta-count",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				d.RejectionDiagnostics.LossDelta.Count = -1
+			},
+			want: "loss_delta.count must be non-negative",
+		},
+		{
+			name: "rejection-delta-sum",
+			mutate: func(d *AOQTSidecarOptimizerDiagnostics) {
+				d.RejectionDiagnostics.LossDelta.Sum = 2
+			},
+			want: "loss_delta.sum",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -214,6 +319,126 @@ func TestAOQTProtectedCoordinateDiagnosticsAreStrictlyBound(t *testing.T) {
 	legacy.Schema = "eos.q3_aoqt_sidecar_metrics.v1"
 	if err := legacy.Validate(); err == nil || !strings.Contains(err.Error(), AOQTSidecarMetricsSchema) {
 		t.Fatalf("legacy metrics schema error = %v, want explicit v2 incompatibility", err)
+	}
+}
+
+func TestAOQTV2MetricsRejectsLegacyQ3OnlyAdamSummary(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 96)
+	metrics := safeTinyAOQTCandidateMetrics(t, set, AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs:     2,
+		Q3GainContributingPairs: 2,
+	})
+	q3OnlyContract := tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed).ObjectiveContract(AOQTSidecarRowWeights{
+		Q3Gain: metrics.ObjectiveContract.WeightSums.Q3Gain,
+	})
+	metrics.ObjectiveContract = q3OnlyContract
+	metrics.Summary.ObjectiveContract = q3OnlyContract
+	refreshAOQTDiagnosticsSHAForMetricsTest(t, &metrics)
+	if err := metrics.Validate(); err == nil || !strings.Contains(err.Error(), "active protected objective component") {
+		t.Fatalf("q3-only v2 metrics error = %v, want unconditional protected-component rejection", err)
+	}
+}
+
+func TestAOQTOptimizerDiagnosticsRejectStrippedPathAccounting(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 97)
+	enableTinyAOQTNFGuard(t, &set)
+	metrics := safeTinyAOQTCandidateMetrics(t, set, AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs:         2,
+		Q3GainContributingPairs:     2,
+		Q3OrderGuardPairs:           2,
+		Q3OrderGuardContributing:    2,
+		Q3ScoreDistillCount:         3,
+		Q5OrderGuardPairs:           2,
+		Q5OrderGuardContributing:    2,
+		Q5ScoreDistillCount:         3,
+		NFBoundaryGuardPairs:        1,
+		NFBoundaryGuardContributing: 1,
+	})
+	seedCoordinateDiagnosticsForMetricsTest(t, &metrics, aoqtCoordinateSearchStrategyProtectedConeMicroTail)
+	diagnostics := *metrics.Summary.OptimizerDiagnostics
+	diagnostics.AdamProposalAttempts = 0
+	diagnostics.AdamAcceptedProposals = 0
+	diagnostics.AdamRejectedProposals = 0
+	diagnostics.CoordinateProposalAttempts = 0
+	diagnostics.CoordinateAcceptedProposals = 0
+	diagnostics.CoordinateRejectedProposals = 0
+	diagnostics.CoordinateSearchPlanCount = 0
+	diagnostics.CoordinateTopAngles = 0
+	diagnostics.CoordinateMagnitudeCount = 0
+	diagnostics.CoordinateBlockCount = 0
+	diagnostics.CoordinateSearchStrategy = ""
+	diagnostics.CoordinateSearchOrderingHash = ""
+	diagnostics.CoordinateSearchLearningRate = 0
+	diagnostics.CoordinateSearchAudit = ""
+	diagnostics.CoordinateSearchAuditChain = ""
+	diagnostics.CoordinateSearchHashChain = ""
+	metrics.Summary.OptimizerDiagnostics = &diagnostics
+	refreshAOQTDiagnosticsSHAForMetricsTest(t, &metrics)
+	if err := metrics.Validate(); err == nil || !strings.Contains(err.Error(), "top-level proposal accounting requires optimizer path diagnostics") {
+		t.Fatalf("stripped optimizer path error = %v, want fail-closed top-level accounting rejection", err)
+	}
+}
+
+func TestAOQTOptimizerDiagnosticsRejectNegativePathCounter(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 99)
+	metrics := safeTinyAOQTCandidateMetrics(t, set, AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs:      2,
+		Q3GainContributingPairs:  2,
+		Q3OrderGuardPairs:        2,
+		Q3OrderGuardContributing: 2,
+		Q3ScoreDistillCount:      3,
+		Q5OrderGuardPairs:        2,
+		Q5OrderGuardContributing: 2,
+		Q5ScoreDistillCount:      3,
+	})
+	diagnostics := *metrics.Summary.OptimizerDiagnostics
+	diagnostics.AdamProposalAttempts = -1
+	metrics.Summary.OptimizerDiagnostics = &diagnostics
+	refreshAOQTDiagnosticsSHAForMetricsTest(t, &metrics)
+	if err := metrics.Validate(); err == nil || !strings.Contains(err.Error(), "adam_proposal_attempts must be non-negative") {
+		t.Fatalf("negative Adam counter error = %v, want explicit non-negative rejection", err)
+	}
+}
+
+func TestAOQTOptimizerDiagnosticsRejectIncompleteNonExhaustedPlan(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 100)
+	metrics := safeTinyAOQTCandidateMetrics(t, set, AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs:      2,
+		Q3GainContributingPairs:  2,
+		Q3OrderGuardPairs:        2,
+		Q3OrderGuardContributing: 2,
+		Q3ScoreDistillCount:      3,
+		Q5OrderGuardPairs:        2,
+		Q5OrderGuardContributing: 2,
+		Q5ScoreDistillCount:      3,
+	})
+	bad := metrics
+	bad.Plan.StepCount++
+	bad.Summary.Plan.StepCount++
+	diagnostics := *bad.Summary.OptimizerDiagnostics
+	diagnostics.PlannedSteps++
+	bad.Summary.OptimizerDiagnostics = &diagnostics
+	refreshAOQTDiagnosticsSHAForMetricsTest(t, &bad)
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "want planned_steps") {
+		t.Fatalf("incomplete non-exhausted plan error = %v, want planned/attempted termination rejection", err)
+	}
+}
+
+func TestAOQTMetricsRejectNegativeActivationCounts(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 101)
+	metrics := safeTinyAOQTCandidateMetrics(t, set, AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs:      2,
+		Q3GainContributingPairs:  2,
+		Q3OrderGuardPairs:        2,
+		Q3OrderGuardContributing: 2,
+		Q3ScoreDistillCount:      3,
+		Q5OrderGuardPairs:        2,
+		Q5OrderGuardContributing: 2,
+		Q5ScoreDistillCount:      3,
+	})
+	metrics.Summary.InitialObjectiveActivation.Q3GainEligiblePairs = -1
+	if err := metrics.Validate(); err == nil || !strings.Contains(err.Error(), "initial_objective_activation.q3_gain_eligible_pairs must be non-negative") {
+		t.Fatalf("negative activation error = %v, want explicit non-negative rejection", err)
 	}
 }
 func bindAOQTCoordinateAuditForMetricsTest(t *testing.T, diagnostics *AOQTSidecarOptimizerDiagnostics, payload aoqtCoordinateSearchAuditPayload) {
@@ -249,39 +474,34 @@ func seedCoordinateDiagnosticsForMetricsTest(t *testing.T, metrics *AOQTSidecarR
 	diagnostics.AdamAcceptedProposals = diagnostics.AcceptedSteps
 	diagnostics.CoordinateProposalAttempts = 1
 	diagnostics.CoordinateRejectedProposals = 1
+	diagnostics.RejectionDiagnostics.CandidateEvaluations = 1
+	diagnostics.RejectionDiagnostics.ReasonCounts.LossIncrease = 1
+	diagnostics.RejectionDiagnostics.LossDelta.Record(1)
+	diagnostics.RejectionDiagnostics.ComponentDeltas.Record(
+		AOQTSidecarObjectiveComponents{Q3Gain: 1, Q3OrderGuard: 1, Q3ScoreDistill: 1, Q5OrderGuard: 1, Q5ScoreDistill: 1, NFBoundaryGuard: 1},
+		AOQTSidecarObjectiveComponents{Q3Gain: 2, Q3OrderGuard: 2, Q3ScoreDistill: 2, Q5OrderGuard: 2, Q5ScoreDistill: 2, NFBoundaryGuard: 2},
+	)
+	diagnostics.RejectionDiagnostics.finalizeDominantFields()
 	diagnostics.CoordinateSearchPlanCount = 1
-	diagnostics.CoordinateTopAngles = 1
-	diagnostics.CoordinateMagnitudeCount = aoqtTransactionalCoordinateMicroTailMagnitudeCount
-	diagnostics.CoordinateBlockCount = 0
 	diagnostics.CoordinateSearchStrategy = strategy
 	diagnostics.CoordinateSearchLearningRate = 0.01
 	protectedComponents := aoqtActiveProtectedComponentNames(metrics.ObjectiveContract.WeightSums)
-	microTail := []float32{0.00125, 0.000625, 0.0003125}
-	auditPlan := aoqtCoordinateSearchPlan{
-		Strategy:     strategy,
-		LearningRate: 0.01,
-		Order: []aoqtCoordinateSearchRank{{
-			index:                           0,
-			abs:                             1,
-			aggregateAbs:                    1,
-			aggregateGradient:               1,
-			primaryDirection:                -1,
-			protectedDirectionalDerivatives: make([]float32, len(protectedComponents)),
-		}},
-		FullOrder: []aoqtCoordinateSearchRank{{
-			index:                           0,
-			abs:                             1,
-			aggregateAbs:                    1,
-			aggregateGradient:               1,
-			primaryDirection:                -1,
-			protectedDirectionalDerivatives: make([]float32, len(protectedComponents)),
-		}},
-		Magnitudes:          microTail,
-		BlockMagnitudes:     microTail,
-		MicroTailMagnitudes: microTail,
-		BlockSizes:          nil,
-		ProtectedComponents: protectedComponents,
+	q3GainGrad := make([]float32, metrics.Plan.AngleCount)
+	q3GainGrad[0] = 1
+	q3GainGrad[1] = -0.5
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(protectedComponents))
+	for _, name := range protectedComponents {
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: make([]float32, metrics.Plan.AngleCount)})
 	}
+	auditPlan, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	if err != nil {
+		t.Fatalf("coordinate audit plan: %v", err)
+	}
+	auditPlan.Strategy = strategy
+	diagnostics.CoordinateTopAngles = len(auditPlan.Order)
+	diagnostics.CoordinateMagnitudeCount = len(auditPlan.Magnitudes)
+	diagnostics.CoordinateBlockCount = len(auditPlan.BlockSizes)
 	audit, err := auditPlan.coordinateSearchAuditJSON()
 	if err != nil {
 		t.Fatalf("coordinate audit: %v", err)

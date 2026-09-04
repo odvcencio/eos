@@ -336,12 +336,14 @@ func safeTinyAOQTCandidateMetrics(t *testing.T, set AOQTSidecarCalibrationSet, a
 		DenseMaxAbsDelta:           0,
 	}
 	diagnostics := AOQTSidecarOptimizerDiagnostics{
-		PlannedSteps:       plan.StepCount,
-		AttemptedSteps:     plan.StepCount,
-		AcceptedSteps:      plan.StepCount,
-		ProposalAttempts:   plan.StepCount,
-		AcceptedProposals:  plan.StepCount,
-		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+		PlannedSteps:          plan.StepCount,
+		AttemptedSteps:        plan.StepCount,
+		AcceptedSteps:         plan.StepCount,
+		ProposalAttempts:      plan.StepCount,
+		AcceptedProposals:     plan.StepCount,
+		AdamProposalAttempts:  plan.StepCount,
+		AdamAcceptedProposals: plan.StepCount,
+		MaxAttemptsPerStep:    aoqtTransactionalMaxAttemptsPerStep,
 	}
 	summary.OptimizerDiagnostics = &diagnostics
 	diagnosticsSHA, err := diagnostics.SHA256()
