@@ -75,6 +75,129 @@ func TestWriteAOQTSidecarCandidatePackageLoadsAndBindsPolicy(t *testing.T) {
 	assertTensorClose(t, out.Embeddings, []int{2}, []float32{-1, 0})
 }
 
+func TestWriteAOQTSidecarCandidatePackageAcceptsTrainingAnchor(t *testing.T) {
+	anchor := writeTinyAOQTTrainingAnchorPackage(t)
+	anchorManifest := mustReadPackageManifestForAOQTTest(t, DefaultPackageManifestPath(anchor))
+	if anchorManifest.Kind != PackageTraining {
+		t.Fatalf("anchor package kind = %q, want %q", anchorManifest.Kind, PackageTraining)
+	}
+	anchorPaths, err := packageRolePaths(anchor, anchorManifest)
+	if err != nil {
+		t.Fatalf("training anchor package paths: %v", err)
+	}
+	anchorHashes := make(map[string]string, len(anchorPaths)+1)
+	for role, path := range anchorPaths {
+		sum, _, err := fileHash(path)
+		if err != nil {
+			t.Fatalf("hash training anchor %q: %v", role, err)
+		}
+		anchorHashes[role] = sum
+	}
+	packageManifestPath := DefaultPackageManifestPath(anchor)
+	anchorHashes["package_manifest"], _, err = fileHash(packageManifestPath)
+	if err != nil {
+		t.Fatalf("hash training anchor package manifest: %v", err)
+	}
+
+	cfg := tinyAOQTCandidatePackageConfig(t, anchor, filepath.Join(t.TempDir(), "candidate.mll"))
+	result, err := WriteAOQTSidecarCandidatePackage(cfg)
+	if err != nil {
+		t.Fatalf("write AOQT candidate from training package: %v", err)
+	}
+	if result.PackageManifest.Kind != PackageEmbedding {
+		t.Fatalf("candidate package kind = %q, want %q", result.PackageManifest.Kind, PackageEmbedding)
+	}
+	if !result.PackageManifest.AOQTTransform.ResearchOnly || result.PackageManifest.AOQTTransform.ReleaseTrainAllowed || result.PackageManifest.AOQTTransform.CommercialUseAllowed || result.PackageManifest.AOQTTransform.FreeOpenReleaseAllowed || result.PackageManifest.AOQTTransform.QualityClaim {
+		t.Fatalf("candidate AOQT policy gates = %+v, want research-only/no release claims", result.PackageManifest.AOQTTransform)
+	}
+
+	for role, candidatePath := range map[string]string{
+		"artifact": result.Paths.ArtifactPath,
+		"weights":  result.Paths.WeightFilePath,
+	} {
+		anchorPath := anchorPaths[role]
+		anchorSum, _, err := fileHash(anchorPath)
+		if err != nil {
+			t.Fatalf("hash anchor %q for candidate comparison: %v", role, err)
+		}
+		candidateSum, _, err := fileHash(candidatePath)
+		if err != nil {
+			t.Fatalf("hash candidate %q: %v", role, err)
+		}
+		if candidateSum != anchorSum {
+			t.Fatalf("candidate %q sha256 = %q, want anchor %q", role, candidateSum, anchorSum)
+		}
+	}
+
+	rt := New(cuda.New(), metal.New())
+	model, err := rt.LoadEmbeddingPackage(context.Background(), result.Paths.ArtifactPath)
+	if err != nil {
+		t.Fatalf("load AOQT candidate from training package: %v", err)
+	}
+	out, err := model.Embed(context.Background(), []int32{1})
+	if err != nil {
+		t.Fatalf("embed AOQT candidate from training package: %v", err)
+	}
+	var shape []int
+	if out.Embeddings != nil {
+		shape = out.Embeddings.Shape
+	}
+	if !reflect.DeepEqual(shape, []int{2}) {
+		t.Fatalf("candidate embedding shape = %v, want [2]", shape)
+	}
+
+	for role, path := range anchorPaths {
+		after, _, err := fileHash(path)
+		if err != nil {
+			t.Fatalf("rehash training anchor %q: %v", role, err)
+		}
+		if after != anchorHashes[role] {
+			t.Fatalf("training anchor %q changed from %q to %q", role, anchorHashes[role], after)
+		}
+	}
+	afterPackage, _, err := fileHash(packageManifestPath)
+	if err != nil {
+		t.Fatalf("rehash training anchor package manifest: %v", err)
+	}
+	if afterPackage != anchorHashes["package_manifest"] {
+		t.Fatalf("training anchor package manifest changed from %q to %q", anchorHashes["package_manifest"], afterPackage)
+	}
+}
+
+func TestWriteAOQTSidecarCandidatePackageRejectsMissingInferenceRole(t *testing.T) {
+	anchor := writeTinyAOQTAnchorPackage(t)
+	manifestPath := DefaultPackageManifestPath(anchor)
+	manifest := mustReadPackageManifestForAOQTTest(t, manifestPath)
+	filtered := manifest.Files[:0]
+	for _, item := range manifest.Files {
+		if item.Role != "weights" {
+			filtered = append(filtered, item)
+		}
+	}
+	manifest.Files = filtered
+	if err := manifest.WriteFile(manifestPath); err != nil {
+		t.Fatalf("rewrite anchor package without weights: %v", err)
+	}
+	cfg := tinyAOQTCandidatePackageConfig(t, anchor, filepath.Join(t.TempDir(), "candidate.mll"))
+	if _, err := WriteAOQTSidecarCandidatePackage(cfg); err == nil || !strings.Contains(err.Error(), `missing required role "weights"`) {
+		t.Fatalf("write candidate without inference weights error = %v, want missing weights rejection", err)
+	}
+}
+
+func TestWriteAOQTSidecarCandidatePackageRejectsInvalidAnchorPackageKind(t *testing.T) {
+	anchor := writeTinyAOQTAnchorPackage(t)
+	manifestPath := DefaultPackageManifestPath(anchor)
+	manifest := mustReadPackageManifestForAOQTTest(t, manifestPath)
+	manifest.Kind = PackageKind("not-a-package")
+	if err := manifest.WriteFile(manifestPath); err != nil {
+		t.Fatalf("rewrite anchor package with invalid kind: %v", err)
+	}
+	cfg := tinyAOQTCandidatePackageConfig(t, anchor, filepath.Join(t.TempDir(), "candidate.mll"))
+	if _, err := WriteAOQTSidecarCandidatePackage(cfg); err == nil || !strings.Contains(err.Error(), `want "embedding" or "training"`) {
+		t.Fatalf("write candidate with invalid anchor package kind error = %v, want kind rejection", err)
+	}
+}
+
 func TestRebuildSiblingPackageManifestPreservesAOQTPolicyAndLoadGuards(t *testing.T) {
 	anchor := writeTinyAOQTAnchorPackage(t)
 	cfg := tinyAOQTCandidatePackageConfig(t, anchor, filepath.Join(t.TempDir(), "candidate.mll"))
@@ -472,6 +595,16 @@ func writeTinyAOQTAnchorPackage(t *testing.T) string {
 	}
 	if err := packageManifest.WriteFile(DefaultPackageManifestPath(artifactPath)); err != nil {
 		t.Fatalf("write package manifest: %v", err)
+	}
+	return artifactPath
+}
+
+func writeTinyAOQTTrainingAnchorPackage(t *testing.T) string {
+	t.Helper()
+	trainer := newTinyTrainableFFNEmbeddingTrainer(t, 0.05)
+	artifactPath := filepath.Join(t.TempDir(), "training-anchor.mll")
+	if _, err := trainer.WriteTrainingPackage(artifactPath); err != nil {
+		t.Fatalf("write training anchor package: %v", err)
 	}
 	return artifactPath
 }

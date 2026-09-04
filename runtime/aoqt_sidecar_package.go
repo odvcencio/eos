@@ -49,8 +49,8 @@ func WriteAOQTSidecarCandidatePackage(cfg AOQTSidecarCandidatePackageConfig) (AO
 	if err != nil {
 		return AOQTSidecarCandidatePackageResult{}, err
 	}
-	if anchorPackage.Kind != PackageEmbedding {
-		return AOQTSidecarCandidatePackageResult{}, fmt.Errorf("AOQT candidate anchor package kind = %q, want %q", anchorPackage.Kind, PackageEmbedding)
+	if anchorPackage.Kind != PackageEmbedding && anchorPackage.Kind != PackageTraining {
+		return AOQTSidecarCandidatePackageResult{}, fmt.Errorf("AOQT candidate anchor package kind = %q, want %q or %q", anchorPackage.Kind, PackageEmbedding, PackageTraining)
 	}
 	if anchorPackage.HasFileRole(EmbeddingPostPoolTransformRole) || anchorPackage.AOQTTransform.Enabled {
 		return AOQTSidecarCandidatePackageResult{}, fmt.Errorf("AOQT candidate anchor must not already declare a post-pool transform")
@@ -380,6 +380,13 @@ func packageRolePaths(artifactPath string, manifest PackageManifest) (map[string
 	for _, item := range manifest.Files {
 		switch item.Role {
 		case "artifact", "embedding_manifest", "tokenizer", "weights", "memory_plan", EmbeddingPostPoolTransformRole:
+			out[item.Role] = filepath.Join(dir, item.Path)
+		case "train_manifest", "checkpoint", "train_profile":
+			if manifest.Kind != PackageTraining {
+				return nil, fmt.Errorf("AOQT candidate package does not support anchor file role %q for package kind %q", item.Role, manifest.Kind)
+			}
+			// Training-only siblings are verified as part of the immutable anchor,
+			// but are intentionally not copied into the inference-only candidate.
 			out[item.Role] = filepath.Join(dir, item.Path)
 		default:
 			return nil, fmt.Errorf("AOQT candidate package does not support anchor file role %q", item.Role)
