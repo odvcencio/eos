@@ -78,11 +78,16 @@ type AOQTSidecarOptimizerDiagnostics struct {
 	CoordinateProposalAttempts   int                                      `json:"coordinate_proposal_attempts,omitempty"`
 	CoordinateAcceptedProposals  int                                      `json:"coordinate_accepted_proposals,omitempty"`
 	CoordinateRejectedProposals  int                                      `json:"coordinate_rejected_proposals,omitempty"`
+	CoordinateSearchPlanCount    int                                      `json:"coordinate_search_plan_count,omitempty"`
 	CoordinateTopAngles          int                                      `json:"coordinate_top_angles,omitempty"`
 	CoordinateMagnitudeCount     int                                      `json:"coordinate_magnitude_count,omitempty"`
 	CoordinateBlockCount         int                                      `json:"coordinate_block_count,omitempty"`
 	CoordinateSearchStrategy     string                                   `json:"coordinate_search_strategy,omitempty"`
 	CoordinateSearchOrderingHash string                                   `json:"coordinate_search_ordering_sha256,omitempty"`
+	CoordinateSearchLearningRate float32                                  `json:"coordinate_search_learning_rate,omitempty"`
+	CoordinateSearchAudit        string                                   `json:"coordinate_search_audit,omitempty"`
+	CoordinateSearchAuditChain   string                                   `json:"coordinate_search_audit_chain,omitempty"`
+	CoordinateSearchHashChain    string                                   `json:"coordinate_search_hash_chain,omitempty"`
 	RejectionDiagnostics         AOQTSidecarOptimizerRejectionDiagnostics `json:"rejection_diagnostics,omitempty"`
 }
 
@@ -529,6 +534,13 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	if err := validateAOQTFitObjectiveContract(set.Manifest.ObjectiveContract, objective); err != nil {
 		return summary, err
 	}
+	if len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)) == 0 {
+		return summary, fmt.Errorf("AOQT protected-v2 non-plan training requires at least one active protected objective component")
+	}
+	// The contract check above restricts production protected-v2 fits to the
+	// prepared-IP objective. Component gradients below are isolated by masking
+	// row weights, while the aggregate full-objective gradient remains the
+	// transactional proposal/evaluation authority.
 	diagnostics := AOQTSidecarOptimizerDiagnostics{
 		PlannedSteps:       t.config.MaxSteps,
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
@@ -541,6 +553,10 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 			return summary, err
 		}
 		q3GainGrad, err := t.q3GainOnlyAngleGrad(rows, objective)
+		if err != nil {
+			return summary, err
+		}
+		protectedGradients, err := t.protectedComponentAngleGrads(rows, objective, set.Manifest.ObjectiveContract.WeightSums)
 		if err != nil {
 			return summary, err
 		}
@@ -557,7 +573,7 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 		}, func() (aoqtStepEvaluation, error) {
 			loss, _, activation, components, err := t.lossAndAngleGrad(rows, objective)
 			return aoqtStepEvaluation{loss: loss, activation: activation, components: components}, err
-		}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
+		}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protectedGradients)
 		if err != nil {
 			return summary, err
 		}
@@ -610,6 +626,15 @@ type aoqtStepEvaluation struct {
 	components AOQTSidecarObjectiveComponents
 }
 
+// aoqtProtectedAngleGradient is an angle-space gradient for one of the
+// non-q3-gain objective components. It is used only while constructing the
+// sparse proposal tail; transactional evaluation remains the authority on
+// the actual candidate objective and gates.
+type aoqtProtectedAngleGradient struct {
+	Name string
+	Grad []float32
+}
+
 type aoqtOptimizerState struct {
 	angles []float32
 	adamM  []float32
@@ -618,15 +643,17 @@ type aoqtOptimizerState struct {
 }
 
 const (
-	aoqtTransactionalMaxAttemptsPerStep              = 80
-	aoqtTransactionalAdamMaxAttemptsPerStep          = 4
-	aoqtTransactionalCoordinateTopAngles             = 8
-	aoqtTransactionalCoordinateMagnitudeCount        = 6
-	aoqtTransactionalCoordinateBlockMagnitudeCount   = 4
-	aoqtTransactionalCoordinateReverseMagnitudeCount = 2
-	aoqtCoordinateSearchStrategyQ3GainPrimary        = "q3_gain_primary_fine_tail_v1"
-	aoqtTransactionalLossEpsilon                     = float32(1e-7)
-	aoqtTransactionalQ3ImprovementMinMagnitude       = float32(0)
+	aoqtTransactionalMaxAttemptsPerStep                = 80
+	aoqtTransactionalAdamMaxAttemptsPerStep            = 4
+	aoqtTransactionalCoordinateTopAngles               = 8
+	aoqtTransactionalCoordinateMagnitudeCount          = 6
+	aoqtTransactionalCoordinateBlockMagnitudeCount     = 4
+	aoqtTransactionalCoordinateReverseMagnitudeCount   = 2
+	aoqtTransactionalCoordinateMicroTailMagnitudeCount = 3
+	aoqtCoordinateSearchStrategyLegacyQ3GainPrimary    = "q3_gain_primary_fine_tail_v1"
+	aoqtCoordinateSearchStrategyProtectedConeMicroTail = "q3_gain_protected_cone_micro_tail_v2"
+	aoqtTransactionalLossEpsilon                       = float32(1e-7)
+	aoqtTransactionalQ3ImprovementMinMagnitude         = float32(0)
 )
 
 var aoqtTransactionalCoordinateBlockSizes = []int{2, 4, 8}
@@ -907,7 +934,7 @@ func formatAOQTDiagnosticFloat(value float32) string {
 	return fmt.Sprintf("%.9g", value)
 }
 
-func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []float32, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics) (bool, error) {
+func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []float32, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics, protectedGradientSets ...[]aoqtProtectedAngleGradient) (bool, error) {
 	if evaluate == nil {
 		return false, fmt.Errorf("AOQT transactional optimizer evaluator is required")
 	}
@@ -925,6 +952,15 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []floa
 	}
 	if len(q3GainGrad) != len(grad) {
 		return false, fmt.Errorf("AOQT q3-gain coordinate gradient count = %d, want %d", len(q3GainGrad), len(grad))
+	}
+	protectedGradients, protectedSetProvided, err := aoqtParseProtectedGradientSets(protectedGradientSets)
+	if err != nil {
+		return false, err
+	}
+	if protectedSetProvided {
+		if err := validateAOQTProtectedGradientSet(protectedGradients, weights, len(grad)); err != nil {
+			return false, err
+		}
 	}
 	state := t.snapshotOptimizerState()
 	scale := float32(1)
@@ -955,7 +991,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []floa
 		diagnostics.Backtracks++
 		scale *= 0.5
 	}
-	accepted, err := t.acceptTransactionalCoordinateStep(grad, q3GainGrad, state, baseline, evaluate, weights, diagnostics, attemptsThisStep)
+	accepted, err := t.acceptTransactionalCoordinateStep(grad, q3GainGrad, state, baseline, evaluate, weights, diagnostics, attemptsThisStep, protectedGradientSets...)
 	if err != nil || accepted {
 		return accepted, err
 	}
@@ -963,8 +999,19 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []floa
 	return false, nil
 }
 
-func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad []float32, state aoqtOptimizerState, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics, attemptsThisStep int) (bool, error) {
-	plan, err := newAOQTCoordinateSearchPlan(q3GainGrad, grad, t.config.LearningRate)
+func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad []float32, state aoqtOptimizerState, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics, attemptsThisStep int, protectedGradientSets ...[]aoqtProtectedAngleGradient) (bool, error) {
+	protectedGradients, protectedSetProvided, err := aoqtParseProtectedGradientSets(protectedGradientSets)
+	if err != nil {
+		t.restoreOptimizerState(state)
+		return false, err
+	}
+	if protectedSetProvided {
+		if err := validateAOQTProtectedGradientSet(protectedGradients, weights, len(grad)); err != nil {
+			t.restoreOptimizerState(state)
+			return false, err
+		}
+	}
+	plan, err := newAOQTCoordinateSearchPlan(q3GainGrad, grad, t.config.LearningRate, protectedGradients)
 	if err != nil {
 		t.restoreOptimizerState(state)
 		return false, err
@@ -973,16 +1020,39 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 		t.restoreOptimizerState(state)
 		return false, nil
 	}
+	diagnostics.CoordinateSearchPlanCount++
 	diagnostics.CoordinateTopAngles = len(plan.Order)
 	diagnostics.CoordinateMagnitudeCount = len(plan.Magnitudes)
 	diagnostics.CoordinateBlockCount = len(plan.BlockSizes)
 	diagnostics.CoordinateSearchStrategy = plan.Strategy
-	if hash, err := plan.SHA256(); err != nil {
+	diagnostics.CoordinateSearchLearningRate = plan.LearningRate
+	audit, err := plan.coordinateSearchAuditJSON()
+	if err != nil {
 		t.restoreOptimizerState(state)
 		return false, err
-	} else {
-		diagnostics.CoordinateSearchOrderingHash = hash
 	}
+	diagnostics.CoordinateSearchAudit = string(audit)
+	auditChain, err := appendAOQTCoordinateSearchAuditChain(diagnostics.CoordinateSearchAuditChain, string(audit))
+	if err != nil {
+		t.restoreOptimizerState(state)
+		return false, err
+	}
+	hashChain, err := appendAOQTCoordinateSearchHashChain(diagnostics.CoordinateSearchHashChain, string(audit))
+	if err != nil {
+		t.restoreOptimizerState(state)
+		return false, err
+	}
+	var linkedHashes []string
+	if err := strictUnmarshalAOQT([]byte(hashChain), &linkedHashes); err != nil || len(linkedHashes) == 0 {
+		t.restoreOptimizerState(state)
+		if err != nil {
+			return false, fmt.Errorf("AOQT coordinate search hash chain is invalid after append: %w", err)
+		}
+		return false, fmt.Errorf("AOQT coordinate search hash chain is empty after append")
+	}
+	diagnostics.CoordinateSearchOrderingHash = linkedHashes[len(linkedHashes)-1]
+	diagnostics.CoordinateSearchAuditChain = auditChain
+	diagnostics.CoordinateSearchHashChain = hashChain
 	tryProposal := func(apply func()) (bool, error) {
 		if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
 			return false, nil
@@ -1015,9 +1085,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 	}
 	for _, magnitude := range plan.BlockMagnitudes {
 		for _, blockSize := range plan.BlockSizes {
+			if len(plan.ProtectedComponents) > 0 && !aoqtCoordinateBlockDirectionInCone(plan.Order[:blockSize], q3GainGrad, protectedGradients) {
+				continue
+			}
 			accepted, err := tryProposal(func() {
 				for _, ranked := range plan.Order[:blockSize] {
-					t.angles[ranked.index] += aoqtCoordinateSearchPrimaryDirection(q3GainGrad[ranked.index]) * magnitude
+					t.angles[ranked.index] += ranked.primaryDirection * magnitude
 				}
 			})
 			if err != nil || accepted {
@@ -1026,7 +1099,10 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 		}
 	}
 	for _, ranked := range plan.Order {
-		direction := aoqtCoordinateSearchPrimaryDirection(q3GainGrad[ranked.index])
+		if len(plan.ProtectedComponents) > 0 && ranked.protectedConflictCount > 0 {
+			continue
+		}
+		direction := ranked.primaryDirection
 		for _, magnitude := range plan.Magnitudes {
 			accepted, err := tryProposal(func() {
 				t.angles[ranked.index] += direction * magnitude
@@ -1039,6 +1115,10 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 				return false, nil
 			}
 		}
+	}
+	if len(plan.ProtectedComponents) > 0 {
+		t.restoreOptimizerState(state)
+		return false, nil
 	}
 	for _, ranked := range plan.Order {
 		direction := -aoqtCoordinateSearchPrimaryDirection(q3GainGrad[ranked.index])
@@ -1121,23 +1201,36 @@ func aoqtEvaluateTransactionalStep(baseline, candidate aoqtStepEvaluation, weigh
 }
 
 type aoqtCoordinateSearchRank struct {
-	index         int
-	abs           float32
-	guardConflict bool
-	aggregateAbs  float32
+	index                             int
+	abs                               float32
+	guardConflict                     bool
+	aggregateAbs                      float32
+	aggregateGradient                 float32
+	primaryDirection                  float32
+	protectedConflictCount            int
+	protectedMaxDirectionalDerivative float32
+	protectedDirectionalDerivatives   []float32
 }
 
 type aoqtCoordinateSearchPlan struct {
-	Strategy          string
-	Order             []aoqtCoordinateSearchRank
-	Magnitudes        []float32
-	BlockMagnitudes   []float32
-	ReverseMagnitudes []float32
-	BlockSizes        []int
+	Strategy            string
+	LearningRate        float32
+	Order               []aoqtCoordinateSearchRank
+	FullOrder           []aoqtCoordinateSearchRank
+	Magnitudes          []float32
+	BlockMagnitudes     []float32
+	ReverseMagnitudes   []float32
+	MicroTailMagnitudes []float32
+	BlockSizes          []int
+	ProtectedComponents []string
 }
 
-func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRate float32) (aoqtCoordinateSearchPlan, error) {
-	order, err := rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad)
+func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRate float32, protectedGradientSets ...[]aoqtProtectedAngleGradient) (aoqtCoordinateSearchPlan, error) {
+	protectedGradients, _, err := aoqtParseProtectedGradientSets(protectedGradientSets)
+	if err != nil {
+		return aoqtCoordinateSearchPlan{}, err
+	}
+	order, err := rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad, protectedGradients)
 	if err != nil {
 		return aoqtCoordinateSearchPlan{}, err
 	}
@@ -1145,24 +1238,64 @@ func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRa
 	if len(order) < top {
 		top = len(order)
 	}
-	order = append([]aoqtCoordinateSearchRank(nil), order[:top]...)
+	fullOrder := append([]aoqtCoordinateSearchRank(nil), order...)
+	order = append([]aoqtCoordinateSearchRank(nil), fullOrder[:top]...)
 	magnitudes := aoqtCoordinateSearchMagnitudes(learningRate)
 	if len(magnitudes) == 0 {
 		return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT coordinate search requires at least one finite positive magnitude")
 	}
+	strategy := aoqtCoordinateSearchStrategyLegacyQ3GainPrimary
+	blockMagnitudes := aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateBlockMagnitudeCount)
+	reverseMagnitudes := aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateReverseMagnitudeCount)
+	microTailMagnitudes := []float32(nil)
+	protectedComponents := aoqtProtectedGradientNames(protectedGradients)
+	if len(protectedComponents) > 0 {
+		strategy = aoqtCoordinateSearchStrategyProtectedConeMicroTail
+		microTailMagnitudes = aoqtCoordinateSearchMicroTail(magnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+		if len(microTailMagnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+			return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT protected coordinate search requires exactly %d finite positive micro-tail magnitudes, got %d", aoqtTransactionalCoordinateMicroTailMagnitudeCount, len(microTailMagnitudes))
+		}
+		// The new strategy is deliberately a q3-descent-only tail. Reverse
+		// probes are first-order q3 ascent and therefore cannot be in the
+		// requested q3/protected cone.
+		blockMagnitudes = append([]float32(nil), microTailMagnitudes...)
+		magnitudes = append([]float32(nil), microTailMagnitudes...)
+		reverseMagnitudes = nil
+	}
 	return aoqtCoordinateSearchPlan{
-		Strategy:          aoqtCoordinateSearchStrategyQ3GainPrimary,
-		Order:             order,
-		Magnitudes:        magnitudes,
-		BlockMagnitudes:   aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateBlockMagnitudeCount),
-		ReverseMagnitudes: aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateReverseMagnitudeCount),
-		BlockSizes:        aoqtCoordinateSearchBlockSizes(top),
+		Strategy:            strategy,
+		LearningRate:        learningRate,
+		Order:               order,
+		FullOrder:           fullOrder,
+		Magnitudes:          magnitudes,
+		BlockMagnitudes:     blockMagnitudes,
+		ReverseMagnitudes:   reverseMagnitudes,
+		MicroTailMagnitudes: microTailMagnitudes,
+		BlockSizes:          aoqtCoordinateSearchBlockSizes(top),
+		ProtectedComponents: protectedComponents,
 	}, nil
 }
 
-func rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad []float32) ([]aoqtCoordinateSearchRank, error) {
+func rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad []float32, protectedGradientSets ...[]aoqtProtectedAngleGradient) ([]aoqtCoordinateSearchRank, error) {
 	if len(q3GainGrad) != len(aggregateGrad) {
 		return nil, fmt.Errorf("AOQT coordinate search aggregate gradient count = %d, want %d", len(aggregateGrad), len(q3GainGrad))
+	}
+	protectedGradients, _, err := aoqtParseProtectedGradientSets(protectedGradientSets)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAOQTProtectedGradientNames(protectedGradients); err != nil {
+		return nil, err
+	}
+	for _, protected := range protectedGradients {
+		if len(protected.Grad) != len(q3GainGrad) {
+			return nil, fmt.Errorf("AOQT coordinate search protected component %q gradient count = %d, want %d", protected.Name, len(protected.Grad), len(q3GainGrad))
+		}
+		for i, value := range protected.Grad {
+			if !isFinite32(value) {
+				return nil, fmt.Errorf("AOQT coordinate search protected component %q gradient %d is not finite", protected.Name, i)
+			}
+		}
 	}
 	order := make([]aoqtCoordinateSearchRank, 0, len(q3GainGrad))
 	for i, q3g := range q3GainGrad {
@@ -1177,26 +1310,231 @@ func rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad []float32) ([]ao
 		if abs == 0 {
 			continue
 		}
+		primaryDirection := aoqtCoordinateSearchPrimaryDirection(q3g)
+		protectedDirectionalDerivatives := make([]float32, len(protectedGradients))
+		protectedConflictCount := 0
+		var protectedMaxDirectionalDerivative float32
+		for pi, protected := range protectedGradients {
+			derivative := protected.Grad[i] * primaryDirection
+			protectedDirectionalDerivatives[pi] = derivative
+			if derivative > 0 {
+				protectedConflictCount++
+				if derivative > protectedMaxDirectionalDerivative {
+					protectedMaxDirectionalDerivative = derivative
+				}
+			}
+		}
 		order = append(order, aoqtCoordinateSearchRank{
-			index:         i,
-			abs:           abs,
-			guardConflict: q3g*ag < 0,
-			aggregateAbs:  float32(math.Abs(float64(ag))),
+			index:                             i,
+			abs:                               abs,
+			guardConflict:                     q3g*ag < 0 || protectedConflictCount > 0,
+			aggregateAbs:                      float32(math.Abs(float64(ag))),
+			aggregateGradient:                 ag,
+			primaryDirection:                  primaryDirection,
+			protectedConflictCount:            protectedConflictCount,
+			protectedMaxDirectionalDerivative: protectedMaxDirectionalDerivative,
+			protectedDirectionalDerivatives:   protectedDirectionalDerivatives,
 		})
 	}
 	sort.SliceStable(order, func(i, j int) bool {
-		if order[i].abs == order[j].abs {
-			if order[i].guardConflict != order[j].guardConflict {
-				return !order[i].guardConflict
-			}
-			if order[i].aggregateAbs != order[j].aggregateAbs {
-				return order[i].aggregateAbs > order[j].aggregateAbs
-			}
-			return order[i].index < order[j].index
-		}
-		return order[i].abs > order[j].abs
+		return aoqtCoordinateSearchRankLess(order[i], order[j], len(protectedGradients) > 0)
 	})
 	return order, nil
+}
+
+func aoqtCoordinateSearchRankLess(a, b aoqtCoordinateSearchRank, protected bool) bool {
+	if protected {
+		if a.protectedConflictCount != b.protectedConflictCount {
+			return a.protectedConflictCount < b.protectedConflictCount
+		}
+		if a.protectedMaxDirectionalDerivative != b.protectedMaxDirectionalDerivative {
+			return a.protectedMaxDirectionalDerivative < b.protectedMaxDirectionalDerivative
+		}
+	}
+	if a.abs == b.abs {
+		if a.guardConflict != b.guardConflict {
+			return !a.guardConflict
+		}
+		if a.aggregateAbs != b.aggregateAbs {
+			return a.aggregateAbs > b.aggregateAbs
+		}
+		return a.index < b.index
+	}
+	return a.abs > b.abs
+}
+
+func aoqtParseProtectedGradientSets(gradientSets [][]aoqtProtectedAngleGradient) ([]aoqtProtectedAngleGradient, bool, error) {
+	switch len(gradientSets) {
+	case 0:
+		// Omitted protected gradients preserve the historical q3-only caller
+		// contract. Fit always supplies exactly one set, including an empty set
+		// when no protected component has positive manifest weight.
+		return nil, false, nil
+	case 1:
+		return gradientSets[0], true, nil
+	default:
+		return nil, false, fmt.Errorf("AOQT protected gradient sets = %d, want at most one explicit set", len(gradientSets))
+	}
+}
+
+func aoqtProtectedGradientNames(gradients []aoqtProtectedAngleGradient) []string {
+	if len(gradients) == 0 {
+		return nil
+	}
+	names := make([]string, len(gradients))
+	for i, gradient := range gradients {
+		names[i] = gradient.Name
+	}
+	return names
+}
+
+func aoqtActiveProtectedComponentNames(weights AOQTSidecarRowWeights) []string {
+	components := []struct {
+		name   string
+		weight float32
+	}{
+		{"q3_order_guard", weights.Q3OrderGuard},
+		{"q3_score_distill", weights.Q3ScoreDistill},
+		{"q5_order_guard", weights.Q5OrderGuard},
+		{"q5_score_distill", weights.Q5ScoreDistill},
+		{"nf_boundary_guard", weights.NFBoundaryGuard},
+	}
+	names := make([]string, 0, len(components))
+	for _, component := range components {
+		if component.weight > 0 {
+			names = append(names, component.name)
+		}
+	}
+	return names
+}
+
+func aoqtStringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateAOQTProtectedGradientSet(gradients []aoqtProtectedAngleGradient, weights AOQTSidecarRowWeights, dimension int) error {
+	if err := validateAOQTProtectedGradientNames(gradients); err != nil {
+		return err
+	}
+	wantNames := aoqtActiveProtectedComponentNames(weights)
+	gotNames := aoqtProtectedGradientNames(gradients)
+	if !aoqtStringSlicesEqual(gotNames, wantNames) {
+		return fmt.Errorf("AOQT protected gradient components = %v, want active components %v", gotNames, wantNames)
+	}
+	for _, gradient := range gradients {
+		if len(gradient.Grad) != dimension {
+			return fmt.Errorf("AOQT protected component %q gradient count = %d, want %d", gradient.Name, len(gradient.Grad), dimension)
+		}
+		for i, value := range gradient.Grad {
+			if !isFinite32(value) {
+				return fmt.Errorf("AOQT protected component %q gradient %d is not finite", gradient.Name, i)
+			}
+		}
+	}
+	return nil
+}
+
+func validateAOQTProtectedGradientNames(gradients []aoqtProtectedAngleGradient) error {
+	seen := make(map[string]struct{}, len(gradients))
+	for _, gradient := range gradients {
+		if strings.TrimSpace(gradient.Name) == "" {
+			return fmt.Errorf("AOQT protected gradient component name is required")
+		}
+		if _, ok := seen[gradient.Name]; ok {
+			return fmt.Errorf("AOQT protected gradient component %q is duplicated", gradient.Name)
+		}
+		seen[gradient.Name] = struct{}{}
+		switch gradient.Name {
+		case "q3_order_guard", "q3_score_distill", "q5_order_guard", "q5_score_distill", "nf_boundary_guard":
+		default:
+			return fmt.Errorf("AOQT protected gradient component %q is not a recognized protected component", gradient.Name)
+		}
+	}
+	return nil
+}
+
+func aoqtCoordinateSearchMicroTail(magnitudes []float32, count int) []float32 {
+	if count <= 0 || len(magnitudes) == 0 {
+		return nil
+	}
+	if count > len(magnitudes) {
+		count = len(magnitudes)
+	}
+	start := len(magnitudes) - count
+	return append([]float32(nil), magnitudes[start:]...)
+}
+
+// aoqtCoordinateBlockDirectionInCone checks the exact first-order invariant
+// used by the proposal selector. For a loss gradient p and angle direction d,
+// p·d <= 0 is the protected non-regression half-space. The q3-gain gradient
+// must additionally satisfy g3·d < 0. The full objective is still evaluated
+// after this proposal-only filter, so these checks never replace acceptance.
+func aoqtCoordinateBlockDirectionInCone(order []aoqtCoordinateSearchRank, q3GainGrad []float32, protected []aoqtProtectedAngleGradient) bool {
+	if len(order) == 0 {
+		return false
+	}
+	for _, gradient := range protected {
+		if len(gradient.Grad) != len(q3GainGrad) {
+			return false
+		}
+		for _, value := range gradient.Grad {
+			if !isFinite32(value) {
+				return false
+			}
+		}
+	}
+	q3Derivative := float64(0)
+	for _, ranked := range order {
+		if ranked.index < 0 || ranked.index >= len(q3GainGrad) || !isFinite32(q3GainGrad[ranked.index]) || !isFinite32(ranked.primaryDirection) {
+			return false
+		}
+		q3Derivative += float64(q3GainGrad[ranked.index]) * float64(ranked.primaryDirection)
+	}
+	if !(q3Derivative < 0) {
+		return false
+	}
+	for _, gradient := range protected {
+		derivative := float64(0)
+		for _, ranked := range order {
+			derivative += float64(gradient.Grad[ranked.index]) * float64(ranked.primaryDirection)
+		}
+		if math.IsNaN(derivative) || math.IsInf(derivative, 0) || derivative > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func aoqtDirectionInProtectedCone(direction []float32, protected []aoqtProtectedAngleGradient) bool {
+	for _, value := range direction {
+		if !isFinite32(value) {
+			return false
+		}
+	}
+	for _, gradient := range protected {
+		if len(gradient.Grad) != len(direction) {
+			return false
+		}
+		derivative := float64(0)
+		for i, value := range direction {
+			if !isFinite32(gradient.Grad[i]) {
+				return false
+			}
+			derivative += float64(value) * float64(gradient.Grad[i])
+		}
+		if derivative > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func aoqtCoordinateSearchDirections(gradient float32) [2]float32 {
@@ -1243,39 +1581,142 @@ func aoqtCoordinateSearchBlockSizes(top int) []int {
 	return blockSizes
 }
 
-func (plan aoqtCoordinateSearchPlan) SHA256() (string, error) {
-	payload := struct {
-		Strategy string `json:"strategy"`
-		Order    []struct {
-			Index         int     `json:"index"`
-			Abs           float32 `json:"abs"`
-			GuardConflict bool    `json:"guard_conflict"`
-			AggregateAbs  float32 `json:"aggregate_abs"`
-		} `json:"order"`
-		Magnitudes        []float32 `json:"magnitudes"`
-		BlockMagnitudes   []float32 `json:"block_magnitudes"`
-		ReverseMagnitudes []float32 `json:"reverse_magnitudes"`
-		BlockSizes        []int     `json:"block_sizes"`
-	}{
-		Strategy: plan.Strategy,
-		Order: make([]struct {
-			Index         int     `json:"index"`
-			Abs           float32 `json:"abs"`
-			GuardConflict bool    `json:"guard_conflict"`
-			AggregateAbs  float32 `json:"aggregate_abs"`
-		}, len(plan.Order)),
-		Magnitudes:        append([]float32(nil), plan.Magnitudes...),
-		BlockMagnitudes:   append([]float32(nil), plan.BlockMagnitudes...),
-		ReverseMagnitudes: append([]float32(nil), plan.ReverseMagnitudes...),
-		BlockSizes:        append([]int(nil), plan.BlockSizes...),
+type aoqtCoordinateSearchAuditOrder struct {
+	Index                             int       `json:"index"`
+	Abs                               float32   `json:"abs"`
+	GuardConflict                     bool      `json:"guard_conflict"`
+	AggregateAbs                      float32   `json:"aggregate_abs"`
+	AggregateGradient                 float32   `json:"aggregate_gradient"`
+	PrimaryDirection                  float32   `json:"primary_direction"`
+	ProtectedConflictCount            int       `json:"protected_conflict_count"`
+	ProtectedMaxDirectionalDerivative float32   `json:"protected_max_directional_derivative"`
+	ProtectedDirectionalDerivatives   []float32 `json:"protected_directional_derivatives"`
+}
+
+type aoqtCoordinateSearchAuditPayload struct {
+	Strategy            string                           `json:"strategy"`
+	LearningRate        float32                          `json:"learning_rate"`
+	ProtectedComponents []string                         `json:"protected_components"`
+	Order               []aoqtCoordinateSearchAuditOrder `json:"order"`
+	FullOrder           []aoqtCoordinateSearchAuditOrder `json:"full_order"`
+	FullOrderSHA256     string                           `json:"full_order_sha256"`
+	Magnitudes          []float32                        `json:"magnitudes"`
+	BlockMagnitudes     []float32                        `json:"block_magnitudes"`
+	ReverseMagnitudes   []float32                        `json:"reverse_magnitudes"`
+	MicroTailMagnitudes []float32                        `json:"micro_tail_magnitudes"`
+	BlockSizes          []int                            `json:"block_sizes"`
+}
+
+func aoqtCoordinateSearchAuditOrderFromRank(item aoqtCoordinateSearchRank) aoqtCoordinateSearchAuditOrder {
+	return aoqtCoordinateSearchAuditOrder{
+		Index:                             item.index,
+		Abs:                               item.abs,
+		GuardConflict:                     item.guardConflict,
+		AggregateAbs:                      item.aggregateAbs,
+		AggregateGradient:                 item.aggregateGradient,
+		PrimaryDirection:                  item.primaryDirection,
+		ProtectedConflictCount:            item.protectedConflictCount,
+		ProtectedMaxDirectionalDerivative: item.protectedMaxDirectionalDerivative,
+		ProtectedDirectionalDerivatives:   append([]float32(nil), item.protectedDirectionalDerivatives...),
+	}
+}
+
+func (plan aoqtCoordinateSearchPlan) coordinateSearchAuditPayload() aoqtCoordinateSearchAuditPayload {
+	payload := aoqtCoordinateSearchAuditPayload{
+		Strategy:            plan.Strategy,
+		LearningRate:        plan.LearningRate,
+		ProtectedComponents: append([]string(nil), plan.ProtectedComponents...),
+		Order:               make([]aoqtCoordinateSearchAuditOrder, len(plan.Order)),
+		FullOrder:           make([]aoqtCoordinateSearchAuditOrder, len(plan.FullOrder)),
+		Magnitudes:          append([]float32(nil), plan.Magnitudes...),
+		BlockMagnitudes:     append([]float32(nil), plan.BlockMagnitudes...),
+		ReverseMagnitudes:   append([]float32(nil), plan.ReverseMagnitudes...),
+		MicroTailMagnitudes: append([]float32(nil), plan.MicroTailMagnitudes...),
+		BlockSizes:          append([]int(nil), plan.BlockSizes...),
 	}
 	for i, item := range plan.Order {
-		payload.Order[i].Index = item.index
-		payload.Order[i].Abs = item.abs
-		payload.Order[i].GuardConflict = item.guardConflict
-		payload.Order[i].AggregateAbs = item.aggregateAbs
+		payload.Order[i] = aoqtCoordinateSearchAuditOrderFromRank(item)
 	}
-	data, err := json.Marshal(payload)
+	for i, item := range plan.FullOrder {
+		payload.FullOrder[i] = aoqtCoordinateSearchAuditOrderFromRank(item)
+	}
+	fullOrderJSON, err := json.Marshal(payload.FullOrder)
+	if err == nil {
+		sum := sha256.Sum256(fullOrderJSON)
+		payload.FullOrderSHA256 = hex.EncodeToString(sum[:])
+	}
+	return payload
+}
+
+func (plan aoqtCoordinateSearchPlan) coordinateSearchAuditJSON() ([]byte, error) {
+	return json.Marshal(plan.coordinateSearchAuditPayload())
+}
+
+func appendAOQTCoordinateSearchAuditChain(existing, item string) (string, error) {
+	chain := make([]string, 0, 1)
+	if strings.TrimSpace(existing) != "" {
+		if err := strictUnmarshalAOQT([]byte(existing), &chain); err != nil {
+			return "", fmt.Errorf("AOQT coordinate search audit chain is invalid: %w", err)
+		}
+		if len(chain) == 0 {
+			return "", fmt.Errorf("AOQT coordinate search audit chain must preserve a non-empty history")
+		}
+		canonical, err := json.Marshal(chain)
+		if err != nil {
+			return "", err
+		}
+		if string(canonical) != existing {
+			return "", fmt.Errorf("AOQT coordinate search audit chain is not canonical JSON")
+		}
+	}
+	chain = append(chain, item)
+	data, err := json.Marshal(chain)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func appendAOQTCoordinateSearchHashChain(existing, audit string) (string, error) {
+	chain := make([]string, 0, 1)
+	if strings.TrimSpace(existing) != "" {
+		if err := strictUnmarshalAOQT([]byte(existing), &chain); err != nil {
+			return "", fmt.Errorf("AOQT coordinate search hash chain is invalid: %w", err)
+		}
+		if len(chain) == 0 {
+			return "", fmt.Errorf("AOQT coordinate search hash chain must preserve a non-empty history")
+		}
+		canonical, err := json.Marshal(chain)
+		if err != nil {
+			return "", err
+		}
+		if string(canonical) != existing {
+			return "", fmt.Errorf("AOQT coordinate search hash chain is not canonical JSON")
+		}
+	}
+	previous := ""
+	if len(chain) > 0 {
+		previous = chain[len(chain)-1]
+	}
+	linked := sha256AOQTCoordinateSearchChainEntry(previous, audit)
+	chain = append(chain, linked)
+	data, err := json.Marshal(chain)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func sha256AOQTCoordinateSearchChainEntry(previous, audit string) string {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(previous))
+	_, _ = hash.Write([]byte{0})
+	_, _ = hash.Write([]byte(audit))
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func (plan aoqtCoordinateSearchPlan) SHA256() (string, error) {
+	data, err := plan.coordinateSearchAuditJSON()
 	if err != nil {
 		return "", err
 	}
@@ -1441,16 +1882,56 @@ func (t *AOQTSidecarTrainer) lossAndAngleGrad(rows []AOQTSidecarCalibrationRow, 
 }
 
 func (t *AOQTSidecarTrainer) q3GainOnlyAngleGrad(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective) ([]float32, error) {
-	q3Rows := make([]AOQTSidecarCalibrationRow, len(rows))
-	for i, row := range rows {
-		row.Weights = AOQTSidecarRowWeights{Q3Gain: row.Weights.Q3Gain}
-		q3Rows[i] = row
-	}
-	_, grad, _, _, err := t.lossAndAngleGrad(q3Rows, objective)
+	grad, err := t.componentOnlyAngleGrad(rows, objective, "q3_gain")
 	if err != nil {
 		return nil, err
 	}
 	return grad, nil
+}
+
+func (t *AOQTSidecarTrainer) protectedComponentAngleGrads(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective, weights AOQTSidecarRowWeights) ([]aoqtProtectedAngleGradient, error) {
+	components := aoqtActiveProtectedComponentNames(weights)
+	gradients := make([]aoqtProtectedAngleGradient, 0, len(components))
+	for _, component := range components {
+		grad, err := t.componentOnlyAngleGrad(rows, objective, component)
+		if err != nil {
+			return nil, fmt.Errorf("AOQT protected component %s angle gradient: %w", component, err)
+		}
+		gradients = append(gradients, aoqtProtectedAngleGradient{Name: component, Grad: grad})
+	}
+	return gradients, nil
+}
+
+func (t *AOQTSidecarTrainer) componentOnlyAngleGrad(rows []AOQTSidecarCalibrationRow, objective AOQTSidecarVectorObjective, component string) ([]float32, error) {
+	componentRows := make([]AOQTSidecarCalibrationRow, len(rows))
+	for i, row := range rows {
+		row.Weights = aoqtOnlyComponentWeights(row.Weights, component)
+		componentRows[i] = row
+	}
+	_, grad, _, _, err := t.lossAndAngleGrad(componentRows, objective)
+	if err != nil {
+		return nil, err
+	}
+	return grad, nil
+}
+
+func aoqtOnlyComponentWeights(weights AOQTSidecarRowWeights, component string) AOQTSidecarRowWeights {
+	switch component {
+	case "q3_gain":
+		return AOQTSidecarRowWeights{Q3Gain: weights.Q3Gain}
+	case "q3_order_guard":
+		return AOQTSidecarRowWeights{Q3OrderGuard: weights.Q3OrderGuard}
+	case "q3_score_distill":
+		return AOQTSidecarRowWeights{Q3ScoreDistill: weights.Q3ScoreDistill}
+	case "q5_order_guard":
+		return AOQTSidecarRowWeights{Q5OrderGuard: weights.Q5OrderGuard}
+	case "q5_score_distill":
+		return AOQTSidecarRowWeights{Q5ScoreDistill: weights.Q5ScoreDistill}
+	case "nf_boundary_guard":
+		return AOQTSidecarRowWeights{NFBoundaryGuard: weights.NFBoundaryGuard}
+	default:
+		return AOQTSidecarRowWeights{}
+	}
 }
 
 func validateAOQTObjectiveComponents(components AOQTSidecarObjectiveComponents, label string) error {

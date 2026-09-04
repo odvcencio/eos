@@ -42,7 +42,9 @@ type AOQTSidecarTrainRunnerResult struct {
 
 type aoqtRunnerObjectiveFactory func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error)
 
-const AOQTSidecarFailClosedDiagnosticsSchema = "eos.q3_aoqt_sidecar_failclosed_diagnostics.v1"
+// v2 binds fail-closed optimizer evidence to the protected-cone coordinate
+// audit contract. Older v1 diagnostics are intentionally not relabeled.
+const AOQTSidecarFailClosedDiagnosticsSchema = "eos.q3_aoqt_sidecar_failclosed_diagnostics.v2"
 
 type AOQTSidecarFailClosedDiagnostics struct {
 	Schema            string                          `json:"schema"`
@@ -471,7 +473,7 @@ func (d AOQTSidecarFailClosedDiagnostics) Validate() error {
 	if optimizer.RejectionDiagnostics.CandidateEvaluations != optimizer.ProposalAttempts {
 		return fmt.Errorf("AOQT fail-closed diagnostics candidate_evaluations = %d, want proposal_attempts %d", optimizer.RejectionDiagnostics.CandidateEvaluations, optimizer.ProposalAttempts)
 	}
-	if err := validateAOQTFailClosedOptimizerPathDiagnostics(optimizer); err != nil {
+	if err := validateAOQTFailClosedOptimizerPathDiagnostics(d.Plan, d.ObjectiveContract.WeightSums, optimizer); err != nil {
 		return err
 	}
 	if d.RejectionSummary != optimizer.RejectionSummary() {
@@ -535,7 +537,7 @@ func validateAOQTFailClosedPreflightRawBinding(preflight AOQTSidecarMaterializeP
 	return nil
 }
 
-func validateAOQTFailClosedOptimizerPathDiagnostics(diagnostics AOQTSidecarOptimizerDiagnostics) error {
+func validateAOQTFailClosedOptimizerPathDiagnostics(plan AOQTSidecarWorkPlan, weights AOQTSidecarRowWeights, diagnostics AOQTSidecarOptimizerDiagnostics) error {
 	for _, item := range []struct {
 		name  string
 		value int
@@ -558,7 +560,19 @@ func validateAOQTFailClosedOptimizerPathDiagnostics(diagnostics AOQTSidecarOptim
 		diagnostics.CoordinateAcceptedProposals != 0 ||
 		diagnostics.CoordinateRejectedProposals != 0
 	if !hasPathDiagnostics {
+		if diagnostics.CoordinateSearchPlanCount != 0 || diagnostics.CoordinateSearchStrategy != "" || diagnostics.CoordinateSearchOrderingHash != "" || diagnostics.CoordinateSearchLearningRate != 0 || diagnostics.CoordinateSearchAudit != "" || diagnostics.CoordinateSearchAuditChain != "" || diagnostics.CoordinateSearchHashChain != "" || diagnostics.CoordinateTopAngles != 0 || diagnostics.CoordinateMagnitudeCount != 0 || diagnostics.CoordinateBlockCount != 0 {
+			return fmt.Errorf("AOQT fail-closed diagnostics coordinate audit is present without optimizer path diagnostics")
+		}
 		return nil
+	}
+	if diagnostics.CoordinateSearchPlanCount < 0 {
+		return fmt.Errorf("AOQT fail-closed diagnostics coordinate_search_plan_count must be non-negative")
+	}
+	if diagnostics.CoordinateSearchPlanCount > diagnostics.AttemptedSteps {
+		return fmt.Errorf("AOQT fail-closed diagnostics coordinate_search_plan_count = %d exceeds attempted_steps %d", diagnostics.CoordinateSearchPlanCount, diagnostics.AttemptedSteps)
+	}
+	if diagnostics.CoordinateSearchPlanCount == 0 && (diagnostics.CoordinateProposalAttempts != 0 || diagnostics.CoordinateSearchStrategy != "" || diagnostics.CoordinateSearchOrderingHash != "" || diagnostics.CoordinateSearchLearningRate != 0 || diagnostics.CoordinateSearchAudit != "" || diagnostics.CoordinateSearchAuditChain != "" || diagnostics.CoordinateSearchHashChain != "" || diagnostics.CoordinateTopAngles != 0 || diagnostics.CoordinateMagnitudeCount != 0 || diagnostics.CoordinateBlockCount != 0) {
+		return fmt.Errorf("AOQT fail-closed diagnostics coordinate audit is present without coordinate plan history")
 	}
 	if diagnostics.AdamProposalAttempts != diagnostics.AdamAcceptedProposals+diagnostics.AdamRejectedProposals {
 		return fmt.Errorf("AOQT fail-closed diagnostics adam proposal accounting mismatch")
@@ -575,24 +589,24 @@ func validateAOQTFailClosedOptimizerPathDiagnostics(diagnostics AOQTSidecarOptim
 	if diagnostics.AdamRejectedProposals+diagnostics.CoordinateRejectedProposals != diagnostics.RejectedProposals {
 		return fmt.Errorf("AOQT fail-closed diagnostics optimizer-path rejected proposal accounting mismatch")
 	}
-	if diagnostics.CoordinateProposalAttempts > 0 {
-		if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyQ3GainPrimary {
-			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_search_strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyQ3GainPrimary)
+	if diagnostics.CoordinateSearchPlanCount > 0 {
+		if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail {
+			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_search_strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyProtectedConeMicroTail)
 		}
 		if diagnostics.CoordinateTopAngles <= 0 || diagnostics.CoordinateTopAngles > aoqtTransactionalCoordinateTopAngles {
 			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_top_angles = %d outside expected range", diagnostics.CoordinateTopAngles)
 		}
-		if diagnostics.CoordinateMagnitudeCount <= 0 || diagnostics.CoordinateMagnitudeCount > aoqtTransactionalCoordinateMagnitudeCount {
-			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_magnitude_count = %d outside expected range", diagnostics.CoordinateMagnitudeCount)
+		if diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+			return fmt.Errorf("AOQT fail-closed diagnostics protected coordinate_magnitude_count = %d, want exact micro-tail count %d", diagnostics.CoordinateMagnitudeCount, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+		}
+		if !isFinite32(diagnostics.CoordinateSearchLearningRate) || diagnostics.CoordinateSearchLearningRate <= 0 {
+			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_search_learning_rate must be finite and positive")
 		}
 		if diagnostics.CoordinateBlockCount < 0 || diagnostics.CoordinateBlockCount > len(aoqtTransactionalCoordinateBlockSizes) {
 			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_block_count = %d outside expected range", diagnostics.CoordinateBlockCount)
 		}
-		if strings.TrimSpace(diagnostics.CoordinateSearchOrderingHash) == "" {
-			return fmt.Errorf("AOQT fail-closed diagnostics coordinate_search_ordering_sha256 is required")
-		}
-		if err := validateAOQTSHA256(diagnostics.CoordinateSearchOrderingHash, "AOQT fail-closed diagnostics coordinate_search_ordering_sha256"); err != nil {
-			return err
+		if err := validateAOQTProtectedCoordinateSearchAudit(plan, weights, diagnostics); err != nil {
+			return fmt.Errorf("AOQT fail-closed diagnostics protected coordinate audit: %w", err)
 		}
 	}
 	return nil

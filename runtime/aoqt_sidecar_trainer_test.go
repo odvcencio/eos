@@ -1034,8 +1034,8 @@ func TestAOQTTransactionalCoordinateFallbackUsesQ3GainPrimaryGradient(t *testing
 	if diagnostics.CoordinateProposalAttempts != 1 || diagnostics.CoordinateAcceptedProposals != 1 || diagnostics.CoordinateRejectedProposals != 0 {
 		t.Fatalf("coordinate diagnostics = %+v, want first q3 coordinate accepted", diagnostics)
 	}
-	if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyQ3GainPrimary {
-		t.Fatalf("coordinate search strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyQ3GainPrimary)
+	if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyLegacyQ3GainPrimary {
+		t.Fatalf("coordinate search strategy = %q, want legacy %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyLegacyQ3GainPrimary)
 	}
 }
 
@@ -1177,7 +1177,7 @@ func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
 	}
 	magnitudes := []float32{0.01, 0.005}
 	plan := aoqtCoordinateSearchPlan{
-		Strategy:          aoqtCoordinateSearchStrategyQ3GainPrimary,
+		Strategy:          aoqtCoordinateSearchStrategyLegacyQ3GainPrimary,
 		Order:             order[:top],
 		Magnitudes:        magnitudes,
 		BlockMagnitudes:   aoqtCoordinateSearchMagnitudePrefix(magnitudes, 1),
@@ -1241,6 +1241,448 @@ func TestAOQTCoordinateSearchOrderingUsesQ3GainPrimaryTieBreaks(t *testing.T) {
 	}
 }
 
+func TestAOQTProtectedConeMicroTailPlanIsDeterministicAndAudited(t *testing.T) {
+	q3GainGrad := []float32{3, -2, 2, -1, 1, -4, 0, 0}
+	aggregateGrad := []float32{3, -2, -8, -1, 5, -4, 0, 0}
+	protected := []aoqtProtectedAngleGradient{
+		{Name: "q3_order_guard", Grad: []float32{-1, -1, 1, -1, 1, -1, 0, 0}},
+		{Name: "q3_score_distill", Grad: []float32{-2, -1, 1, -1, 1, -2, 0, 0}},
+		{Name: "q5_order_guard", Grad: []float32{-1, 0, 1, 0, 1, -1, 0, 0}},
+		{Name: "q5_score_distill", Grad: []float32{-1, -1, 1, -1, 1, -1, 0, 0}},
+		{Name: "nf_boundary_guard", Grad: []float32{-1, -1, 1, -1, 1, -1, 0, 0}},
+	}
+	a, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	if err != nil {
+		t.Fatalf("plan A: %v", err)
+	}
+	b, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	if err != nil {
+		t.Fatalf("plan B: %v", err)
+	}
+	if a.Strategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail {
+		t.Fatalf("strategy = %q, want %q", a.Strategy, aoqtCoordinateSearchStrategyProtectedConeMicroTail)
+	}
+	wantTail := []float32{0.00125, 0.000625, 0.0003125}
+	if !float32SlicesEqual(a.Magnitudes, wantTail) || !float32SlicesEqual(a.BlockMagnitudes, wantTail) || !float32SlicesEqual(a.MicroTailMagnitudes, wantTail) {
+		t.Fatalf("micro-tail magnitudes = %v/%v/%v, want %v", a.Magnitudes, a.BlockMagnitudes, a.MicroTailMagnitudes, wantTail)
+	}
+	if len(a.ReverseMagnitudes) != 0 {
+		t.Fatalf("reverse magnitudes = %v, want q3-descent-only tail", a.ReverseMagnitudes)
+	}
+	if fmt.Sprint(a.ProtectedComponents) != fmt.Sprint([]string{"q3_order_guard", "q3_score_distill", "q5_order_guard", "q5_score_distill", "nf_boundary_guard"}) {
+		t.Fatalf("protected components = %v, want fixed component order", a.ProtectedComponents)
+	}
+	ha, err := a.SHA256()
+	if err != nil {
+		t.Fatalf("plan A hash: %v", err)
+	}
+	hb, err := b.SHA256()
+	if err != nil {
+		t.Fatalf("plan B hash: %v", err)
+	}
+	if ha != hb {
+		t.Fatalf("protected plan hash is not deterministic: %s vs %s", ha, hb)
+	}
+	mutated := a
+	mutated.ProtectedComponents = append([]string(nil), a.ProtectedComponents...)
+	mutated.ProtectedComponents[0] = "tampered_component"
+	hc, err := mutated.SHA256()
+	if err != nil {
+		t.Fatalf("mutated plan hash: %v", err)
+	}
+	if ha == hc {
+		t.Fatalf("plan hash does not bind protected component identity: %s", ha)
+	}
+}
+
+func TestAOQTCoordinateSearchPlanKeepsLegacyProvenanceWithoutProtectedSet(t *testing.T) {
+	q3GainGrad := []float32{3, -2, 1, 0}
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	legacy, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01)
+	if err != nil {
+		t.Fatalf("legacy plan: %v", err)
+	}
+	if legacy.Strategy != aoqtCoordinateSearchStrategyLegacyQ3GainPrimary {
+		t.Fatalf("legacy strategy = %q, want %q", legacy.Strategy, aoqtCoordinateSearchStrategyLegacyQ3GainPrimary)
+	}
+	if len(legacy.Magnitudes) != aoqtTransactionalCoordinateMagnitudeCount || len(legacy.BlockMagnitudes) != aoqtTransactionalCoordinateBlockMagnitudeCount || len(legacy.ReverseMagnitudes) != aoqtTransactionalCoordinateReverseMagnitudeCount || len(legacy.MicroTailMagnitudes) != 0 || len(legacy.ProtectedComponents) != 0 {
+		t.Fatalf("legacy schedule/protected audit = %+v, want historical full schedule and no protected set", legacy)
+	}
+	protected := []aoqtProtectedAngleGradient{{Name: "q3_score_distill", Grad: []float32{-1, 0, -1, 0}}}
+	protectedPlan, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	if err != nil {
+		t.Fatalf("protected plan: %v", err)
+	}
+	if protectedPlan.Strategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail || len(protectedPlan.Magnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount || len(protectedPlan.ReverseMagnitudes) != 0 {
+		t.Fatalf("protected strategy/schedule = %+v, want exact protected micro-tail", protectedPlan)
+	}
+}
+
+func TestAOQTProtectedConeMicroTailRequiresThreeFiniteMagnitudes(t *testing.T) {
+	protected := []aoqtProtectedAngleGradient{{Name: "q3_score_distill", Grad: []float32{-1}}}
+	_, err := newAOQTCoordinateSearchPlan([]float32{1}, []float32{1}, math.SmallestNonzeroFloat32, protected)
+	if err == nil || !strings.Contains(err.Error(), "exactly 3 finite positive micro-tail magnitudes") {
+		t.Fatalf("subnormal learning-rate plan error = %v, want exact protected micro-tail rejection", err)
+	}
+}
+
+func TestAOQTProtectedGradientSetsRejectMultipleOrIncompleteSets(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 94)
+	enableTinyAOQTNFGuard(t, &set)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = 1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	one := []aoqtProtectedAngleGradient{{Name: "q3_order_guard", Grad: make([]float32, AOQTSidecarAngleCount)}}
+	if _, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, one, one); err == nil || !strings.Contains(err.Error(), "at most one explicit set") {
+		t.Fatalf("multiple protected gradient sets error = %v, want fail-closed variadic rejection", err)
+	}
+	unknown := []aoqtProtectedAngleGradient{{Name: "q3_score_distill_typo", Grad: make([]float32, AOQTSidecarAngleCount)}}
+	if _, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, unknown); err == nil || !strings.Contains(err.Error(), "not a recognized protected component") {
+		t.Fatalf("unknown protected component error = %v, want fail-closed component validation", err)
+	}
+	trainer := newTinyAOQTTrainer(t, false, 94)
+	stateBefore := trainer.snapshotOptimizerState()
+	evaluateCalls := 0
+	diagnostics := AOQTSidecarOptimizerDiagnostics{PlannedSteps: 1, MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep}
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		evaluateCalls++
+		return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, one)
+	if err == nil || !strings.Contains(err.Error(), "want active components") {
+		t.Fatalf("incomplete protected gradient set error = %v, want active-component validation", err)
+	}
+	if accepted || evaluateCalls != 0 {
+		t.Fatalf("incomplete protected set accepted=%t evaluate_calls=%d, want rejected before proposal evaluation", accepted, evaluateCalls)
+	}
+	if trainer.step != stateBefore.step || !float32SlicesEqual(trainer.angles, stateBefore.angles) || !float32SlicesEqual(trainer.adamM, stateBefore.adamM) || !float32SlicesEqual(trainer.adamV, stateBefore.adamV) {
+		t.Fatalf("incomplete protected set mutated optimizer state")
+	}
+}
+
+func TestAOQTCoordinateSearchAuditChainRejectsTruncatedHistory(t *testing.T) {
+	if _, err := appendAOQTCoordinateSearchAuditChain("[]", "next-audit"); err == nil || !strings.Contains(err.Error(), "preserve a non-empty history") {
+		t.Fatalf("truncated coordinate audit chain error = %v, want fail-closed history rejection", err)
+	}
+}
+
+func TestAOQTProtectedConeSelectorRejectsFirstOrderProtectedAscent(t *testing.T) {
+	q3GainGrad := []float32{1, -1, 0}
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := []aoqtProtectedAngleGradient{{
+		Name: "q3_score_distill",
+		Grad: []float32{-1, -1, 0},
+	}}
+	order, err := rankedAOQTCoordinateSearchAngles(q3GainGrad, aggregateGrad, protected)
+	if err != nil {
+		t.Fatalf("rank protected coordinates: %v", err)
+	}
+	if len(order) != 2 || order[0].index != 1 || order[1].index != 0 {
+		t.Fatalf("protected coordinate order = %+v, want safe index 1 before conflicting index 0", order)
+	}
+	var first, second aoqtCoordinateSearchRank
+	for _, ranked := range order {
+		switch ranked.index {
+		case 0:
+			first = ranked
+		case 1:
+			second = ranked
+		}
+	}
+	if first.protectedConflictCount != 1 || len(first.protectedDirectionalDerivatives) != 1 || first.protectedDirectionalDerivatives[0] <= 0 {
+		t.Fatalf("conflicting coordinate rank = %+v, want positive protected directional derivative", first)
+	}
+	if second.protectedConflictCount != 0 || second.protectedDirectionalDerivatives[0] >= 0 {
+		t.Fatalf("safe coordinate rank = %+v, want non-positive protected derivative", second)
+	}
+	if aoqtCoordinateBlockDirectionInCone([]aoqtCoordinateSearchRank{first}, q3GainGrad, protected) {
+		t.Fatalf("protected-ascent coordinate was admitted to the first-order cone")
+	}
+	if !aoqtCoordinateBlockDirectionInCone([]aoqtCoordinateSearchRank{second}, q3GainGrad, protected) {
+		t.Fatalf("protected-descent coordinate was rejected from the first-order cone")
+	}
+	if !aoqtDirectionInProtectedCone([]float32{0, 1, 0}, protected) || aoqtDirectionInProtectedCone([]float32{-1, 0, 0}, protected) {
+		t.Fatalf("generic protected-cone check did not reject positive directional derivative")
+	}
+	if !aoqtCoordinateBlockDirectionInCone([]aoqtCoordinateSearchRank{first, second}, q3GainGrad, protected) {
+		t.Fatalf("balanced block with zero protected derivative was rejected")
+	}
+	plan, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	if err != nil {
+		t.Fatalf("protected plan: %v", err)
+	}
+	hBefore, err := plan.SHA256()
+	if err != nil {
+		t.Fatalf("protected plan hash: %v", err)
+	}
+	plan.Order[0].protectedDirectionalDerivatives[0] = -0.5
+	hAfter, err := plan.SHA256()
+	if err != nil {
+		t.Fatalf("mutated protected plan hash: %v", err)
+	}
+	if hBefore == hAfter {
+		t.Fatalf("protected plan hash does not bind directional derivative audit")
+	}
+}
+
+func TestAOQTProtectedConeMicroTailSkipsConflictingCoordinatesAndRollsBack(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 90)
+	trainer := newTinyAOQTTrainer(t, false, 90)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = 1
+	q3GainGrad[1] = -0.5
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, 5)
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		protected = append(protected, aoqtProtectedAngleGradient{
+			Name: name,
+			Grad: func() []float32 {
+				grad := make([]float32, AOQTSidecarAngleCount)
+				grad[0] = -2
+				grad[1] = -1
+				return grad
+			}(),
+		})
+	}
+	before := trainer.snapshotOptimizerState()
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+	var proposals [][]float32
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		proposals = append(proposals, append([]float32(nil), trainer.angles...))
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+	if err != nil {
+		t.Fatalf("protected transactional step: %v", err)
+	}
+	if accepted {
+		t.Fatalf("accepted intentionally unsafe candidate")
+	}
+	if len(proposals) != aoqtTransactionalAdamMaxAttemptsPerStep+aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+		t.Fatalf("evaluated proposals = %d, want Adam plus safe-coordinate micro-tail %d", len(proposals), aoqtTransactionalAdamMaxAttemptsPerStep+aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+	}
+	for i, direction := range proposals[aoqtTransactionalAdamMaxAttemptsPerStep:] {
+		if direction[0] != 0 {
+			t.Fatalf("micro-tail proposal %d moved conflicting angle 0 = %.9g", i, direction[0])
+		}
+		if direction[1] <= 0 || !aoqtDirectionInProtectedCone(direction, protected) {
+			t.Fatalf("micro-tail proposal %d direction is outside protected cone: angle1=%.9g", i, direction[1])
+		}
+	}
+	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
+		t.Fatalf("protected micro-tail rejection did not restore optimizer state")
+	}
+	if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail || diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+		t.Fatalf("protected coordinate diagnostics = %+v, want protected micro-tail strategy/count", diagnostics)
+	}
+	if diagnostics.CoordinateProposalAttempts != aoqtTransactionalCoordinateMicroTailMagnitudeCount || diagnostics.CoordinateAcceptedProposals != 0 || diagnostics.CoordinateRejectedProposals != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+		t.Fatalf("protected coordinate accounting = %+v, want only safe coordinate probes", diagnostics)
+	}
+}
+
+func TestAOQTPreparedIPProtectedGradientsDecomposeFullGradientAndAuditFallback(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 91)
+	enableTinyAOQTNFGuard(t, &set)
+	objective, err := NewAOQTSidecarPreparedIPObjective(tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed))
+	if err != nil {
+		t.Fatalf("objective: %v", err)
+	}
+	trainer := newTinyAOQTTrainer(t, false, 91)
+	fullLoss, aggregateGrad, activation, components, err := trainer.lossAndAngleGrad(set.Rows, objective)
+	if err != nil {
+		t.Fatalf("full objective gradient: %v", err)
+	}
+	q3GainGrad, err := trainer.q3GainOnlyAngleGrad(set.Rows, objective)
+	if err != nil {
+		t.Fatalf("q3 gain gradient: %v", err)
+	}
+	protected, err := trainer.protectedComponentAngleGrads(set.Rows, objective, set.Manifest.ObjectiveContract.WeightSums)
+	if err != nil {
+		t.Fatalf("protected gradients: %v", err)
+	}
+	wantNames := []string{"q3_order_guard", "q3_score_distill", "q5_order_guard", "q5_score_distill", "nf_boundary_guard"}
+	if !aoqtStringSlicesEqual(aoqtProtectedGradientNames(protected), wantNames) {
+		t.Fatalf("prepared protected gradient names = %v, want %v", aoqtProtectedGradientNames(protected), wantNames)
+	}
+	decomposed := append([]float32(nil), q3GainGrad...)
+	for _, gradient := range protected {
+		if len(gradient.Grad) != len(decomposed) {
+			t.Fatalf("prepared protected %s gradient length = %d, want %d", gradient.Name, len(gradient.Grad), len(decomposed))
+		}
+		for i, value := range gradient.Grad {
+			if !isFinite32(value) {
+				t.Fatalf("prepared protected %s gradient[%d] = %.9g, want finite", gradient.Name, i, value)
+			}
+			decomposed[i] += value
+		}
+	}
+	maxGradientDelta := float32(0)
+	for i := range aggregateGrad {
+		delta := float32(math.Abs(float64(aggregateGrad[i] - decomposed[i])))
+		if delta > maxGradientDelta {
+			maxGradientDelta = delta
+		}
+	}
+	if maxGradientDelta > 2e-4 {
+		t.Fatalf("prepared full gradient decomposition max delta = %.9g, want <= 2e-4", maxGradientDelta)
+	}
+	baseline := aoqtStepEvaluation{loss: fullLoss, activation: activation, components: components}
+	before := trainer.snapshotOptimizerState()
+	diagnostics := AOQTSidecarOptimizerDiagnostics{PlannedSteps: 1, MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep}
+	var proposals [][]float32
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, baseline, func() (aoqtStepEvaluation, error) {
+		proposals = append(proposals, append([]float32(nil), trainer.angles...))
+		return baseline, nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+	if err != nil {
+		t.Fatalf("prepared protected fallback: %v", err)
+	}
+	if accepted {
+		t.Fatalf("same-objective proposals unexpectedly accepted")
+	}
+	if len(proposals) <= aoqtTransactionalAdamMaxAttemptsPerStep {
+		t.Fatalf("prepared fallback proposals = %d, want coordinate fallback after Adam", len(proposals))
+	}
+	for i, proposal := range proposals[aoqtTransactionalAdamMaxAttemptsPerStep:] {
+		direction := make([]float32, len(proposal))
+		for j := range proposal {
+			direction[j] = proposal[j] - before.angles[j]
+		}
+		q3Derivative := float64(0)
+		for j, value := range direction {
+			q3Derivative += float64(q3GainGrad[j]) * float64(value)
+		}
+		if !(q3Derivative < 0) || !aoqtDirectionInProtectedCone(direction, protected) {
+			t.Fatalf("prepared coordinate proposal %d is outside q3/protected cone: q3 derivative %.9g", i, q3Derivative)
+		}
+	}
+	plan, err := trainer.Plan(set)
+	if err != nil {
+		t.Fatalf("prepared fallback plan: %v", err)
+	}
+	if diagnostics.CoordinateSearchPlanCount != 1 {
+		t.Fatalf("prepared fallback plan count = %d, want one audited coordinate fallback", diagnostics.CoordinateSearchPlanCount)
+	}
+	if err := validateAOQTProtectedCoordinateSearchAudit(plan, set.Manifest.ObjectiveContract.WeightSums, diagnostics); err != nil {
+		t.Fatalf("prepared fallback audit: %v", err)
+	}
+	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
+		t.Fatalf("prepared protected rejection did not restore optimizer state")
+	}
+}
+
+func TestAOQTPreparedIPProtectedBalancedBlockCanBeAccepted(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 92)
+	trainer := newTinyAOQTTrainer(t, false, 92)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = 1
+	q3GainGrad[1] = -1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)))
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		gradient := make([]float32, AOQTSidecarAngleCount)
+		gradient[0] = -1
+		gradient[1] = -1
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: gradient})
+	}
+	baseline := aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums)
+	diagnostics := AOQTSidecarOptimizerDiagnostics{PlannedSteps: 1, MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep}
+	var proposals [][]float32
+	callbackCalls := 0
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, baseline, func() (aoqtStepEvaluation, error) {
+		callbackCalls++
+		proposals = append(proposals, append([]float32(nil), trainer.angles...))
+		if callbackCalls > aoqtTransactionalAdamMaxAttemptsPerStep && trainer.angles[0] != 0 && trainer.angles[1] != 0 {
+			return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
+		}
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+	if err != nil {
+		t.Fatalf("balanced protected block fallback: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("balanced protected block was not accepted")
+	}
+	if len(proposals) != aoqtTransactionalAdamMaxAttemptsPerStep+1 {
+		t.Fatalf("balanced block proposals = %d, want Adam plus first accepted block", len(proposals))
+	}
+	block := proposals[aoqtTransactionalAdamMaxAttemptsPerStep]
+	if block[0] >= 0 || block[1] <= 0 || !aoqtDirectionInProtectedCone(block, protected) {
+		t.Fatalf("accepted balanced block = [%.9g %.9g], want q3/protected-cone directions", block[0], block[1])
+	}
+	if diagnostics.CoordinateSearchPlanCount != 1 || diagnostics.CoordinateProposalAttempts != 1 || diagnostics.CoordinateAcceptedProposals != 1 || diagnostics.CoordinateRejectedProposals != 0 {
+		t.Fatalf("balanced block diagnostics = %+v, want one accepted audited coordinate block", diagnostics)
+	}
+	plan, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, trainer.config.LearningRate, protected)
+	if err != nil {
+		t.Fatalf("balanced block plan: %v", err)
+	}
+	if !aoqtCoordinateBlockDirectionInCone(plan.Order[:2], q3GainGrad, protected) {
+		t.Fatalf("balanced block plan was not in protected cone")
+	}
+}
+
+func TestAOQTProtectedCoordinatePlanHistoryRetainsMultipleFallbacks(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 93)
+	trainer := newTinyAOQTTrainer(t, false, 93)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = 1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)))
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: make([]float32, AOQTSidecarAngleCount)})
+	}
+	diagnostics := AOQTSidecarOptimizerDiagnostics{PlannedSteps: 2, MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep}
+	baseline := aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums)
+	for step := 0; step < 2; step++ {
+		accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, baseline, func() (aoqtStepEvaluation, error) {
+			return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+		}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+		if err != nil {
+			t.Fatalf("fallback %d: %v", step, err)
+		}
+		if accepted {
+			t.Fatalf("fallback %d unexpectedly accepted unsafe candidate", step)
+		}
+	}
+	if diagnostics.CoordinateSearchPlanCount != 2 {
+		t.Fatalf("coordinate search plan count = %d, want two fallback plans", diagnostics.CoordinateSearchPlanCount)
+	}
+	audits, err := decodeAOQTCoordinateSearchStringChain(diagnostics.CoordinateSearchAuditChain, "coordinate_search_audit_chain")
+	if err != nil {
+		t.Fatalf("audit history: %v", err)
+	}
+	hashes, err := decodeAOQTCoordinateSearchStringChain(diagnostics.CoordinateSearchHashChain, "coordinate_search_hash_chain")
+	if err != nil {
+		t.Fatalf("hash history: %v", err)
+	}
+	if len(audits) != 2 || len(hashes) != 2 {
+		t.Fatalf("coordinate history lengths = %d/%d, want two per-step entries", len(audits), len(hashes))
+	}
+	plan, err := trainer.Plan(set)
+	if err != nil {
+		t.Fatalf("history plan: %v", err)
+	}
+	if err := validateAOQTProtectedCoordinateSearchAudit(plan, set.Manifest.ObjectiveContract.WeightSums, diagnostics); err != nil {
+		t.Fatalf("history audit validation: %v", err)
+	}
+	tampered := diagnostics
+	var tamperedHashes []string
+	if err := strictUnmarshalAOQT([]byte(tampered.CoordinateSearchHashChain), &tamperedHashes); err != nil {
+		t.Fatalf("decode tampered hash history: %v", err)
+	}
+	tamperedHashes[0] = strings.Repeat("a", 64)
+	tamperedHashChain, err := json.Marshal(tamperedHashes)
+	if err != nil {
+		t.Fatalf("marshal tampered hash history: %v", err)
+	}
+	tampered.CoordinateSearchHashChain = string(tamperedHashChain)
+	if err := validateAOQTProtectedCoordinateSearchAudit(plan, set.Manifest.ObjectiveContract.WeightSums, tampered); err == nil || !strings.Contains(err.Error(), "bind audit payload/predecessor") {
+		t.Fatalf("tampered predecessor hash history error = %v, want linked-chain rejection", err)
+	}
+}
+
 func TestAOQTQ3GainOnlyAngleGradMatchesAggregateForQ3OnlyObjective(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 88)
 	for i := range set.Rows {
@@ -1261,6 +1703,21 @@ func TestAOQTQ3GainOnlyAngleGradMatchesAggregateForQ3OnlyObjective(t *testing.T)
 	}
 }
 
+func TestAOQTProtectedV2FitRejectsInactiveProtectedObjective(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 95)
+	for i := range set.Rows {
+		set.Rows[i].Weights = AOQTSidecarRowWeights{Q3Gain: set.Rows[i].Weights.Q3Gain}
+	}
+	set.Manifest.ObjectiveContract = tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed).ObjectiveContract(sumAOQTRowWeights(set.Rows))
+	if err := set.Validate(); err != nil {
+		t.Fatalf("q3-only fixture invalid: %v", err)
+	}
+	trainer := newTinyAOQTTrainer(t, false, 95)
+	if _, err := trainer.Fit(set, toyAOQTObjective{}); err == nil || !strings.Contains(err.Error(), "protected-v2 non-plan training requires") {
+		t.Fatalf("q3-only non-plan fit error = %v, want explicit protected-v2 fail-closed policy", err)
+	}
+}
+
 func TestAOQTTransactionalFitRejectsZeroAcceptedAndRestoresState(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 79)
 	trainer := newTinyAOQTTrainer(t, false, 79)
@@ -1268,14 +1725,15 @@ func TestAOQTTransactionalFitRejectsZeroAcceptedAndRestoresState(t *testing.T) {
 	objective := &statefulRejectingAOQTObjective{config: tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed)}
 
 	summary, err := trainer.Fit(set, objective)
-	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") || !strings.Contains(err.Error(), "dominant_reason=loss_increase(80/80)") {
+	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") || !strings.Contains(err.Error(), "dominant_reason=loss_increase(") {
 		t.Fatalf("fit error = %v, want zero-accepted transactional failure with bounded rejection diagnostics", err)
 	}
-	if summary.OptimizerDiagnostics == nil || summary.OptimizerDiagnostics.AcceptedSteps != 0 || summary.OptimizerDiagnostics.ProposalAttempts != aoqtTransactionalMaxAttemptsPerStep {
+	if summary.OptimizerDiagnostics == nil || summary.OptimizerDiagnostics.AcceptedSteps != 0 || summary.OptimizerDiagnostics.ProposalAttempts <= 0 || summary.OptimizerDiagnostics.ProposalAttempts > aoqtTransactionalMaxAttemptsPerStep {
 		t.Fatalf("diagnostics = %+v, want zero accepted and bounded proposals", summary.OptimizerDiagnostics)
 	}
-	if summary.OptimizerDiagnostics.RejectionDiagnostics.CandidateEvaluations != aoqtTransactionalMaxAttemptsPerStep || summary.OptimizerDiagnostics.RejectionDiagnostics.ReasonCounts.LossIncrease != aoqtTransactionalMaxAttemptsPerStep {
-		t.Fatalf("rejection diagnostics = %+v, want exact exhausted proposal accounting", summary.OptimizerDiagnostics.RejectionDiagnostics)
+	attempts := summary.OptimizerDiagnostics.ProposalAttempts
+	if summary.OptimizerDiagnostics.RejectionDiagnostics.CandidateEvaluations != attempts || summary.OptimizerDiagnostics.RejectionDiagnostics.ReasonCounts.LossIncrease != attempts {
+		t.Fatalf("rejection diagnostics = %+v, want exact exhausted proposal accounting for %d proposals", summary.OptimizerDiagnostics.RejectionDiagnostics, attempts)
 	}
 	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
 		t.Fatalf("optimizer state was not restored after zero accepted fit")
@@ -1548,8 +2006,11 @@ func (o *statefulRejectingAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSid
 func (o *statefulRejectingAOQTObjective) EvaluateAOQT(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
 	o.calls++
 	queryGrad := make([]float32, len(input.Query))
-	if len(queryGrad) > 0 {
-		queryGrad[0] = 1
+	for i := range queryGrad {
+		// A dense upstream vector guarantees a non-zero angle direction for
+		// the identity/unit-vector fixtures, allowing runner tests to exercise
+		// the protected coordinate fallback rather than only Adam no-ops.
+		queryGrad[i] = 1
 	}
 	candidateGrads := make([][]float32, len(input.Candidates))
 	for i := range input.Candidates {

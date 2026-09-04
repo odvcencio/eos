@@ -2,6 +2,7 @@ package eosruntime
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -175,6 +176,9 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 	if diagnostics.Preflight.RowCount != result.Preflight.RowCount || diagnostics.Preflight.CandidateCount != result.Preflight.CandidateCount || diagnostics.Preflight.PairCount != result.Preflight.PairCount || diagnostics.Preflight.PlanSHA256 != result.Preflight.PlanSHA256 || diagnostics.Preflight.CalibrationManifestSHA256 != result.Preflight.CalibrationManifestSHA256 {
 		t.Fatalf("written diagnostics did not preserve preflight workload/provenance: %+v vs %+v", diagnostics.Preflight, result.Preflight)
 	}
+	if optimizer := diagnostics.Summary.OptimizerDiagnostics; optimizer == nil || optimizer.CoordinateSearchPlanCount == 0 || optimizer.CoordinateSearchAudit == "" {
+		t.Fatalf("zero-safe fixture did not produce genuine protected coordinate audit: %+v", optimizer)
+	}
 	if !aoqtStringMapsEqual(diagnostics.Preflight.InputSHA256, result.Preflight.InputSHA256) || !aoqtStringMapsEqual(diagnostics.Preflight.QrelsSHA256ByDataset, result.Preflight.QrelsSHA256ByDataset) {
 		t.Fatalf("written diagnostics did not preserve preflight input/qrels hashes")
 	}
@@ -241,6 +245,63 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 		} else if !os.IsNotExist(err) {
 			t.Fatalf("stat %s output: %v", role, err)
 		}
+	}
+	mutateOptimizer := func(tampered *AOQTSidecarFailClosedDiagnostics, mutate func(*AOQTSidecarOptimizerDiagnostics)) {
+		optimizer := *tampered.Summary.OptimizerDiagnostics
+		mutate(&optimizer)
+		tampered.Summary.OptimizerDiagnostics = &optimizer
+		sha, err := optimizer.SHA256()
+		if err != nil {
+			t.Fatalf("tampered optimizer diagnostics sha: %v", err)
+		}
+		tampered.Summary.OptimizerDiagnosticsSHA256 = sha
+	}
+	for name, mutate := range map[string]func(*AOQTSidecarOptimizerDiagnostics){
+		"coordinate-audit-chain": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.CoordinateSearchAuditChain = "[]"
+		},
+		"coordinate-plan-count": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.CoordinateSearchPlanCount = 0
+			optimizer.CoordinateSearchAudit = ""
+			optimizer.CoordinateSearchAuditChain = ""
+			optimizer.CoordinateSearchHashChain = ""
+		},
+		"coordinate-magnitude-count": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			optimizer.CoordinateMagnitudeCount = 1
+		},
+		"coordinate-schedule": func(optimizer *AOQTSidecarOptimizerDiagnostics) {
+			var payload aoqtCoordinateSearchAuditPayload
+			if err := strictUnmarshalAOQT([]byte(optimizer.CoordinateSearchAudit), &payload); err != nil {
+				t.Fatalf("decode protected coordinate audit: %v", err)
+			}
+			payload.MicroTailMagnitudes[0] *= 2
+			audit, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal protected coordinate audit: %v", err)
+			}
+			optimizer.CoordinateSearchAudit = string(audit)
+			optimizer.CoordinateSearchAuditChain, err = appendAOQTCoordinateSearchAuditChain("", string(audit))
+			if err != nil {
+				t.Fatalf("append protected coordinate audit chain: %v", err)
+			}
+			optimizer.CoordinateSearchHashChain, err = appendAOQTCoordinateSearchHashChain("", string(audit))
+			if err != nil {
+				t.Fatalf("append protected coordinate hash chain: %v", err)
+			}
+			var hashes []string
+			if err := strictUnmarshalAOQT([]byte(optimizer.CoordinateSearchHashChain), &hashes); err != nil || len(hashes) == 0 {
+				t.Fatalf("decode protected coordinate hash chain: %v", err)
+			}
+			optimizer.CoordinateSearchOrderingHash = hashes[len(hashes)-1]
+		},
+	} {
+		t.Run("protected-"+name, func(t *testing.T) {
+			tampered := diagnostics
+			mutateOptimizer(&tampered, mutate)
+			if err := tampered.Validate(); err == nil {
+				t.Fatalf("tampered protected fail-closed diagnostics unexpectedly validated")
+			}
+		})
 	}
 }
 
