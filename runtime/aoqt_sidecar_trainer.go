@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"sort"
 	"strings"
+	"sync"
 
 	"m31labs.dev/turboquant"
 )
@@ -237,7 +238,8 @@ func (cfg AOQTSidecarPreparedIPObjectiveConfig) ObjectiveContract(weights AOQTSi
 }
 
 type AOQTSidecarPreparedIPObjective struct {
-	config AOQTSidecarPreparedIPObjectiveConfig
+	config    AOQTSidecarPreparedIPObjectiveConfig
+	workspace *aoqtPreparedIPObjectiveWorkspace
 }
 
 func NewAOQTSidecarPreparedIPObjective(cfg AOQTSidecarPreparedIPObjectiveConfig) (AOQTSidecarPreparedIPObjective, error) {
@@ -245,7 +247,7 @@ func NewAOQTSidecarPreparedIPObjective(cfg AOQTSidecarPreparedIPObjectiveConfig)
 	if err := validateAOQTPreparedIPObjectiveConfig(cfg); err != nil {
 		return AOQTSidecarPreparedIPObjective{}, err
 	}
-	return AOQTSidecarPreparedIPObjective{config: cfg}, nil
+	return AOQTSidecarPreparedIPObjective{config: cfg, workspace: newAOQTPreparedIPObjectiveWorkspace(cfg)}, nil
 }
 
 func (o AOQTSidecarPreparedIPObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPreparedIPObjectiveConfig {
@@ -283,7 +285,7 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 	for i := range result.CandidateGrads {
 		result.CandidateGrads[i] = make([]float32, cfg.Dim)
 	}
-	q3Gain := newAOQTPreparedIPSurface(input.Query, input.Candidates, cfg.Dim, cfg.GainBit, cfg.TurboQuantSeed)
+	q3Gain := newAOQTPreparedIPSurfaceWithWorkspace(o.workspace, input.Query, input.Candidates, cfg.Dim, cfg.GainBit, cfg.TurboQuantSeed)
 	if row.Weights.Q3Gain > 0 {
 		loss, err := topkLambdaNDCGLossAndGrad(q3Gain.scores, row.QrelGains, row.CandidateDocIDs, cfg.GainCutoff, cfg.GainTau, cfg.GainMargin, row.EligiblePairMask)
 		if err != nil {
@@ -302,7 +304,7 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 	}
 	q3Guard := q3Gain
 	if cfg.Q3GuardBit != cfg.GainBit {
-		q3Guard = newAOQTPreparedIPSurface(input.Query, input.Candidates, cfg.Dim, cfg.Q3GuardBit, cfg.TurboQuantSeed)
+		q3Guard = newAOQTPreparedIPSurfaceWithWorkspace(o.workspace, input.Query, input.Candidates, cfg.Dim, cfg.Q3GuardBit, cfg.TurboQuantSeed)
 	}
 	if row.Weights.Q3OrderGuard > 0 {
 		loss, grads, pairs, contributing := aoqtAnchorOrderGuardLossAndGrad(q3Guard.scores, row.AnchorRanks.Q3, row.EligiblePairMask, cfg.GuardTau, cfg.GuardMargin)
@@ -343,7 +345,7 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 		q3Guard.accumulateScoreGrads(grads, scale, result.QueryGrad, result.CandidateGrads)
 	}
 	if row.Weights.Q5OrderGuard > 0 || row.Weights.Q5ScoreDistill > 0 {
-		q5 := newAOQTPreparedIPSurface(input.Query, input.Candidates, cfg.Dim, cfg.Q5GuardBit, cfg.TurboQuantSeed)
+		q5 := newAOQTPreparedIPSurfaceWithWorkspace(o.workspace, input.Query, input.Candidates, cfg.Dim, cfg.Q5GuardBit, cfg.TurboQuantSeed)
 		if row.Weights.Q5OrderGuard > 0 {
 			loss, grads, pairs, contributing := aoqtAnchorOrderGuardLossAndGrad(q5.scores, row.AnchorRanks.Q5, row.EligiblePairMask, cfg.GuardTau, cfg.GuardMargin)
 			if pairs == 0 || contributing == 0 {
@@ -1737,8 +1739,64 @@ type aoqtPreparedIPSurface struct {
 	candidateDequantized [][]float32
 }
 
+type aoqtPreparedIPObjectiveWorkspace struct {
+	mu       sync.Mutex
+	dim      int
+	seed     int64
+	surfaces map[int]*aoqtPreparedIPSurfaceWorkspace
+}
+
+type aoqtPreparedIPSurfaceWorkspace struct {
+	quantizer *turboquant.IPQuantizer
+	prepared  turboquant.PreparedQuery
+	quantized turboquant.IPQuantized
+}
+
+func newAOQTPreparedIPObjectiveWorkspace(cfg AOQTSidecarPreparedIPObjectiveConfig) *aoqtPreparedIPObjectiveWorkspace {
+	return &aoqtPreparedIPObjectiveWorkspace{
+		dim:      cfg.Dim,
+		seed:     cfg.TurboQuantSeed,
+		surfaces: make(map[int]*aoqtPreparedIPSurfaceWorkspace, 3),
+	}
+}
+
 func newAOQTPreparedIPSurface(query []float32, candidates [][]float32, dim, bitWidth int, seed int64) aoqtPreparedIPSurface {
+	return newAOQTPreparedIPSurfaceWithWorkspace(nil, query, candidates, dim, bitWidth, seed)
+}
+
+func newAOQTPreparedIPSurfaceWithWorkspace(workspace *aoqtPreparedIPObjectiveWorkspace, query []float32, candidates [][]float32, dim, bitWidth int, seed int64) aoqtPreparedIPSurface {
+	if workspace == nil {
+		q := turboquant.NewIPWithSeed(dim, bitWidth, seed)
+		prepared := q.PrepareQuery(query)
+		return newAOQTPreparedIPSurfaceWithQuantizer(q, prepared, nil, query, candidates, dim)
+	}
+	workspace.mu.Lock()
+	defer workspace.mu.Unlock()
+	state := workspace.surfaceWorkspace(dim, bitWidth, seed)
+	state.quantizer.PrepareQueryToTrusted(&state.prepared, query)
+	return newAOQTPreparedIPSurfaceWithQuantizer(state.quantizer, state.prepared, &state.quantized, query, candidates, dim)
+}
+
+func (w *aoqtPreparedIPObjectiveWorkspace) surfaceWorkspace(dim, bitWidth int, seed int64) *aoqtPreparedIPSurfaceWorkspace {
+	if w.dim != dim || w.seed != seed {
+		w.dim = dim
+		w.seed = seed
+		w.surfaces = make(map[int]*aoqtPreparedIPSurfaceWorkspace, 3)
+	}
+	if state := w.surfaces[bitWidth]; state != nil {
+		return state
+	}
 	q := turboquant.NewIPWithSeed(dim, bitWidth, seed)
+	state := &aoqtPreparedIPSurfaceWorkspace{
+		quantizer: q,
+		prepared:  q.AllocPreparedQuery(),
+		quantized: turboquant.AllocIPQuantized(dim, bitWidth),
+	}
+	w.surfaces[bitWidth] = state
+	return state
+}
+
+func newAOQTPreparedIPSurfaceWithQuantizer(q *turboquant.IPQuantizer, prepared turboquant.PreparedQuery, quantized *turboquant.IPQuantized, query []float32, candidates [][]float32, dim int) aoqtPreparedIPSurface {
 	surface := aoqtPreparedIPSurface{
 		dim:                  dim,
 		scores:               make([]float32, len(candidates)),
@@ -1750,14 +1808,23 @@ func newAOQTPreparedIPSurface(query []float32, candidates [][]float32, dim, bitW
 		candidateNorms:       make([]float32, len(candidates)),
 		candidateDequantized: make([][]float32, len(candidates)),
 	}
-	prepared := q.PrepareQuery(surface.queryRaw)
 	for i, candidate := range candidates {
 		surface.candidateRaw[i] = append([]float32(nil), candidate...)
 		surface.candidateNormalized[i] = append([]float32(nil), candidate...)
 		surface.candidateNorms[i] = vectorNorm(candidate)
-		qx := q.Quantize(surface.candidateRaw[i])
+		qx := turboquant.IPQuantized{}
+		if quantized == nil {
+			qx = q.Quantize(surface.candidateRaw[i])
+		} else {
+			q.QuantizeTo(quantized, surface.candidateRaw[i])
+			qx = *quantized
+		}
 		surface.candidateDequantized[i] = q.Dequantize(qx)
-		surface.scores[i] = q.InnerProductPrepared(qx, prepared)
+		if quantized == nil {
+			surface.scores[i] = q.InnerProductPrepared(qx, prepared)
+		} else {
+			surface.scores[i] = q.InnerProductPreparedTrusted(qx, prepared)
+		}
 	}
 	return surface
 }

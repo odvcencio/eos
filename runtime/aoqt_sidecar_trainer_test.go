@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"strings"
+	"sync"
 	"testing"
 
 	"m31labs.dev/turboquant"
@@ -413,6 +414,91 @@ func TestAOQTStage2BPreparedIPSurfaceBindsRawUnitVectorContract(t *testing.T) {
 		if math.Abs(float64(raw-unit)) > 1e-6 {
 			t.Fatalf("raw/unit prepared-IP score[%d] diverged %.9g vs %.9g for unit-vector row", i, raw, unit)
 		}
+	}
+}
+
+func TestAOQTStage2BPreparedIPObjectiveWorkspaceMatchesUncachedReference(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 681)
+	cfg := tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed)
+	cached, err := NewAOQTSidecarPreparedIPObjective(cfg)
+	if err != nil {
+		t.Fatalf("cached objective: %v", err)
+	}
+	uncached := AOQTSidecarPreparedIPObjective{config: normalizedAOQTPreparedIPObjectiveConfig(cfg)}
+	inputs := []AOQTSidecarObjectiveInput{
+		aoqtObjectiveInputForRow(set.Rows[0]),
+		aoqtObjectiveInputForRow(tinyAOQTCalibrationSet(t, 682).Rows[0]),
+	}
+	for i, input := range inputs {
+		want, err := uncached.EvaluateAOQT(input)
+		if err != nil {
+			t.Fatalf("uncached evaluate input %d: %v", i, err)
+		}
+		first, err := cached.EvaluateAOQT(input)
+		if err != nil {
+			t.Fatalf("cached first evaluate input %d: %v", i, err)
+		}
+		if cached.workspace == nil || len(cached.workspace.surfaces) != 2 {
+			t.Fatalf("cached workspace surfaces after input %d = %d, want q3 and q5", i, len(cached.workspace.surfaces))
+		}
+		q3State := cached.workspace.surfaces[AOQTSidecarDefaultGainBit]
+		q5State := cached.workspace.surfaces[AOQTSidecarDefaultGuardBit5]
+		second, err := cached.EvaluateAOQT(input)
+		if err != nil {
+			t.Fatalf("cached second evaluate input %d: %v", i, err)
+		}
+		if cached.workspace.surfaces[AOQTSidecarDefaultGainBit] != q3State || cached.workspace.surfaces[AOQTSidecarDefaultGuardBit5] != q5State {
+			t.Fatalf("cached objective rebuilt prepared-IP workspace after input %d", i)
+		}
+		assertAOQTObjectiveResultsEqual(t, fmt.Sprintf("cached first input %d", i), first, want)
+		assertAOQTObjectiveResultsEqual(t, fmt.Sprintf("cached second input %d", i), second, want)
+	}
+}
+
+func TestAOQTStage2BPreparedIPObjectiveWorkspaceConcurrentCopiesMatchReference(t *testing.T) {
+	setA := tinyAOQTCalibrationSet(t, 683)
+	setB := tinyAOQTCalibrationSet(t, 684)
+	cfg := tinyAOQTObjectiveConfig(setA.Manifest.TurboQuantSeed)
+	shared, err := NewAOQTSidecarPreparedIPObjective(cfg)
+	if err != nil {
+		t.Fatalf("shared objective: %v", err)
+	}
+	uncached := AOQTSidecarPreparedIPObjective{config: normalizedAOQTPreparedIPObjectiveConfig(cfg)}
+	inputs := []AOQTSidecarObjectiveInput{
+		aoqtObjectiveInputForRow(setA.Rows[0]),
+		aoqtObjectiveInputForRow(setB.Rows[0]),
+	}
+	wants := make([]AOQTSidecarObjectiveResult, len(inputs))
+	for i, input := range inputs {
+		wants[i], err = uncached.EvaluateAOQT(input)
+		if err != nil {
+			t.Fatalf("uncached evaluate input %d: %v", i, err)
+		}
+	}
+
+	const workers = 8
+	var wg sync.WaitGroup
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		i := i
+		wg.Add(1)
+		go func(objective AOQTSidecarPreparedIPObjective) {
+			defer wg.Done()
+			inputIndex := i % len(inputs)
+			got, err := objective.EvaluateAOQT(inputs[inputIndex])
+			if err != nil {
+				errs <- fmt.Errorf("cached concurrent evaluate %d: %w", i, err)
+				return
+			}
+			if err := compareAOQTObjectiveResults(got, wants[inputIndex]); err != nil {
+				errs <- fmt.Errorf("cached concurrent evaluate %d input %d: %w", i, inputIndex, err)
+			}
+		}(shared)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }
 
@@ -1405,6 +1491,49 @@ func (mutatingAOQTObjective) AOQTPreparedIPObjectiveConfig() AOQTSidecarPrepared
 
 func tinyAOQTObjectiveConfig(seed int64) AOQTSidecarPreparedIPObjectiveConfig {
 	return AOQTSidecarPreparedIPObjectiveConfig{TurboQuantSeed: seed}
+}
+
+func aoqtObjectiveInputForRow(row AOQTSidecarCalibrationRow) AOQTSidecarObjectiveInput {
+	return AOQTSidecarObjectiveInput{
+		Row:        aoqtObjectiveRowView(row),
+		Query:      append([]float32(nil), row.QueryVector...),
+		Candidates: cloneAOQTVectors(row.CandidateVectors),
+	}
+}
+
+func assertAOQTObjectiveResultsEqual(t *testing.T, label string, got, want AOQTSidecarObjectiveResult) {
+	t.Helper()
+	if err := compareAOQTObjectiveResults(got, want); err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
+}
+
+func compareAOQTObjectiveResults(got, want AOQTSidecarObjectiveResult) error {
+	if got.Loss != want.Loss || got.Components != want.Components || got.Activation != want.Activation {
+		return fmt.Errorf("result mismatch:\ngot  loss %.9g components %+v activation %+v\nwant loss %.9g components %+v activation %+v", got.Loss, got.Components, got.Activation, want.Loss, want.Components, want.Activation)
+	}
+	if len(got.QueryGrad) != len(want.QueryGrad) {
+		return fmt.Errorf("query grad length = %d, want %d", len(got.QueryGrad), len(want.QueryGrad))
+	}
+	for i := range got.QueryGrad {
+		if got.QueryGrad[i] != want.QueryGrad[i] {
+			return fmt.Errorf("query grad[%d] = %.9g, want %.9g", i, got.QueryGrad[i], want.QueryGrad[i])
+		}
+	}
+	if len(got.CandidateGrads) != len(want.CandidateGrads) {
+		return fmt.Errorf("candidate grad count = %d, want %d", len(got.CandidateGrads), len(want.CandidateGrads))
+	}
+	for i := range got.CandidateGrads {
+		if len(got.CandidateGrads[i]) != len(want.CandidateGrads[i]) {
+			return fmt.Errorf("candidate grad[%d] length = %d, want %d", i, len(got.CandidateGrads[i]), len(want.CandidateGrads[i]))
+		}
+		for j := range got.CandidateGrads[i] {
+			if got.CandidateGrads[i][j] != want.CandidateGrads[i][j] {
+				return fmt.Errorf("candidate grad[%d][%d] = %.9g, want %.9g", i, j, got.CandidateGrads[i][j], want.CandidateGrads[i][j])
+			}
+		}
+	}
+	return nil
 }
 
 type statefulRejectingAOQTObjective struct {
