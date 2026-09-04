@@ -494,7 +494,7 @@ func TestAOQTStage2BValidQ5AndNFGuardsActivate(t *testing.T) {
 	}
 }
 
-func TestAOQTStage2BPreparedIPObjectiveFailsClosedWithoutQ3ImprovingStep(t *testing.T) {
+func TestAOQTStage2BPreparedIPObjectiveAcceptsBoundedQ3SafeStep(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 71)
 	objective, err := NewAOQTSidecarPreparedIPObjective(AOQTSidecarPreparedIPObjectiveConfig{
 		TurboQuantSeed: set.Manifest.TurboQuantSeed,
@@ -505,26 +505,34 @@ func TestAOQTStage2BPreparedIPObjectiveFailsClosedWithoutQ3ImprovingStep(t *test
 	a := newTinyAOQTTrainer(t, false, 71)
 	b := newTinyAOQTTrainer(t, false, 71)
 	sa, err := a.Fit(set, objective)
-	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") {
-		t.Fatalf("fit A error = %v, want fail-closed zero-safe-step rejection", err)
+	if err != nil {
+		t.Fatalf("fit A: %v", err)
 	}
 	sb, err := b.Fit(set, objective)
-	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") {
-		t.Fatalf("fit B error = %v, want fail-closed zero-safe-step rejection", err)
+	if err != nil {
+		t.Fatalf("fit B: %v", err)
 	}
 	if sa.OptimizerDiagnostics == nil || sb.OptimizerDiagnostics == nil {
-		t.Fatalf("optimizer diagnostics missing after fail-closed prepared-IP fit")
+		t.Fatalf("optimizer diagnostics missing after prepared-IP fit")
 	}
 	if *sa.OptimizerDiagnostics != *sb.OptimizerDiagnostics || sa.OptimizerDiagnosticsSHA256 != sb.OptimizerDiagnosticsSHA256 {
-		t.Fatalf("prepared-IP rejection diagnostics differ: %+v/%s vs %+v/%s", *sa.OptimizerDiagnostics, sa.OptimizerDiagnosticsSHA256, *sb.OptimizerDiagnostics, sb.OptimizerDiagnosticsSHA256)
+		t.Fatalf("prepared-IP diagnostics differ: %+v/%s vs %+v/%s", *sa.OptimizerDiagnostics, sa.OptimizerDiagnosticsSHA256, *sb.OptimizerDiagnostics, sb.OptimizerDiagnosticsSHA256)
 	}
-	if sa.OptimizerDiagnostics.AcceptedSteps != 0 || sa.OptimizerDiagnostics.ProposalAttempts != aoqtTransactionalMaxAttemptsPerStep {
-		t.Fatalf("diagnostics = %+v, want no accepted steps and bounded full proposal search", sa.OptimizerDiagnostics)
+	if sa.OptimizerDiagnostics.AcceptedSteps != sa.Steps || sa.Steps == 0 {
+		t.Fatalf("diagnostics = %+v summary steps=%d, want accepted safe prepared-IP step", sa.OptimizerDiagnostics, sa.Steps)
 	}
-	for i, angle := range a.Angles() {
-		if angle != 0 {
-			t.Fatalf("angle %d = %.9g after fail-closed prepared-IP fit, want restored identity", i, angle)
-		}
+	if sa.FinalObjectiveComponents.Q3Gain >= sa.InitialObjectiveComponents.Q3Gain {
+		t.Fatalf("q3_gain final %.9g initial %.9g, want strict improvement", sa.FinalObjectiveComponents.Q3Gain, sa.InitialObjectiveComponents.Q3Gain)
+	}
+	if sa.AngleMaxAbs == 0 || sa.AngleL2 == 0 {
+		t.Fatalf("angle stats l2=%.9g max=%.9g, want nonidentity movement", sa.AngleL2, sa.AngleMaxAbs)
+	}
+	metrics, err := NewAOQTSidecarRunMetrics(set, sa)
+	if err != nil {
+		t.Fatalf("metrics: %v", err)
+	}
+	if err := ValidateAOQTSidecarCandidateEligibility(metrics, AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true}); err != nil {
+		t.Fatalf("candidate eligibility: %v", err)
 	}
 }
 
@@ -751,25 +759,25 @@ func TestAOQTTransactionalStepFallsBackToCoordinateAfterAdamRejection(t *testing
 	if !accepted {
 		t.Fatalf("coordinate fallback did not accept safe opposite-sign proposal")
 	}
-	if len(observedAngles) != 7 {
-		t.Fatalf("observed %d proposals %v, want 4 Adam rejects + 3 coordinate probes", len(observedAngles), observedAngles)
+	if len(observedAngles) != 9 {
+		t.Fatalf("observed %d proposals %v, want 4 Adam rejects + 5 coordinate probes", len(observedAngles), observedAngles)
 	}
-	for i, angle := range observedAngles[:6] {
+	for i, angle := range observedAngles[:8] {
 		if angle >= 0 {
 			t.Fatalf("proposal %d angle = %.9g, want negative rejected proposal before opposite sign", i, angle)
 		}
 	}
-	if observedAngles[6] <= 0 {
-		t.Fatalf("accepted proposal angle = %.9g, want opposite positive coordinate sign", observedAngles[6])
+	if observedAngles[8] <= 0 {
+		t.Fatalf("accepted proposal angle = %.9g, want opposite positive coordinate sign", observedAngles[8])
 	}
-	if diagnostics.ProposalAttempts != 7 || diagnostics.AcceptedProposals != 1 || diagnostics.RejectedProposals != 6 || diagnostics.Backtracks != 6 {
-		t.Fatalf("diagnostics = %+v, want six rejects and one coordinate acceptance", diagnostics)
+	if diagnostics.ProposalAttempts != 9 || diagnostics.AcceptedProposals != 1 || diagnostics.RejectedProposals != 8 || diagnostics.Backtracks != 8 {
+		t.Fatalf("diagnostics = %+v, want eight rejects and one coordinate acceptance", diagnostics)
 	}
 	if diagnostics.AdamProposalAttempts != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.AdamAcceptedProposals != 0 || diagnostics.AdamRejectedProposals != aoqtTransactionalAdamMaxAttemptsPerStep {
 		t.Fatalf("adam diagnostics = %+v, want all Adam probes rejected", diagnostics)
 	}
-	if diagnostics.CoordinateProposalAttempts != 3 || diagnostics.CoordinateAcceptedProposals != 1 || diagnostics.CoordinateRejectedProposals != 2 {
-		t.Fatalf("coordinate diagnostics = %+v, want third coordinate probe accepted", diagnostics)
+	if diagnostics.CoordinateProposalAttempts != 5 || diagnostics.CoordinateAcceptedProposals != 1 || diagnostics.CoordinateRejectedProposals != 4 {
+		t.Fatalf("coordinate diagnostics = %+v, want fifth coordinate probe accepted", diagnostics)
 	}
 	if diagnostics.CoordinateTopAngles != 1 || diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMagnitudeCount {
 		t.Fatalf("coordinate search bounds = %+v, want one active angle and configured magnitudes", diagnostics)
@@ -779,6 +787,55 @@ func TestAOQTTransactionalStepFallsBackToCoordinateAfterAdamRejection(t *testing
 	}
 	if got := trainer.angles[0]; got < 0.0099 || got > 0.0101 {
 		t.Fatalf("accepted coordinate angle = %.9g, want +learning_rate", got)
+	}
+}
+
+func TestAOQTTransactionalStepTriesSafeTopCoordinateBlock(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 83)
+	trainer := newTinyAOQTTrainer(t, false, 83)
+	grad := make([]float32, AOQTSidecarAngleCount)
+	for i := 0; i < aoqtTransactionalCoordinateTopAngles; i++ {
+		grad[i] = float32(aoqtTransactionalCoordinateTopAngles - i)
+	}
+	grad[aoqtTransactionalCoordinateTopAngles] = 0.5
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+
+	accepted, err := trainer.acceptTransactionalAdamStep(grad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		for i := 0; i < aoqtTransactionalCoordinateTopAngles; i++ {
+			if trainer.angles[i] >= -0.0099 {
+				return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+			}
+		}
+		if trainer.angles[aoqtTransactionalCoordinateTopAngles] != 0 {
+			return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+		}
+		return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics)
+	if err != nil {
+		t.Fatalf("transactional step: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("top-coordinate block proposal was not accepted")
+	}
+	if diagnostics.AdamProposalAttempts != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.AdamAcceptedProposals != 0 {
+		t.Fatalf("adam diagnostics = %+v, want all Adam probes rejected before block search", diagnostics)
+	}
+	if diagnostics.CoordinateProposalAttempts != 3 || diagnostics.CoordinateAcceptedProposals != 1 || diagnostics.CoordinateRejectedProposals != 2 {
+		t.Fatalf("coordinate diagnostics = %+v, want third block probe accepted", diagnostics)
+	}
+	if diagnostics.CoordinateTopAngles != aoqtTransactionalCoordinateTopAngles || diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMagnitudeCount || diagnostics.CoordinateBlockCount != len(aoqtTransactionalCoordinateBlockSizes) {
+		t.Fatalf("coordinate search plan diagnostics = %+v, want full top/block/magnitude plan", diagnostics)
+	}
+	for i := 0; i < aoqtTransactionalCoordinateTopAngles; i++ {
+		if got := trainer.angles[i]; got < -0.0101 || got > -0.0099 {
+			t.Fatalf("angle %d = %.9g, want block descent step", i, got)
+		}
+	}
+	if got := trainer.angles[aoqtTransactionalCoordinateTopAngles]; got != 0 {
+		t.Fatalf("angle outside top block = %.9g, want untouched", got)
 	}
 }
 
@@ -821,10 +878,14 @@ func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
 		t.Fatalf("rank coordinates: %v", err)
 	}
 	var got []int
-	for _, item := range order[:aoqtTransactionalCoordinateTopAngles] {
+	top := aoqtTransactionalCoordinateTopAngles
+	if len(order) < top {
+		top = len(order)
+	}
+	for _, item := range order[:top] {
 		got = append(got, item.index)
 	}
-	want := []int{1, 4, 5, 0}
+	want := []int{1, 4, 5, 0, 2}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("coordinate order = %v, want abs-desc/index-stable %v", got, want)
 	}
@@ -835,11 +896,19 @@ func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
 		t.Fatalf("positive-gradient directions = %v, want negative then positive", dirs)
 	}
 	magnitudes := []float32{0.01, 0.005}
-	ha, err := aoqtCoordinateSearchOrderingSHA256(order[:aoqtTransactionalCoordinateTopAngles], magnitudes)
+	plan := aoqtCoordinateSearchPlan{
+		Order:      order[:top],
+		Magnitudes: magnitudes,
+		BlockSizes: aoqtCoordinateSearchBlockSizes(top),
+	}
+	if fmt.Sprint(plan.BlockSizes) != fmt.Sprint([]int{2, 4}) {
+		t.Fatalf("block sizes = %v, want deterministic applicable prefix blocks", plan.BlockSizes)
+	}
+	ha, err := plan.SHA256()
 	if err != nil {
 		t.Fatalf("hash A: %v", err)
 	}
-	hb, err := aoqtCoordinateSearchOrderingSHA256(order[:aoqtTransactionalCoordinateTopAngles], magnitudes)
+	hb, err := plan.SHA256()
 	if err != nil {
 		t.Fatalf("hash B: %v", err)
 	}

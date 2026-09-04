@@ -399,6 +399,9 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 			if diagnostics.CoordinateMagnitudeCount <= 0 || diagnostics.CoordinateMagnitudeCount > aoqtTransactionalCoordinateMagnitudeCount {
 				return fmt.Errorf("AOQT optimizer diagnostics coordinate_magnitude_count = %d outside expected range", diagnostics.CoordinateMagnitudeCount)
 			}
+			if diagnostics.CoordinateBlockCount < 0 || diagnostics.CoordinateBlockCount > len(aoqtTransactionalCoordinateBlockSizes) {
+				return fmt.Errorf("AOQT optimizer diagnostics coordinate_block_count = %d outside expected range", diagnostics.CoordinateBlockCount)
+			}
 			if strings.TrimSpace(diagnostics.CoordinateSearchOrderingHash) == "" {
 				return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_ordering_sha256 is required")
 			}

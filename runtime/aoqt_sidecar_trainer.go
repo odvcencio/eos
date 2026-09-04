@@ -78,6 +78,7 @@ type AOQTSidecarOptimizerDiagnostics struct {
 	CoordinateRejectedProposals  int    `json:"coordinate_rejected_proposals,omitempty"`
 	CoordinateTopAngles          int    `json:"coordinate_top_angles,omitempty"`
 	CoordinateMagnitudeCount     int    `json:"coordinate_magnitude_count,omitempty"`
+	CoordinateBlockCount         int    `json:"coordinate_block_count,omitempty"`
 	CoordinateSearchOrderingHash string `json:"coordinate_search_ordering_sha256,omitempty"`
 }
 
@@ -562,13 +563,15 @@ type aoqtOptimizerState struct {
 }
 
 const (
-	aoqtTransactionalMaxAttemptsPerStep        = 20
+	aoqtTransactionalMaxAttemptsPerStep        = 80
 	aoqtTransactionalAdamMaxAttemptsPerStep    = 4
-	aoqtTransactionalCoordinateTopAngles       = 4
-	aoqtTransactionalCoordinateMagnitudeCount  = 2
+	aoqtTransactionalCoordinateTopAngles       = 8
+	aoqtTransactionalCoordinateMagnitudeCount  = 4
 	aoqtTransactionalLossEpsilon               = float32(1e-7)
 	aoqtTransactionalQ3ImprovementMinMagnitude = float32(0)
 )
+
+var aoqtTransactionalCoordinateBlockSizes = []int{2, 4, 8}
 
 func (d AOQTSidecarOptimizerDiagnostics) SHA256() (string, error) {
 	data, err := json.Marshal(d)
@@ -631,62 +634,78 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad []float32, baselin
 }
 
 func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad []float32, state aoqtOptimizerState, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics, attemptsThisStep int) (bool, error) {
-	order, err := rankedAOQTCoordinateSearchAngles(grad)
+	plan, err := newAOQTCoordinateSearchPlan(grad, t.config.LearningRate)
 	if err != nil {
 		t.restoreOptimizerState(state)
 		return false, err
 	}
-	if len(order) == 0 || attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
+	if len(plan.Order) == 0 || attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
 		t.restoreOptimizerState(state)
 		return false, nil
 	}
-	top := aoqtTransactionalCoordinateTopAngles
-	if len(order) < top {
-		top = len(order)
-	}
-	magnitudes := aoqtCoordinateSearchMagnitudes(t.config.LearningRate)
-	if len(magnitudes) == 0 {
-		t.restoreOptimizerState(state)
-		return false, fmt.Errorf("AOQT coordinate search requires at least one finite positive magnitude")
-	}
-	diagnostics.CoordinateTopAngles = top
-	diagnostics.CoordinateMagnitudeCount = len(magnitudes)
-	if hash, err := aoqtCoordinateSearchOrderingSHA256(order[:top], magnitudes); err != nil {
+	diagnostics.CoordinateTopAngles = len(plan.Order)
+	diagnostics.CoordinateMagnitudeCount = len(plan.Magnitudes)
+	diagnostics.CoordinateBlockCount = len(plan.BlockSizes)
+	if hash, err := plan.SHA256(); err != nil {
 		t.restoreOptimizerState(state)
 		return false, err
 	} else {
 		diagnostics.CoordinateSearchOrderingHash = hash
 	}
-	for _, ranked := range order[:top] {
+	tryProposal := func(apply func()) (bool, error) {
+		if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
+			return false, nil
+		}
+		t.restoreOptimizerState(state)
+		diagnostics.ProposalAttempts++
+		diagnostics.CoordinateProposalAttempts++
+		attemptsThisStep++
+		apply()
+		if err := t.ProjectAngles(); err != nil {
+			t.restoreOptimizerState(state)
+			return false, err
+		}
+		candidate, err := evaluate()
+		if err != nil {
+			t.restoreOptimizerState(state)
+			return false, err
+		}
+		if t.acceptsTransactionalProposal(state, baseline, candidate, weights) {
+			diagnostics.CoordinateAcceptedProposals++
+			diagnostics.AcceptedProposals++
+			return true, nil
+		}
+		diagnostics.RejectedProposals++
+		diagnostics.CoordinateRejectedProposals++
+		diagnostics.Backtracks++
+		return false, nil
+	}
+	for _, magnitude := range plan.Magnitudes {
+		for _, blockSize := range plan.BlockSizes {
+			accepted, err := tryProposal(func() {
+				for _, ranked := range plan.Order[:blockSize] {
+					t.angles[ranked.index] += aoqtCoordinateSearchPrimaryDirection(grad[ranked.index]) * magnitude
+				}
+			})
+			if err != nil || accepted {
+				return accepted, err
+			}
+		}
+	}
+	for _, ranked := range plan.Order {
 		directions := aoqtCoordinateSearchDirections(grad[ranked.index])
 		for _, direction := range directions {
-			for _, magnitude := range magnitudes {
+			for _, magnitude := range plan.Magnitudes {
+				accepted, err := tryProposal(func() {
+					t.angles[ranked.index] += direction * magnitude
+				})
+				if err != nil || accepted {
+					return accepted, err
+				}
 				if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
 					t.restoreOptimizerState(state)
 					return false, nil
 				}
-				t.restoreOptimizerState(state)
-				diagnostics.ProposalAttempts++
-				diagnostics.CoordinateProposalAttempts++
-				attemptsThisStep++
-				t.angles[ranked.index] += direction * magnitude
-				if err := t.ProjectAngles(); err != nil {
-					t.restoreOptimizerState(state)
-					return false, err
-				}
-				candidate, err := evaluate()
-				if err != nil {
-					t.restoreOptimizerState(state)
-					return false, err
-				}
-				if t.acceptsTransactionalProposal(state, baseline, candidate, weights) {
-					diagnostics.CoordinateAcceptedProposals++
-					diagnostics.AcceptedProposals++
-					return true, nil
-				}
-				diagnostics.RejectedProposals++
-				diagnostics.CoordinateRejectedProposals++
-				diagnostics.Backtracks++
 			}
 		}
 	}
@@ -729,6 +748,33 @@ type aoqtCoordinateSearchRank struct {
 	abs   float32
 }
 
+type aoqtCoordinateSearchPlan struct {
+	Order      []aoqtCoordinateSearchRank
+	Magnitudes []float32
+	BlockSizes []int
+}
+
+func newAOQTCoordinateSearchPlan(grad []float32, learningRate float32) (aoqtCoordinateSearchPlan, error) {
+	order, err := rankedAOQTCoordinateSearchAngles(grad)
+	if err != nil {
+		return aoqtCoordinateSearchPlan{}, err
+	}
+	top := aoqtTransactionalCoordinateTopAngles
+	if len(order) < top {
+		top = len(order)
+	}
+	order = append([]aoqtCoordinateSearchRank(nil), order[:top]...)
+	magnitudes := aoqtCoordinateSearchMagnitudes(learningRate)
+	if len(magnitudes) == 0 {
+		return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT coordinate search requires at least one finite positive magnitude")
+	}
+	return aoqtCoordinateSearchPlan{
+		Order:      order,
+		Magnitudes: magnitudes,
+		BlockSizes: aoqtCoordinateSearchBlockSizes(top),
+	}, nil
+}
+
 func rankedAOQTCoordinateSearchAngles(grad []float32) ([]aoqtCoordinateSearchRank, error) {
 	order := make([]aoqtCoordinateSearchRank, 0, len(grad))
 	for i, g := range grad {
@@ -751,10 +797,15 @@ func rankedAOQTCoordinateSearchAngles(grad []float32) ([]aoqtCoordinateSearchRan
 }
 
 func aoqtCoordinateSearchDirections(gradient float32) [2]float32 {
+	primary := aoqtCoordinateSearchPrimaryDirection(gradient)
+	return [2]float32{primary, -primary}
+}
+
+func aoqtCoordinateSearchPrimaryDirection(gradient float32) float32 {
 	if gradient < 0 {
-		return [2]float32{1, -1}
+		return 1
 	}
-	return [2]float32{-1, 1}
+	return -1
 }
 
 func aoqtCoordinateSearchMagnitudes(learningRate float32) []float32 {
@@ -769,12 +820,27 @@ func aoqtCoordinateSearchMagnitudes(learningRate float32) []float32 {
 	return magnitudes
 }
 
-func aoqtCoordinateSearchOrderingSHA256(order []aoqtCoordinateSearchRank, magnitudes []float32) (string, error) {
+func aoqtCoordinateSearchBlockSizes(top int) []int {
+	blockSizes := make([]int, 0, len(aoqtTransactionalCoordinateBlockSizes))
+	for _, size := range aoqtTransactionalCoordinateBlockSizes {
+		if size > 1 && size <= top {
+			blockSizes = append(blockSizes, size)
+		}
+	}
+	return blockSizes
+}
+
+func (plan aoqtCoordinateSearchPlan) SHA256() (string, error) {
 	payload := struct {
 		Order      []int     `json:"order"`
 		Magnitudes []float32 `json:"magnitudes"`
-	}{Order: make([]int, len(order)), Magnitudes: append([]float32(nil), magnitudes...)}
-	for i, item := range order {
+		BlockSizes []int     `json:"block_sizes"`
+	}{
+		Order:      make([]int, len(plan.Order)),
+		Magnitudes: append([]float32(nil), plan.Magnitudes...),
+		BlockSizes: append([]int(nil), plan.BlockSizes...),
+	}
+	for i, item := range plan.Order {
 		payload.Order[i] = item.index
 	}
 	data, err := json.Marshal(payload)
