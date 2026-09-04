@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 
 	"m31labs.dev/turboquant"
 )
@@ -61,25 +62,72 @@ type AOQTSidecarTrainSummary struct {
 }
 
 type AOQTSidecarOptimizerDiagnostics struct {
-	PlannedSteps                 int    `json:"planned_steps"`
-	AttemptedSteps               int    `json:"attempted_steps"`
-	AcceptedSteps                int    `json:"accepted_steps"`
-	ProposalAttempts             int    `json:"proposal_attempts"`
-	AcceptedProposals            int    `json:"accepted_proposals"`
-	RejectedProposals            int    `json:"rejected_proposals"`
-	Backtracks                   int    `json:"backtracks"`
-	MaxAttemptsPerStep           int    `json:"max_attempts_per_step"`
-	ExhaustedSteps               int    `json:"exhausted_steps"`
-	AdamProposalAttempts         int    `json:"adam_proposal_attempts,omitempty"`
-	AdamAcceptedProposals        int    `json:"adam_accepted_proposals,omitempty"`
-	AdamRejectedProposals        int    `json:"adam_rejected_proposals,omitempty"`
-	CoordinateProposalAttempts   int    `json:"coordinate_proposal_attempts,omitempty"`
-	CoordinateAcceptedProposals  int    `json:"coordinate_accepted_proposals,omitempty"`
-	CoordinateRejectedProposals  int    `json:"coordinate_rejected_proposals,omitempty"`
-	CoordinateTopAngles          int    `json:"coordinate_top_angles,omitempty"`
-	CoordinateMagnitudeCount     int    `json:"coordinate_magnitude_count,omitempty"`
-	CoordinateBlockCount         int    `json:"coordinate_block_count,omitempty"`
-	CoordinateSearchOrderingHash string `json:"coordinate_search_ordering_sha256,omitempty"`
+	PlannedSteps                 int                                      `json:"planned_steps"`
+	AttemptedSteps               int                                      `json:"attempted_steps"`
+	AcceptedSteps                int                                      `json:"accepted_steps"`
+	ProposalAttempts             int                                      `json:"proposal_attempts"`
+	AcceptedProposals            int                                      `json:"accepted_proposals"`
+	RejectedProposals            int                                      `json:"rejected_proposals"`
+	Backtracks                   int                                      `json:"backtracks"`
+	MaxAttemptsPerStep           int                                      `json:"max_attempts_per_step"`
+	ExhaustedSteps               int                                      `json:"exhausted_steps"`
+	AdamProposalAttempts         int                                      `json:"adam_proposal_attempts,omitempty"`
+	AdamAcceptedProposals        int                                      `json:"adam_accepted_proposals,omitempty"`
+	AdamRejectedProposals        int                                      `json:"adam_rejected_proposals,omitempty"`
+	CoordinateProposalAttempts   int                                      `json:"coordinate_proposal_attempts,omitempty"`
+	CoordinateAcceptedProposals  int                                      `json:"coordinate_accepted_proposals,omitempty"`
+	CoordinateRejectedProposals  int                                      `json:"coordinate_rejected_proposals,omitempty"`
+	CoordinateTopAngles          int                                      `json:"coordinate_top_angles,omitempty"`
+	CoordinateMagnitudeCount     int                                      `json:"coordinate_magnitude_count,omitempty"`
+	CoordinateBlockCount         int                                      `json:"coordinate_block_count,omitempty"`
+	CoordinateSearchOrderingHash string                                   `json:"coordinate_search_ordering_sha256,omitempty"`
+	RejectionDiagnostics         AOQTSidecarOptimizerRejectionDiagnostics `json:"rejection_diagnostics,omitempty"`
+}
+
+type AOQTSidecarOptimizerRejectionDiagnostics struct {
+	CandidateEvaluations        int                                          `json:"candidate_evaluations,omitempty"`
+	ReasonCounts                AOQTSidecarOptimizerRejectionReasonCounts    `json:"reason_counts,omitempty"`
+	ComponentRegressionCounts   AOQTSidecarObjectiveComponentRejectionCounts `json:"component_regression_counts,omitempty"`
+	LossDelta                   AOQTSidecarOptimizerDeltaStats               `json:"loss_delta,omitempty"`
+	ComponentDeltas             AOQTSidecarObjectiveComponentDeltaStats      `json:"component_deltas,omitempty"`
+	DominantReason              string                                       `json:"dominant_reason,omitempty"`
+	DominantComponentRegression string                                       `json:"dominant_component_regression,omitempty"`
+}
+
+type AOQTSidecarOptimizerRejectionReasonCounts struct {
+	NoAngleMovement       int `json:"no_angle_movement,omitempty"`
+	NonFiniteLoss         int `json:"non_finite_loss,omitempty"`
+	LossIncrease          int `json:"loss_increase,omitempty"`
+	InvalidComponents     int `json:"invalid_components,omitempty"`
+	LossComponentMismatch int `json:"loss_component_mismatch,omitempty"`
+	InactiveObjective     int `json:"inactive_objective,omitempty"`
+	NoQ3GainImprovement   int `json:"no_q3_gain_improvement,omitempty"`
+	ComponentRegression   int `json:"component_regression,omitempty"`
+}
+
+type AOQTSidecarObjectiveComponentRejectionCounts struct {
+	Q3Gain          int `json:"q3_gain,omitempty"`
+	Q3OrderGuard    int `json:"q3_order_guard,omitempty"`
+	Q3ScoreDistill  int `json:"q3_score_distill,omitempty"`
+	Q5OrderGuard    int `json:"q5_order_guard,omitempty"`
+	Q5ScoreDistill  int `json:"q5_score_distill,omitempty"`
+	NFBoundaryGuard int `json:"nf_boundary_guard,omitempty"`
+}
+
+type AOQTSidecarOptimizerDeltaStats struct {
+	Count int     `json:"count,omitempty"`
+	Min   float32 `json:"min,omitempty"`
+	Max   float32 `json:"max,omitempty"`
+	Sum   float32 `json:"sum,omitempty"`
+}
+
+type AOQTSidecarObjectiveComponentDeltaStats struct {
+	Q3Gain          AOQTSidecarOptimizerDeltaStats `json:"q3_gain,omitempty"`
+	Q3OrderGuard    AOQTSidecarOptimizerDeltaStats `json:"q3_order_guard,omitempty"`
+	Q3ScoreDistill  AOQTSidecarOptimizerDeltaStats `json:"q3_score_distill,omitempty"`
+	Q5OrderGuard    AOQTSidecarOptimizerDeltaStats `json:"q5_order_guard,omitempty"`
+	Q5ScoreDistill  AOQTSidecarOptimizerDeltaStats `json:"q5_score_distill,omitempty"`
+	NFBoundaryGuard AOQTSidecarOptimizerDeltaStats `json:"nf_boundary_guard,omitempty"`
 }
 
 type AOQTSidecarObjectiveInput struct {
@@ -514,7 +562,7 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 				if sum, err := diagnostics.SHA256(); err == nil {
 					summary.OptimizerDiagnosticsSHA256 = sum
 				}
-				return summary, fmt.Errorf("AOQT transactional optimizer accepted zero safe steps after %d proposal attempts", diagnostics.ProposalAttempts)
+				return summary, fmt.Errorf("AOQT transactional optimizer accepted zero safe steps after %d proposal attempts; %s", diagnostics.ProposalAttempts, diagnostics.RejectionSummary())
 			}
 			break
 		}
@@ -582,6 +630,273 @@ func (d AOQTSidecarOptimizerDiagnostics) SHA256() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
+func (d AOQTSidecarOptimizerDiagnostics) RejectionSummary() string {
+	rejections := d.RejectionDiagnostics
+	if rejections.CandidateEvaluations == 0 {
+		return "rejection diagnostics: no evaluated candidate proposals"
+	}
+	rejections.finalizeDominantFields()
+	parts := []string{
+		fmt.Sprintf("dominant_reason=%s(%d/%d)", rejections.DominantReason, rejections.reasonCount(rejections.DominantReason), rejections.CandidateEvaluations),
+		fmt.Sprintf("reason_counts=%s", rejections.ReasonCounts.summaryString()),
+	}
+	if rejections.DominantComponentRegression != "" {
+		parts = append(parts, fmt.Sprintf("dominant_component_regression=%s(%d)", rejections.DominantComponentRegression, rejections.componentRegressionCount(rejections.DominantComponentRegression)))
+	} else {
+		parts = append(parts, "dominant_component_regression=none")
+	}
+	if name, stats, ok := rejections.ComponentDeltas.dominantPositiveMean(); ok {
+		parts = append(parts, fmt.Sprintf("dominant_component_delta=%s(mean=%s max=%s)", name, formatAOQTDiagnosticFloat(stats.Mean()), formatAOQTDiagnosticFloat(stats.Max)))
+	}
+	if rejections.LossDelta.Count > 0 {
+		parts = append(parts, fmt.Sprintf("loss_delta_mean=%s", formatAOQTDiagnosticFloat(rejections.LossDelta.Mean())))
+	}
+	return "rejection diagnostics: " + strings.Join(parts, "; ")
+}
+
+func (d *AOQTSidecarOptimizerDiagnostics) RecordRejection(decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) {
+	if d == nil || decision.accepted {
+		return
+	}
+	d.RejectionDiagnostics.record(decision, baseline, candidate)
+}
+
+func (d *AOQTSidecarOptimizerRejectionDiagnostics) record(decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) {
+	d.CandidateEvaluations++
+	d.ReasonCounts.add(decision.reason)
+	d.LossDelta.Record(candidate.loss - baseline.loss)
+	d.ComponentDeltas.Record(baseline.components, candidate.components)
+	for _, regression := range decision.componentRegressions {
+		d.ComponentRegressionCounts.add(regression.name)
+	}
+	d.finalizeDominantFields()
+}
+
+func (d *AOQTSidecarOptimizerRejectionDiagnostics) finalizeDominantFields() {
+	d.DominantReason = d.ReasonCounts.dominant()
+	d.DominantComponentRegression = d.ComponentRegressionCounts.dominant()
+}
+
+func (c *AOQTSidecarOptimizerRejectionReasonCounts) add(reason aoqtTransactionalRejectionReason) {
+	switch reason {
+	case aoqtRejectionNoAngleMovement:
+		c.NoAngleMovement++
+	case aoqtRejectionNonFiniteLoss:
+		c.NonFiniteLoss++
+	case aoqtRejectionLossIncrease:
+		c.LossIncrease++
+	case aoqtRejectionInvalidComponents:
+		c.InvalidComponents++
+	case aoqtRejectionLossComponentMismatch:
+		c.LossComponentMismatch++
+	case aoqtRejectionInactiveObjective:
+		c.InactiveObjective++
+	case aoqtRejectionNoQ3GainImprovement:
+		c.NoQ3GainImprovement++
+	case aoqtRejectionComponentRegression:
+		c.ComponentRegression++
+	}
+}
+
+func (c AOQTSidecarOptimizerRejectionReasonCounts) count(reason string) int {
+	switch reason {
+	case string(aoqtRejectionNoAngleMovement):
+		return c.NoAngleMovement
+	case string(aoqtRejectionNonFiniteLoss):
+		return c.NonFiniteLoss
+	case string(aoqtRejectionLossIncrease):
+		return c.LossIncrease
+	case string(aoqtRejectionInvalidComponents):
+		return c.InvalidComponents
+	case string(aoqtRejectionLossComponentMismatch):
+		return c.LossComponentMismatch
+	case string(aoqtRejectionInactiveObjective):
+		return c.InactiveObjective
+	case string(aoqtRejectionNoQ3GainImprovement):
+		return c.NoQ3GainImprovement
+	case string(aoqtRejectionComponentRegression):
+		return c.ComponentRegression
+	default:
+		return 0
+	}
+}
+
+func (d AOQTSidecarOptimizerRejectionDiagnostics) reasonCount(reason string) int {
+	return d.ReasonCounts.count(reason)
+}
+
+func (c AOQTSidecarOptimizerRejectionReasonCounts) dominant() string {
+	var bestName string
+	var bestCount int
+	for _, item := range []struct {
+		name  aoqtTransactionalRejectionReason
+		count int
+	}{
+		{aoqtRejectionNoAngleMovement, c.NoAngleMovement},
+		{aoqtRejectionNonFiniteLoss, c.NonFiniteLoss},
+		{aoqtRejectionLossIncrease, c.LossIncrease},
+		{aoqtRejectionInvalidComponents, c.InvalidComponents},
+		{aoqtRejectionLossComponentMismatch, c.LossComponentMismatch},
+		{aoqtRejectionInactiveObjective, c.InactiveObjective},
+		{aoqtRejectionNoQ3GainImprovement, c.NoQ3GainImprovement},
+		{aoqtRejectionComponentRegression, c.ComponentRegression},
+	} {
+		if item.count > bestCount {
+			bestName = string(item.name)
+			bestCount = item.count
+		}
+	}
+	return bestName
+}
+
+func (c AOQTSidecarOptimizerRejectionReasonCounts) summaryString() string {
+	parts := make([]string, 0, 8)
+	for _, item := range []struct {
+		name  aoqtTransactionalRejectionReason
+		count int
+	}{
+		{aoqtRejectionNoAngleMovement, c.NoAngleMovement},
+		{aoqtRejectionNonFiniteLoss, c.NonFiniteLoss},
+		{aoqtRejectionLossIncrease, c.LossIncrease},
+		{aoqtRejectionInvalidComponents, c.InvalidComponents},
+		{aoqtRejectionLossComponentMismatch, c.LossComponentMismatch},
+		{aoqtRejectionInactiveObjective, c.InactiveObjective},
+		{aoqtRejectionNoQ3GainImprovement, c.NoQ3GainImprovement},
+		{aoqtRejectionComponentRegression, c.ComponentRegression},
+	} {
+		if item.count > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d", item.name, item.count))
+		}
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, ",")
+}
+
+func (c *AOQTSidecarObjectiveComponentRejectionCounts) add(name string) {
+	switch name {
+	case "q3_gain":
+		c.Q3Gain++
+	case "q3_order_guard":
+		c.Q3OrderGuard++
+	case "q3_score_distill":
+		c.Q3ScoreDistill++
+	case "q5_order_guard":
+		c.Q5OrderGuard++
+	case "q5_score_distill":
+		c.Q5ScoreDistill++
+	case "nf_boundary_guard":
+		c.NFBoundaryGuard++
+	}
+}
+
+func (c AOQTSidecarObjectiveComponentRejectionCounts) count(name string) int {
+	switch name {
+	case "q3_gain":
+		return c.Q3Gain
+	case "q3_order_guard":
+		return c.Q3OrderGuard
+	case "q3_score_distill":
+		return c.Q3ScoreDistill
+	case "q5_order_guard":
+		return c.Q5OrderGuard
+	case "q5_score_distill":
+		return c.Q5ScoreDistill
+	case "nf_boundary_guard":
+		return c.NFBoundaryGuard
+	default:
+		return 0
+	}
+}
+
+func (d AOQTSidecarOptimizerRejectionDiagnostics) componentRegressionCount(name string) int {
+	return d.ComponentRegressionCounts.count(name)
+}
+
+func (c AOQTSidecarObjectiveComponentRejectionCounts) dominant() string {
+	var bestName string
+	var bestCount int
+	for _, item := range []struct {
+		name  string
+		count int
+	}{
+		{"q3_gain", c.Q3Gain},
+		{"q3_order_guard", c.Q3OrderGuard},
+		{"q3_score_distill", c.Q3ScoreDistill},
+		{"q5_order_guard", c.Q5OrderGuard},
+		{"q5_score_distill", c.Q5ScoreDistill},
+		{"nf_boundary_guard", c.NFBoundaryGuard},
+	} {
+		if item.count > bestCount {
+			bestName = item.name
+			bestCount = item.count
+		}
+	}
+	return bestName
+}
+
+func (s *AOQTSidecarOptimizerDeltaStats) Record(delta float32) {
+	if !isFinite32(delta) {
+		return
+	}
+	if s.Count == 0 || delta < s.Min {
+		s.Min = delta
+	}
+	if s.Count == 0 || delta > s.Max {
+		s.Max = delta
+	}
+	s.Count++
+	s.Sum += delta
+}
+
+func (s AOQTSidecarOptimizerDeltaStats) Mean() float32 {
+	if s.Count == 0 {
+		return 0
+	}
+	return s.Sum / float32(s.Count)
+}
+
+func (d *AOQTSidecarObjectiveComponentDeltaStats) Record(baseline, candidate AOQTSidecarObjectiveComponents) {
+	d.Q3Gain.Record(candidate.Q3Gain - baseline.Q3Gain)
+	d.Q3OrderGuard.Record(candidate.Q3OrderGuard - baseline.Q3OrderGuard)
+	d.Q3ScoreDistill.Record(candidate.Q3ScoreDistill - baseline.Q3ScoreDistill)
+	d.Q5OrderGuard.Record(candidate.Q5OrderGuard - baseline.Q5OrderGuard)
+	d.Q5ScoreDistill.Record(candidate.Q5ScoreDistill - baseline.Q5ScoreDistill)
+	d.NFBoundaryGuard.Record(candidate.NFBoundaryGuard - baseline.NFBoundaryGuard)
+}
+
+func (d AOQTSidecarObjectiveComponentDeltaStats) dominantPositiveMean() (string, AOQTSidecarOptimizerDeltaStats, bool) {
+	var bestName string
+	var best AOQTSidecarOptimizerDeltaStats
+	var ok bool
+	for _, item := range []struct {
+		name  string
+		stats AOQTSidecarOptimizerDeltaStats
+	}{
+		{"q3_gain", d.Q3Gain},
+		{"q3_order_guard", d.Q3OrderGuard},
+		{"q3_score_distill", d.Q3ScoreDistill},
+		{"q5_order_guard", d.Q5OrderGuard},
+		{"q5_score_distill", d.Q5ScoreDistill},
+		{"nf_boundary_guard", d.NFBoundaryGuard},
+	} {
+		if item.stats.Count == 0 {
+			continue
+		}
+		if !ok || item.stats.Mean() > best.Mean() {
+			bestName = item.name
+			best = item.stats
+			ok = true
+		}
+	}
+	return bestName, best, ok
+}
+
+func formatAOQTDiagnosticFloat(value float32) string {
+	return fmt.Sprintf("%.9g", value)
+}
+
 func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad []float32, baseline aoqtStepEvaluation, evaluate func() (aoqtStepEvaluation, error), weights AOQTSidecarRowWeights, diagnostics *AOQTSidecarOptimizerDiagnostics) (bool, error) {
 	if evaluate == nil {
 		return false, fmt.Errorf("AOQT transactional optimizer evaluator is required")
@@ -615,10 +930,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad []float32, baselin
 			t.restoreOptimizerState(state)
 			return false, err
 		}
-		if t.acceptsTransactionalProposal(state, baseline, candidate, weights) {
+		if decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights); decision.accepted {
 			diagnostics.AdamAcceptedProposals++
 			diagnostics.AcceptedProposals++
 			return true, nil
+		} else {
+			diagnostics.RecordRejection(decision, baseline, candidate)
 		}
 		diagnostics.RejectedProposals++
 		diagnostics.AdamRejectedProposals++
@@ -670,10 +987,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad []float32, s
 			t.restoreOptimizerState(state)
 			return false, err
 		}
-		if t.acceptsTransactionalProposal(state, baseline, candidate, weights) {
+		if decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights); decision.accepted {
 			diagnostics.CoordinateAcceptedProposals++
 			diagnostics.AcceptedProposals++
 			return true, nil
+		} else {
+			diagnostics.RecordRejection(decision, baseline, candidate)
 		}
 		diagnostics.RejectedProposals++
 		diagnostics.CoordinateRejectedProposals++
@@ -714,33 +1033,64 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad []float32, s
 }
 
 func (t *AOQTSidecarTrainer) acceptsTransactionalProposal(state aoqtOptimizerState, baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) bool {
+	return t.evaluateTransactionalProposal(state, baseline, candidate, weights).accepted
+}
+
+func (t *AOQTSidecarTrainer) evaluateTransactionalProposal(state aoqtOptimizerState, baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) aoqtTransactionalProposalDecision {
 	if !aoqtAnglesMoved(state.angles, t.angles) {
-		return false
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionNoAngleMovement}
 	}
-	return aoqtAcceptsTransactionalStep(baseline, candidate, weights)
+	return aoqtEvaluateTransactionalStep(baseline, candidate, weights)
 }
 
 func aoqtAcceptsTransactionalStep(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) bool {
-	if !isFinite32(candidate.loss) || candidate.loss-baseline.loss > aoqtTransactionalLossEpsilon {
-		return false
+	return aoqtEvaluateTransactionalStep(baseline, candidate, weights).accepted
+}
+
+type aoqtTransactionalRejectionReason string
+
+const (
+	aoqtRejectionNoAngleMovement       aoqtTransactionalRejectionReason = "no_angle_movement"
+	aoqtRejectionNonFiniteLoss         aoqtTransactionalRejectionReason = "non_finite_loss"
+	aoqtRejectionLossIncrease          aoqtTransactionalRejectionReason = "loss_increase"
+	aoqtRejectionInvalidComponents     aoqtTransactionalRejectionReason = "invalid_components"
+	aoqtRejectionLossComponentMismatch aoqtTransactionalRejectionReason = "loss_component_mismatch"
+	aoqtRejectionInactiveObjective     aoqtTransactionalRejectionReason = "inactive_objective"
+	aoqtRejectionNoQ3GainImprovement   aoqtTransactionalRejectionReason = "no_q3_gain_improvement"
+	aoqtRejectionComponentRegression   aoqtTransactionalRejectionReason = "component_regression"
+)
+
+type aoqtTransactionalProposalDecision struct {
+	accepted             bool
+	reason               aoqtTransactionalRejectionReason
+	componentRegressions []aoqtComponentRegression
+}
+
+func aoqtEvaluateTransactionalStep(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) aoqtTransactionalProposalDecision {
+	if !isFinite32(candidate.loss) {
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionNonFiniteLoss}
+	}
+	if candidate.loss-baseline.loss > aoqtTransactionalLossEpsilon {
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionLossIncrease}
 	}
 	if err := validateAOQTObjectiveComponents(candidate.components, "AOQT transactional optimizer candidate components"); err != nil {
-		return false
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionInvalidComponents}
 	}
 	if err := validateAOQTLossMatchesComponents(candidate.loss, candidate.components, "AOQT transactional optimizer candidate"); err != nil {
-		return false
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionLossComponentMismatch}
 	}
 	if err := validateAOQTActiveObjectiveContributions(weights, candidate.activation); err != nil {
-		return false
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionInactiveObjective}
 	}
 	if candidate.components.Q3Gain >= baseline.components.Q3Gain-aoqtTransactionalQ3ImprovementMinMagnitude {
-		return false
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionNoQ3GainImprovement}
 	}
 	policy := normalizedAOQTSidecarCandidateEligibilityPolicy(AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true})
-	if err := validateAOQTAllowedComponentRegressions(baseline.components, candidate.components, policy); err != nil {
-		return false
+	regressions := aoqtComponentRegressions(baseline.components, candidate.components, policy)
+	if len(regressions) > 0 {
+		return aoqtTransactionalProposalDecision{reason: aoqtRejectionComponentRegression, componentRegressions: regressions}
 	}
-	return true
+	return aoqtTransactionalProposalDecision{accepted: true}
 }
 
 type aoqtCoordinateSearchRank struct {

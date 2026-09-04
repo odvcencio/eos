@@ -294,6 +294,22 @@ func validateAOQTActiveObjectiveContributions(weights AOQTSidecarRowWeights, act
 }
 
 func validateAOQTAllowedComponentRegressions(initial, final AOQTSidecarObjectiveComponents, policy AOQTSidecarCandidateEligibilityPolicy) error {
+	regressions := aoqtComponentRegressions(initial, final, policy)
+	if len(regressions) > 0 {
+		item := regressions[0]
+		return fmt.Errorf("AOQT candidate %s component regressed by %.9g, allowed %.9g", item.name, item.delta, item.allowed)
+	}
+	return nil
+}
+
+type aoqtComponentRegression struct {
+	name    string
+	delta   float32
+	allowed float32
+}
+
+func aoqtComponentRegressions(initial, final AOQTSidecarObjectiveComponents, policy AOQTSidecarCandidateEligibilityPolicy) []aoqtComponentRegression {
+	var regressions []aoqtComponentRegression
 	for _, item := range []struct {
 		name    string
 		initial float32
@@ -307,11 +323,12 @@ func validateAOQTAllowedComponentRegressions(initial, final AOQTSidecarObjective
 		{"q5_score_distill", initial.Q5ScoreDistill, final.Q5ScoreDistill, policy.Q5ScoreDistillAllowedLossIncrease},
 		{"nf_boundary_guard", initial.NFBoundaryGuard, final.NFBoundaryGuard, policy.NFBoundaryGuardAllowedLossIncrease},
 	} {
-		if item.final-item.initial > item.allowed+1e-7 {
-			return fmt.Errorf("AOQT candidate %s component regressed by %.9g, allowed %.9g", item.name, item.final-item.initial, item.allowed)
+		delta := item.final - item.initial
+		if delta > item.allowed+1e-7 {
+			regressions = append(regressions, aoqtComponentRegression{name: item.name, delta: delta, allowed: item.allowed})
 		}
 	}
-	return nil
+	return regressions
 }
 
 func validateAOQTSidecarSummaryPlan(summary AOQTSidecarTrainSummary, manifest AOQTSidecarCalibrationManifest, rows []AOQTSidecarCalibrationRow) error {

@@ -696,6 +696,15 @@ func TestAOQTTransactionalStepRollsBackExactStateWhenUnsafe(t *testing.T) {
 	if diagnostics.AdamProposalAttempts != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.AdamRejectedProposals != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.CoordinateProposalAttempts != 2*aoqtTransactionalCoordinateMagnitudeCount || diagnostics.CoordinateRejectedProposals != 2*aoqtTransactionalCoordinateMagnitudeCount {
 		t.Fatalf("optimizer-path diagnostics = %+v, want Adam plus single-coordinate rejection accounting", diagnostics)
 	}
+	if diagnostics.RejectionDiagnostics.CandidateEvaluations != wantAttempts || diagnostics.RejectionDiagnostics.ReasonCounts.LossIncrease != wantAttempts {
+		t.Fatalf("rejection diagnostics = %+v, want every exact proposal counted as loss_increase", diagnostics.RejectionDiagnostics)
+	}
+	if diagnostics.RejectionDiagnostics.DominantReason != string(aoqtRejectionLossIncrease) {
+		t.Fatalf("dominant rejection = %q, want %q", diagnostics.RejectionDiagnostics.DominantReason, aoqtRejectionLossIncrease)
+	}
+	if diagnostics.RejectionDiagnostics.LossDelta.Count != wantAttempts || diagnostics.RejectionDiagnostics.LossDelta.Min < 0.999 || diagnostics.RejectionDiagnostics.LossDelta.Max > 1.001 {
+		t.Fatalf("loss deltas = %+v, want aggregate +1 deltas for rejected proposals", diagnostics.RejectionDiagnostics.LossDelta)
+	}
 }
 
 func TestAOQTTransactionalStepAcceptsSmallerScale(t *testing.T) {
@@ -864,6 +873,84 @@ func TestAOQTTransactionalStepRejectsNoOpSafeCandidate(t *testing.T) {
 	if diagnostics.ProposalAttempts != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.AcceptedProposals != 0 || diagnostics.RejectedProposals != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.CoordinateProposalAttempts != 0 {
 		t.Fatalf("diagnostics = %+v, want bounded Adam-only no-op rejection", diagnostics)
 	}
+	if diagnostics.RejectionDiagnostics.CandidateEvaluations != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.RejectionDiagnostics.ReasonCounts.NoAngleMovement != aoqtTransactionalAdamMaxAttemptsPerStep {
+		t.Fatalf("rejection diagnostics = %+v, want Adam no-op proposals diagnosed without coordinate fallback", diagnostics.RejectionDiagnostics)
+	}
+}
+
+func TestAOQTTransactionalRejectionDiagnosticsClassifyGates(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 86)
+	weights := AOQTSidecarRowWeights{Q3Gain: 1}
+
+	for _, tc := range []struct {
+		name        string
+		baseline    aoqtStepEvaluation
+		candidate   aoqtStepEvaluation
+		wantReason  aoqtTransactionalRejectionReason
+		wantRegress string
+	}{
+		{
+			name: "no-q3-gain-improvement",
+			baseline: aoqtStepEvaluation{
+				loss:       2,
+				components: AOQTSidecarObjectiveComponents{Q3Gain: 1, Q3OrderGuard: 1},
+				activation: aoqtActiveObjectiveForWeights(weights, 3),
+			},
+			candidate: aoqtStepEvaluation{
+				loss:       1.9,
+				components: AOQTSidecarObjectiveComponents{Q3Gain: 1, Q3OrderGuard: 0.9},
+				activation: aoqtActiveObjectiveForWeights(weights, 3),
+			},
+			wantReason: aoqtRejectionNoQ3GainImprovement,
+		},
+		{
+			name: "component-regression",
+			baseline: aoqtStepEvaluation{
+				loss:       2,
+				components: AOQTSidecarObjectiveComponents{Q3Gain: 1, Q3ScoreDistill: 1},
+				activation: aoqtActiveObjectiveForWeights(weights, 3),
+			},
+			candidate: aoqtStepEvaluation{
+				loss:       1.9,
+				components: AOQTSidecarObjectiveComponents{Q3Gain: 0.5, Q3ScoreDistill: 1.4},
+				activation: aoqtActiveObjectiveForWeights(weights, 3),
+			},
+			wantReason:  aoqtRejectionComponentRegression,
+			wantRegress: "q3_score_distill",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			trainer := newTinyAOQTTrainer(t, false, set.Manifest.Topology.Seed)
+			grad := make([]float32, AOQTSidecarAngleCount)
+			grad[0] = 1
+			diagnostics := AOQTSidecarOptimizerDiagnostics{
+				PlannedSteps:       1,
+				MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+			}
+
+			accepted, err := trainer.acceptTransactionalAdamStep(grad, tc.baseline, func() (aoqtStepEvaluation, error) {
+				return tc.candidate, nil
+			}, weights, &diagnostics)
+			if err != nil {
+				t.Fatalf("transactional step: %v", err)
+			}
+			if accepted {
+				t.Fatalf("accepted intentionally unsafe %s proposal", tc.name)
+			}
+			if diagnostics.RejectionDiagnostics.CandidateEvaluations != diagnostics.ProposalAttempts {
+				t.Fatalf("rejection evaluations = %d, proposal attempts = %d", diagnostics.RejectionDiagnostics.CandidateEvaluations, diagnostics.ProposalAttempts)
+			}
+			if diagnostics.RejectionDiagnostics.DominantReason != string(tc.wantReason) || diagnostics.RejectionDiagnostics.ReasonCounts.count(string(tc.wantReason)) != diagnostics.ProposalAttempts {
+				t.Fatalf("rejection diagnostics = %+v, want all proposals rejected by %s", diagnostics.RejectionDiagnostics, tc.wantReason)
+			}
+			if tc.wantRegress != "" && diagnostics.RejectionDiagnostics.DominantComponentRegression != tc.wantRegress {
+				t.Fatalf("dominant component regression = %q, want %q in %+v", diagnostics.RejectionDiagnostics.DominantComponentRegression, tc.wantRegress, diagnostics.RejectionDiagnostics.ComponentRegressionCounts)
+			}
+			if diagnostics.RejectionDiagnostics.ComponentDeltas.Q3Gain.Count != diagnostics.ProposalAttempts {
+				t.Fatalf("component deltas = %+v, want exact proposal aggregate deltas", diagnostics.RejectionDiagnostics.ComponentDeltas)
+			}
+		})
+	}
 }
 
 func TestAOQTCoordinateSearchOrderingIsDeterministic(t *testing.T) {
@@ -927,11 +1014,14 @@ func TestAOQTTransactionalFitRejectsZeroAcceptedAndRestoresState(t *testing.T) {
 	objective := &statefulRejectingAOQTObjective{config: tinyAOQTObjectiveConfig(set.Manifest.TurboQuantSeed)}
 
 	summary, err := trainer.Fit(set, objective)
-	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") {
-		t.Fatalf("fit error = %v, want zero-accepted transactional failure", err)
+	if err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") || !strings.Contains(err.Error(), "dominant_reason=loss_increase(80/80)") {
+		t.Fatalf("fit error = %v, want zero-accepted transactional failure with bounded rejection diagnostics", err)
 	}
 	if summary.OptimizerDiagnostics == nil || summary.OptimizerDiagnostics.AcceptedSteps != 0 || summary.OptimizerDiagnostics.ProposalAttempts != aoqtTransactionalMaxAttemptsPerStep {
 		t.Fatalf("diagnostics = %+v, want zero accepted and bounded proposals", summary.OptimizerDiagnostics)
+	}
+	if summary.OptimizerDiagnostics.RejectionDiagnostics.CandidateEvaluations != aoqtTransactionalMaxAttemptsPerStep || summary.OptimizerDiagnostics.RejectionDiagnostics.ReasonCounts.LossIncrease != aoqtTransactionalMaxAttemptsPerStep {
+		t.Fatalf("rejection diagnostics = %+v, want exact exhausted proposal accounting", summary.OptimizerDiagnostics.RejectionDiagnostics)
 	}
 	if trainer.step != before.step || !float32SlicesEqual(trainer.angles, before.angles) || !float32SlicesEqual(trainer.adamM, before.adamM) || !float32SlicesEqual(trainer.adamV, before.adamV) {
 		t.Fatalf("optimizer state was not restored after zero accepted fit")

@@ -95,8 +95,13 @@ func TestAOQTSidecarTrainRunnerRejectsZeroAcceptedWithoutPackage(t *testing.T) {
 		}}, nil
 	}
 
-	if _, err := runAOQTSidecarTraining(trainCfg, objectiveFactory); err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") {
-		t.Fatalf("run AOQT sidecar training error = %v, want zero-accepted failure", err)
+	if _, err := runAOQTSidecarTraining(trainCfg, objectiveFactory); err == nil || !strings.Contains(err.Error(), "accepted zero safe steps") || !strings.Contains(err.Error(), "rejection diagnostics: dominant_reason=") {
+		t.Fatalf("run AOQT sidecar training error = %v, want zero-accepted failure with rejection diagnostics", err)
+	}
+	if _, err := os.Lstat(trainCfg.MetricsJSONPath); err == nil {
+		t.Fatalf("runner wrote metrics output %q despite zero accepted safe steps", trainCfg.MetricsJSONPath)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat metrics output: %v", err)
 	}
 	for role, candidate := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(trainCfg.OutputArtifactPath, true)) {
 		if _, err := os.Lstat(candidate); err == nil {
