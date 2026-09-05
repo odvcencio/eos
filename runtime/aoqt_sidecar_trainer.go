@@ -685,7 +685,10 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 		return summary, err
 	}
 	summary.OptimizerDiagnosticsSHA256 = diagnosticsSHA
-	finalLoss, _, finalActivation, finalComponents, err := t.lossAndAngleGrad(set.Rows, objective)
+	// Reuse step-zero's deterministic row order for final telemetry so
+	// float32 aggregate components remain comparable to the initial summary.
+	finalRows := deterministicAOQTRowOrder(set.Rows, t.config.WorkplanSeed, 0)
+	finalLoss, _, finalActivation, finalComponents, err := t.lossAndAngleGrad(finalRows, objective)
 	if err != nil {
 		return summary, err
 	}
