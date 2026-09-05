@@ -129,11 +129,12 @@ func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory a
 		result := AOQTSidecarTrainRunnerResult{IOReport: ioReport, Preflight: preflight}
 		if !cfg.PlanOnly {
 			diagnostics, diagnosticsErr := newAOQTFailClosedDiagnostics(set, ioReport, preflight, cfg.PreflightJSONPath, preflightSHA256, summary, err)
-			if diagnosticsErr == nil {
-				result.FailureDiagnostics = &diagnostics
-				if writeErr := writeAOQTFailClosedDiagnosticsFile(AOQTFailClosedDiagnosticsPath(cfg.MetricsJSONPath), diagnostics); writeErr != nil {
-					return result, fmt.Errorf("%w; failed to write AOQT fail-closed diagnostics: %v", err, writeErr)
-				}
+			if diagnosticsErr != nil {
+				return result, fmt.Errorf("%w; failed to construct AOQT fail-closed diagnostics: %v", err, diagnosticsErr)
+			}
+			result.FailureDiagnostics = &diagnostics
+			if writeErr := writeAOQTFailClosedDiagnosticsFile(AOQTFailClosedDiagnosticsPath(cfg.MetricsJSONPath), diagnostics); writeErr != nil {
+				return result, fmt.Errorf("%w; failed to write AOQT fail-closed diagnostics: %v", err, writeErr)
 			}
 		}
 		return result, err
@@ -840,11 +841,29 @@ func validateAOQTFailClosedPreflight(preflight AOQTSidecarMaterializePreflight, 
 			return fmt.Errorf("AOQT fail-closed diagnostics preflight outputs.%s is required", key)
 		}
 	}
-	if preflight.Outputs["rows_jsonl"] != report.RowsJSONLPath || preflight.Outputs["manifest_json"] != report.ManifestPath {
-		return fmt.Errorf("AOQT fail-closed diagnostics preflight outputs must bind IO report paths")
+	if err := validateAOQTPathBinding(preflight.Outputs["rows_jsonl"], report.RowsJSONLPath, "AOQT fail-closed diagnostics preflight outputs.rows_jsonl", "IO report rows_jsonl_path"); err != nil {
+		return err
 	}
-	if preflight.Outputs["preflight_json"] != preflightPath {
-		return fmt.Errorf("AOQT fail-closed diagnostics preflight outputs must bind preflight path")
+	if err := validateAOQTPathBinding(preflight.Outputs["manifest_json"], report.ManifestPath, "AOQT fail-closed diagnostics preflight outputs.manifest_json", "IO report manifest_path"); err != nil {
+		return err
+	}
+	if err := validateAOQTPathBinding(preflight.Outputs["preflight_json"], preflightPath, "AOQT fail-closed diagnostics preflight outputs.preflight_json", "preflight path"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateAOQTPathBinding(declared, actual, declaredLabel, actualLabel string) error {
+	declaredCanonical, err := canonicalAOQTPath(declared)
+	if err != nil {
+		return fmt.Errorf("%s path %q cannot be resolved: %w", declaredLabel, declared, err)
+	}
+	actualCanonical, err := canonicalAOQTPath(actual)
+	if err != nil {
+		return fmt.Errorf("%s %q cannot be resolved: %w", actualLabel, actual, err)
+	}
+	if declaredCanonical != actualCanonical {
+		return fmt.Errorf("%s must bind %s", declaredLabel, actualLabel)
 	}
 	return nil
 }
