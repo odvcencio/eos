@@ -58,6 +58,148 @@ func TestAOQTCandidateEligibilityRequiresAngleMovementAndQ3Improvement(t *testin
 	}
 }
 
+func TestAOQTScoreDistillBudgetContractPreservesLegacyZeroBudget(t *testing.T) {
+	baseline := aoqtStepEvaluation{
+		loss:       6,
+		activation: AOQTSidecarObjectiveActivation{Q3GainEligiblePairs: 1, Q3GainContributingPairs: 1, Q3ScoreDistillCount: 1, Q5ScoreDistillCount: 1},
+		components: AOQTSidecarObjectiveComponents{Q3Gain: 1, Q3ScoreDistill: 1, Q5ScoreDistill: 1, Q3OrderGuard: 1, Q5OrderGuard: 1, NFBoundaryGuard: 1},
+	}
+	candidate := baseline
+	candidate.components.Q3Gain = 0.5
+	candidate.components.Q3ScoreDistill += 5e-6
+	candidate.components.Q5ScoreDistill += 5e-6
+	candidate.loss = candidate.components.Sum()
+	weights := AOQTSidecarRowWeights{Q3Gain: 1, Q3ScoreDistill: 1, Q5ScoreDistill: 1}
+	if decision := aoqtEvaluateTransactionalStep(baseline, candidate, weights); decision.accepted || decision.reason != aoqtRejectionComponentRegression {
+		t.Fatalf("legacy zero-budget decision = %+v, want component-regression rejection", decision)
+	}
+	lanePolicy := AOQTSidecarScoreDistillBudgetLaneAPolicy()
+	resolved, err := AOQTSidecarTrainingContractPolicy(AOQTSidecarScoreDistillBudgetLaneAContract, &lanePolicy)
+	if err != nil {
+		t.Fatalf("resolve laneA contract: %v", err)
+	}
+	if decision := aoqtEvaluateTransactionalStepWithPolicy(baseline, candidate, weights, resolved); !decision.accepted {
+		t.Fatalf("laneA within-budget decision = %+v, want acceptance", decision)
+	}
+	trainer, err := NewAOQTSidecarTrainer(AOQTSidecarTrainConfig{
+		PairingSeed:                1,
+		WorkplanSeed:               2,
+		PlanOnly:                   true,
+		TrainingContract:           AOQTSidecarScoreDistillBudgetLaneAContract,
+		CandidateEligibilityPolicy: &lanePolicy,
+	})
+	if err != nil {
+		t.Fatalf("laneA trainer: %v", err)
+	}
+	state := trainer.snapshotOptimizerState()
+	trainer.angles[0] = 1e-4
+	if decision := trainer.evaluateTransactionalProposal(state, baseline, candidate, weights); !decision.accepted {
+		t.Fatalf("laneA trainer wiring decision = %+v, want acceptance", decision)
+	}
+
+	over := candidate
+	over.components.Q3ScoreDistill = baseline.components.Q3ScoreDistill + 2e-5
+	over.loss = over.components.Sum()
+	if decision := aoqtEvaluateTransactionalStepWithPolicy(baseline, over, weights, resolved); decision.accepted || decision.reason != aoqtRejectionComponentRegression {
+		t.Fatalf("laneA above-budget decision = %+v, want component-regression rejection", decision)
+	}
+	otherGuard := candidate
+	otherGuard.components.Q3OrderGuard = baseline.components.Q3OrderGuard + 2e-6
+	otherGuard.loss = otherGuard.components.Sum()
+	if decision := aoqtEvaluateTransactionalStepWithPolicy(baseline, otherGuard, weights, resolved); decision.accepted || decision.reason != aoqtRejectionComponentRegression {
+		t.Fatalf("laneA other-guard decision = %+v, want component-regression rejection", decision)
+	}
+}
+
+func TestAOQTScoreDistillBudgetContractRejectsMislabelledProvenance(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 186)
+	activation := AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs: 2, Q3GainContributingPairs: 2,
+		Q3OrderGuardPairs: 2, Q3OrderGuardContributing: 2,
+		Q3ScoreDistillCount: 3, Q5OrderGuardPairs: 2,
+		Q5OrderGuardContributing: 2, Q5ScoreDistillCount: 3,
+	}
+	metrics := safeTinyAOQTCandidateMetrics(t, set, activation)
+	policy := AOQTSidecarScoreDistillBudgetLaneAPolicy()
+	metrics.TrainingContract = AOQTSidecarScoreDistillBudgetLaneAContract
+	metrics.CandidateEligibilityPolicy = &policy
+	metrics.Summary.TrainingContract = AOQTSidecarScoreDistillBudgetLaneAContract
+	metrics.Summary.CandidateEligibilityPolicy = &policy
+	if err := metrics.Validate(); err != nil {
+		t.Fatalf("valid laneA metrics: %v", err)
+	}
+	if err := ValidateAOQTSidecarCandidateEligibility(metrics, policy); err != nil {
+		t.Fatalf("valid laneA candidate: %v", err)
+	}
+	bad := metrics
+	bad.Summary.CandidateEligibilityPolicy = &AOQTSidecarCandidateEligibilityPolicy{
+		DenseMaxAbsDeltaTolerance:         policy.DenseMaxAbsDeltaTolerance,
+		AngleMaxAbsCap:                    policy.AngleMaxAbsCap,
+		RequireObjectiveActivation:        true,
+		Q3ScoreDistillAllowedLossIncrease: 2e-5,
+		Q5ScoreDistillAllowedLossIncrease: 1e-5,
+	}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "does not match its preregistered q3/q5 score-distill budgets") {
+		t.Fatalf("mislabelled budget validation error = %v, want preregistered-policy rejection", err)
+	}
+	if err := ValidateAOQTSidecarCandidateEligibility(metrics, AOQTSidecarDefaultCandidateEligibilityPolicy()); err == nil || !strings.Contains(err.Error(), "does not match metrics training contract") {
+		t.Fatalf("wrong caller budget error = %v, want contract mismatch", err)
+	}
+}
+
+func TestAOQTCandidateEligibilityEnforcesTransactionalTotalLossEpsilon(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 187)
+	activation := AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs: 2, Q3GainContributingPairs: 2,
+		Q3OrderGuardPairs: 2, Q3OrderGuardContributing: 2,
+		Q3ScoreDistillCount: 3, Q5OrderGuardPairs: 2,
+		Q5OrderGuardContributing: 2, Q5ScoreDistillCount: 3,
+	}
+	metrics := safeTinyAOQTCandidateMetrics(t, set, activation)
+	lanePolicy := AOQTSidecarScoreDistillBudgetLaneAPolicy()
+	metrics.TrainingContract = AOQTSidecarScoreDistillBudgetLaneAContract
+	metrics.CandidateEligibilityPolicy = &lanePolicy
+	metrics.Summary.TrainingContract = AOQTSidecarScoreDistillBudgetLaneAContract
+	metrics.Summary.CandidateEligibilityPolicy = &lanePolicy
+	initial := metrics.Summary.InitialObjectiveComponents
+
+	bad := metrics
+	badFinal := initial
+	badFinal.Q3Gain -= float32(1e-6)
+	badFinal.Q3ScoreDistill += float32(9e-6)
+	badFinal.Q5ScoreDistill += float32(9e-6)
+	bad.Summary.FinalObjectiveComponents = badFinal
+	bad.Summary.InitialLoss = initial.Sum()
+	bad.Summary.FinalLoss = badFinal.Sum()
+	if delta := bad.Summary.FinalLoss - bad.Summary.InitialLoss; delta <= aoqtTransactionalLossEpsilon {
+		t.Fatalf("regression fixture total loss delta = %.9g, want > epsilon %.9g", delta, aoqtTransactionalLossEpsilon)
+	}
+	if err := bad.Validate(); err != nil {
+		t.Fatalf("regression fixture metrics: %v", err)
+	}
+	if err := ValidateAOQTSidecarCandidateEligibility(bad, lanePolicy); err == nil || !strings.Contains(err.Error(), "total loss increased") {
+		t.Fatalf("total-loss regression error = %v, want transactional epsilon rejection", err)
+	}
+
+	good := metrics
+	goodFinal := initial
+	goodFinal.Q3Gain -= float32(1e-6)
+	goodFinal.Q3ScoreDistill += float32(1e-7)
+	goodFinal.Q5ScoreDistill += float32(1e-7)
+	good.Summary.FinalObjectiveComponents = goodFinal
+	good.Summary.InitialLoss = initial.Sum()
+	good.Summary.FinalLoss = goodFinal.Sum()
+	if delta := good.Summary.FinalLoss - good.Summary.InitialLoss; delta > aoqtTransactionalLossEpsilon {
+		t.Fatalf("non-regression fixture total loss delta = %.9g, want <= epsilon %.9g", delta, aoqtTransactionalLossEpsilon)
+	}
+	if err := good.Validate(); err != nil {
+		t.Fatalf("non-regression fixture metrics: %v", err)
+	}
+	if err := ValidateAOQTSidecarCandidateEligibility(good, lanePolicy); err != nil {
+		t.Fatalf("total-loss delta within transactional epsilon: %v", err)
+	}
+}
+
 func TestAOQTOptimizerDiagnosticsRequireKnownCoordinateSearchStrategy(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 89)
 	enableTinyAOQTNFGuard(t, &set)

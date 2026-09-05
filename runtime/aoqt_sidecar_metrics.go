@@ -15,15 +15,17 @@ import (
 const AOQTSidecarMetricsSchema = "eos.q3_aoqt_sidecar_metrics.v2"
 
 type AOQTSidecarRunMetrics struct {
-	Schema            string                       `json:"schema"`
-	Plan              AOQTSidecarWorkPlan          `json:"plan"`
-	Inputs            AOQTSidecarRunMetricInputs   `json:"inputs"`
-	Topology          AOQTSidecarTopologyBinding   `json:"topology"`
-	ObjectiveContract AOQTSidecarObjectiveContract `json:"objective_contract"`
-	LegalGates        AOQTSidecarLegalGates        `json:"legal_gates"`
-	Summary           AOQTSidecarTrainSummary      `json:"summary"`
-	QualityClaim      bool                         `json:"quality_claim"`
-	ReservedStage     string                       `json:"reserved_stage,omitempty"`
+	Schema                     string                                 `json:"schema"`
+	Plan                       AOQTSidecarWorkPlan                    `json:"plan"`
+	Inputs                     AOQTSidecarRunMetricInputs             `json:"inputs"`
+	Topology                   AOQTSidecarTopologyBinding             `json:"topology"`
+	ObjectiveContract          AOQTSidecarObjectiveContract           `json:"objective_contract"`
+	LegalGates                 AOQTSidecarLegalGates                  `json:"legal_gates"`
+	Summary                    AOQTSidecarTrainSummary                `json:"summary"`
+	QualityClaim               bool                                   `json:"quality_claim"`
+	ReservedStage              string                                 `json:"reserved_stage,omitempty"`
+	TrainingContract           string                                 `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
 }
 
 type AOQTSidecarRunMetricInputs struct {
@@ -47,11 +49,113 @@ type AOQTSidecarCandidateEligibilityPolicy struct {
 	NFBoundaryGuardAllowedLossIncrease float32 `json:"nf_boundary_guard_allowed_loss_increase"`
 }
 
+// AOQTSidecarScoreDistillBudgetLaneAContract is an explicit train-only
+// contract. It permits only the measured score-distill component budgets;
+// strict q3 gain improvement, total-loss non-increase, dense/angle caps, and
+// every other component guard remain unchanged. The allowance is in the
+// existing AOQTSidecarObjectiveComponents units: each field is the aggregate
+// row-weighted component sum, not a second per-row mean.
+const AOQTSidecarScoreDistillBudgetLaneAContract = "aoqt-trainonly-score-distill-budget-laneA-v1"
+
+func AOQTSidecarDefaultCandidateEligibilityPolicy() AOQTSidecarCandidateEligibilityPolicy {
+	return normalizedAOQTSidecarCandidateEligibilityPolicy(AOQTSidecarCandidateEligibilityPolicy{})
+}
+
+func AOQTSidecarScoreDistillBudgetLaneAPolicy() AOQTSidecarCandidateEligibilityPolicy {
+	policy := AOQTSidecarDefaultCandidateEligibilityPolicy()
+	policy.Q3ScoreDistillAllowedLossIncrease = 1e-5
+	policy.Q5ScoreDistillAllowedLossIncrease = 1e-5
+	return policy
+}
+
+// AOQTSidecarTrainingContractPolicy resolves the policy bound to a manifest,
+// preflight, summary, or metrics artifact. Empty fields mean the historical
+// zero-budget contract. Positive budgets are accepted only under the named
+// laneA contract, preventing a budget from being silently relabeled as the
+// legacy policy or from being changed under a reused name.
+func AOQTSidecarTrainingContractPolicy(name string, declared *AOQTSidecarCandidateEligibilityPolicy) (AOQTSidecarCandidateEligibilityPolicy, error) {
+	originalName := name
+	name = strings.TrimSpace(name)
+	if originalName != name {
+		return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("AOQT training contract name must be canonical without surrounding whitespace")
+	}
+	if name == "" {
+		defaultPolicy := AOQTSidecarDefaultCandidateEligibilityPolicy()
+		if declared == nil {
+			return defaultPolicy, nil
+		}
+		policy := normalizedAOQTSidecarCandidateEligibilityPolicy(*declared)
+		if err := validateAOQTSidecarCandidateEligibilityPolicy(policy); err != nil {
+			return AOQTSidecarCandidateEligibilityPolicy{}, err
+		}
+		if !aoqtCandidateEligibilityPoliciesEqual(policy, defaultPolicy) {
+			return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("legacy AOQT training contract must retain the default zero-budget eligibility policy")
+		}
+		return policy, nil
+	}
+	if name != AOQTSidecarScoreDistillBudgetLaneAContract {
+		return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("unsupported AOQT training contract %q", name)
+	}
+	if declared == nil {
+		return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("AOQT training contract %q requires an explicit candidate eligibility policy", name)
+	}
+	policy := normalizedAOQTSidecarCandidateEligibilityPolicy(*declared)
+	if err := validateAOQTSidecarCandidateEligibilityPolicy(policy); err != nil {
+		return AOQTSidecarCandidateEligibilityPolicy{}, err
+	}
+	want := AOQTSidecarScoreDistillBudgetLaneAPolicy()
+	if !aoqtCandidateEligibilityPoliciesEqual(policy, want) {
+		return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("AOQT training contract %q policy does not match its preregistered q3/q5 score-distill budgets", name)
+	}
+	return policy, nil
+}
+
+func cloneAOQTSidecarCandidateEligibilityPolicy(policy *AOQTSidecarCandidateEligibilityPolicy) *AOQTSidecarCandidateEligibilityPolicy {
+	if policy == nil {
+		return nil
+	}
+	copy := *policy
+	return &copy
+}
+
+func aoqtCandidateEligibilityPoliciesEqual(a, b AOQTSidecarCandidateEligibilityPolicy) bool {
+	return a.DenseMaxAbsDeltaTolerance == b.DenseMaxAbsDeltaTolerance &&
+		a.AngleMaxAbsCap == b.AngleMaxAbsCap &&
+		a.RequireObjectiveActivation == b.RequireObjectiveActivation &&
+		a.Q3GainAllowedLossIncrease == b.Q3GainAllowedLossIncrease &&
+		a.Q3OrderGuardAllowedLossIncrease == b.Q3OrderGuardAllowedLossIncrease &&
+		a.Q3ScoreDistillAllowedLossIncrease == b.Q3ScoreDistillAllowedLossIncrease &&
+		a.Q5OrderGuardAllowedLossIncrease == b.Q5OrderGuardAllowedLossIncrease &&
+		a.Q5ScoreDistillAllowedLossIncrease == b.Q5ScoreDistillAllowedLossIncrease &&
+		a.NFBoundaryGuardAllowedLossIncrease == b.NFBoundaryGuardAllowedLossIncrease
+}
+
+func validateAOQTSidecarTrainingContractBinding(leftName string, leftPolicy *AOQTSidecarCandidateEligibilityPolicy, rightName string, rightPolicy *AOQTSidecarCandidateEligibilityPolicy) error {
+	leftEffective, err := AOQTSidecarTrainingContractPolicy(leftName, leftPolicy)
+	if err != nil {
+		return fmt.Errorf("left contract: %w", err)
+	}
+	rightEffective, err := AOQTSidecarTrainingContractPolicy(rightName, rightPolicy)
+	if err != nil {
+		return fmt.Errorf("right contract: %w", err)
+	}
+	if strings.TrimSpace(leftName) != strings.TrimSpace(rightName) {
+		return fmt.Errorf("contract name mismatch %q vs %q", leftName, rightName)
+	}
+	if !aoqtCandidateEligibilityPoliciesEqual(leftEffective, rightEffective) {
+		return fmt.Errorf("candidate eligibility policy mismatch")
+	}
+	return nil
+}
+
 func NewAOQTSidecarRunMetrics(set AOQTSidecarCalibrationSet, summary AOQTSidecarTrainSummary) (AOQTSidecarRunMetrics, error) {
 	if err := set.Validate(); err != nil {
 		return AOQTSidecarRunMetrics{}, err
 	}
 	if err := validateAOQTSidecarSummaryPlan(summary, set.Manifest, set.Rows); err != nil {
+		return AOQTSidecarRunMetrics{}, err
+	}
+	if err := validateAOQTSidecarTrainingContractBinding(set.Manifest.TrainingContract, set.Manifest.CandidateEligibilityPolicy, summary.TrainingContract, summary.CandidateEligibilityPolicy); err != nil {
 		return AOQTSidecarRunMetrics{}, err
 	}
 	manifestHash, err := AOQTSidecarManifestSHA256(set.Manifest)
@@ -69,12 +173,14 @@ func NewAOQTSidecarRunMetrics(set AOQTSidecarCalibrationSet, summary AOQTSidecar
 			QrelsSHA256ByDataset:        cloneAOQTStringMap(set.Manifest.QrelsSHA256ByDataset),
 			CompatibilityDigest:         set.Manifest.CompatibilityDigest,
 		},
-		Topology:          set.Manifest.Topology,
-		ObjectiveContract: set.Manifest.ObjectiveContract,
-		LegalGates:        set.Manifest.LegalGates,
-		Summary:           summary,
-		QualityClaim:      false,
-		ReservedStage:     "Stage2B score-spectrum TurboQuant STE adapter",
+		Topology:                   set.Manifest.Topology,
+		ObjectiveContract:          set.Manifest.ObjectiveContract,
+		LegalGates:                 set.Manifest.LegalGates,
+		Summary:                    summary,
+		QualityClaim:               false,
+		ReservedStage:              "Stage2B score-spectrum TurboQuant STE adapter",
+		TrainingContract:           set.Manifest.TrainingContract,
+		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
 	}
 	return metrics, metrics.Validate()
 }
@@ -91,6 +197,9 @@ func (m AOQTSidecarRunMetrics) Validate() error {
 	}
 	if m.Plan != m.Summary.Plan {
 		return fmt.Errorf("AOQT metrics plan must exactly match summary.plan")
+	}
+	if err := validateAOQTSidecarTrainingContractBinding(m.TrainingContract, m.CandidateEligibilityPolicy, m.Summary.TrainingContract, m.Summary.CandidateEligibilityPolicy); err != nil {
+		return fmt.Errorf("AOQT metrics training contract: %w", err)
 	}
 	if err := m.Topology.Validate(); err != nil {
 		return err
@@ -197,6 +306,13 @@ func ValidateAOQTSidecarCandidateEligibility(metrics AOQTSidecarRunMetrics, poli
 	if err := metrics.Validate(); err != nil {
 		return err
 	}
+	declaredPolicy, err := AOQTSidecarTrainingContractPolicy(metrics.TrainingContract, metrics.CandidateEligibilityPolicy)
+	if err != nil {
+		return fmt.Errorf("AOQT candidate training contract: %w", err)
+	}
+	if !aoqtCandidateEligibilityPoliciesEqual(policy, declaredPolicy) {
+		return fmt.Errorf("AOQT candidate eligibility policy does not match metrics training contract")
+	}
 	if metrics.Plan.PlanOnly || metrics.Summary.Steps == 0 {
 		return fmt.Errorf("AOQT candidate eligibility requires a non-plan training summary")
 	}
@@ -208,6 +324,9 @@ func ValidateAOQTSidecarCandidateEligibility(metrics AOQTSidecarRunMetrics, poli
 	}
 	if !isFinite32(metrics.Summary.InitialLoss) || !isFinite32(metrics.Summary.FinalLoss) {
 		return fmt.Errorf("AOQT candidate eligibility losses must be finite")
+	}
+	if lossDelta := metrics.Summary.FinalLoss - metrics.Summary.InitialLoss; lossDelta > aoqtTransactionalLossEpsilon {
+		return fmt.Errorf("AOQT candidate total loss increased by %.9g beyond transactional epsilon %.9g", lossDelta, aoqtTransactionalLossEpsilon)
 	}
 	if metrics.Summary.DenseMaxAbsDelta < 0 || math.IsNaN(metrics.Summary.DenseMaxAbsDelta) || math.IsInf(metrics.Summary.DenseMaxAbsDelta, 0) {
 		return fmt.Errorf("AOQT candidate dense_max_abs_delta must be finite and non-negative")

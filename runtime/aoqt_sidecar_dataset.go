@@ -113,6 +113,11 @@ type AOQTSidecarCalibrationManifest struct {
 	CompatibilityDigest         string                         `json:"compatibility_digest"`
 	LegalGates                  AOQTSidecarLegalGates          `json:"legal_gates"`
 	Extra                       map[string]json.RawMessage     `json:"extra,omitempty"`
+	// TrainingContract and CandidateEligibilityPolicy are omitted for legacy
+	// manifests. A non-empty named contract is a new, explicitly materialized
+	// training policy and is included in the canonical manifest digest.
+	TrainingContract           string                                 `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
 }
 
 type AOQTSidecarCalibrationRow struct {
@@ -220,6 +225,9 @@ func (m AOQTSidecarCalibrationManifest) Validate() error {
 	}
 	if err := m.ObjectiveContract.Validate(m); err != nil {
 		return err
+	}
+	if _, err := AOQTSidecarTrainingContractPolicy(m.TrainingContract, m.CandidateEligibilityPolicy); err != nil {
+		return fmt.Errorf("AOQT manifest training contract: %w", err)
 	}
 	if len(m.QrelsSHA256ByDataset) == 0 {
 		return fmt.Errorf("AOQT manifest qrels_sha256_by_dataset is required")

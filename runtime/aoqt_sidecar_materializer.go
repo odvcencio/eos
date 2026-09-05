@@ -25,46 +25,50 @@ const (
 )
 
 type AOQTSidecarMaterializeConfig struct {
-	PlanPath               string
-	ExclusionQIDPaths      []string
-	VectorPaths            []string
-	ScoreEvidencePaths     []string
-	QrelsPaths             []string
-	RowJSONLPath           string
-	ManifestJSONPath       string
-	PreflightJSONPath      string
-	AnchorEmbeddingSpaceID string
-	CreatedAtUTC           string
-	AllowResearchOnly      bool
-	ExpectedTurboQuantSeed int64
-	ExpectedTopologySeed   int64
-	AnchorArtifactPath     string
-	AnchorArtifactSHA256   string
-	PackageManifestSHA256  string
+	PlanPath                   string
+	ExclusionQIDPaths          []string
+	VectorPaths                []string
+	ScoreEvidencePaths         []string
+	QrelsPaths                 []string
+	RowJSONLPath               string
+	ManifestJSONPath           string
+	PreflightJSONPath          string
+	AnchorEmbeddingSpaceID     string
+	CreatedAtUTC               string
+	AllowResearchOnly          bool
+	ExpectedTurboQuantSeed     int64
+	ExpectedTopologySeed       int64
+	AnchorArtifactPath         string
+	AnchorArtifactSHA256       string
+	PackageManifestSHA256      string
+	TrainingContract           string
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy
 }
 
 type AOQTSidecarMaterializePreflight struct {
-	Schema                    string                       `json:"schema"`
-	CreatedAtUTC              string                       `json:"created_at_utc"`
-	QualityClaim              bool                         `json:"quality_claim"`
-	ResearchOnly              bool                         `json:"research_only"`
-	ActualTrainingRan         bool                         `json:"actual_training_ran"`
-	ActualEvalRan             bool                         `json:"actual_eval_ran"`
-	ActualVectorExportRan     bool                         `json:"actual_vector_export_ran"`
-	PlanSHA256                string                       `json:"plan_sha256"`
-	InputSHA256               map[string]string            `json:"input_sha256"`
-	RowCount                  int                          `json:"row_count"`
-	CandidateCount            int                          `json:"candidate_count"`
-	PairCount                 int                          `json:"pair_count"`
-	TurboQuantSeed            int64                        `json:"turboquant_seed"`
-	TopologySeed              int64                        `json:"topology_seed"`
-	QuantScoreSurface         string                       `json:"quant_score_surface"`
-	QrelsSHA256ByDataset      map[string]string            `json:"qrels_sha256_by_dataset"`
-	SourceSemantics           []string                     `json:"source_semantics"`
-	Outputs                   map[string]string            `json:"outputs"`
-	CalibrationManifestSHA256 string                       `json:"calibration_manifest_sha256"`
-	LegalGates                AOQTSidecarLegalGates        `json:"legal_gates"`
-	ObjectiveContract         AOQTSidecarObjectiveContract `json:"objective_contract"`
+	Schema                     string                                 `json:"schema"`
+	CreatedAtUTC               string                                 `json:"created_at_utc"`
+	QualityClaim               bool                                   `json:"quality_claim"`
+	ResearchOnly               bool                                   `json:"research_only"`
+	ActualTrainingRan          bool                                   `json:"actual_training_ran"`
+	ActualEvalRan              bool                                   `json:"actual_eval_ran"`
+	ActualVectorExportRan      bool                                   `json:"actual_vector_export_ran"`
+	PlanSHA256                 string                                 `json:"plan_sha256"`
+	InputSHA256                map[string]string                      `json:"input_sha256"`
+	RowCount                   int                                    `json:"row_count"`
+	CandidateCount             int                                    `json:"candidate_count"`
+	PairCount                  int                                    `json:"pair_count"`
+	TurboQuantSeed             int64                                  `json:"turboquant_seed"`
+	TopologySeed               int64                                  `json:"topology_seed"`
+	QuantScoreSurface          string                                 `json:"quant_score_surface"`
+	QrelsSHA256ByDataset       map[string]string                      `json:"qrels_sha256_by_dataset"`
+	SourceSemantics            []string                               `json:"source_semantics"`
+	Outputs                    map[string]string                      `json:"outputs"`
+	CalibrationManifestSHA256  string                                 `json:"calibration_manifest_sha256"`
+	LegalGates                 AOQTSidecarLegalGates                  `json:"legal_gates"`
+	ObjectiveContract          AOQTSidecarObjectiveContract           `json:"objective_contract"`
+	TrainingContract           string                                 `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
 }
 
 type aoqtMaterializePlan struct {
@@ -311,6 +315,8 @@ func MaterializeAOQTSidecarCalibration(cfg AOQTSidecarMaterializeConfig) (AOQTSi
 		TurboQuantSeed:   cfg.ExpectedTurboQuantSeed,
 		NFBoundarySource: "nf_boundary80_120",
 	}.ObjectiveContract(sumAOQTRowWeights(rows))
+	manifest.TrainingContract = cfg.TrainingContract
+	manifest.CandidateEligibilityPolicy = cloneAOQTSidecarCandidateEligibilityPolicy(cfg.CandidateEligibilityPolicy)
 	set := AOQTSidecarCalibrationSet{Manifest: manifest, Rows: rows}
 	if err := set.Validate(); err != nil {
 		return AOQTSidecarMaterializePreflight{}, err
@@ -326,24 +332,26 @@ func MaterializeAOQTSidecarCalibration(cfg AOQTSidecarMaterializeConfig) (AOQTSi
 		return AOQTSidecarMaterializePreflight{}, err
 	}
 	preflight := AOQTSidecarMaterializePreflight{
-		Schema:                    AOQTSidecarMaterializerPreflightSchema,
-		CreatedAtUTC:              cfg.CreatedAtUTC,
-		QualityClaim:              false,
-		ResearchOnly:              true,
-		PlanSHA256:                planSHA,
-		InputSHA256:               inputHashes,
-		RowCount:                  len(rows),
-		CandidateCount:            countAOQTCandidates(rows),
-		PairCount:                 countAOQTPairs(rows),
-		TurboQuantSeed:            cfg.ExpectedTurboQuantSeed,
-		TopologySeed:              cfg.ExpectedTopologySeed,
-		QuantScoreSurface:         AOQTSidecarPreparedIPScoreSurface,
-		QrelsSHA256ByDataset:      qrelsByDataset,
-		SourceSemantics:           []string{"q3_top10", "q5_top10", "nf_boundary80_120"},
-		Outputs:                   map[string]string{"rows_jsonl": cfg.RowJSONLPath, "manifest_json": cfg.ManifestJSONPath, "preflight_json": cfg.PreflightJSONPath},
-		CalibrationManifestSHA256: manifestSHA,
-		LegalGates:                manifest.LegalGates,
-		ObjectiveContract:         manifest.ObjectiveContract,
+		Schema:                     AOQTSidecarMaterializerPreflightSchema,
+		CreatedAtUTC:               cfg.CreatedAtUTC,
+		QualityClaim:               false,
+		ResearchOnly:               true,
+		PlanSHA256:                 planSHA,
+		InputSHA256:                inputHashes,
+		RowCount:                   len(rows),
+		CandidateCount:             countAOQTCandidates(rows),
+		PairCount:                  countAOQTPairs(rows),
+		TurboQuantSeed:             cfg.ExpectedTurboQuantSeed,
+		TopologySeed:               cfg.ExpectedTopologySeed,
+		QuantScoreSurface:          AOQTSidecarPreparedIPScoreSurface,
+		QrelsSHA256ByDataset:       qrelsByDataset,
+		SourceSemantics:            []string{"q3_top10", "q5_top10", "nf_boundary80_120"},
+		Outputs:                    map[string]string{"rows_jsonl": cfg.RowJSONLPath, "manifest_json": cfg.ManifestJSONPath, "preflight_json": cfg.PreflightJSONPath},
+		CalibrationManifestSHA256:  manifestSHA,
+		LegalGates:                 manifest.LegalGates,
+		ObjectiveContract:          manifest.ObjectiveContract,
+		TrainingContract:           manifest.TrainingContract,
+		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(manifest.CandidateEligibilityPolicy),
 	}
 	if err := writeJSONFileAOQT(cfg.PreflightJSONPath, preflight); err != nil {
 		return AOQTSidecarMaterializePreflight{}, err
@@ -385,6 +393,9 @@ func validateAOQTMaterializeConfig(cfg AOQTSidecarMaterializeConfig) error {
 	}
 	if len(cfg.VectorPaths) == 0 || len(cfg.ScoreEvidencePaths) == 0 || len(cfg.QrelsPaths) == 0 {
 		return fmt.Errorf("AOQT materializer requires vector, score-evidence, and qrels inputs")
+	}
+	if _, err := AOQTSidecarTrainingContractPolicy(cfg.TrainingContract, cfg.CandidateEligibilityPolicy); err != nil {
+		return fmt.Errorf("AOQT materializer training contract: %w", err)
 	}
 	return nil
 }

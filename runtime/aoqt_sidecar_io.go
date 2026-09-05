@@ -31,22 +31,24 @@ type AOQTSidecarCalibrationIOConfig struct {
 }
 
 type AOQTSidecarCalibrationIOReport struct {
-	Schema                      string                       `json:"schema"`
-	ManifestPath                string                       `json:"manifest_path"`
-	RowsJSONLPath               string                       `json:"rows_jsonl_path"`
-	ManifestSHA256              string                       `json:"manifest_sha256"`
-	RowsSHA256                  string                       `json:"rows_sha256"`
-	AnchorArtifactSHA256        string                       `json:"anchor_artifact_sha256"`
-	AnchorPackageManifestSHA256 string                       `json:"anchor_package_manifest_sha256"`
-	AnchorEmbeddingSpaceID      string                       `json:"anchor_embedding_space_id"`
-	CompatibilityDigest         string                       `json:"compatibility_digest"`
-	TurboQuantSeed              int64                        `json:"turboquant_seed"`
-	Topology                    AOQTSidecarTopologyBinding   `json:"topology"`
-	ObjectiveContract           AOQTSidecarObjectiveContract `json:"objective_contract"`
-	LegalGates                  AOQTSidecarLegalGates        `json:"legal_gates"`
-	RowCount                    int                          `json:"row_count"`
-	CandidateCount              int                          `json:"candidate_count"`
-	PairCount                   int                          `json:"pair_count"`
+	Schema                      string                                 `json:"schema"`
+	ManifestPath                string                                 `json:"manifest_path"`
+	RowsJSONLPath               string                                 `json:"rows_jsonl_path"`
+	ManifestSHA256              string                                 `json:"manifest_sha256"`
+	RowsSHA256                  string                                 `json:"rows_sha256"`
+	AnchorArtifactSHA256        string                                 `json:"anchor_artifact_sha256"`
+	AnchorPackageManifestSHA256 string                                 `json:"anchor_package_manifest_sha256"`
+	AnchorEmbeddingSpaceID      string                                 `json:"anchor_embedding_space_id"`
+	CompatibilityDigest         string                                 `json:"compatibility_digest"`
+	TurboQuantSeed              int64                                  `json:"turboquant_seed"`
+	Topology                    AOQTSidecarTopologyBinding             `json:"topology"`
+	ObjectiveContract           AOQTSidecarObjectiveContract           `json:"objective_contract"`
+	LegalGates                  AOQTSidecarLegalGates                  `json:"legal_gates"`
+	RowCount                    int                                    `json:"row_count"`
+	CandidateCount              int                                    `json:"candidate_count"`
+	PairCount                   int                                    `json:"pair_count"`
+	TrainingContract            string                                 `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy  *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
 }
 
 func LoadAOQTSidecarCalibrationSet(cfg AOQTSidecarCalibrationIOConfig) (AOQTSidecarCalibrationSet, AOQTSidecarCalibrationIOReport, error) {
@@ -107,6 +109,8 @@ func LoadAOQTSidecarCalibrationSet(cfg AOQTSidecarCalibrationIOConfig) (AOQTSide
 		RowCount:                    len(rows),
 		CandidateCount:              countAOQTCandidates(rows),
 		PairCount:                   countAOQTPairs(rows),
+		TrainingContract:            manifest.TrainingContract,
+		CandidateEligibilityPolicy:  cloneAOQTSidecarCandidateEligibilityPolicy(manifest.CandidateEligibilityPolicy),
 	}
 	return set, report, nil
 }

@@ -15,18 +15,21 @@ import (
 )
 
 type AOQTSidecarTrainConfig struct {
-	Dim          int
-	Stages       int
-	PairingSeed  int64
-	WorkplanSeed int64
-	PlanOnly     bool
-	MaxSteps     int
-	LearningRate float32
-	Beta1        float32
-	Beta2        float32
-	Epsilon      float32
-	AngleCap     float32
-	MaxAngleCap  float32
+	Dim                        int
+	Stages                     int
+	PairingSeed                int64
+	WorkplanSeed               int64
+	PlanOnly                   bool
+	MaxSteps                   int
+	LearningRate               float32
+	Beta1                      float32
+	Beta2                      float32
+	Epsilon                    float32
+	AngleCap                   float32
+	MaxAngleCap                float32
+	CaptureProposalReceipts    bool
+	TrainingContract           string
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy
 }
 
 type AOQTSidecarWorkPlan struct {
@@ -45,22 +48,24 @@ type AOQTSidecarWorkPlan struct {
 }
 
 type AOQTSidecarTrainSummary struct {
-	Plan                       AOQTSidecarWorkPlan              `json:"plan"`
-	ObjectiveContract          AOQTSidecarObjectiveContract     `json:"objective_contract"`
-	Steps                      int                              `json:"steps"`
-	InitialLoss                float32                          `json:"initial_loss"`
-	FinalLoss                  float32                          `json:"final_loss"`
-	InitialObjectiveComponents AOQTSidecarObjectiveComponents   `json:"initial_objective_components"`
-	FinalObjectiveComponents   AOQTSidecarObjectiveComponents   `json:"final_objective_components"`
-	InitialObjectiveActivation AOQTSidecarObjectiveActivation   `json:"initial_objective_activation"`
-	FinalObjectiveActivation   AOQTSidecarObjectiveActivation   `json:"final_objective_activation"`
-	AngleL2                    float32                          `json:"angle_l2"`
-	AngleMaxAbs                float32                          `json:"angle_max_abs"`
-	AnglesSHA256               string                           `json:"angles_sha256"`
-	DenseMaxAbsDelta           float64                          `json:"dense_max_abs_delta"`
-	OptimizerDiagnostics       *AOQTSidecarOptimizerDiagnostics `json:"optimizer_diagnostics,omitempty"`
-	OptimizerDiagnosticsSHA256 string                           `json:"optimizer_diagnostics_sha256,omitempty"`
-	QualityClaim               bool                             `json:"quality_claim"`
+	Plan                       AOQTSidecarWorkPlan                    `json:"plan"`
+	ObjectiveContract          AOQTSidecarObjectiveContract           `json:"objective_contract"`
+	Steps                      int                                    `json:"steps"`
+	InitialLoss                float32                                `json:"initial_loss"`
+	FinalLoss                  float32                                `json:"final_loss"`
+	InitialObjectiveComponents AOQTSidecarObjectiveComponents         `json:"initial_objective_components"`
+	FinalObjectiveComponents   AOQTSidecarObjectiveComponents         `json:"final_objective_components"`
+	InitialObjectiveActivation AOQTSidecarObjectiveActivation         `json:"initial_objective_activation"`
+	FinalObjectiveActivation   AOQTSidecarObjectiveActivation         `json:"final_objective_activation"`
+	AngleL2                    float32                                `json:"angle_l2"`
+	AngleMaxAbs                float32                                `json:"angle_max_abs"`
+	AnglesSHA256               string                                 `json:"angles_sha256"`
+	DenseMaxAbsDelta           float64                                `json:"dense_max_abs_delta"`
+	OptimizerDiagnostics       *AOQTSidecarOptimizerDiagnostics       `json:"optimizer_diagnostics,omitempty"`
+	OptimizerDiagnosticsSHA256 string                                 `json:"optimizer_diagnostics_sha256,omitempty"`
+	QualityClaim               bool                                   `json:"quality_claim"`
+	TrainingContract           string                                 `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
 }
 
 type AOQTSidecarOptimizerDiagnostics struct {
@@ -90,6 +95,32 @@ type AOQTSidecarOptimizerDiagnostics struct {
 	CoordinateSearchAuditChain   string                                   `json:"coordinate_search_audit_chain,omitempty"`
 	CoordinateSearchHashChain    string                                   `json:"coordinate_search_hash_chain,omitempty"`
 	RejectionDiagnostics         AOQTSidecarOptimizerRejectionDiagnostics `json:"rejection_diagnostics,omitempty"`
+	ProposalReceipts             *AOQTSidecarOptimizerProposalReceipts    `json:"proposal_receipts,omitempty"`
+}
+
+type AOQTSidecarOptimizerProposalReceipts []AOQTSidecarOptimizerProposalReceipt
+
+// AOQTSidecarOptimizerProposalReceipt is bounded, row-independent evidence
+// for one evaluated transactional proposal. It intentionally contains no row,
+// query, document, or vector payloads. The finite flags make a non-finite
+// candidate explicit without attempting to marshal NaN/Inf into JSON.
+type AOQTSidecarOptimizerProposalReceipt struct {
+	Ordinal                   int                            `json:"ordinal"`
+	Kind                      string                         `json:"kind"`
+	Accepted                  bool                           `json:"accepted"`
+	Reason                    string                         `json:"reason"`
+	AngleMoved                bool                           `json:"angle_moved"`
+	ActivationChecked         bool                           `json:"activation_checked"`
+	ActivationSufficient      bool                           `json:"activation_sufficient"`
+	BaselineLoss              float32                        `json:"baseline_loss"`
+	BaselineLossFinite        bool                           `json:"baseline_loss_finite"`
+	CandidateLoss             float32                        `json:"candidate_loss"`
+	CandidateLossFinite       bool                           `json:"candidate_loss_finite"`
+	BaselineComponents        AOQTSidecarObjectiveComponents `json:"baseline_components"`
+	BaselineComponentsFinite  bool                           `json:"baseline_components_finite"`
+	CandidateComponents       AOQTSidecarObjectiveComponents `json:"candidate_components"`
+	CandidateComponentsFinite bool                           `json:"candidate_components_finite"`
+	CandidateActivation       AOQTSidecarObjectiveActivation `json:"candidate_activation"`
 }
 
 type AOQTSidecarOptimizerRejectionDiagnostics struct {
@@ -416,16 +447,21 @@ func (o AOQTSidecarPreparedIPObjective) EvaluateAOQT(input AOQTSidecarObjectiveI
 }
 
 type AOQTSidecarTrainer struct {
-	config   AOQTSidecarTrainConfig
-	topology AOQTGivensTransform
-	angles   []float32
-	adamM    []float32
-	adamV    []float32
-	step     int
+	config            AOQTSidecarTrainConfig
+	eligibilityPolicy AOQTSidecarCandidateEligibilityPolicy
+	topology          AOQTGivensTransform
+	angles            []float32
+	adamM             []float32
+	adamV             []float32
+	step              int
 }
 
 func NewAOQTSidecarTrainer(cfg AOQTSidecarTrainConfig) (*AOQTSidecarTrainer, error) {
 	cfg = normalizedAOQTSidecarTrainConfig(cfg)
+	eligibilityPolicy, err := AOQTSidecarTrainingContractPolicy(cfg.TrainingContract, cfg.CandidateEligibilityPolicy)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateAOQTSidecarTrainConfig(cfg); err != nil {
 		return nil, err
 	}
@@ -435,11 +471,12 @@ func NewAOQTSidecarTrainer(cfg AOQTSidecarTrainConfig) (*AOQTSidecarTrainer, err
 	}
 	angleCount := countAOQTAngles(topology)
 	return &AOQTSidecarTrainer{
-		config:   cfg,
-		topology: topology,
-		angles:   make([]float32, angleCount),
-		adamM:    make([]float32, angleCount),
-		adamV:    make([]float32, angleCount),
+		config:            cfg,
+		eligibilityPolicy: eligibilityPolicy,
+		topology:          topology,
+		angles:            make([]float32, angleCount),
+		adamM:             make([]float32, angleCount),
+		adamV:             make([]float32, angleCount),
 	}, nil
 }
 
@@ -552,7 +589,20 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	if err != nil {
 		return AOQTSidecarTrainSummary{}, err
 	}
-	summary := AOQTSidecarTrainSummary{Plan: plan, ObjectiveContract: set.Manifest.ObjectiveContract, QualityClaim: false}
+	manifestPolicy, err := AOQTSidecarTrainingContractPolicy(set.Manifest.TrainingContract, set.Manifest.CandidateEligibilityPolicy)
+	if err != nil {
+		return AOQTSidecarTrainSummary{}, err
+	}
+	if !aoqtCandidateEligibilityPoliciesEqual(manifestPolicy, t.eligibilityPolicy) {
+		return AOQTSidecarTrainSummary{}, fmt.Errorf("AOQT trainer eligibility policy does not match calibration manifest training contract")
+	}
+	summary := AOQTSidecarTrainSummary{
+		Plan:                       plan,
+		ObjectiveContract:          set.Manifest.ObjectiveContract,
+		QualityClaim:               false,
+		TrainingContract:           set.Manifest.TrainingContract,
+		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
+	}
 	if t.config.PlanOnly {
 		angles, err := t.Transform().AnglesSHA256()
 		if err != nil {
@@ -577,6 +627,10 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	diagnostics := AOQTSidecarOptimizerDiagnostics{
 		PlannedSteps:       t.config.MaxSteps,
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+	if t.config.CaptureProposalReceipts {
+		receipts := make(AOQTSidecarOptimizerProposalReceipts, 0)
+		diagnostics.ProposalReceipts = &receipts
 	}
 	var initialSet bool
 	for step := 0; step < t.config.MaxSteps; step++ {
@@ -729,6 +783,61 @@ func (d *AOQTSidecarOptimizerDiagnostics) RecordRejection(decision aoqtTransacti
 		return
 	}
 	d.RejectionDiagnostics.record(decision, baseline, candidate)
+}
+
+const (
+	aoqtProposalKindAdam       = "adam"
+	aoqtProposalKindCoordinate = "coordinate"
+	aoqtProposalAcceptedReason = "accepted"
+)
+
+// RecordProposal appends one bounded receipt for an actually evaluated
+// proposal and preserves the existing aggregate rejection diagnostics.
+func (d *AOQTSidecarOptimizerDiagnostics) RecordProposal(ordinal int, kind string, decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) {
+	if d == nil {
+		return
+	}
+	if d.ProposalReceipts != nil {
+		*d.ProposalReceipts = append(*d.ProposalReceipts, newAOQTProposalReceipt(ordinal, kind, decision, baseline, candidate))
+	}
+	if !decision.accepted {
+		d.RejectionDiagnostics.record(decision, baseline, candidate)
+	}
+}
+
+func newAOQTProposalReceipt(ordinal int, kind string, decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) AOQTSidecarOptimizerProposalReceipt {
+	receipt := AOQTSidecarOptimizerProposalReceipt{
+		Ordinal:              ordinal,
+		Kind:                 kind,
+		Accepted:             decision.accepted,
+		Reason:               string(decision.reason),
+		AngleMoved:           decision.angleMoved,
+		ActivationChecked:    decision.activationChecked,
+		ActivationSufficient: decision.activationSufficient,
+		CandidateActivation:  candidate.activation,
+	}
+	if receipt.Accepted {
+		receipt.Reason = aoqtProposalAcceptedReason
+	}
+	receipt.BaselineLoss, receipt.BaselineLossFinite = aoqtFiniteReceiptFloat(baseline.loss)
+	receipt.CandidateLoss, receipt.CandidateLossFinite = aoqtFiniteReceiptFloat(candidate.loss)
+	receipt.BaselineComponents, receipt.BaselineComponentsFinite = aoqtFiniteReceiptComponents(baseline.components)
+	receipt.CandidateComponents, receipt.CandidateComponentsFinite = aoqtFiniteReceiptComponents(candidate.components)
+	return receipt
+}
+
+func aoqtFiniteReceiptFloat(value float32) (float32, bool) {
+	if !isFinite32(value) {
+		return 0, false
+	}
+	return value, true
+}
+
+func aoqtFiniteReceiptComponents(components AOQTSidecarObjectiveComponents) (AOQTSidecarObjectiveComponents, bool) {
+	if !isFinite32(components.Q3Gain) || !isFinite32(components.Q3OrderGuard) || !isFinite32(components.Q3ScoreDistill) || !isFinite32(components.Q5OrderGuard) || !isFinite32(components.Q5ScoreDistill) || !isFinite32(components.NFBoundaryGuard) {
+		return AOQTSidecarObjectiveComponents{}, false
+	}
+	return components, true
 }
 
 func (d *AOQTSidecarOptimizerRejectionDiagnostics) record(decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) {
@@ -1083,6 +1192,143 @@ func validateAOQTRejectionDiagnostics(diagnostics AOQTSidecarOptimizerRejectionD
 	return nil
 }
 
+func validateAOQTOptimizerProposalReceipts(diagnostics AOQTSidecarOptimizerDiagnostics, label string) error {
+	if diagnostics.ProposalReceipts == nil {
+		return nil
+	}
+	receipts := *diagnostics.ProposalReceipts
+	if len(receipts) == 0 {
+		if diagnostics.ProposalAttempts != 0 {
+			return fmt.Errorf("%s proposal_receipts are empty with %d proposal_attempts", label, diagnostics.ProposalAttempts)
+		}
+		return nil
+	}
+	if diagnostics.ProposalAttempts <= 0 {
+		return fmt.Errorf("%s proposal_receipts require positive proposal_attempts", label)
+	}
+	if len(receipts) != diagnostics.ProposalAttempts {
+		return fmt.Errorf("%s proposal_receipts = %d, want proposal_attempts %d", label, len(receipts), diagnostics.ProposalAttempts)
+	}
+	if diagnostics.AttemptedSteps <= 0 || diagnostics.MaxAttemptsPerStep <= 0 {
+		return fmt.Errorf("%s proposal_receipts require positive attempted_steps and max_attempts_per_step", label)
+	}
+	maxReceipts := int64(diagnostics.AttemptedSteps) * int64(diagnostics.MaxAttemptsPerStep)
+	if int64(len(receipts)) > maxReceipts {
+		return fmt.Errorf("%s proposal_receipts = %d exceeds actual max attempts %d", label, len(receipts), maxReceipts)
+	}
+
+	var (
+		adamAttempts, coordinateAttempts int
+		adamAccepted, coordinateAccepted int
+		accepted, rejected               int
+		reasonCounts                     AOQTSidecarOptimizerRejectionReasonCounts
+	)
+	for i, receipt := range receipts {
+		if receipt.Ordinal != i+1 {
+			return fmt.Errorf("%s proposal_receipts[%d].ordinal = %d, want %d", label, i, receipt.Ordinal, i+1)
+		}
+		switch receipt.Kind {
+		case aoqtProposalKindAdam:
+			adamAttempts++
+		case aoqtProposalKindCoordinate:
+			coordinateAttempts++
+		default:
+			return fmt.Errorf("%s proposal_receipts[%d].kind %q is unsupported", label, i, receipt.Kind)
+		}
+		switch receipt.Reason {
+		case aoqtProposalAcceptedReason:
+			if !receipt.Accepted {
+				return fmt.Errorf("%s proposal_receipts[%d] marks a rejected proposal as accepted", label, i)
+			}
+		case string(aoqtRejectionNoAngleMovement), string(aoqtRejectionNonFiniteLoss), string(aoqtRejectionLossIncrease), string(aoqtRejectionInvalidComponents), string(aoqtRejectionLossComponentMismatch), string(aoqtRejectionInactiveObjective), string(aoqtRejectionNoQ3GainImprovement), string(aoqtRejectionComponentRegression):
+			if receipt.Accepted {
+				return fmt.Errorf("%s proposal_receipts[%d] marks a rejected reason %q as accepted", label, i, receipt.Reason)
+			}
+			reasonCounts.add(aoqtTransactionalRejectionReason(receipt.Reason))
+		default:
+			return fmt.Errorf("%s proposal_receipts[%d].reason %q is unsupported", label, i, receipt.Reason)
+		}
+		if receipt.Accepted {
+			accepted++
+			if receipt.Kind == aoqtProposalKindAdam {
+				adamAccepted++
+			} else {
+				coordinateAccepted++
+			}
+		} else {
+			rejected++
+		}
+		if !receipt.BaselineLossFinite || !isFinite32(receipt.BaselineLoss) {
+			return fmt.Errorf("%s proposal_receipts[%d] baseline loss evidence is not finite", label, i)
+		}
+		if !receipt.BaselineComponentsFinite || !aoqtFiniteReceiptComponentsValue(receipt.BaselineComponents) {
+			return fmt.Errorf("%s proposal_receipts[%d] baseline component evidence is not finite", label, i)
+		}
+		if receipt.CandidateLossFinite {
+			if !isFinite32(receipt.CandidateLoss) {
+				return fmt.Errorf("%s proposal_receipts[%d] candidate loss is marked finite but is not finite", label, i)
+			}
+		} else {
+			if receipt.CandidateLoss != 0 || (receipt.Reason != string(aoqtRejectionNonFiniteLoss) && receipt.Reason != string(aoqtRejectionNoAngleMovement)) {
+				return fmt.Errorf("%s proposal_receipts[%d] unavailable candidate loss evidence is inconsistent", label, i)
+			}
+		}
+		if receipt.CandidateComponentsFinite {
+			if !aoqtFiniteReceiptComponentsValue(receipt.CandidateComponents) {
+				return fmt.Errorf("%s proposal_receipts[%d] candidate components are marked finite but are not finite", label, i)
+			}
+		} else if !aoqtReceiptComponentsZero(receipt.CandidateComponents) {
+			return fmt.Errorf("%s proposal_receipts[%d] unavailable candidate component evidence must be zero", label, i)
+		}
+		if err := validateAOQTObjectiveActivation(receipt.CandidateActivation, fmt.Sprintf("%s proposal_receipts[%d].candidate_activation", label, i)); err != nil {
+			return err
+		}
+		if receipt.ActivationSufficient && !receipt.ActivationChecked {
+			return fmt.Errorf("%s proposal_receipts[%d] activation_sufficient requires activation_checked", label, i)
+		}
+		if receipt.Accepted {
+			if !receipt.AngleMoved || !receipt.ActivationChecked || !receipt.ActivationSufficient || !receipt.CandidateLossFinite || !receipt.CandidateComponentsFinite {
+				return fmt.Errorf("%s proposal_receipts[%d] accepted evidence is incomplete", label, i)
+			}
+		} else {
+			if !receipt.AngleMoved && receipt.Reason != string(aoqtRejectionNoAngleMovement) {
+				return fmt.Errorf("%s proposal_receipts[%d] angle movement evidence is inconsistent", label, i)
+			}
+			if receipt.Reason == string(aoqtRejectionNoAngleMovement) && receipt.AngleMoved {
+				return fmt.Errorf("%s proposal_receipts[%d] no-angle reason has angle_moved=true", label, i)
+			}
+			if receipt.Reason == string(aoqtRejectionInactiveObjective) && (!receipt.ActivationChecked || receipt.ActivationSufficient) {
+				return fmt.Errorf("%s proposal_receipts[%d] inactive-objective activation evidence is inconsistent", label, i)
+			}
+			if (receipt.Reason == string(aoqtRejectionNoQ3GainImprovement) || receipt.Reason == string(aoqtRejectionComponentRegression)) && (!receipt.ActivationChecked || !receipt.ActivationSufficient) {
+				return fmt.Errorf("%s proposal_receipts[%d] post-activation rejection evidence is incomplete", label, i)
+			}
+		}
+	}
+	if adamAttempts != diagnostics.AdamProposalAttempts || coordinateAttempts != diagnostics.CoordinateProposalAttempts {
+		return fmt.Errorf("%s proposal_receipts kind accounting mismatch", label)
+	}
+	if adamAccepted != diagnostics.AdamAcceptedProposals || coordinateAccepted != diagnostics.CoordinateAcceptedProposals {
+		return fmt.Errorf("%s proposal_receipts accepted kind accounting mismatch", label)
+	}
+	if accepted != diagnostics.AcceptedProposals || rejected != diagnostics.RejectedProposals {
+		return fmt.Errorf("%s proposal_receipts accepted/rejected accounting mismatch", label)
+	}
+	if reasonCounts != diagnostics.RejectionDiagnostics.ReasonCounts {
+		return fmt.Errorf("%s proposal_receipts reason accounting mismatch", label)
+	}
+	return nil
+}
+
+func aoqtFiniteReceiptComponentsValue(components AOQTSidecarObjectiveComponents) bool {
+	_, ok := aoqtFiniteReceiptComponents(components)
+	return ok
+}
+
+func aoqtReceiptComponentsZero(components AOQTSidecarObjectiveComponents) bool {
+	return components == (AOQTSidecarObjectiveComponents{})
+}
+
 // validateAOQTOptimizerPathDiagnostics is shared by metrics and fail-closed
 // validation so top-level/path counters and their nested rejection evidence
 // cannot drift between the two output formats.
@@ -1128,6 +1374,9 @@ func validateAOQTOptimizerPathDiagnostics(diagnostics AOQTSidecarOptimizerDiagno
 		if diagnostics.CoordinateSearchPlanCount != 0 || diagnostics.CoordinateSearchStrategy != "" || diagnostics.CoordinateSearchOrderingHash != "" || diagnostics.CoordinateSearchLearningRate != 0 || diagnostics.CoordinateSearchAudit != "" || diagnostics.CoordinateSearchAuditChain != "" || diagnostics.CoordinateSearchHashChain != "" || diagnostics.CoordinateTopAngles != 0 || diagnostics.CoordinateMagnitudeCount != 0 || diagnostics.CoordinateBlockCount != 0 {
 			return fmt.Errorf("%s coordinate audit is present without optimizer path diagnostics", label)
 		}
+		if err := validateAOQTOptimizerProposalReceipts(diagnostics, label); err != nil {
+			return err
+		}
 		return validateAOQTRejectionDiagnostics(diagnostics.RejectionDiagnostics, 0, label+" rejection diagnostics")
 	}
 	if diagnostics.AdamProposalAttempts != diagnostics.AdamAcceptedProposals+diagnostics.AdamRejectedProposals {
@@ -1150,6 +1399,9 @@ func validateAOQTOptimizerPathDiagnostics(diagnostics AOQTSidecarOptimizerDiagno
 	}
 	if diagnostics.CoordinateSearchPlanCount == 0 && (diagnostics.CoordinateProposalAttempts != 0 || diagnostics.CoordinateSearchStrategy != "" || diagnostics.CoordinateSearchOrderingHash != "" || diagnostics.CoordinateSearchLearningRate != 0 || diagnostics.CoordinateSearchAudit != "" || diagnostics.CoordinateSearchAuditChain != "" || diagnostics.CoordinateSearchHashChain != "" || diagnostics.CoordinateTopAngles != 0 || diagnostics.CoordinateMagnitudeCount != 0 || diagnostics.CoordinateBlockCount != 0) {
 		return fmt.Errorf("%s coordinate audit is present without coordinate plan history", label)
+	}
+	if err := validateAOQTOptimizerProposalReceipts(diagnostics, label); err != nil {
+		return err
 	}
 	return validateAOQTRejectionDiagnostics(diagnostics.RejectionDiagnostics, diagnostics.RejectedProposals, label+" rejection diagnostics")
 }
@@ -1203,12 +1455,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []floa
 			t.restoreOptimizerState(state)
 			return false, err
 		}
-		if decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights); decision.accepted {
+		decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights)
+		diagnostics.RecordProposal(diagnostics.ProposalAttempts, aoqtProposalKindAdam, decision, baseline, candidate)
+		if decision.accepted {
 			diagnostics.AdamAcceptedProposals++
 			diagnostics.AcceptedProposals++
 			return true, nil
-		} else {
-			diagnostics.RecordRejection(decision, baseline, candidate)
 		}
 		diagnostics.RejectedProposals++
 		diagnostics.AdamRejectedProposals++
@@ -1305,12 +1557,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 			t.restoreOptimizerState(state)
 			return false, err
 		}
-		if decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights); decision.accepted {
+		decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights)
+		diagnostics.RecordProposal(diagnostics.ProposalAttempts, aoqtProposalKindCoordinate, decision, baseline, candidate)
+		if decision.accepted {
 			diagnostics.CoordinateAcceptedProposals++
 			diagnostics.AcceptedProposals++
 			return true, nil
-		} else {
-			diagnostics.RecordRejection(decision, baseline, candidate)
 		}
 		diagnostics.RejectedProposals++
 		diagnostics.CoordinateRejectedProposals++
@@ -1381,7 +1633,9 @@ func (t *AOQTSidecarTrainer) evaluateTransactionalProposal(state aoqtOptimizerSt
 	if !aoqtAnglesMoved(state.angles, t.angles) {
 		return aoqtTransactionalProposalDecision{reason: aoqtRejectionNoAngleMovement}
 	}
-	return aoqtEvaluateTransactionalStep(baseline, candidate, weights)
+	decision := aoqtEvaluateTransactionalStepWithPolicy(baseline, candidate, weights, t.eligibilityPolicy)
+	decision.angleMoved = true
+	return decision
 }
 
 func aoqtAcceptsTransactionalStep(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) bool {
@@ -1405,9 +1659,16 @@ type aoqtTransactionalProposalDecision struct {
 	accepted             bool
 	reason               aoqtTransactionalRejectionReason
 	componentRegressions []aoqtComponentRegression
+	angleMoved           bool
+	activationChecked    bool
+	activationSufficient bool
 }
 
 func aoqtEvaluateTransactionalStep(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights) aoqtTransactionalProposalDecision {
+	return aoqtEvaluateTransactionalStepWithPolicy(baseline, candidate, weights, AOQTSidecarDefaultCandidateEligibilityPolicy())
+}
+
+func aoqtEvaluateTransactionalStepWithPolicy(baseline, candidate aoqtStepEvaluation, weights AOQTSidecarRowWeights, policy AOQTSidecarCandidateEligibilityPolicy) aoqtTransactionalProposalDecision {
 	if !isFinite32(candidate.loss) {
 		return aoqtTransactionalProposalDecision{reason: aoqtRejectionNonFiniteLoss}
 	}
@@ -1421,17 +1682,34 @@ func aoqtEvaluateTransactionalStep(baseline, candidate aoqtStepEvaluation, weigh
 		return aoqtTransactionalProposalDecision{reason: aoqtRejectionLossComponentMismatch}
 	}
 	if err := validateAOQTActiveObjectiveContributions(weights, candidate.activation); err != nil {
-		return aoqtTransactionalProposalDecision{reason: aoqtRejectionInactiveObjective}
+		return aoqtTransactionalProposalDecision{
+			reason:               aoqtRejectionInactiveObjective,
+			activationChecked:    true,
+			activationSufficient: false,
+		}
 	}
 	if candidate.components.Q3Gain >= baseline.components.Q3Gain-aoqtTransactionalQ3ImprovementMinMagnitude {
-		return aoqtTransactionalProposalDecision{reason: aoqtRejectionNoQ3GainImprovement}
+		return aoqtTransactionalProposalDecision{
+			reason:               aoqtRejectionNoQ3GainImprovement,
+			activationChecked:    true,
+			activationSufficient: true,
+		}
 	}
-	policy := normalizedAOQTSidecarCandidateEligibilityPolicy(AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true})
+	policy = normalizedAOQTSidecarCandidateEligibilityPolicy(policy)
 	regressions := aoqtComponentRegressions(baseline.components, candidate.components, policy)
 	if len(regressions) > 0 {
-		return aoqtTransactionalProposalDecision{reason: aoqtRejectionComponentRegression, componentRegressions: regressions}
+		return aoqtTransactionalProposalDecision{
+			reason:               aoqtRejectionComponentRegression,
+			componentRegressions: regressions,
+			activationChecked:    true,
+			activationSufficient: true,
+		}
 	}
-	return aoqtTransactionalProposalDecision{accepted: true}
+	return aoqtTransactionalProposalDecision{
+		accepted:             true,
+		activationChecked:    true,
+		activationSufficient: true,
+	}
 }
 
 type aoqtCoordinateSearchRank struct {

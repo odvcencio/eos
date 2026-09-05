@@ -47,21 +47,23 @@ type aoqtRunnerObjectiveFactory func(AOQTSidecarObjectiveContract) (AOQTSidecarV
 const AOQTSidecarFailClosedDiagnosticsSchema = "eos.q3_aoqt_sidecar_failclosed_diagnostics.v2"
 
 type AOQTSidecarFailClosedDiagnostics struct {
-	Schema            string                          `json:"schema"`
-	FailureKind       string                          `json:"failure_kind"`
-	Error             string                          `json:"error"`
-	RejectionSummary  string                          `json:"rejection_summary"`
-	Plan              AOQTSidecarWorkPlan             `json:"plan"`
-	Inputs            AOQTSidecarRunMetricInputs      `json:"inputs"`
-	IOReport          AOQTSidecarCalibrationIOReport  `json:"io_report"`
-	Preflight         AOQTSidecarMaterializePreflight `json:"preflight"`
-	PreflightPath     string                          `json:"preflight_path"`
-	PreflightSHA256   string                          `json:"preflight_sha256"`
-	Topology          AOQTSidecarTopologyBinding      `json:"topology"`
-	ObjectiveContract AOQTSidecarObjectiveContract    `json:"objective_contract"`
-	LegalGates        AOQTSidecarLegalGates           `json:"legal_gates"`
-	Summary           AOQTSidecarTrainSummary         `json:"summary"`
-	QualityClaim      bool                            `json:"quality_claim"`
+	Schema                     string                                 `json:"schema"`
+	FailureKind                string                                 `json:"failure_kind"`
+	Error                      string                                 `json:"error"`
+	RejectionSummary           string                                 `json:"rejection_summary"`
+	Plan                       AOQTSidecarWorkPlan                    `json:"plan"`
+	Inputs                     AOQTSidecarRunMetricInputs             `json:"inputs"`
+	IOReport                   AOQTSidecarCalibrationIOReport         `json:"io_report"`
+	Preflight                  AOQTSidecarMaterializePreflight        `json:"preflight"`
+	PreflightPath              string                                 `json:"preflight_path"`
+	PreflightSHA256            string                                 `json:"preflight_sha256"`
+	Topology                   AOQTSidecarTopologyBinding             `json:"topology"`
+	ObjectiveContract          AOQTSidecarObjectiveContract           `json:"objective_contract"`
+	LegalGates                 AOQTSidecarLegalGates                  `json:"legal_gates"`
+	Summary                    AOQTSidecarTrainSummary                `json:"summary"`
+	QualityClaim               bool                                   `json:"quality_claim"`
+	TrainingContract           string                                 `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
 }
 
 func RunAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig) (AOQTSidecarTrainRunnerResult, error) {
@@ -98,13 +100,16 @@ func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory a
 		return AOQTSidecarTrainRunnerResult{}, err
 	}
 	trainer, err := NewAOQTSidecarTrainer(AOQTSidecarTrainConfig{
-		PairingSeed:  AOQTSidecarMaterializerTopologySeed,
-		WorkplanSeed: AOQTSidecarMaterializerQuantSeed,
-		PlanOnly:     cfg.PlanOnly,
-		MaxSteps:     cfg.MaxSteps,
-		LearningRate: cfg.LearningRate,
-		AngleCap:     AOQTSidecarDefaultAngleCap,
-		MaxAngleCap:  AOQTSidecarHardMaxAngleCap,
+		PairingSeed:                AOQTSidecarMaterializerTopologySeed,
+		WorkplanSeed:               AOQTSidecarMaterializerQuantSeed,
+		PlanOnly:                   cfg.PlanOnly,
+		MaxSteps:                   cfg.MaxSteps,
+		LearningRate:               cfg.LearningRate,
+		AngleCap:                   AOQTSidecarDefaultAngleCap,
+		MaxAngleCap:                AOQTSidecarHardMaxAngleCap,
+		CaptureProposalReceipts:    true,
+		TrainingContract:           set.Manifest.TrainingContract,
+		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
 	})
 	if err != nil {
 		return AOQTSidecarTrainRunnerResult{}, err
@@ -142,7 +147,11 @@ func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory a
 		return AOQTSidecarTrainRunnerResult{}, fmt.Errorf("AOQT runner work plan learning_rate = %.9g, want configured learning_rate %.9g", metrics.Plan.LearningRate, expectedLearningRate)
 	}
 	if !cfg.PlanOnly {
-		if err := ValidateAOQTSidecarCandidateEligibility(metrics, AOQTSidecarCandidateEligibilityPolicy{RequireObjectiveActivation: true}); err != nil {
+		policy, err := AOQTSidecarTrainingContractPolicy(metrics.TrainingContract, metrics.CandidateEligibilityPolicy)
+		if err != nil {
+			return AOQTSidecarTrainRunnerResult{}, err
+		}
+		if err := ValidateAOQTSidecarCandidateEligibility(metrics, policy); err != nil {
 			return AOQTSidecarTrainRunnerResult{}, err
 		}
 	}
@@ -292,6 +301,12 @@ func loadAndValidateAOQTTrainPreflight(cfg AOQTSidecarTrainRunnerConfig, set AOQ
 	if !aoqtObjectiveContractsEqual(preflight.ObjectiveContract, set.Manifest.ObjectiveContract) {
 		return AOQTSidecarMaterializePreflight{}, "", fmt.Errorf("AOQT sidecar preflight objective contract mismatch")
 	}
+	if err := validateAOQTSidecarTrainingContractBinding(set.Manifest.TrainingContract, set.Manifest.CandidateEligibilityPolicy, preflight.TrainingContract, preflight.CandidateEligibilityPolicy); err != nil {
+		return AOQTSidecarMaterializePreflight{}, "", fmt.Errorf("AOQT sidecar preflight training contract mismatch: %w", err)
+	}
+	if err := validateAOQTSidecarTrainingContractBinding(set.Manifest.TrainingContract, set.Manifest.CandidateEligibilityPolicy, ioReport.TrainingContract, ioReport.CandidateEligibilityPolicy); err != nil {
+		return AOQTSidecarMaterializePreflight{}, "", fmt.Errorf("AOQT sidecar IO training contract mismatch: %w", err)
+	}
 	if preflight.LegalGates != set.Manifest.LegalGates {
 		return AOQTSidecarMaterializePreflight{}, "", fmt.Errorf("AOQT sidecar preflight legal gates mismatch")
 	}
@@ -404,15 +419,17 @@ func newAOQTFailClosedDiagnostics(set AOQTSidecarCalibrationSet, ioReport AOQTSi
 			QrelsSHA256ByDataset:        cloneAOQTStringMap(set.Manifest.QrelsSHA256ByDataset),
 			CompatibilityDigest:         set.Manifest.CompatibilityDigest,
 		},
-		IOReport:          ioReport,
-		Preflight:         preflight,
-		PreflightPath:     preflightPath,
-		PreflightSHA256:   preflightSHA256,
-		Topology:          set.Manifest.Topology,
-		ObjectiveContract: set.Manifest.ObjectiveContract,
-		LegalGates:        set.Manifest.LegalGates,
-		Summary:           summary,
-		QualityClaim:      false,
+		IOReport:                   ioReport,
+		Preflight:                  preflight,
+		PreflightPath:              preflightPath,
+		PreflightSHA256:            preflightSHA256,
+		Topology:                   set.Manifest.Topology,
+		ObjectiveContract:          set.Manifest.ObjectiveContract,
+		LegalGates:                 set.Manifest.LegalGates,
+		Summary:                    summary,
+		QualityClaim:               false,
+		TrainingContract:           set.Manifest.TrainingContract,
+		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
 	}
 	return diagnostics, diagnostics.Validate()
 }
@@ -444,6 +461,15 @@ func (d AOQTSidecarFailClosedDiagnostics) Validate() error {
 	}
 	if d.Plan != d.Summary.Plan {
 		return fmt.Errorf("AOQT fail-closed diagnostics plan must exactly match summary.plan")
+	}
+	if err := validateAOQTSidecarTrainingContractBinding(d.TrainingContract, d.CandidateEligibilityPolicy, d.Summary.TrainingContract, d.Summary.CandidateEligibilityPolicy); err != nil {
+		return fmt.Errorf("AOQT fail-closed diagnostics training contract: %w", err)
+	}
+	if err := validateAOQTSidecarTrainingContractBinding(d.TrainingContract, d.CandidateEligibilityPolicy, d.IOReport.TrainingContract, d.IOReport.CandidateEligibilityPolicy); err != nil {
+		return fmt.Errorf("AOQT fail-closed diagnostics IO report training contract: %w", err)
+	}
+	if err := validateAOQTSidecarTrainingContractBinding(d.TrainingContract, d.CandidateEligibilityPolicy, d.Preflight.TrainingContract, d.Preflight.CandidateEligibilityPolicy); err != nil {
+		return fmt.Errorf("AOQT fail-closed diagnostics preflight training contract: %w", err)
 	}
 	if d.Plan.PlanOnly {
 		return fmt.Errorf("AOQT fail-closed diagnostics require a non-plan optimizer run")
