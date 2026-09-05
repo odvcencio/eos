@@ -194,6 +194,49 @@ AOQT_TRAIN_PROVENANCE = {
     },
     "compatibility_digest": "67c25bda77ef87322dbd16f675ba480fbdc8ce100f29f06778c5ffebc31e5181",
 }
+# The native XPKG policy carries the canonical calibration-manifest digest,
+# train qrels, and compatibility digest, but deliberately does not duplicate
+# the calibration manifest's optional training-contract fields.  Resolve that
+# digest only through this closed registry.  The historical raw-v4 entry and
+# the materialized lane-A revision are the only accepted train-only inputs;
+# callers cannot introduce a new manifest or relabel a budget by editing a
+# package policy.
+AOQT_TRAIN_LANE_A_CONTRACT = "aoqt-trainonly-score-distill-budget-laneA-v1"
+AOQT_TRAIN_LANE_A_CONTRACT_ID = f"{AOQT_TRAIN_LANE_A_CONTRACT}/q3q5"
+AOQT_TRAIN_LANE_A_POLICY = {
+    "dense_max_abs_delta_tolerance": 0.0005,
+    "angle_max_abs_cap": 0.04,
+    "require_objective_activation": True,
+    "q3_gain_allowed_loss_increase": 0.0,
+    "q3_order_guard_allowed_loss_increase": 0.0,
+    "q3_score_distill_allowed_loss_increase": 1e-5,
+    "q5_order_guard_allowed_loss_increase": 0.0,
+    "q5_score_distill_allowed_loss_increase": 1e-5,
+    "nf_boundary_guard_allowed_loss_increase": 0.0,
+}
+AOQT_TRAIN_PROVENANCE_REGISTRY = {
+    "raw-v4": {
+        **AOQT_TRAIN_PROVENANCE,
+        "provenance_id": "raw-v4",
+        "training_contract": None,
+        "contract_id": "raw-v4",
+        "aggregate_score_distill_budget": 0.0,
+        "candidate_eligibility_policy": None,
+    },
+    "laneA": {
+        "dataset_manifest_sha256": "f58f42acf30874f0d2c8773d2508672534348f9b20279da29719fe3e7737d39f",
+        "qrels_sha256_by_dataset": dict(AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"]),
+        "compatibility_digest": AOQT_TRAIN_PROVENANCE["compatibility_digest"],
+        "provenance_id": "raw-v4-score-distill-budget-laneA-v1",
+        "training_contract": AOQT_TRAIN_LANE_A_CONTRACT,
+        "contract_id": AOQT_TRAIN_LANE_A_CONTRACT_ID,
+        "aggregate_score_distill_budget": 1e-5,
+        "candidate_eligibility_policy": dict(AOQT_TRAIN_LANE_A_POLICY),
+    },
+}
+AOQT_TRAIN_PROVENANCE_BY_MANIFEST_SHA256 = {
+    entry["dataset_manifest_sha256"]: entry for entry in AOQT_TRAIN_PROVENANCE_REGISTRY.values()
+}
 AOQT_LEGAL_SCOPE = {
     "train_allowed_for_research": True,
     "release_train_allowed": False,
@@ -880,6 +923,43 @@ def _parse_aoqt_qrels_hashes(value: Any, label: str) -> dict[str, str]:
     return result
 
 
+def _resolve_registered_aoqt_train_provenance(
+    *,
+    dataset_manifest_sha256: str,
+    qrels_sha256_by_dataset: dict[str, str],
+    compatibility_digest: str,
+    label: str,
+    training_contract: str | None = None,
+    contract_id: str | None = None,
+    aggregate_score_distill_budget: float | None = None,
+) -> dict[str, Any]:
+    """Resolve the exact train-only contract bound by a native manifest hash.
+
+    Native XPKG has no training-contract field, so the canonical materialized
+    calibration-manifest digest is the selector.  Optional declarations are
+    accepted only for internal metadata/tests and must agree with the
+    immutable registry entry; they are never used to add a new contract.
+    """
+
+    entry = AOQT_TRAIN_PROVENANCE_BY_MANIFEST_SHA256.get(dataset_manifest_sha256)
+    if entry is None:
+        raise GateContractError(f"{label}: AOQT training manifest is not a preregistered train-only provenance")
+    if qrels_sha256_by_dataset != entry["qrels_sha256_by_dataset"]:
+        raise GateContractError(f"{label}: AOQT training qrels do not match the preregistered {entry['provenance_id']} provenance")
+    if compatibility_digest != entry["compatibility_digest"]:
+        raise GateContractError(f"{label}: AOQT compatibility digest does not match the preregistered {entry['provenance_id']} provenance")
+    if training_contract is not None and training_contract != entry["training_contract"]:
+        raise GateContractError(f"{label}: AOQT training contract {training_contract!r} does not match the preregistered {entry['contract_id']!r} contract")
+    if contract_id is not None and contract_id != entry["contract_id"]:
+        raise GateContractError(f"{label}: AOQT training contract identity {contract_id!r} does not match the preregistered {entry['contract_id']!r} contract")
+    if aggregate_score_distill_budget is not None:
+        if isinstance(aggregate_score_distill_budget, bool) or not isinstance(aggregate_score_distill_budget, (int, float)) or not math.isfinite(float(aggregate_score_distill_budget)):
+            raise GateContractError(f"{label}: AOQT aggregate score-distill budget must be finite")
+        if float(aggregate_score_distill_budget) != entry["aggregate_score_distill_budget"]:
+            raise GateContractError(f"{label}: AOQT aggregate score-distill budget does not match the preregistered {entry['contract_id']!r} contract")
+    return copy.deepcopy(entry)
+
+
 def _parse_xpkg_aoqt_policy(head: dict[str, Any], role: str, label: str) -> dict[str, Any] | None:
     """Normalize the AOQTTransformPolicy serialized in native XPKG HEAD."""
 
@@ -944,8 +1024,25 @@ def _parse_xpkg_aoqt_policy(head: dict[str, Any], role: str, label: str) -> dict
     }
     if policy["schema"] != "eos.aoqt_transform_policy.v1" or policy["research_only"] is not True or policy["research_train_allowed"] is not True or policy["release_train_allowed"] or policy["commercial_use_allowed"] or policy["free_open_release_allowed"] or policy["quality_claim"]:
         raise GateContractError(f"{label}: native XPKG AOQT policy/legal scope mismatch")
-    if policy["dataset_manifest_sha256"] != AOQT_TRAIN_PROVENANCE["dataset_manifest_sha256"] or policy["qrels_sha256_by_dataset"] != AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"] or policy["compatibility_digest"] != AOQT_TRAIN_PROVENANCE["compatibility_digest"]:
-        raise GateContractError(f"{label}: native XPKG AOQT policy is not bound to pinned raw-v4 training provenance")
+    provenance = _resolve_registered_aoqt_train_provenance(
+        dataset_manifest_sha256=policy["dataset_manifest_sha256"],
+        qrels_sha256_by_dataset=policy["qrels_sha256_by_dataset"],
+        compatibility_digest=policy["compatibility_digest"],
+        label=f"{label}.HEAD.aoqt_transform",
+    )
+    # These fields are registry-resolved annotations, not native XPKG
+    # metadata.  Keeping them explicit prevents downstream callers from
+    # mistaking an inferred lane contract for a producer-emitted field.
+    policy.update(
+        {
+            "train_provenance_id": provenance["provenance_id"],
+            "training_contract": provenance["training_contract"],
+            "training_contract_id": provenance["contract_id"],
+            "aggregate_score_distill_budget": provenance["aggregate_score_distill_budget"],
+            "candidate_eligibility_policy": provenance["candidate_eligibility_policy"],
+            "training_provenance_source": "closed_registry_by_manifest_sha256",
+        }
+    )
     return policy
 
 

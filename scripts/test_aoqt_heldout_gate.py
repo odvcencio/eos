@@ -701,9 +701,56 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         }
         policy = gate._parse_xpkg_aoqt_policy(head, "candidate", "fixture")
         self.assertIsNotNone(policy)
+        self.assertEqual(policy["train_provenance_id"], "raw-v4")
+        self.assertEqual(policy["training_contract_id"], "raw-v4")
         head["aoqt_transform_qrels_sha256_by_dataset"] = "\n".join(f"{domain}={'0' * 64 if domain == 'fiqa' else digest}" for domain, digest in gate.AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"].items())
-        with self.assertRaisesRegex(gate.GateError, "raw-v4 training provenance"):
+        with self.assertRaisesRegex(gate.GateError, "raw-v4 provenance"):
             gate._parse_xpkg_aoqt_policy(head, "candidate", "fixture")
+
+    def test_native_aoqt_json_accepts_registered_lane_a_contract(self) -> None:
+        entry = gate.AOQT_TRAIN_PROVENANCE_REGISTRY["laneA"]
+        head = {
+            "aoqt_transform_enabled": True,
+            "aoqt_transform_research_only": True,
+            "aoqt_transform_research_train_allowed": True,
+            "aoqt_transform_release_train_allowed": False,
+            "aoqt_transform_commercial_use_allowed": False,
+            "aoqt_transform_free_open_release_allowed": False,
+            "aoqt_transform_quality_claim": False,
+            "aoqt_transform_schema": "eos.aoqt_transform_policy.v1",
+            "aoqt_transform_anchor_artifact_sha256": "a" * 64,
+            "aoqt_transform_anchor_package_manifest_sha256": "b" * 64,
+            "aoqt_transform_anchor_embedding_space_id": "c" * 64,
+            "aoqt_transform_dataset_manifest_sha256": entry["dataset_manifest_sha256"],
+            "aoqt_transform_qrels_sha256_by_dataset": "\n".join(f"{domain}={digest}" for domain, digest in entry["qrels_sha256_by_dataset"].items()),
+            "aoqt_transform_compatibility_digest": entry["compatibility_digest"],
+            "aoqt_transform_transform_sha256": "d" * 64,
+            "aoqt_transform_pairings_sha256": "e" * 64,
+            "aoqt_transform_angles_sha256": "f" * 64,
+        }
+        policy = gate._parse_xpkg_aoqt_policy(head, "candidate", "laneA")
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy["dataset_manifest_sha256"], "f58f42acf30874f0d2c8773d2508672534348f9b20279da29719fe3e7737d39f")
+        self.assertEqual(policy["train_provenance_id"], "raw-v4-score-distill-budget-laneA-v1")
+        self.assertEqual(policy["training_contract"], gate.AOQT_TRAIN_LANE_A_CONTRACT)
+        self.assertEqual(policy["training_contract_id"], "aoqt-trainonly-score-distill-budget-laneA-v1/q3q5")
+        self.assertEqual(policy["aggregate_score_distill_budget"], 1e-5)
+        self.assertEqual(policy["candidate_eligibility_policy"], gate.AOQT_TRAIN_LANE_A_POLICY)
+        self.assertEqual(policy["training_provenance_source"], "closed_registry_by_manifest_sha256")
+
+    def test_registered_aoqt_train_provenance_rejects_unknown_manifest_and_contract(self) -> None:
+        entry = gate.AOQT_TRAIN_PROVENANCE_REGISTRY["laneA"]
+        common = {
+            "qrels_sha256_by_dataset": entry["qrels_sha256_by_dataset"],
+            "compatibility_digest": entry["compatibility_digest"],
+            "label": "laneA.registration",
+        }
+        with self.assertRaisesRegex(gate.GateError, "not a preregistered train-only provenance"):
+            gate._resolve_registered_aoqt_train_provenance(dataset_manifest_sha256="0" * 64, **common)
+        with self.assertRaisesRegex(gate.GateError, "does not match the preregistered"):
+            gate._resolve_registered_aoqt_train_provenance(dataset_manifest_sha256=entry["dataset_manifest_sha256"], training_contract="unregistered-contract", **common)
+        with self.assertRaisesRegex(gate.GateError, "aggregate score-distill budget"):
+            gate._resolve_registered_aoqt_train_provenance(dataset_manifest_sha256=entry["dataset_manifest_sha256"], aggregate_score_distill_budget=2e-5, **common)
 
     def test_workload_output_root_collision_is_rejected(self) -> None:
         f = self.fixture()
