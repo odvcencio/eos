@@ -309,7 +309,7 @@ class Fixture:
         qrels_records = {domain: record(path) for domain, path in self.qrels.items()}
         dataset_records = {domain: {"dataset_id": domain, "dataset_dir": str(self.datasets[domain]), "corpus": record(self.datasets[domain] / "corpus.jsonl"), "queries": record(self.datasets[domain] / "queries.jsonl"), "manifest": record(self.datasets[domain] / "manifest.json")} for domain in gate.DOMAINS}
         compatibility = gate.sha256_bytes(b"fixture-compatibility")
-        approved_payload = {"schema": gate.APPROVED_WORKLOAD_SCHEMA, "gate_id": "fixture-gate", "descriptor_id": "fixture-approved", "split": gate.HELDOUT_SPLIT, "dimension": gate.DIMENSION, "domains": list(gate.DOMAINS), "query_ids_by_domain": copy.deepcopy(self.qids), "qid_set_sha256_by_domain": gate.qids_sha256_by_domain(self.qids), "query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}, "qrels_query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "relevant_pair_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "compatibility_digest": compatibility, "nfcorpus_boundary_qids": [self.qids["nfcorpus"][0]], "nfcorpus_boundary_qids_sha256": gate.sha256_json([self.qids["nfcorpus"][0]]), "nfcorpus_boundary_rank_window": [80, 120], "metric_surfaces": list(gate.SURFACES), "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100}, "turboquant": {"q3_bits": 3, "q5_bits": 5, "seed": gate.TURBOQUANT_SEED, "top_k": 120, "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling"}}
+        approved_payload = {"schema": gate.APPROVED_WORKLOAD_SCHEMA, "gate_id": "fixture-gate", "descriptor_id": "fixture-approved", "split": gate.HELDOUT_SPLIT, "dimension": gate.DIMENSION, "domains": list(gate.DOMAINS), "query_ids_by_domain": copy.deepcopy(self.qids), "qid_set_sha256_by_domain": gate.qids_sha256_by_domain(self.qids), "query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}, "qrels_query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "relevant_pair_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "compatibility_digest": compatibility, "nfcorpus_boundary_qids": sorted(self.qids["nfcorpus"]), "nfcorpus_boundary_qids_sha256": gate.sha256_json(sorted(self.qids["nfcorpus"])), "nfcorpus_boundary_rank_window": [80, 120], "metric_surfaces": list(gate.SURFACES), "cutoffs": {"ndcg_at_10": 10, "recall_at_100": 100}, "turboquant": {"q3_bits": 3, "q5_bits": 5, "seed": gate.TURBOQUANT_SEED, "top_k": 120, "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling"}}
         write_json(self.approved, approved_payload)
         approved_record = record(self.approved)
         workload_payload = {"schema": gate.WORKLOAD_SCHEMA, "gate_id": "fixture-gate", "workload_id": "fixture-workload", "descriptor_sha256": approved_record["sha256"], "split": gate.HELDOUT_SPLIT, "dimension": gate.DIMENSION, "query_ids_by_domain": copy.deepcopy(self.qids), "qid_set_sha256_by_domain": gate.qids_sha256_by_domain(self.qids), "query_count_by_domain": {domain: 2 for domain in gate.DOMAINS}, "qrels_sha256_by_domain": {domain: qrels_records[domain]["sha256"] for domain in gate.DOMAINS}, "dataset_manifest_sha256_by_domain": {domain: dataset_records[domain]["manifest"]["sha256"] for domain in gate.DOMAINS}, "corpus_sha256_by_domain": {domain: dataset_records[domain]["corpus"]["sha256"] for domain in gate.DOMAINS}, "queries_sha256_by_domain": {domain: dataset_records[domain]["queries"]["sha256"] for domain in gate.DOMAINS}, "compatibility_digest": compatibility}
@@ -319,7 +319,8 @@ class Fixture:
             source = self.exclusion_sources[name]
             write_json(source, {"source": name, "fixture": True})
             source_map = {str(source.resolve()): gate.sha256_file(source)}
-            write_json(self.exclusions[name], {"schema": "eos.aoqt_stage2.exclusion_qids.v1", "name": name, "qids_by_dataset": {domain: [f"excluded-{name}-{domain}"] for domain in gate.DOMAINS}, "source_sha256": gate.sha256_json(source_map), "source_sha256_by_file": source_map})
+            qids_by_domain = copy.deepcopy(self.qids) if name == "official-test" else {domain: [f"excluded-{name}-{domain}"] for domain in gate.DOMAINS}
+            write_json(self.exclusions[name], {"schema": "eos.aoqt_stage2.exclusion_qids.v1", "name": name, "qids_by_dataset": qids_by_domain, "source_sha256": gate.sha256_json(source_map), "source_sha256_by_file": source_map})
         anchor_space = gate.sha256_bytes(b"fixture-anchor-space")
         candidate_space = gate.sha256_bytes(b"fixture-candidate-space")
         self.anchor_package.parent.mkdir(parents=True, exist_ok=True)
@@ -418,8 +419,65 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         f.plan["source"]["workload"] = record(f.workload)
         write_json(f.plan_path, f.plan)
         with mock.patch.object(gate, "require_elf_executable"):
-            with self.assertRaisesRegex(gate.GateError, "fixed trusted registry artifact|registry qrels identity/count mismatch"):
+            with self.assertRaisesRegex(gate.GateError, "fixed trusted registry artifact|registry qrels identity/count mismatch|official-test qids must equal"):
                 gate.validate_plan(f.plan_path, production=True)
+
+    def test_synthetic_production_registry_accepts_exact_official_population(self) -> None:
+        f = self.fixture()
+        qrels = {domain: gate.parse_qrels(path, f"synthetic.{domain}.qrels") for domain, path in f.qrels.items()}
+        datasets = {
+            domain: gate.normalize_dataset_record(
+                {
+                    "dataset_id": domain,
+                    "dataset_dir": str(f.datasets[domain]),
+                    "corpus": record(f.datasets[domain] / "corpus.jsonl"),
+                    "queries": record(f.datasets[domain] / "queries.jsonl"),
+                    "manifest": record(f.datasets[domain] / "manifest.json"),
+                },
+                f.root,
+                domain,
+                f"synthetic.{domain}.dataset",
+            )
+            for domain in gate.DOMAINS
+        }
+        approved = gate.validate_approved_workload(f.approved, gate_id="fixture-gate", qrels=qrels, datasets=datasets, label="synthetic.approved")
+        exclusions = {
+            name: gate.normalize_exclusion_record(
+                {"kind": "qid_only", "name": name, "manifest": record(f.exclusions[name])},
+                f.root,
+                name,
+                approved["query_ids_by_domain"],
+                f"synthetic.exclusions.{name}",
+            )
+            for name in gate.EXCLUSION_NAMES
+        }
+        registry = {
+            "schema": gate.TRUSTED_WORKLOAD_REGISTRY_SCHEMA,
+            "status": "active",
+            "domains": {
+                domain: {
+                    "qrels_path_suffix": str(f.qrels[domain].resolve()).lstrip("/"),
+                    "qrels_sha256": qrels[domain]["sha256"],
+                    "qid_set_sha256": qrels[domain]["qid_set_sha256"],
+                    "query_count": qrels[domain]["query_count"],
+                    "qrels_pair_count": qrels[domain]["qrels_pair_count"],
+                    "corpus_path_suffix": str((f.datasets[domain] / "corpus.jsonl").resolve()).lstrip("/"),
+                    "corpus_sha256": datasets[domain]["corpus"]["sha256"],
+                    "queries_path_suffix": str((f.datasets[domain] / "queries.jsonl").resolve()).lstrip("/"),
+                    "queries_sha256": datasets[domain]["queries"]["sha256"],
+                }
+                for domain in gate.DOMAINS
+            },
+            "nfcorpus_boundary": {
+                "source_path_suffix": str(f.exclusions["official-test"].resolve()).lstrip("/"),
+                "source_sha256": exclusions["official-test"]["manifest_sha256"],
+                "qid_set_sha256": gate.sha256_json(sorted(f.qids["nfcorpus"])),
+                "qid_count": len(f.qids["nfcorpus"]),
+                "rank_window": [80, 120],
+            },
+        }
+        with mock.patch.object(gate, "PRODUCTION_TRUSTED_WORKLOAD_REGISTRY", registry):
+            gate._validate_production_registry_binding(approved, qrels, datasets, exclusions, label="synthetic.production")
 
     def test_production_rejects_synthetic_json_package_fallback(self) -> None:
         f = self.fixture()
@@ -511,6 +569,34 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         f.plan["exclusions"][0]["manifest"] = record(f.exclusions["dev4"])
         write_json(f.plan_path, f.plan)
         with self.assertRaisesRegex(gate.GateError, "source_sha256 does not bind"):
+            f.freeze()
+
+    def test_official_test_population_equals_complete_workload(self) -> None:
+        f = self.fixture()
+        # The fixture now uses a real-shaped official-test exclusion: all
+        # workload qids are included, while dev4/reserve4 remain separate.
+        frozen = f.freeze()
+        official = next(item for item in frozen["manifest"]["exclusions"] if item["name"] == "official-test")
+        self.assertEqual(official["qids_by_domain"], f.qids)
+
+    def test_partial_official_test_population_is_rejected(self) -> None:
+        f = self.fixture()
+        payload = json.loads(f.exclusions["official-test"].read_text())
+        payload["qids_by_dataset"]["fiqa"] = [f.qids["fiqa"][0]]
+        write_json(f.exclusions["official-test"], payload)
+        f.plan["exclusions"][2]["manifest"] = record(f.exclusions["official-test"])
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "official-test qids must equal"):
+            f.freeze()
+
+    def test_outside_official_test_population_is_rejected(self) -> None:
+        f = self.fixture()
+        payload = json.loads(f.exclusions["official-test"].read_text())
+        payload["qids_by_dataset"]["nfcorpus"] = ["outside-official-qid"]
+        write_json(f.exclusions["official-test"], payload)
+        f.plan["exclusions"][2]["manifest"] = record(f.exclusions["official-test"])
+        write_json(f.plan_path, f.plan)
+        with self.assertRaisesRegex(gate.GateError, "official-test qids must equal"):
             f.freeze()
 
     def test_exclusion_identity_source_hash_and_intersection_firewall(self) -> None:

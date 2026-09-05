@@ -702,9 +702,18 @@ def normalize_exclusion_record(value: Any, base_dir: Path, expected_name: str, w
     if sha256_json(dict(sorted(normalized_source.items()))) != source_sha:
         raise GateContractError(f"{label}: source_sha256 does not bind source_sha256_by_file")
     for domain in DOMAINS:
-        intersection = sorted(set(qids[domain]) & set(workload_qids[domain]))
-        if intersection:
-            raise GateContractError(f"{label}: workload/exclusion qid intersection in {domain}: {intersection[:4]}")
+        exclusion_qids = sorted(qids[domain])
+        workload_domain_qids = sorted(workload_qids[domain])
+        if expected_name == "official-test":
+            # The official-test exclusion identifies the complete heldout
+            # evaluation population.  It is intentionally the same qid set
+            # as the workload; only dev4/reserve4 must be disjoint from it.
+            if exclusion_qids != workload_domain_qids:
+                raise GateContractError(f"{label}: official-test qids must equal the complete workload in {domain}")
+        else:
+            intersection = sorted(set(exclusion_qids) & set(workload_domain_qids))
+            if intersection:
+                raise GateContractError(f"{label}: workload/exclusion qid intersection in {domain}: {intersection[:4]}")
     return {
         "kind": "qid_only",
         "semantic": EXCLUSION_SEMANTIC,
