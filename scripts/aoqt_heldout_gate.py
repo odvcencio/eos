@@ -2099,9 +2099,15 @@ def _canonical_evaluator_argv(frozen_info: dict[str, Any], role: str, domain: st
         "--metrics-json", str(outputs["metrics"]),
         "--metrics-tsv", str(outputs["metrics_tsv"]),
         "--per-query-jsonl", str(outputs["per_query"]),
-        package["path"],
-        dataset["dataset_dir"],
     ]
+    # The ordinary anchor package must use the normal production loader.  The
+    # candidate's native XPKG explicitly declares research-only AOQT policy,
+    # so only that evaluation receives the opt-in loader flag.  Keeping the
+    # flag in the canonical argv and both binding configs makes dropping or
+    # adding it an evidence mismatch rather than an ambient runtime choice.
+    if role == "candidate":
+        argv.append("--allow-research-only-aoqt")
+    argv.extend((package["path"], dataset["dataset_dir"]))
     return argv
 
 
@@ -2159,7 +2165,7 @@ def _binding_for_run(frozen_info: dict[str, Any], role: str, domain: str, nonce:
         "workload_qid_set_sha256_by_domain": frozen["approved_workload"]["descriptor"]["qid_set_sha256_by_domain"],
         "workload_query_count_by_domain": frozen["approved_workload"]["descriptor"]["query_count_by_domain"],
         "workload_qrels_sha256_by_domain": frozen["approved_workload"]["descriptor"]["qrels_sha256_by_domain"],
-        "config": {"dimension": DIMENSION, "bits": [Q3_BITS, Q5_BITS], "seed": TURBOQUANT_SEED, "top_k": TOP_K, "batch_size": BATCH_SIZE, "max_docs": 0, "max_queries": 0, "per_query_top_k": TOP_K, "rerank_overfetch": [], "package_mode": "native_mll_sibling", "score_mode": "turboquant_ip_prepared", "split": HELDOUT_SPLIT},
+        "config": {"dimension": DIMENSION, "bits": [Q3_BITS, Q5_BITS], "seed": TURBOQUANT_SEED, "top_k": TOP_K, "batch_size": BATCH_SIZE, "max_docs": 0, "max_queries": 0, "per_query_top_k": TOP_K, "rerank_overfetch": [], "package_mode": "native_mll_sibling", "score_mode": "turboquant_ip_prepared", "split": HELDOUT_SPLIT, "allow_research_only_aoqt": role == "candidate"},
         "outputs": {key: str(outputs[key]) for key in ("metrics", "metrics_tsv", "per_query")},
         "nfcorpus_boundary_qids_sha256": frozen["approved_workload"]["descriptor"]["nfcorpus_boundary_qids_sha256"],
         "nfcorpus_boundary_rank_window": [80, 120],
@@ -2254,6 +2260,7 @@ def _runtime_binding_for_run(frozen_info: dict[str, Any], role: str, domain: str
             "package_mode": "native_mll_sibling",
             "rerank_overfetch": [],
             "rerank_bits": 0,
+            "allow_research_only_aoqt": role == "candidate",
         },
         "outputs": {key: str(outputs[key]) for key in ("metrics", "metrics_tsv", "per_query")},
     }
@@ -2495,7 +2502,7 @@ def _parse_native_result(metrics_path: Path, tsv_path: Path, per_query_path: Pat
     if inputs.get("queries") != frozen_info["qrels"][domain]["query_count"] or inputs.get("relevant_pairs") != frozen_info["qrels"][domain]["qrels_pair_count"]:
         raise GateContractError(f"{role}/{domain}: native metrics workload counts mismatch")
     config = require_mapping(metrics["config"], f"{role}/{domain}.native_metrics.config")
-    if config.get("dimension") != DIMENSION or config.get("split") != HELDOUT_SPLIT or config.get("score_mode") != "turboquant_ip_prepared" or config.get("package_mode") != "native_mll_sibling" or config.get("batch_size") != BATCH_SIZE or config.get("top_k") != TOP_K or config.get("per_query_top_k") != TOP_K or config.get("bits") != [Q3_BITS, Q5_BITS] or config.get("quantizer_seed") != TURBOQUANT_SEED or config.get("max_docs", 0) != 0 or config.get("max_queries", 0) != 0 or config.get("rerank_overfetch", []) != [] or config.get("rerank_bits", 0) != 0:
+    if config.get("dimension") != DIMENSION or config.get("split") != HELDOUT_SPLIT or config.get("score_mode") != "turboquant_ip_prepared" or config.get("package_mode") != "native_mll_sibling" or config.get("batch_size") != BATCH_SIZE or config.get("top_k") != TOP_K or config.get("per_query_top_k") != TOP_K or config.get("bits") != [Q3_BITS, Q5_BITS] or config.get("quantizer_seed") != TURBOQUANT_SEED or config.get("max_docs", 0) != 0 or config.get("max_queries", 0) != 0 or config.get("rerank_overfetch", []) != [] or config.get("rerank_bits", 0) != 0 or config.get("allow_research_only_aoqt") is not (role == "candidate"):
         raise GateContractError(f"{role}/{domain}: native evaluator config mismatch")
     rows = metrics["rows"]
     if not isinstance(rows, list) or len(rows) != 2:

@@ -135,7 +135,7 @@ def runtime_binding(binding, frozen, package, dataset_dir, qpath, outputs):
         "dataset": {"dataset_id": domain, "dataset_dir": dataset_dir.as_posix(), "manifest_path": (dataset_dir / "manifest.json").as_posix(), "manifest_sha256": file_digest(dataset_dir / "manifest.json"), "corpus_path": corpus.as_posix(), "corpus_sha256": file_digest(corpus), "queries_path": queries.as_posix(), "queries_sha256": file_digest(queries)},
         "qrels": {"path": qpath.as_posix(), "sha256": file_digest(qpath), "qid_set_sha256": digest(sorted(rels_by_qid)), "query_count": len(rels_by_qid), "qrels_pair_count": sum(len(rels) for rels in rels_by_qid.values()), "relevant_pair_count": sum(1 for rels in rels_by_qid.values() for value in rels.values() if value > 0)},
         "workload": {"path": str(Path(frozen_workload["path"]).resolve()), "sha256": frozen_workload["sha256"], "descriptor_sha256": frozen_approved["sha256"], "qid_set_sha256_by_domain": descriptor["qid_set_sha256_by_domain"], "query_count_by_domain": descriptor["query_count_by_domain"]},
-        "config": {"dimension": 384, "bits": [3, 5], "seed": 5581486560434873699, "top_k": 120, "per_query_top_k": 120, "batch_size": 64, "max_docs": 0, "max_queries": 0, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "rerank_overfetch": [], "rerank_bits": 0},
+        "config": {"dimension": 384, "bits": [3, 5], "seed": 5581486560434873699, "top_k": 120, "per_query_top_k": 120, "batch_size": 64, "max_docs": 0, "max_queries": 0, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "rerank_overfetch": [], "rerank_bits": 0, "allow_research_only_aoqt": role == "candidate"},
         "outputs": {key: str(outputs[key].resolve()) for key in ("metrics", "metrics_tsv", "per_query")},
     }
     runtime["binding_sha256"] = digest(runtime)
@@ -174,6 +174,12 @@ def main():
         runtime = binding
     elif MODE == "bad-runtime-binding":
         runtime["binary_sha256"] = "0" * 64
+    elif MODE == "drop-research-loader" and candidate:
+        runtime["config"].pop("allow_research_only_aoqt", None)
+        runtime["binding_sha256"] = digest(runtime)
+    elif MODE == "alter-research-loader" and candidate:
+        runtime["config"]["allow_research_only_aoqt"] = not runtime["config"]["allow_research_only_aoqt"]
+        runtime["binding_sha256"] = digest(runtime)
     rows = []
     aggregates = {3: [], 5: []}
     dense_values = []
@@ -221,7 +227,7 @@ def main():
     payload = {
         "schema": "manta.embedding_turboquant_retrieval_metrics.v1", "dataset": domain, "artifact": str(package.resolve()), "backend": "mock-native",
         "inputs": {"corpus_path": str((dataset_dir / "corpus.jsonl").resolve()), "corpus_sha256": file_digest(dataset_dir / "corpus.jsonl"), "queries_path": str((dataset_dir / "queries.jsonl").resolve()), "queries_sha256": file_digest(dataset_dir / "queries.jsonl"), "qrels_path": str(qpath.resolve()), "qrels_sha256": file_digest(qpath), "workload_sha256": frozen["workload"]["sha256"], "approved_workload_sha256": frozen["approved_workload"]["sha256"], "documents": corpus_count, "queries": len(rels_by_qid), "relevant_pairs": sum(len(rels) for rels in rels_by_qid.values()), "scored_pairs": 120 * len(rels_by_qid)},
-        "config": {"dimension": 384, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "batch_size": 64, "top_k": 120, "per_query_top_k": 120, "bits": [3, 5], "quantizer_seed": 5581486560434873699, "max_docs": 0, "max_queries": 0, "rerank_overfetch": [], "rerank_bits": 0},
+        "config": {"dimension": 384, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "batch_size": 64, "top_k": 120, "per_query_top_k": 120, "bits": [3, 5], "quantizer_seed": 5581486560434873699, "max_docs": 0, "max_queries": 0, "rerank_overfetch": [], "rerank_bits": 0, "allow_research_only_aoqt": candidate},
         "dense": {"quality": dense}, "rows": native_rows, "gate_binding": binding, "runtime_binding": runtime,
     }
     if MODE == "bad-qrels-binding":
@@ -544,6 +550,27 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"MOCK_MODE": "bad-runtime-binding"}, clear=False):
             with self.assertRaisesRegex(gate.GateError, "native runtime binding mismatch"):
                 gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_research_only_loader_opt_in_is_candidate_only_and_bound(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        info = gate.validate_frozen_manifest(f.frozen_path, expected_frozen_manifest_sha256=frozen["file_sha256"], production=False)
+        outputs = {"metrics": f.root / "m.json", "metrics_tsv": f.root / "m.tsv", "per_query": f.root / "m.jsonl"}
+        for role, expected in (("anchor", False), ("candidate", True)):
+            argv = gate.build_evaluator_argv(info, role, "nfcorpus", outputs)
+            self.assertEqual("--allow-research-only-aoqt" in argv, expected)
+            binding = gate._binding_for_run(info, role, "nfcorpus", "a" * 32, argv, outputs)
+            runtime = gate._runtime_binding_for_run(info, role, "nfcorpus", "a" * 32, argv, outputs)
+            self.assertEqual(binding["config"]["allow_research_only_aoqt"], expected)
+            self.assertEqual(runtime["config"]["allow_research_only_aoqt"], expected)
+
+    def test_runtime_evidence_cannot_drop_or_alter_research_loader_binding(self) -> None:
+        for mode in ("drop-research-loader", "alter-research-loader"):
+            f = self.fixture()
+            frozen = f.freeze()
+            with self.subTest(mode=mode), mock.patch.dict(os.environ, {"MOCK_MODE": mode}, clear=False):
+                with self.assertRaisesRegex(gate.GateError, "native runtime binding mismatch"):
+                    gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
     def test_native_gate_binding_environment_uses_self_digest(self) -> None:
         f = self.fixture()
