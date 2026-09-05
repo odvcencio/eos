@@ -33,11 +33,12 @@ type AOQTSidecarTrainRunnerConfig struct {
 }
 
 type AOQTSidecarTrainRunnerResult struct {
-	IOReport           AOQTSidecarCalibrationIOReport
-	Preflight          AOQTSidecarMaterializePreflight
-	Metrics            AOQTSidecarRunMetrics
-	PackageResult      *AOQTSidecarCandidatePackageResult
-	FailureDiagnostics *AOQTSidecarFailClosedDiagnostics
+	IOReport                  AOQTSidecarCalibrationIOReport
+	Preflight                 AOQTSidecarMaterializePreflight
+	Metrics                   AOQTSidecarRunMetrics
+	PackageResult             *AOQTSidecarCandidatePackageResult
+	FailureDiagnostics        *AOQTSidecarFailClosedDiagnostics
+	PostFitFailureDiagnostics *AOQTSidecarPostFitFailClosedDiagnostics
 }
 
 type aoqtRunnerObjectiveFactory func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error)
@@ -152,8 +153,17 @@ func runAOQTSidecarTraining(cfg AOQTSidecarTrainRunnerConfig, objectiveFactory a
 		if err != nil {
 			return AOQTSidecarTrainRunnerResult{}, err
 		}
-		if err := ValidateAOQTSidecarCandidateEligibility(metrics, policy); err != nil {
-			return AOQTSidecarTrainRunnerResult{}, err
+		if eligibilityErr := ValidateAOQTSidecarCandidateEligibility(metrics, policy); eligibilityErr != nil {
+			result := AOQTSidecarTrainRunnerResult{IOReport: ioReport, Preflight: preflight}
+			diagnostics, diagnosticsErr := newAOQTPostFitFailClosedDiagnostics(metrics, ioReport, preflight, cfg.PreflightJSONPath, preflightSHA256, policy, eligibilityErr)
+			if diagnosticsErr != nil {
+				return result, fmt.Errorf("%w; failed to construct AOQT post-fit fail-closed diagnostics: %v", eligibilityErr, diagnosticsErr)
+			}
+			result.PostFitFailureDiagnostics = &diagnostics
+			if writeErr := writeAOQTPostFitFailClosedDiagnosticsFile(AOQTPostFitFailClosedDiagnosticsPath(cfg.MetricsJSONPath), diagnostics); writeErr != nil {
+				return result, fmt.Errorf("%w; failed to write AOQT post-fit fail-closed diagnostics: %v", eligibilityErr, writeErr)
+			}
+			return result, eligibilityErr
 		}
 	}
 	if err := writeAOQTRunMetricsFile(cfg.MetricsJSONPath, metrics); err != nil {
@@ -216,6 +226,9 @@ func validateAOQTSidecarTrainRunnerConfig(cfg AOQTSidecarTrainRunnerConfig) erro
 		}
 	}
 	if err := ensureAOQTFailClosedDiagnosticsAbsent(cfg.MetricsJSONPath); err != nil {
+		return err
+	}
+	if err := ensureAOQTPostFitFailClosedDiagnosticsAbsent(cfg.MetricsJSONPath); err != nil {
 		return err
 	}
 	if err := ensureAOQTRunMetricsAbsent(cfg.MetricsJSONPath); err != nil {
@@ -333,11 +346,12 @@ func objectiveFromAOQTContract(contract AOQTSidecarObjectiveContract) (AOQTSidec
 
 func validateAOQTTrainRunnerOutputPathDistinctness(cfg AOQTSidecarTrainRunnerConfig) error {
 	paths := map[string]string{
-		"metrics":                 cfg.MetricsJSONPath,
-		"fail-closed diagnostics": AOQTFailClosedDiagnosticsPath(cfg.MetricsJSONPath),
-		"manifest input":          cfg.ManifestPath,
-		"rows input":              cfg.RowsJSONLPath,
-		"preflight input":         cfg.PreflightJSONPath,
+		"metrics":                          cfg.MetricsJSONPath,
+		"fail-closed diagnostics":          AOQTFailClosedDiagnosticsPath(cfg.MetricsJSONPath),
+		"post-fit fail-closed diagnostics": AOQTPostFitFailClosedDiagnosticsPath(cfg.MetricsJSONPath),
+		"manifest input":                   cfg.ManifestPath,
+		"rows input":                       cfg.RowsJSONLPath,
+		"preflight input":                  cfg.PreflightJSONPath,
 	}
 	if strings.TrimSpace(cfg.OutputArtifactPath) != "" {
 		for role, path := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(cfg.OutputArtifactPath, true)) {
