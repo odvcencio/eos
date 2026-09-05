@@ -57,6 +57,12 @@ type AOQTSidecarCandidateEligibilityPolicy struct {
 // row-weighted component sum, not a second per-row mean.
 const AOQTSidecarScoreDistillBudgetLaneAContract = "aoqt-trainonly-score-distill-budget-laneA-v1"
 
+// AOQTSidecarScoreDistillJointBudgetV1Contract is a distinct, explicitly
+// preregistered train-only contract. It is the only contract allowed to use
+// the jointly calibrated q3/q5 score-distill budgets below; callers cannot
+// supply arbitrary positive budgets under this name.
+const AOQTSidecarScoreDistillJointBudgetV1Contract = "aoqt-trainonly-score-distill-joint-budget-v1"
+
 func AOQTSidecarDefaultCandidateEligibilityPolicy() AOQTSidecarCandidateEligibilityPolicy {
 	return normalizedAOQTSidecarCandidateEligibilityPolicy(AOQTSidecarCandidateEligibilityPolicy{})
 }
@@ -68,11 +74,18 @@ func AOQTSidecarScoreDistillBudgetLaneAPolicy() AOQTSidecarCandidateEligibilityP
 	return policy
 }
 
+func AOQTSidecarScoreDistillJointBudgetV1Policy() AOQTSidecarCandidateEligibilityPolicy {
+	policy := AOQTSidecarDefaultCandidateEligibilityPolicy()
+	policy.Q3ScoreDistillAllowedLossIncrease = 1e-4
+	policy.Q5ScoreDistillAllowedLossIncrease = 2e-5
+	return policy
+}
+
 // AOQTSidecarTrainingContractPolicy resolves the policy bound to a manifest,
 // preflight, summary, or metrics artifact. Empty fields mean the historical
-// zero-budget contract. Positive budgets are accepted only under the named
-// laneA contract, preventing a budget from being silently relabeled as the
-// legacy policy or from being changed under a reused name.
+// zero-budget contract. Positive budgets are accepted only under an exact
+// named preregistered contract, preventing a budget from being silently
+// relabeled as the legacy policy or from being changed under a reused name.
 func AOQTSidecarTrainingContractPolicy(name string, declared *AOQTSidecarCandidateEligibilityPolicy) (AOQTSidecarCandidateEligibilityPolicy, error) {
 	originalName := name
 	name = strings.TrimSpace(name)
@@ -93,11 +106,22 @@ func AOQTSidecarTrainingContractPolicy(name string, declared *AOQTSidecarCandida
 		}
 		return policy, nil
 	}
-	if name != AOQTSidecarScoreDistillBudgetLaneAContract {
+	if name != AOQTSidecarScoreDistillBudgetLaneAContract && name != AOQTSidecarScoreDistillJointBudgetV1Contract {
 		return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("unsupported AOQT training contract %q", name)
 	}
 	if declared == nil {
 		return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("AOQT training contract %q requires an explicit candidate eligibility policy", name)
+	}
+	if name == AOQTSidecarScoreDistillJointBudgetV1Contract {
+		// The jointly calibrated revision is a closed declaration, not a
+		// caller-configurable policy. Compare the raw decoded fields before
+		// normalization so omitted zero values or false activation cannot be
+		// silently filled with defaults and accepted under this new name.
+		want := AOQTSidecarScoreDistillJointBudgetV1Policy()
+		if !aoqtCandidateEligibilityPoliciesEqual(*declared, want) {
+			return AOQTSidecarCandidateEligibilityPolicy{}, fmt.Errorf("AOQT training contract %q policy does not match its preregistered q3/q5 score-distill budgets", name)
+		}
+		return want, nil
 	}
 	policy := normalizedAOQTSidecarCandidateEligibilityPolicy(*declared)
 	if err := validateAOQTSidecarCandidateEligibilityPolicy(policy); err != nil {

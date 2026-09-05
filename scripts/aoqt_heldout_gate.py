@@ -197,10 +197,10 @@ AOQT_TRAIN_PROVENANCE = {
 # The native XPKG policy carries the canonical calibration-manifest digest,
 # train qrels, and compatibility digest, but deliberately does not duplicate
 # the calibration manifest's optional training-contract fields.  Resolve that
-# digest only through this closed registry.  The historical raw-v4 entry and
-# the materialized lane-A revision are the only accepted train-only inputs;
-# callers cannot introduce a new manifest or relabel a budget by editing a
-# package policy.
+# digest only through this closed registry.  The historical raw-v4 entry, the
+# materialized lane-A revision, and the separately preregistered joint-budget
+# revision are the only accepted train-only inputs; callers cannot introduce
+# a new manifest or relabel a budget by editing a package policy.
 AOQT_TRAIN_LANE_A_CONTRACT = "aoqt-trainonly-score-distill-budget-laneA-v1"
 AOQT_TRAIN_LANE_A_CONTRACT_ID = f"{AOQT_TRAIN_LANE_A_CONTRACT}/q3q5"
 AOQT_TRAIN_LANE_A_POLICY = {
@@ -213,6 +213,40 @@ AOQT_TRAIN_LANE_A_POLICY = {
     "q5_order_guard_allowed_loss_increase": 0.0,
     "q5_score_distill_allowed_loss_increase": 1e-5,
     "nf_boundary_guard_allowed_loss_increase": 0.0,
+}
+# The joint-budget question is a distinct research contract.  Keep its
+# asymmetric component allowances in an explicit map; the legacy aggregate
+# field cannot represent q3=1e-4 and q5=2e-5 without losing provenance.
+AOQT_SCORE_DISTILL_BUDGET_COMPONENTS = ("q3_score_distill", "q5_score_distill")
+AOQT_TRAIN_JOINT_BUDGET_CONTRACT = "aoqt-trainonly-score-distill-joint-budget-v1"
+AOQT_TRAIN_JOINT_BUDGET_CONTRACT_ID = f"{AOQT_TRAIN_JOINT_BUDGET_CONTRACT}/q3q5"
+AOQT_TRAIN_JOINT_BUDGET_PROVENANCE_ID = "raw-v4-score-distill-joint-budget-v1"
+AOQT_TRAIN_JOINT_BUDGET_COMPONENTS = {
+    "q3_score_distill": 1e-4,
+    "q5_score_distill": 2e-5,
+}
+AOQT_TRAIN_JOINT_BUDGET_POLICY = {
+    **AOQT_TRAIN_LANE_A_POLICY,
+    "q3_score_distill_allowed_loss_increase": AOQT_TRAIN_JOINT_BUDGET_COMPONENTS["q3_score_distill"],
+    "q5_score_distill_allowed_loss_increase": AOQT_TRAIN_JOINT_BUDGET_COMPONENTS["q5_score_distill"],
+}
+# This is the native materializer's canonical manifest digest, not the raw
+# manifest file SHA256 (558f4751...) or preflight file SHA256 (c6796e9f...).
+# Keep this exact immutable selector; never replace it with a wildcard or a
+# caller-supplied digest: an unregistered joint package must fail closed.
+AOQT_TRAIN_JOINT_BUDGET_MANIFEST_SHA256 = "ea05d195813f22a7829836f0bf1227b5522aa4f460cd6b4a066b55ee7444f269"
+AOQT_TRAIN_JOINT_BUDGET_TEMPLATE = {
+    "dataset_manifest_sha256": AOQT_TRAIN_JOINT_BUDGET_MANIFEST_SHA256,
+    "qrels_sha256_by_dataset": dict(AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"]),
+    "compatibility_digest": AOQT_TRAIN_PROVENANCE["compatibility_digest"],
+    "provenance_id": AOQT_TRAIN_JOINT_BUDGET_PROVENANCE_ID,
+    "training_contract": AOQT_TRAIN_JOINT_BUDGET_CONTRACT,
+    "contract_id": AOQT_TRAIN_JOINT_BUDGET_CONTRACT_ID,
+    # This map is the aggregate component budget in the native objective
+    # units.  Do not add the legacy singular scalar: it cannot represent the
+    # asymmetric q3/q5 contract without silently changing its meaning.
+    "aggregate_score_distill_budgets": dict(AOQT_TRAIN_JOINT_BUDGET_COMPONENTS),
+    "candidate_eligibility_policy": dict(AOQT_TRAIN_JOINT_BUDGET_POLICY),
 }
 AOQT_TRAIN_PROVENANCE_REGISTRY = {
     "raw-v4": {
@@ -232,6 +266,9 @@ AOQT_TRAIN_PROVENANCE_REGISTRY = {
         "contract_id": AOQT_TRAIN_LANE_A_CONTRACT_ID,
         "aggregate_score_distill_budget": 1e-5,
         "candidate_eligibility_policy": dict(AOQT_TRAIN_LANE_A_POLICY),
+    },
+    "joint-budget-v1": {
+        **AOQT_TRAIN_JOINT_BUDGET_TEMPLATE,
     },
 }
 AOQT_TRAIN_PROVENANCE_BY_MANIFEST_SHA256 = {
@@ -932,6 +969,20 @@ def _parse_aoqt_qrels_hashes(value: Any, label: str) -> dict[str, str]:
     return result
 
 
+def _normalize_aggregate_score_distill_budgets(value: Any, label: str) -> dict[str, float]:
+    """Normalize the closed per-component score-distill budget map."""
+
+    budgets = require_mapping(value, label)
+    require_exact_keys(budgets, AOQT_SCORE_DISTILL_BUDGET_COMPONENTS, label)
+    normalized: dict[str, float] = {}
+    for component in AOQT_SCORE_DISTILL_BUDGET_COMPONENTS:
+        budget = require_finite_number(budgets[component], f"{label}.{component}")
+        if budget < 0.0:
+            raise GateContractError(f"{label}.{component}: budget must be non-negative")
+        normalized[component] = budget
+    return normalized
+
+
 def _resolve_registered_aoqt_train_provenance(
     *,
     dataset_manifest_sha256: str,
@@ -941,6 +992,7 @@ def _resolve_registered_aoqt_train_provenance(
     training_contract: str | None = None,
     contract_id: str | None = None,
     aggregate_score_distill_budget: float | None = None,
+    aggregate_score_distill_budgets: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Resolve the exact train-only contract bound by a native manifest hash.
 
@@ -961,12 +1013,29 @@ def _resolve_registered_aoqt_train_provenance(
         raise GateContractError(f"{label}: AOQT training contract {training_contract!r} does not match the preregistered {entry['contract_id']!r} contract")
     if contract_id is not None and contract_id != entry["contract_id"]:
         raise GateContractError(f"{label}: AOQT training contract identity {contract_id!r} does not match the preregistered {entry['contract_id']!r} contract")
+    expected_component_budgets = entry.get("aggregate_score_distill_budgets")
+    if entry.get("training_contract") == AOQT_TRAIN_JOINT_BUDGET_CONTRACT and expected_component_budgets is None:
+        raise GateContractError(f"{label}: joint score-distill contract is missing its closed per-component budget map")
+    if expected_component_budgets is not None:
+        expected_component_budgets = _normalize_aggregate_score_distill_budgets(expected_component_budgets, f"{label}.registered.aggregate_score_distill_budgets")
+        if aggregate_score_distill_budgets is not None:
+            actual_component_budgets = _normalize_aggregate_score_distill_budgets(aggregate_score_distill_budgets, f"{label}.aggregate_score_distill_budgets")
+            if actual_component_budgets != expected_component_budgets:
+                raise GateContractError(f"{label}: per-component score-distill budgets do not match the preregistered {entry['contract_id']!r} contract")
+    elif aggregate_score_distill_budgets is not None:
+        raise GateContractError(f"{label}: per-component score-distill budgets are not registered for {entry['contract_id']!r}")
     if aggregate_score_distill_budget is not None:
         if isinstance(aggregate_score_distill_budget, bool) or not isinstance(aggregate_score_distill_budget, (int, float)) or not math.isfinite(float(aggregate_score_distill_budget)):
             raise GateContractError(f"{label}: AOQT aggregate score-distill budget must be finite")
-        if float(aggregate_score_distill_budget) != entry["aggregate_score_distill_budget"]:
+        expected_aggregate_budget = entry.get("aggregate_score_distill_budget")
+        if expected_aggregate_budget is None:
+            raise GateContractError(f"{label}: aggregate score-distill budget is not valid for the asymmetric {entry['contract_id']!r} contract")
+        if float(aggregate_score_distill_budget) != expected_aggregate_budget:
             raise GateContractError(f"{label}: AOQT aggregate score-distill budget does not match the preregistered {entry['contract_id']!r} contract")
-    return copy.deepcopy(entry)
+    resolved = copy.deepcopy(entry)
+    if expected_component_budgets is not None:
+        resolved["aggregate_score_distill_budgets"] = expected_component_budgets
+    return resolved
 
 
 def _parse_xpkg_aoqt_policy(head: dict[str, Any], role: str, label: str) -> dict[str, Any] | None:
@@ -1047,11 +1116,16 @@ def _parse_xpkg_aoqt_policy(head: dict[str, Any], role: str, label: str) -> dict
             "train_provenance_id": provenance["provenance_id"],
             "training_contract": provenance["training_contract"],
             "training_contract_id": provenance["contract_id"],
-            "aggregate_score_distill_budget": provenance["aggregate_score_distill_budget"],
             "candidate_eligibility_policy": provenance["candidate_eligibility_policy"],
             "training_provenance_source": "closed_registry_by_manifest_sha256",
         }
     )
+    # Preserve the legacy scalar for raw-v4/Lane-A, but never emit a null or
+    # misleading singular value for the asymmetric joint contract.
+    if "aggregate_score_distill_budget" in provenance:
+        policy["aggregate_score_distill_budget"] = provenance["aggregate_score_distill_budget"]
+    if "aggregate_score_distill_budgets" in provenance:
+        policy["aggregate_score_distill_budgets"] = copy.deepcopy(provenance["aggregate_score_distill_budgets"])
     return policy
 
 

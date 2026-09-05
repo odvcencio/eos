@@ -789,6 +789,7 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         self.assertIsNotNone(policy)
         self.assertEqual(policy["train_provenance_id"], "raw-v4")
         self.assertEqual(policy["training_contract_id"], "raw-v4")
+        self.assertNotIn("aggregate_score_distill_budgets", policy)
         head["aoqt_transform_qrels_sha256_by_dataset"] = "\n".join(f"{domain}={'0' * 64 if domain == 'fiqa' else digest}" for domain, digest in gate.AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"].items())
         with self.assertRaisesRegex(gate.GateError, "raw-v4 provenance"):
             gate._parse_xpkg_aoqt_policy(head, "candidate", "fixture")
@@ -821,8 +822,99 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         self.assertEqual(policy["training_contract"], gate.AOQT_TRAIN_LANE_A_CONTRACT)
         self.assertEqual(policy["training_contract_id"], "aoqt-trainonly-score-distill-budget-laneA-v1/q3q5")
         self.assertEqual(policy["aggregate_score_distill_budget"], 1e-5)
+        self.assertNotIn("aggregate_score_distill_budgets", policy)
         self.assertEqual(policy["candidate_eligibility_policy"], gate.AOQT_TRAIN_LANE_A_POLICY)
         self.assertEqual(policy["training_provenance_source"], "closed_registry_by_manifest_sha256")
+
+    def test_joint_budget_contract_is_explicitly_asymmetric_and_not_aggregate(self) -> None:
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_CONTRACT_ID, "aoqt-trainonly-score-distill-joint-budget-v1/q3q5")
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_PROVENANCE_ID, "raw-v4-score-distill-joint-budget-v1")
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_COMPONENTS, {"q3_score_distill": 1e-4, "q5_score_distill": 2e-5})
+        self.assertNotIn("aggregate_score_distill_budget", gate.AOQT_TRAIN_JOINT_BUDGET_TEMPLATE)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_TEMPLATE["aggregate_score_distill_budgets"], gate.AOQT_TRAIN_JOINT_BUDGET_COMPONENTS)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_POLICY["q3_score_distill_allowed_loss_increase"], 1e-4)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_POLICY["q5_score_distill_allowed_loss_increase"], 2e-5)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_POLICY["q3_order_guard_allowed_loss_increase"], 0.0)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_POLICY["q5_order_guard_allowed_loss_increase"], 0.0)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_POLICY["nf_boundary_guard_allowed_loss_increase"], 0.0)
+        self.assertEqual(gate.AOQT_TRAIN_JOINT_BUDGET_MANIFEST_SHA256, "ea05d195813f22a7829836f0bf1227b5522aa4f460cd6b4a066b55ee7444f269")
+        self.assertEqual(gate.AOQT_TRAIN_PROVENANCE_REGISTRY["joint-budget-v1"]["dataset_manifest_sha256"], gate.AOQT_TRAIN_JOINT_BUDGET_MANIFEST_SHA256)
+
+    def test_joint_budget_registry_resolves_map_and_rejects_tampering(self) -> None:
+        manifest_sha = "9" * 64
+        entry = copy.deepcopy(gate.AOQT_TRAIN_JOINT_BUDGET_TEMPLATE)
+        entry["dataset_manifest_sha256"] = manifest_sha
+        common = {
+            "dataset_manifest_sha256": manifest_sha,
+            "qrels_sha256_by_dataset": entry["qrels_sha256_by_dataset"],
+            "compatibility_digest": entry["compatibility_digest"],
+            "label": "joint.registration",
+        }
+        with mock.patch.dict(gate.AOQT_TRAIN_PROVENANCE_BY_MANIFEST_SHA256, {manifest_sha: entry}, clear=False):
+            resolved = gate._resolve_registered_aoqt_train_provenance(
+                **common,
+                training_contract=gate.AOQT_TRAIN_JOINT_BUDGET_CONTRACT,
+                contract_id=gate.AOQT_TRAIN_JOINT_BUDGET_CONTRACT_ID,
+                aggregate_score_distill_budgets=gate.AOQT_TRAIN_JOINT_BUDGET_COMPONENTS,
+            )
+            self.assertEqual(resolved["provenance_id"], gate.AOQT_TRAIN_JOINT_BUDGET_PROVENANCE_ID)
+            self.assertNotIn("aggregate_score_distill_budget", resolved)
+            self.assertEqual(resolved["aggregate_score_distill_budgets"], gate.AOQT_TRAIN_JOINT_BUDGET_COMPONENTS)
+            with self.assertRaisesRegex(gate.GateError, "per-component score-distill budgets"):
+                gate._resolve_registered_aoqt_train_provenance(**common, aggregate_score_distill_budgets={"q3_score_distill": 1e-4, "q5_score_distill": 1e-5})
+            with self.assertRaisesRegex(gate.GateError, "aggregate score-distill budget is not valid"):
+                gate._resolve_registered_aoqt_train_provenance(**common, aggregate_score_distill_budget=1e-4)
+            with self.assertRaisesRegex(gate.GateError, "training contract"):
+                gate._resolve_registered_aoqt_train_provenance(**common, training_contract=gate.AOQT_TRAIN_LANE_A_CONTRACT)
+        missing_map_sha = "7" * 64
+        missing_map_entry = copy.deepcopy(entry)
+        missing_map_entry.pop("aggregate_score_distill_budgets")
+        with mock.patch.dict(gate.AOQT_TRAIN_PROVENANCE_BY_MANIFEST_SHA256, {missing_map_sha: missing_map_entry}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "missing its closed per-component budget map"):
+                gate._resolve_registered_aoqt_train_provenance(
+                    dataset_manifest_sha256=missing_map_sha,
+                    qrels_sha256_by_dataset=missing_map_entry["qrels_sha256_by_dataset"],
+                    compatibility_digest=missing_map_entry["compatibility_digest"],
+                    label="joint.missing-map",
+                )
+        with self.assertRaisesRegex(gate.GateError, "not a preregistered train-only provenance"):
+            gate._resolve_registered_aoqt_train_provenance(
+                dataset_manifest_sha256="0" * 64,
+                qrels_sha256_by_dataset=gate.AOQT_TRAIN_PROVENANCE["qrels_sha256_by_dataset"],
+                compatibility_digest=gate.AOQT_TRAIN_PROVENANCE["compatibility_digest"],
+                label="joint.unregistered",
+            )
+
+    def test_joint_budget_policy_parse_exposes_closed_component_map(self) -> None:
+        manifest_sha = "8" * 64
+        entry = copy.deepcopy(gate.AOQT_TRAIN_JOINT_BUDGET_TEMPLATE)
+        entry["dataset_manifest_sha256"] = manifest_sha
+        head = {
+            "aoqt_transform_enabled": True,
+            "aoqt_transform_research_only": True,
+            "aoqt_transform_research_train_allowed": True,
+            "aoqt_transform_release_train_allowed": False,
+            "aoqt_transform_commercial_use_allowed": False,
+            "aoqt_transform_free_open_release_allowed": False,
+            "aoqt_transform_quality_claim": False,
+            "aoqt_transform_schema": "eos.aoqt_transform_policy.v1",
+            "aoqt_transform_anchor_artifact_sha256": "a" * 64,
+            "aoqt_transform_anchor_package_manifest_sha256": "b" * 64,
+            "aoqt_transform_anchor_embedding_space_id": "c" * 64,
+            "aoqt_transform_dataset_manifest_sha256": manifest_sha,
+            "aoqt_transform_qrels_sha256_by_dataset": "\n".join(f"{domain}={digest}" for domain, digest in entry["qrels_sha256_by_dataset"].items()),
+            "aoqt_transform_compatibility_digest": entry["compatibility_digest"],
+            "aoqt_transform_transform_sha256": "d" * 64,
+            "aoqt_transform_pairings_sha256": "e" * 64,
+            "aoqt_transform_angles_sha256": "f" * 64,
+        }
+        with mock.patch.dict(gate.AOQT_TRAIN_PROVENANCE_BY_MANIFEST_SHA256, {manifest_sha: entry}, clear=False):
+            policy = gate._parse_xpkg_aoqt_policy(head, "candidate", "joint")
+        self.assertIsNotNone(policy)
+        self.assertEqual(policy["training_contract"], gate.AOQT_TRAIN_JOINT_BUDGET_CONTRACT)
+        self.assertEqual(policy["training_contract_id"], gate.AOQT_TRAIN_JOINT_BUDGET_CONTRACT_ID)
+        self.assertEqual(policy["aggregate_score_distill_budgets"], gate.AOQT_TRAIN_JOINT_BUDGET_COMPONENTS)
+        self.assertNotIn("aggregate_score_distill_budget", policy)
 
     def test_registered_aoqt_train_provenance_rejects_unknown_manifest_and_contract(self) -> None:
         entry = gate.AOQT_TRAIN_PROVENANCE_REGISTRY["laneA"]

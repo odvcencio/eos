@@ -111,6 +111,106 @@ func TestAOQTScoreDistillBudgetContractPreservesLegacyZeroBudget(t *testing.T) {
 	}
 }
 
+func TestAOQTScoreDistillJointBudgetV1ContractIsExactAndBindsProvenance(t *testing.T) {
+	defaultPolicy := AOQTSidecarDefaultCandidateEligibilityPolicy()
+	jointPolicy := AOQTSidecarScoreDistillJointBudgetV1Policy()
+	if jointPolicy.Q3ScoreDistillAllowedLossIncrease != 1e-4 || jointPolicy.Q5ScoreDistillAllowedLossIncrease != 2e-5 {
+		t.Fatalf("joint score-distill budgets = %.9g/%.9g, want 1e-4/2e-5", jointPolicy.Q3ScoreDistillAllowedLossIncrease, jointPolicy.Q5ScoreDistillAllowedLossIncrease)
+	}
+	if jointPolicy.DenseMaxAbsDeltaTolerance != defaultPolicy.DenseMaxAbsDeltaTolerance ||
+		jointPolicy.AngleMaxAbsCap != defaultPolicy.AngleMaxAbsCap ||
+		jointPolicy.RequireObjectiveActivation != defaultPolicy.RequireObjectiveActivation ||
+		jointPolicy.Q3GainAllowedLossIncrease != defaultPolicy.Q3GainAllowedLossIncrease ||
+		jointPolicy.Q3OrderGuardAllowedLossIncrease != defaultPolicy.Q3OrderGuardAllowedLossIncrease ||
+		jointPolicy.Q5OrderGuardAllowedLossIncrease != defaultPolicy.Q5OrderGuardAllowedLossIncrease ||
+		jointPolicy.NFBoundaryGuardAllowedLossIncrease != defaultPolicy.NFBoundaryGuardAllowedLossIncrease {
+		t.Fatalf("joint policy changed a non-score guard: default=%+v joint=%+v", defaultPolicy, jointPolicy)
+	}
+	if resolved, err := AOQTSidecarTrainingContractPolicy(AOQTSidecarScoreDistillJointBudgetV1Contract, &jointPolicy); err != nil || !aoqtCandidateEligibilityPoliciesEqual(resolved, jointPolicy) {
+		t.Fatalf("resolve exact joint contract: policy=%+v err=%v", resolved, err)
+	}
+	if _, err := AOQTSidecarTrainingContractPolicy(AOQTSidecarScoreDistillJointBudgetV1Contract, nil); err == nil || !strings.Contains(err.Error(), "requires an explicit candidate eligibility policy") {
+		t.Fatalf("missing joint policy error = %v", err)
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*AOQTSidecarCandidateEligibilityPolicy)
+	}{
+		{name: "omitted defaults", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { *policy = AOQTSidecarCandidateEligibilityPolicy{} }},
+		{name: "activation false", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.RequireObjectiveActivation = false }},
+		{name: "dense zero", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.DenseMaxAbsDeltaTolerance = 0 }},
+		{name: "angle zero", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.AngleMaxAbsCap = 0 }},
+		{name: "q3 gain tampered", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.Q3GainAllowedLossIncrease = 1e-9 }},
+		{name: "q3 order tampered", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.Q3OrderGuardAllowedLossIncrease = 1e-9 }},
+		{name: "q3 score tampered", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.Q3ScoreDistillAllowedLossIncrease = 1.1e-4 }},
+		{name: "q5 order tampered", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.Q5OrderGuardAllowedLossIncrease = 1e-9 }},
+		{name: "q5 score tampered", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.Q5ScoreDistillAllowedLossIncrease = 2.1e-5 }},
+		{name: "nf tampered", mutate: func(policy *AOQTSidecarCandidateEligibilityPolicy) { policy.NFBoundaryGuardAllowedLossIncrease = 1e-9 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tampered := jointPolicy
+			test.mutate(&tampered)
+			if _, err := AOQTSidecarTrainingContractPolicy(AOQTSidecarScoreDistillJointBudgetV1Contract, &tampered); err == nil || !strings.Contains(err.Error(), "does not match its preregistered") {
+				t.Fatalf("tampered joint policy error = %v", err)
+			}
+		})
+	}
+	if _, err := AOQTSidecarTrainingContractPolicy(" "+AOQTSidecarScoreDistillJointBudgetV1Contract+" ", &jointPolicy); err == nil || !strings.Contains(err.Error(), "canonical without surrounding whitespace") {
+		t.Fatalf("whitespace joint contract error = %v", err)
+	}
+	if _, err := AOQTSidecarTrainingContractPolicy("aoqt-trainonly-score-distill-joint-budget-v0", &jointPolicy); err == nil || !strings.Contains(err.Error(), "unsupported AOQT training contract") {
+		t.Fatalf("wrong joint contract error = %v", err)
+	}
+	tampered := jointPolicy
+	tampered.Q3ScoreDistillAllowedLossIncrease = 1.1e-4
+	if _, err := AOQTSidecarTrainingContractPolicy(AOQTSidecarScoreDistillJointBudgetV1Contract, &tampered); err == nil || !strings.Contains(err.Error(), "does not match its preregistered") {
+		t.Fatalf("tampered joint policy error = %v", err)
+	}
+	if _, err := AOQTSidecarTrainingContractPolicy(AOQTSidecarScoreDistillBudgetLaneAContract, &jointPolicy); err == nil || !strings.Contains(err.Error(), "does not match its preregistered") {
+		t.Fatalf("relabelled joint policy error = %v", err)
+	}
+
+	baseline := aoqtStepEvaluation{
+		loss:       6,
+		activation: AOQTSidecarObjectiveActivation{Q3GainEligiblePairs: 1, Q3GainContributingPairs: 1, Q3OrderGuardPairs: 1, Q3OrderGuardContributing: 1, Q3ScoreDistillCount: 1, Q5OrderGuardPairs: 1, Q5OrderGuardContributing: 1, Q5ScoreDistillCount: 1, NFBoundaryGuardPairs: 1, NFBoundaryGuardContributing: 1},
+		components: AOQTSidecarObjectiveComponents{Q3Gain: 1, Q3OrderGuard: 1, Q3ScoreDistill: 1, Q5OrderGuard: 1, Q5ScoreDistill: 1, NFBoundaryGuard: 1},
+	}
+	candidate := baseline
+	candidate.components.Q3Gain = 0.5
+	candidate.components.Q3OrderGuard -= 0.0126953125
+	candidate.components.Q3ScoreDistill += 8.670463e-5
+	candidate.components.Q5OrderGuard -= 0.00146484375
+	candidate.components.Q5ScoreDistill += 1.2905049e-5
+	candidate.components.NFBoundaryGuard -= 0.023498535
+	candidate.loss = candidate.components.Sum()
+	weights := AOQTSidecarRowWeights{Q3Gain: 1, Q3OrderGuard: 1, Q3ScoreDistill: 1, Q5OrderGuard: 1, Q5ScoreDistill: 1, NFBoundaryGuard: 1}
+	if decision := aoqtEvaluateTransactionalStepWithPolicy(baseline, candidate, weights, AOQTSidecarScoreDistillBudgetLaneAPolicy()); decision.accepted || decision.reason != aoqtRejectionComponentRegression {
+		t.Fatalf("ordinal-20-style laneA decision = %+v, want component-regression rejection", decision)
+	}
+	if decision := aoqtEvaluateTransactionalStepWithPolicy(baseline, candidate, weights, jointPolicy); !decision.accepted || !decision.activationSufficient {
+		t.Fatalf("ordinal-20-style joint decision = %+v, want accepted with sufficient activation", decision)
+	}
+
+	metrics := safeTinyAOQTCandidateMetrics(t, tinyAOQTCalibrationSet(t, 188), AOQTSidecarObjectiveActivation{Q3GainEligiblePairs: 2, Q3GainContributingPairs: 2, Q3OrderGuardPairs: 2, Q3OrderGuardContributing: 2, Q3ScoreDistillCount: 3, Q5OrderGuardPairs: 2, Q5OrderGuardContributing: 2, Q5ScoreDistillCount: 3})
+	metrics.TrainingContract = AOQTSidecarScoreDistillJointBudgetV1Contract
+	metrics.CandidateEligibilityPolicy = &jointPolicy
+	metrics.Summary.TrainingContract = AOQTSidecarScoreDistillJointBudgetV1Contract
+	metrics.Summary.CandidateEligibilityPolicy = &jointPolicy
+	if err := metrics.Validate(); err != nil {
+		t.Fatalf("joint metrics provenance: %v", err)
+	}
+	missing := metrics
+	missing.CandidateEligibilityPolicy = nil
+	if err := missing.Validate(); err == nil || !strings.Contains(err.Error(), "requires an explicit candidate eligibility policy") {
+		t.Fatalf("missing metrics policy error = %v", err)
+	}
+	relabelled := metrics
+	relabelled.TrainingContract = AOQTSidecarScoreDistillBudgetLaneAContract
+	if err := relabelled.Validate(); err == nil || !strings.Contains(err.Error(), "does not match its preregistered") {
+		t.Fatalf("relabelled metrics policy error = %v", err)
+	}
+}
+
 func TestAOQTScoreDistillBudgetContractRejectsMislabelledProvenance(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 186)
 	activation := AOQTSidecarObjectiveActivation{
