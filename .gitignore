@@ -2,6 +2,8 @@ bin/
 dist/
 datasets/
 runs/
+tmp/
+/eos
 .DS_Store
 .local/
 .ferrous-wheel-build/
