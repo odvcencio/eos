@@ -26,3 +26,49 @@ jobs:
           ./runtime/backends/cuda
           ./runtime/backends/metal
           ./syntax
+
+  # CGO_ENABLED=0 above means runtime/backends/cuda and runtime/backends/metal
+  # only build their `!cgo` stub files; the real CGo device code
+  # (native_linux.go, native_darwin.go) never compiles in the job above. These
+  # two jobs compile (not run) the CGo device paths so a broken CUDA/Metal
+  # build fails CI instead of surfacing only on a developer's GPU machine.
+  cgo-cuda-build:
+    name: cgo cuda compile (linux, no GPU)
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    steps:
+      - name: Install git
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Compile CUDA backend with cgo
+        env:
+          CGO_ENABLED: "1"
+          # native_linux.go's #cgo LDFLAGS looks for -lcuda under
+          # /usr/local/cuda/lib64, but the devel image ships no real driver
+          # there (no GPU in this job). The devel image does ship a link-only
+          # driver stub under lib64/stubs; add it to the search path so the
+          # link step succeeds without a GPU. CGO_LDFLAGS is additive to the
+          # source #cgo LDFLAGS, so the package source is unchanged.
+          CGO_LDFLAGS: -L/usr/local/cuda/lib64/stubs
+        run: |
+          go build ./runtime/backends/cuda/...
+          go vet ./runtime/backends/cuda/...
+
+  cgo-metal-build:
+    name: cgo metal compile (darwin, no GPU)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Compile Metal backend with cgo
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          go build ./runtime/backends/metal/...
+          go vet ./runtime/backends/metal/...
