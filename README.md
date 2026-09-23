@@ -1,17 +1,17 @@
 # Eos
 
-Eos is an inference-first GPU language and runtime stack. It compiles `.eos` source into backend-neutral `.mll` execution plans for GPU-accelerated embedding, reranking, retrieval-time scoring, and decode-time inference. Write the model-facing compute once, then run it through CUDA, Metal, Vulkan, DirectML, or WebGPU with the same artifact and the same entrypoint contract.
+Eos is an inference-first GPU language and runtime stack. It compiles `.eos` source into backend-neutral `.mll` execution plans for GPU-accelerated embedding, reranking, retrieval-time scoring, and decode-time inference. The same artifact and entrypoint contract targets five backend names; CUDA and Metal run on-device today, and Vulkan, DirectML, and WebGPU currently execute through a host fallback (see Status).
 
 - **Inference-first product surface** with `kernel` and `pipeline` abstractions
-- **Three-level IR pipeline**: HIR (typed) -> MIR (semantic) -> LIR (scheduled)
-- **Portable artifact format** (`.mll`): compile once, deploy anywhere
-- **Portable backend surface**: CUDA, Metal, Vulkan, DirectML, and WebGPU variants from the same source
+- **Two-stage IR pipeline in active use**: HIR (typed), then LIR (scheduled). A third level, MIR, exists as a package and is built during compilation, but LIR currently lowers from the syntax tree and HIR, not from MIR.
+- **Portable artifact format** (`.mll`): compile once, deploy anywhere the backend has a device path or a host fallback
+- **Backend surface for five targets**: CUDA and Metal execute on-device through CGo (native CUDA/nvrtc/cuBLAS linkage on Linux, Metal/MetalPerformanceShaders on Apple). Vulkan, DirectML, and WebGPU currently share a host-fallback implementation while device runtimes are built.
 - **First-class KV cache**: `kv_cache` type with `kv_read`/`kv_write` for autoregressive decoding
 - **TurboQuant-native direction**: Eos is designed to consume and emit quantized tensors and quantized vectors without repacking through a separate framework
 - **Schedule hints**: `tile`, `vector_width`, `subgroup`, memory classes -- backend-neutral, lowered late
 - **Hybrid runtime**: backend-native execution where promoted kernels exist, host reference execution where they do not yet
 - **Go-authored tree-sitter grammar**: Eos source parsing is backed by gotreesitter, while the compiler keeps its source-oriented AST
-- **Pure Go toolchain**: no Python, no C++ build dependencies
+- **Go compiler and runtime core, CGo for GPU device access**: the compiler, IR, artifact format, and CLI are pure Go. CUDA and Metal device execution link through CGo. The repository also carries about 90 Python scripts under `scripts/` for dataset preparation, training orchestration, and parity oracles; Python is not required to build or run the Go toolchain, but it is used by parts of the training and evaluation pipeline.
 
 ## Product direction
 
@@ -24,6 +24,8 @@ The credible long-context wedge is the best local long-context embedder: consume
 Agents working with Eos should use the [using-manta](https://github.com/odvcencio/m31labs-skills/blob/main/skills/using-manta/SKILL.md) skill. The skill is still published under the former project name while the runtime, CLI, and module path have moved to Eos.
 
 Current embedder work is focused on retrieval-aligned training, not pairwise-only wins. The alignment harness now supports source-aware hard-negative scheduling, promotion gates over full retrieval scoreboards, recall@100 guardrails, grouped hard-negative InfoNCE, hybrid InfoNCE, and teacher-score distillation over mined candidate groups. The current nDCG best is the teacher-distilled hybrid follow-up with grouped weight `0.05`, teacher weight `0.20`, LR `0.000010`, NF-biased model-hard mining, and `nfcorpus=3` source bias during training; macro nDCG@10 improves from `0.145568` to `0.147862` against the previous best while staying inside the nDCG and recall@100 floors.
+
+These deltas are internal candidate-over-candidate progress, not an absolute quality claim. Against the BM25 baseline in the same harness, the native encoder currently trails on all three tracked BEIR sets (`ndcg@10`, latest full-control eval): SciFact BM25 `0.6618` vs. native `0.5645`; NfCorpus BM25 `0.3045` vs. native `0.2057`; FiQA BM25 `0.2321` vs. native `0.1213`. Closing that gap is the open problem, not a solved one.
 
 That means the language and runtime should bias toward:
 
