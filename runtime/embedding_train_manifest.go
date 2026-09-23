@@ -168,11 +168,26 @@ func (m EmbeddingTrainManifest) mllValues() map[string]authoredManifestValue {
 		"config.turboquant_compact_objectives":              authoredString(FormatTurboQuantPrefixObjectives(m.Config.TurboQuantCompactObjectives)),
 		"config.turboquant_rank_margin_objectives":          authoredString(FormatTurboQuantPrefixObjectives(m.Config.TurboQuantRankMarginObjectives)),
 		"config.turboquant_rank_margin":                     authoredFloat(float64(m.Config.TurboQuantRankMargin)),
+		"config.turboquant_rank_margin_loss":                authoredString(m.Config.TurboQuantRankMarginLoss),
+		"config.turboquant_rank_margin_reduction":           authoredString(m.Config.TurboQuantRankMarginReduction),
+		"config.turboquant_rank_margin_tau":                 authoredFloat(float64(m.Config.TurboQuantRankMarginTau)),
+		"config.turboquant_topk_objectives":                 authoredString(FormatTurboQuantPrefixObjectives(m.Config.TurboQuantTopKObjectives)),
+		"config.turboquant_topk_loss":                       authoredString(m.Config.TurboQuantTopKLoss),
+		"config.turboquant_topk_cutoff":                     authoredInt(int64(m.Config.TurboQuantTopKCutoff)),
+		"config.turboquant_topk_tau":                        authoredFloat(float64(m.Config.TurboQuantTopKTau)),
+		"config.turboquant_topk_margin":                     authoredFloat(float64(m.Config.TurboQuantTopKMargin)),
+		"config.turboquant_topk_negative_mask":              authoredString(m.Config.TurboQuantTopKNegativeMask),
+		"config.turboquant_topk_recall_weight":              authoredFloat(float64(m.Config.TurboQuantTopKRecallWeight)),
+		"config.turboquant_topk_recall_cutoff":              authoredInt(int64(m.Config.TurboQuantTopKRecallCutoff)),
+		"config.turboquant_topk_recall_tau":                 authoredFloat(float64(m.Config.TurboQuantTopKRecallTau)),
+		"config.turboquant_topk_recall_margin":              authoredFloat(float64(m.Config.TurboQuantTopKRecallMargin)),
+		"config.turboquant_topk_recall_negative_mask":       authoredString(m.Config.TurboQuantTopKRecallNegativeMask),
 		"config.score_spectrum_loss_mode":                   authoredString(m.Config.ScoreSpectrumLossMode),
 		"config.score_spectrum_recovery_weight":             authoredFloat(float64(m.Config.ScoreSpectrumRecoveryWeight)),
 		"config.score_spectrum_recovery_margin":             authoredFloat(float64(m.Config.ScoreSpectrumRecoveryMargin)),
 		"config.score_spectrum_recovery_top_k":              authoredInt(int64(m.Config.ScoreSpectrumRecoveryTopK)),
 		"config.score_spectrum_recovery_tau":                authoredFloat(float64(m.Config.ScoreSpectrumRecoveryTau)),
+		"config.score_spectrum_activation_microbatch_size":  authoredInt(int64(m.Config.ScoreSpectrumActivationMicrobatchSize)),
 		"score_spectrum.score_spectrum_train":               authoredBool(m.ScoreSpectrum.ScoreSpectrumTrain),
 		"score_spectrum.score_spectrum_research_only":       authoredBool(m.ScoreSpectrum.ScoreSpectrumResearchOnly),
 		"score_spectrum.train_allowed_for_research":         authoredBool(m.ScoreSpectrum.TrainAllowedForResearch),
@@ -348,6 +363,80 @@ func embeddingTrainManifestFromDoc(doc authoredManifestDoc) (EmbeddingTrainManif
 	} else if ok {
 		manifest.Config.TurboQuantRankMargin = float32(value)
 	}
+	if value, ok, err := doc.string("config.turboquant_rank_margin_loss"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantRankMarginLoss = value
+	}
+	if value, ok, err := doc.string("config.turboquant_rank_margin_reduction"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantRankMarginReduction = value
+	}
+	if value, ok, err := doc.float("config.turboquant_rank_margin_tau"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantRankMarginTau = float32(value)
+	}
+	if value, ok, err := doc.string("config.turboquant_topk_objectives"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		objectives, err := ParseTurboQuantPrefixObjectives(value)
+		if err != nil {
+			return EmbeddingTrainManifest{}, err
+		}
+		manifest.Config.TurboQuantTopKObjectives = objectives
+	}
+	if value, ok, err := doc.string("config.turboquant_topk_loss"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKLoss = value
+	}
+	if value, ok, err := doc.int("config.turboquant_topk_cutoff"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKCutoff = int(value)
+	}
+	if value, ok, err := doc.float("config.turboquant_topk_tau"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKTau = float32(value)
+	}
+	if value, ok, err := doc.float("config.turboquant_topk_margin"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKMargin = float32(value)
+	}
+	if value, ok, err := doc.string("config.turboquant_topk_negative_mask"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKNegativeMask = value
+	}
+	if value, ok, err := doc.float("config.turboquant_topk_recall_weight"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKRecallWeight = float32(value)
+	}
+	if value, ok, err := doc.int("config.turboquant_topk_recall_cutoff"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKRecallCutoff = int(value)
+	}
+	if value, ok, err := doc.float("config.turboquant_topk_recall_tau"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKRecallTau = float32(value)
+	}
+	if value, ok, err := doc.float("config.turboquant_topk_recall_margin"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKRecallMargin = float32(value)
+	}
+	if value, ok, err := doc.string("config.turboquant_topk_recall_negative_mask"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.TurboQuantTopKRecallNegativeMask = value
+	}
 	if value, ok, err := doc.string("config.score_spectrum_loss_mode"); err != nil {
 		return EmbeddingTrainManifest{}, err
 	} else if ok {
@@ -372,6 +461,11 @@ func embeddingTrainManifestFromDoc(doc authoredManifestDoc) (EmbeddingTrainManif
 		return EmbeddingTrainManifest{}, err
 	} else if ok {
 		manifest.Config.ScoreSpectrumRecoveryTau = float32(value)
+	}
+	if value, ok, err := doc.int("config.score_spectrum_activation_microbatch_size"); err != nil {
+		return EmbeddingTrainManifest{}, err
+	} else if ok {
+		manifest.Config.ScoreSpectrumActivationMicrobatchSize = int(value)
 	}
 	if manifest.ScoreSpectrum, err = scoreSpectrumPolicyFromAuthoredDoc(doc, "score_spectrum."); err != nil {
 		return EmbeddingTrainManifest{}, err

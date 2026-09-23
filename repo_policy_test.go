@@ -131,6 +131,142 @@ func TestTrainMantaCandidatePassesPerEpochRetrievalEvalFlags(t *testing.T) {
 	}
 }
 
+func TestTrainMantaCandidateRecordsInitialArtifactAndDeterministicRetrievalEval(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("scripts", "train_manta_embed_v1_candidate.fw"))
+	if err != nil {
+		t.Fatalf("read candidate wrapper: %v", err)
+	}
+	src := string(data)
+	for _, want := range []string{
+		`InitialArtifact`,
+		`InitialArtifactSHA256`,
+		`EOS_INITIAL_ARTIFACT`,
+		`cfg.InitialArtifactSHA256, err = sha256File(cfg.InitialArtifact)`,
+		`"initial_artifact": %s`,
+		`"initial_artifact_sha256": %s`,
+		`evalRunID := cfg.RunID + "-retrieval"`,
+		`"EOS_EVAL_RUN_ID=" + evalRunID`,
+		`"retrieval_eval_leaderboard": %s`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("candidate wrapper missing continuation/retrieval provenance %q", want)
+		}
+	}
+	if strings.Contains(src, `let initialArtifact = os.Getenv("EOS_INITIAL_ARTIFACT")`) {
+		t.Fatalf("candidate wrapper must resolve EOS_INITIAL_ARTIFACT during config prep, not inside runCandidate")
+	}
+}
+
+func TestTrainMantaCandidatePlumbsScoreSpectrumAndRetrievalSelection(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("scripts", "train_manta_embed_v1_candidate.fw"))
+	if err != nil {
+		t.Fatalf("read candidate wrapper: %v", err)
+	}
+	src := string(data)
+	commonBlock := sliceBetween(t, src, `func trainCommonArgs`, `func pairwiseTrainEnabled`)
+	runBlock := sliceBetween(t, src, `func runCandidate`, `func main`)
+	for _, want := range []string{
+		`EOS_SCORE_SPECTRUM_TRAIN`,
+		`EOS_ALLOW_RESEARCH_ONLY_SCORE_SPECTRUM`,
+		`EOS_SCORE_SPECTRUM_EVAL`,
+		`EOS_SCORE_SPECTRUM_LOSS_MODE`,
+		`EOS_SCORE_SPECTRUM_RECOVERY_WEIGHT`,
+		`EOS_SCORE_SPECTRUM_RECOVERY_MARGIN`,
+		`EOS_SCORE_SPECTRUM_RECOVERY_TOP_K`,
+		`EOS_SCORE_SPECTRUM_RECOVERY_TAU`,
+		`EOS_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES`,
+		`EOS_SCORE_SPECTRUM_ACTIVATION_MICROBATCH_SIZE`,
+		`"--score-spectrum-eval"`,
+		`"--score-spectrum-loss-mode"`,
+		`"--score-spectrum-recovery-weight"`,
+		`"--score-spectrum-recovery-margin"`,
+		`"--score-spectrum-recovery-top-k"`,
+		`"--score-spectrum-recovery-tau"`,
+		`"--score-spectrum-max-batch-candidates"`,
+		`"--score-spectrum-activation-microbatch-size"`,
+	} {
+		if !strings.Contains(src, want) && !strings.Contains(commonBlock, want) {
+			t.Fatalf("candidate wrapper missing score-spectrum passthrough %q", want)
+		}
+	}
+	for _, want := range []string{
+		`scoreSpectrumTrainEnabled(cfg)`,
+		`"--score-spectrum-train"`,
+		`"--allow-research-only-score-spectrum"`,
+		`envEnabled("EOS_PRETOKENIZE_JSONL") && !scoreSpectrumTrainEnabled(cfg)`,
+	} {
+		if !strings.Contains(runBlock, want) {
+			t.Fatalf("candidate wrapper missing score-spectrum run flow %q", want)
+		}
+	}
+	for _, want := range []string{
+		`trainRetrievalEvalConfigured(cfg)`,
+		`cfg.SelectMetric = "retrieval_ndcg"`,
+		`cfg.SelectMetric = "score_margin"`,
+		`choose only one of EOS_PAIRWISE_TRAIN, EOS_HARD_NEGATIVE_TRAIN, or EOS_SCORE_SPECTRUM_TRAIN`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Fatalf("candidate wrapper missing retrieval-selection or mutual-exclusion guard %q", want)
+		}
+	}
+}
+
+func TestTrainMantaCandidateScoreSpectrumDoesNotUsePositionalPairEval(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("scripts", "train_manta_embed_v1_candidate.fw"))
+	if err != nil {
+		t.Fatalf("read candidate wrapper: %v", err)
+	}
+	src := string(data)
+	runBlock := sliceBetween(t, src, `func runCandidate`, `func main`)
+	for _, want := range []string{
+		`if scoreSpectrumTrainEnabled(cfg) {
+			args = append(args, cfg.Artifact, trainJSONLForRun)
+		} else {
+			args = append(args, cfg.Artifact, trainJSONLForRun, evalJSONLForRun)
+		}`,
+		`if scoreSpectrumTrainEnabled(cfg) {
+			planArgs = append(planArgs, cfg.Artifact, trainJSONLForRun)
+		} else {
+			planArgs = append(planArgs, cfg.Artifact, trainJSONLForRun, evalJSONLForRun)
+		}`,
+		`scoreSpectrumEvalOnly := scoreSpectrumTrainEnabled(cfg) && cfg.ScoreSpectrumEval != ""`,
+		`if scoreSpectrumEvalOnly {
+		evalArgs = append(evalArgs, evalCandidate, trainJSONLForRun)
+	} else {
+		evalArgs = append(evalArgs, evalCandidate, evalJSONLForRun)
+	}`,
+		`if scoreSpectrumEvalOnly {
+			hardArgs = append(hardArgs, hardCandidate, trainJSONLForRun)
+		} else {
+			hardArgs = append(hardArgs, hardCandidate, hardEvalJSONLForRun)
+		}`,
+	} {
+		if !strings.Contains(runBlock, want) {
+			t.Fatalf("candidate wrapper missing score-spectrum native-eval command shape %q", want)
+		}
+	}
+}
+
+func TestTrainMantaCandidateDoesNotForceResidentRepairRoute(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("scripts", "train_manta_embed_v1_candidate.fw"))
+	if err != nil {
+		t.Fatalf("read candidate wrapper: %v", err)
+	}
+	src := string(data)
+	block := sliceBetween(t, src, `func applyCandidateRuntimeEnv`, `func runCandidate`)
+	if strings.Contains(block, `EOS_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN`+`=1`) {
+		t.Fatalf("candidate wrapper must not force resident training for repair mode: %s", block)
+	}
+	for _, want := range []string{
+		`EOS_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN`,
+		`os.Setenv("EOS_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN", "0")`,
+	} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("candidate wrapper missing explicit resident-off default %q: %s", want, block)
+		}
+	}
+}
+
 func sliceBetween(t *testing.T, src string, start string, end string) string {
 	t.Helper()
 	startIdx := strings.Index(src, start)

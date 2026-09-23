@@ -21,25 +21,37 @@ func TestEmbeddingTrainManifestRoundTrip(t *testing.T) {
 		Name:      "tiny_train_embed_q8",
 		Embedding: tinyMaskedEmbeddingManifest(),
 		Config: EmbeddingTrainConfig{
-			LearningRate:                0.05,
-			WeightBits:                  8,
-			Optimizer:                   "adamw",
-			Beta1:                       0.9,
-			Beta2:                       0.999,
-			Epsilon:                     1e-8,
-			ContrastiveLoss:             "infonce",
-			Temperature:                 0.05,
-			MatryoshkaDims:              []int{64, 128},
-			MatryoshkaWeights:           []float32{0.5, 1},
-			TurboQuantPrefixBits:        []int{2, 4},
-			TurboQuantPrefixWeight:      0.25,
-			TurboQuantPrefixSeed:        DefaultTurboQuantMultiVectorQuantizerSeed,
-			TurboQuantPrefixScoreMode:   TurboQuantPrefixScoreModePreparedIP,
-			ScoreSpectrumLossMode:       ScoreSpectrumLossModeHardSoftRecovery,
-			ScoreSpectrumRecoveryWeight: 1.5,
-			ScoreSpectrumRecoveryMargin: 0.2,
-			ScoreSpectrumRecoveryTopK:   3,
-			ScoreSpectrumRecoveryTau:    0.07,
+			LearningRate:                          0.05,
+			WeightBits:                            8,
+			Optimizer:                             "adamw",
+			Beta1:                                 0.9,
+			Beta2:                                 0.999,
+			Epsilon:                               1e-8,
+			ContrastiveLoss:                       "infonce",
+			Temperature:                           0.05,
+			MatryoshkaDims:                        []int{64, 128},
+			MatryoshkaWeights:                     []float32{0.5, 1},
+			TurboQuantPrefixBits:                  []int{2, 4},
+			TurboQuantPrefixWeight:                0.25,
+			TurboQuantPrefixSeed:                  DefaultTurboQuantMultiVectorQuantizerSeed,
+			TurboQuantPrefixScoreMode:             TurboQuantPrefixScoreModePreparedIP,
+			TurboQuantTopKObjectives:              []TurboQuantPrefixObjective{{Dim: 4, BitWidth: 3, Weight: 0.5}},
+			TurboQuantTopKLoss:                    TurboQuantTopKLossLambdaNDCG,
+			TurboQuantTopKCutoff:                  7,
+			TurboQuantTopKTau:                     0.08,
+			TurboQuantTopKMargin:                  0.01,
+			TurboQuantTopKNegativeMask:            TurboQuantTopKNegativeMaskQ3,
+			TurboQuantTopKRecallWeight:            0.2,
+			TurboQuantTopKRecallCutoff:            100,
+			TurboQuantTopKRecallTau:               0.07,
+			TurboQuantTopKRecallMargin:            0.03,
+			TurboQuantTopKRecallNegativeMask:      TurboQuantTopKNegativeMaskBM25,
+			ScoreSpectrumLossMode:                 ScoreSpectrumLossModeHardSoftRecovery,
+			ScoreSpectrumRecoveryWeight:           1.5,
+			ScoreSpectrumRecoveryMargin:           0.2,
+			ScoreSpectrumRecoveryTopK:             3,
+			ScoreSpectrumRecoveryTau:              0.07,
+			ScoreSpectrumActivationMicrobatchSize: 7,
 		},
 		ScoreSpectrum: EmbeddingScoreSpectrumPolicy{
 			ScoreSpectrumTrain:        true,
@@ -108,8 +120,20 @@ func TestEmbeddingTrainManifestRoundTrip(t *testing.T) {
 	if got.Config.TurboQuantPrefixScoreMode != TurboQuantPrefixScoreModePreparedIP {
 		t.Fatalf("turboquant prefix score mode = %q, want %q", got.Config.TurboQuantPrefixScoreMode, TurboQuantPrefixScoreModePreparedIP)
 	}
+	if formatted := FormatTurboQuantPrefixObjectives(got.Config.TurboQuantTopKObjectives); formatted != "4:3=0.5" {
+		t.Fatalf("turboquant top-k objectives = %q", formatted)
+	}
+	if got.Config.TurboQuantTopKLoss != TurboQuantTopKLossLambdaNDCG || got.Config.TurboQuantTopKCutoff != 7 || got.Config.TurboQuantTopKTau != 0.08 || got.Config.TurboQuantTopKMargin != 0.01 || got.Config.TurboQuantTopKNegativeMask != TurboQuantTopKNegativeMaskQ3 {
+		t.Fatalf("turboquant top-k config = %+v, want lambdandcg cutoff=7 tau=0.08 margin=0.01 mask=q3", got.Config)
+	}
+	if got.Config.TurboQuantTopKRecallWeight != 0.2 || got.Config.TurboQuantTopKRecallCutoff != 100 || got.Config.TurboQuantTopKRecallTau != 0.07 || got.Config.TurboQuantTopKRecallMargin != 0.03 || got.Config.TurboQuantTopKRecallNegativeMask != TurboQuantTopKNegativeMaskBM25 {
+		t.Fatalf("turboquant top-k recall config = %+v, want weight=0.2 cutoff=100 tau=0.07 margin=0.03 mask=bm25", got.Config)
+	}
 	if got.Config.ScoreSpectrumLossMode != ScoreSpectrumLossModeHardSoftRecovery || got.Config.ScoreSpectrumRecoveryWeight != 1.5 || got.Config.ScoreSpectrumRecoveryMargin != 0.2 || got.Config.ScoreSpectrumRecoveryTopK != 3 || got.Config.ScoreSpectrumRecoveryTau != 0.07 {
 		t.Fatalf("score-spectrum recovery config = %+v, want hard_soft_recovery weight=1.5 margin=0.2 topK=3 tau=0.07", got.Config)
+	}
+	if got.Config.ScoreSpectrumActivationMicrobatchSize != 7 {
+		t.Fatalf("score-spectrum activation microbatch size = %d, want 7", got.Config.ScoreSpectrumActivationMicrobatchSize)
 	}
 	if !got.ScoreSpectrum.ScoreSpectrumTrain || !got.ScoreSpectrum.ScoreSpectrumResearchOnly || !got.ScoreSpectrum.TrainAllowedForResearch || got.ScoreSpectrum.ReleaseTrainAllowed || got.ScoreSpectrum.CommercialUseAllowed {
 		t.Fatalf("score-spectrum policy mismatch: %+v", got.ScoreSpectrum)
@@ -188,9 +212,12 @@ func TestEmbeddingTrainManifestRoundTripTurboQuantRankMarginObjectives(t *testin
 			TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{
 				{Dim: 128, BitWidth: 4, Weight: 0.1},
 			},
-			TurboQuantRankMargin:      0.03,
-			TurboQuantPrefixSeed:      DefaultTurboQuantMultiVectorQuantizerSeed,
-			TurboQuantPrefixScoreMode: TurboQuantPrefixScoreModePreparedIP,
+			TurboQuantRankMargin:          0.03,
+			TurboQuantRankMarginLoss:      TurboQuantRankMarginLossSoftplus,
+			TurboQuantRankMarginReduction: TurboQuantRankMarginReductionMeanEligible,
+			TurboQuantRankMarginTau:       0.04,
+			TurboQuantPrefixSeed:          DefaultTurboQuantMultiVectorQuantizerSeed,
+			TurboQuantPrefixScoreMode:     TurboQuantPrefixScoreModePreparedIP,
 		},
 	}
 	if err := want.WriteFile(path); err != nil {
@@ -205,6 +232,9 @@ func TestEmbeddingTrainManifestRoundTripTurboQuantRankMarginObjectives(t *testin
 	}
 	if got.Config.TurboQuantRankMargin != 0.03 {
 		t.Fatalf("turboquant rank margin = %f, want 0.03", got.Config.TurboQuantRankMargin)
+	}
+	if got.Config.TurboQuantRankMarginLoss != TurboQuantRankMarginLossSoftplus || got.Config.TurboQuantRankMarginReduction != TurboQuantRankMarginReductionMeanEligible || got.Config.TurboQuantRankMarginTau != 0.04 {
+		t.Fatalf("turboquant rank-margin shape = %q/%q/%f, want softplus/mean_eligible/0.04", got.Config.TurboQuantRankMarginLoss, got.Config.TurboQuantRankMarginReduction, got.Config.TurboQuantRankMarginTau)
 	}
 }
 

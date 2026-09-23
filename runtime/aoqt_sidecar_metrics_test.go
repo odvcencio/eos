@@ -343,6 +343,36 @@ func TestAOQTOptimizerDiagnosticsRequireKnownCoordinateSearchStrategy(t *testing
 	}
 }
 
+func TestAOQTV7DevTrustRegionMetricsValidateButFailCandidateEligibility(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 189)
+	enableTinyAOQTNFGuard(t, &set)
+	activation := AOQTSidecarObjectiveActivation{
+		Q3GainEligiblePairs:         2,
+		Q3GainContributingPairs:     2,
+		Q3OrderGuardPairs:           2,
+		Q3OrderGuardContributing:    2,
+		Q3ScoreDistillCount:         3,
+		Q5OrderGuardPairs:           2,
+		Q5OrderGuardContributing:    2,
+		Q5ScoreDistillCount:         3,
+		NFBoundaryGuardPairs:        1,
+		NFBoundaryGuardContributing: 1,
+	}
+	metrics := safeTinyAOQTCandidateMetrics(t, set, activation)
+	seedCoordinateDiagnosticsForMetricsTest(t, &metrics, aoqtCoordinateSearchStrategyV7DevTrustRegion)
+
+	if err := metrics.Validate(); err != nil {
+		t.Fatalf("coherent dev trust-region metrics should validate as research telemetry: %v", err)
+	}
+	if metrics.Plan.OptimizerMode != AOQTSidecarOptimizerModeV7DevTrustRegion || !metrics.Summary.OptimizerDiagnostics.DevOnly {
+		t.Fatalf("dev mode was not recorded in metrics: plan=%q diagnostics=%+v", metrics.Plan.OptimizerMode, metrics.Summary.OptimizerDiagnostics)
+	}
+	err := ValidateAOQTSidecarCandidateEligibility(metrics, AOQTSidecarDefaultCandidateEligibilityPolicy())
+	if err == nil || !strings.Contains(err.Error(), "dev-only optimizer artifacts") {
+		t.Fatalf("dev candidate eligibility error = %v, want explicit dev-only rejection", err)
+	}
+}
+
 func TestAOQTProtectedCoordinateDiagnosticsAreStrictlyBound(t *testing.T) {
 	set := tinyAOQTCalibrationSet(t, 90)
 	enableTinyAOQTNFGuard(t, &set)
@@ -708,6 +738,15 @@ func bindAOQTCoordinateAuditForMetricsTest(t *testing.T, diagnostics *AOQTSideca
 func seedCoordinateDiagnosticsForMetricsTest(t *testing.T, metrics *AOQTSidecarRunMetrics, strategy string) {
 	t.Helper()
 	diagnostics := *metrics.Summary.OptimizerDiagnostics
+	optimizerMode := ""
+	if strategy == aoqtCoordinateSearchStrategyV7DevTrustRegion {
+		optimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+		metrics.Plan.OptimizerMode = optimizerMode
+		metrics.Summary.Plan.OptimizerMode = optimizerMode
+		metrics.Summary.OptimizerMode = optimizerMode
+		diagnostics.OptimizerMode = optimizerMode
+		diagnostics.DevOnly = true
+	}
 	diagnostics.ProposalAttempts = diagnostics.AcceptedSteps + 1
 	diagnostics.AcceptedProposals = diagnostics.AcceptedSteps
 	diagnostics.RejectedProposals = 1
@@ -736,7 +775,7 @@ func seedCoordinateDiagnosticsForMetricsTest(t *testing.T, metrics *AOQTSidecarR
 	for _, name := range protectedComponents {
 		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: make([]float32, metrics.Plan.AngleCount)})
 	}
-	auditPlan, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	auditPlan, err := newAOQTCoordinateSearchPlanForMode(q3GainGrad, aggregateGrad, 0.01, AOQTSidecarDefaultAngleCap, optimizerMode, protected)
 	if err != nil {
 		t.Fatalf("coordinate audit plan: %v", err)
 	}
@@ -744,6 +783,14 @@ func seedCoordinateDiagnosticsForMetricsTest(t *testing.T, metrics *AOQTSidecarR
 	diagnostics.CoordinateTopAngles = len(auditPlan.Order)
 	diagnostics.CoordinateMagnitudeCount = len(auditPlan.Magnitudes)
 	diagnostics.CoordinateBlockCount = len(auditPlan.BlockSizes)
+	diagnostics.TrustRegionRadius = auditPlan.TrustRegionRadius
+	if optimizerMode == AOQTSidecarOptimizerModeV7DevTrustRegion {
+		diagnostics.TrustRegionProposalAttempts = diagnostics.CoordinateProposalAttempts
+		moved := []int{0}
+		diagnostics.TrustRegionMovedAngleIndices = &moved
+		diagnostics.TrustRegionMaxMovedAngles = 1
+		diagnostics.TrustRegionMaxMagnitude = auditPlan.Magnitudes[0]
+	}
 	audit, err := auditPlan.coordinateSearchAuditJSON()
 	if err != nil {
 		t.Fatalf("coordinate audit: %v", err)

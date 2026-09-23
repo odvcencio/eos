@@ -2,6 +2,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +39,16 @@ type shippingConfig struct {
 	FinalTrainArtifact  string
 	FinalSealedArtifact string
 	FinalTokenizer      string
+	EosBin              string
+	RepairMode          bool
+	BootstrapArtifact   string
+	TokenizerExplicit   bool
+	RepairStageATrain   string
+	RepairStageAEval    string
+	RepairStageAManifest string
+	RepairStageBTrain   string
+	RepairStageBEval    string
+	RepairStageBManifest string
 	CorkScrewRoot       string
 	CorkScrewAssetID    string
 	CorkScrewAssetDir   string
@@ -46,6 +58,14 @@ type shippingConfig struct {
 	MinNFCorpusNDCG10   float64
 	MinFiQANDCG10       float64
 	MinMeanNDCG10       float64
+	BaselineSciFactNDCG10 float64
+	BaselineNFCorpusNDCG10 float64
+	BaselineFiQANDCG10 float64
+	MaxStageARegression float64
+	StageAMeanSlack     float64
+	ScoreSpectrumMaxBatchCandidates int
+	ScoreSpectrumActivationMicrobatchSize int
+	TrainEnableCompactResidentTrain bool
 }
 
 type hardNegativeProbe struct {
@@ -65,9 +85,10 @@ func usage() {
 	fmt.Println(`Train a CorkScrew-shippable eos-embed-v1 candidate from local pipeline data.
 
 Stages:
-  A. Train from mixed synthetic pretraining + BEIR hard-negative rows.
-  B. Mine model-hard negatives from Stage A, build a FiQA-weighted BEIR mix,
-     and fine-tune from the Stage A trainable package.
+  A. In repair mode, continue from EOS_SHIP_BOOTSTRAP_ARTIFACT at low LR on
+     deterministic BEIR qrels/BM25 score-spectrum rows.
+  B. Gate Stage A retrieval before mining, mine model-hard negatives, then
+     continue on deduped BM25+model score-spectrum rows.
   C. Optional one-epoch FiQA rescue fine-tune (disabled by default).
   D. Evaluate the final sealed artifact on SciFact, NfCorpus, and FiQA.
   E. Optionally install the gated artifact into CorkScrewDB assets.
@@ -76,13 +97,20 @@ Run:
   EOS_REPO_ROOT=$PWD ferrous-wheel run scripts/train_manta_embed_v1_shipping_pipeline.fw
 
 Useful knobs:
+  EOS_SHIP_BOOTSTRAP_ARTIFACT=/path/to/promoted-or-sealed-base.mll
+  EOS_SHIP_REPAIR_MODE=1
   EOS_SHIP_RUN_ROOT=$PWD/runs/eos-embed-v1-shipping-20260424
   EOS_SHIP_TOKENIZER=/path/to/eos-embed-v1.tokenizer.mll
+  EOS_SHIP_STAGE_A_LR=0.000000025
+  EOS_SHIP_STAGE_B_LR=0.000000025
   EOS_SHIP_FIQA_WEIGHT=5
   EOS_SHIP_NFCORPUS_WEIGHT=2
   EOS_SHIP_SCIFACT_WEIGHT=1
   EOS_SHIP_HARD_NEGATIVES_PER_QUERY=3
   EOS_SHIP_MODEL_HARD_NEGATIVES=3
+  EOS_SHIP_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES=4096
+  EOS_SHIP_SCORE_SPECTRUM_ACTIVATION_MICROBATCH_SIZE=8
+  EOS_SHIP_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN=1
   EOS_SHIP_FIQA_RESCUE=1
   EOS_INSTALL_CORKSCREW=1
   EOS_CORKSCREW_ROOT=$HOME/work/corkscrewdb
@@ -99,6 +127,14 @@ func getenv(name string, fallback string) string {
 
 func envEnabled(name string) bool {
 	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func envEnabledDefault(name string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if value == "" {
+		return fallback
+	}
 	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
@@ -243,6 +279,23 @@ func prepareConfig(root string) (shippingConfig, error) {
 	guard err == nil else return shippingConfig{}, err
 	minMean, err := parseFloatEnv("EOS_SHIP_MIN_MEAN_NDCG10", 0.25)
 	guard err == nil else return shippingConfig{}, err
+	baselineSciFact, err := parseFloatEnv("EOS_SHIP_BASELINE_SCIFACT_NDCG10", 0.564538)
+	guard err == nil else return shippingConfig{}, err
+	baselineNFCorpus, err := parseFloatEnv("EOS_SHIP_BASELINE_NFCORPUS_NDCG10", 0.205746)
+	guard err == nil else return shippingConfig{}, err
+	baselineFiQA, err := parseFloatEnv("EOS_SHIP_BASELINE_FIQA_NDCG10", 0.121261)
+	guard err == nil else return shippingConfig{}, err
+	maxStageARegression, err := parseFloatEnv("EOS_SHIP_STAGE_A_MAX_REGRESSION", 0.01)
+	guard err == nil else return shippingConfig{}, err
+	stageAMeanSlack, err := parseFloatEnv("EOS_SHIP_STAGE_A_MEAN_SLACK", 0.005)
+	guard err == nil else return shippingConfig{}, err
+	scoreSpectrumMaxBatchCandidates, err := parseIntEnv("EOS_SHIP_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES", 4096)
+	guard err == nil else return shippingConfig{}, err
+	guard scoreSpectrumMaxBatchCandidates >= 0 else return shippingConfig{}, fmt.Errorf("EOS_SHIP_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES must be non-negative")
+	scoreSpectrumActivationMicrobatchSize, err := parseIntEnv("EOS_SHIP_SCORE_SPECTRUM_ACTIVATION_MICROBATCH_SIZE", 8)
+	guard err == nil else return shippingConfig{}, err
+	guard scoreSpectrumActivationMicrobatchSize >= 0 else return shippingConfig{}, fmt.Errorf("EOS_SHIP_SCORE_SPECTRUM_ACTIVATION_MICROBATCH_SIZE must be non-negative")
+	repairMode := envEnabledDefault("EOS_SHIP_REPAIR_MODE", true)
 	cfg := shippingConfig{
 		Root:              root,
 		RunID:             runID,
@@ -264,6 +317,16 @@ func prepareConfig(root string) (shippingConfig, error) {
 		StageBDir:         filepath.Join(runRoot, stageBID),
 		StageCDir:         filepath.Join(runRoot, stageCID),
 		FinalEvalDir:      filepath.Join(runRoot, finalEvalID),
+		EosBin:            filepath.Join(runRoot, "bin", "eos"),
+		RepairMode:        repairMode,
+		BootstrapArtifact: os.Getenv("EOS_SHIP_BOOTSTRAP_ARTIFACT"),
+		TokenizerExplicit: os.Getenv("EOS_SHIP_TOKENIZER") != "",
+		RepairStageATrain: filepath.Join(runRoot, "score-spectrum", "stage-a.train.jsonl"),
+		RepairStageAEval:  filepath.Join(runRoot, "score-spectrum", "stage-a.eval.jsonl"),
+		RepairStageAManifest: filepath.Join(runRoot, "score-spectrum", "stage-a.manifest.json"),
+		RepairStageBTrain: filepath.Join(runRoot, "score-spectrum", "stage-b.train.jsonl"),
+		RepairStageBEval:  filepath.Join(runRoot, "score-spectrum", "stage-b.eval.jsonl"),
+		RepairStageBManifest: filepath.Join(runRoot, "score-spectrum", "stage-b.manifest.json"),
 		CorkScrewRoot:     corkscrewRoot,
 		CorkScrewAssetID:  assetID,
 		CorkScrewAssetDir: getenv("EOS_CORKSCREW_ASSET_DIR", filepath.Join(corkscrewRoot, "assets", assetID)),
@@ -273,12 +336,25 @@ func prepareConfig(root string) (shippingConfig, error) {
 		MinNFCorpusNDCG10: minNFCorpus,
 		MinFiQANDCG10:     minFiQA,
 		MinMeanNDCG10:     minMean,
+		BaselineSciFactNDCG10: baselineSciFact,
+		BaselineNFCorpusNDCG10: baselineNFCorpus,
+		BaselineFiQANDCG10: baselineFiQA,
+		MaxStageARegression: maxStageARegression,
+		StageAMeanSlack:     stageAMeanSlack,
+		ScoreSpectrumMaxBatchCandidates: scoreSpectrumMaxBatchCandidates,
+		ScoreSpectrumActivationMicrobatchSize: scoreSpectrumActivationMicrobatchSize,
+		TrainEnableCompactResidentTrain: envEnabled("EOS_SHIP_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN"),
+	}
+	if cfg.RepairMode {
+		guard !cfg.InstallCorkScrew else return shippingConfig{}, fmt.Errorf("repair mode will not install CorkScrew assets; rerun after passing gates with EOS_SHIP_REPAIR_MODE=0 or a dedicated install step")
+		cfg.BootstrapArtifact, err = requireFile(cfg.BootstrapArtifact, "EOS_SHIP_BOOTSTRAP_ARTIFACT")
+		guard err == nil else return shippingConfig{}, fmt.Errorf("repair mode requires an explicit promoted/sealed bootstrap: %w", err)
 	}
 	if cfg.Tokenizer != "" {
 		cfg.Tokenizer, err = requireFile(cfg.Tokenizer, "EOS_SHIP_TOKENIZER")
 		guard err == nil else return shippingConfig{}, err
 	}
-	if cfg.Tokenizer == "" {
+	if cfg.Tokenizer == "" && !cfg.RepairMode {
 		cfg.TokenizerCorpus, err = requireFile(cfg.TokenizerCorpus, "EOS_TOKENIZER_CORPUS")
 		guard err == nil else return shippingConfig{}, err
 	}
@@ -467,6 +543,7 @@ func baseCandidateEnv(cfg shippingConfig, runID string, trainJSONL string, evalJ
 		"EOS_RESTORE_BEST=false",
 		"EOS_HARD_NEGATIVE_TRAIN=1",
 		"EOS_PAIRWISE_TRAIN=0",
+		"EOS_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES=" + strconv.Itoa(cfg.ScoreSpectrumMaxBatchCandidates),
 		"EOS_HARD_NEGATIVES_PER_QUERY=" + getenv("EOS_SHIP_HARD_NEGATIVES_PER_QUERY", "3"),
 		"EOS_PRETOKENIZE_JSONL=" + getenv("EOS_SHIP_PRETOKENIZE_JSONL", "1"),
 		"EOS_EVAL_BATCH_SIZE=" + getenv("EOS_SHIP_EVAL_BATCH_SIZE", "1024"),
@@ -509,7 +586,7 @@ func mineModelHardNegatives(cfg shippingConfig) error {
 		"EOS_MODEL_HARD_NEGATIVE_MAX_QUERIES=" + getenv("EOS_SHIP_MODEL_HARD_MAX_QUERIES", "0"),
 		"EOS_MODEL_HARD_NEGATIVE_NEGATIVES=" + getenv("EOS_SHIP_MODEL_HARD_NEGATIVES", getenv("EOS_SHIP_HARD_NEGATIVES_PER_QUERY", "3")),
 		"EOS_MODEL_HARD_NEGATIVE_CANDIDATE_TOP_K=" + getenv("EOS_SHIP_MODEL_HARD_CANDIDATE_TOP_K", "200"),
-		"EOS_MODEL_HARD_NEGATIVE_BATCH_SIZE=" + getenv("EOS_SHIP_MODEL_HARD_BATCH_SIZE", "1024"),
+		"EOS_MODEL_HARD_NEGATIVE_BATCH_SIZE=" + getenv("EOS_SHIP_MODEL_HARD_BATCH_SIZE", "128"),
 		"EOS_MODEL_HARD_NEGATIVE_BLEND_BM25=1",
 		"ferrous-wheel", "run", "scripts/mine_manta_embed_v1_model_hard_negatives.fw",
 	})
@@ -610,7 +687,312 @@ func installCorkScrewAssets(cfg shippingConfig) error {
 	return nil
 }
 
+func isSealedArtifactPath(path string) bool {
+	return strings.HasSuffix(filepath.Base(path), ".sealed.mll")
+}
+
+func copyPretrainedPackage(srcArtifact string, dstArtifact string, modelName string) error {
+	srcDir := filepath.Dir(srcArtifact)
+	dstDir := filepath.Dir(dstArtifact)
+	err := os.MkdirAll(dstDir, 0o755)
+	guard err == nil else return err
+	if isSealedArtifactPath(srcArtifact) {
+		err = copyFile(srcArtifact, dstArtifact)
+	} else {
+		err = copyFile(srcArtifact, dstArtifact)
+	}
+	guard err == nil else return fmt.Errorf("copy bootstrap artifact: %w", err)
+	matches, err := filepath.Glob(filepath.Join(srcDir, modelName+".*"))
+	guard err == nil else return err
+	for _, src := range matches {
+		if filepath.Clean(src) == filepath.Clean(srcArtifact) || isSealedArtifactPath(src) {
+			continue
+		}
+		dst := filepath.Join(dstDir, filepath.Base(src))
+		err = copyFile(src, dst)
+		guard err == nil else return fmt.Errorf("copy bootstrap sibling %s: %w", src, err)
+	}
+	return nil
+}
+
+func tokenizerForArtifact(cfg shippingConfig, artifact string) (string, error) {
+	tokenizer := filepath.Join(filepath.Dir(artifact), cfg.ModelName+".tokenizer.mll")
+	if _, err := os.Stat(tokenizer); err == nil {
+		return tokenizer, nil
+	}
+	if cfg.Tokenizer != "" {
+		return cfg.Tokenizer, nil
+	}
+	_, err := os.Stat(tokenizer)
+	guard err == nil else return "", fmt.Errorf("missing tokenizer beside artifact: %s", tokenizer)
+	return tokenizer, nil
+}
+
+func copyRepairTokenizer(cfg shippingConfig, stageDir string) (string, error) {
+	tokenizerDst := filepath.Join(stageDir, cfg.ModelName+".tokenizer.mll")
+	err := copyFile(cfg.Tokenizer, tokenizerDst)
+	guard err == nil else return "", err
+	return tokenizerDst, nil
+}
+
+func sha256File(path string) (string, error) {
+	file, err := os.Open(path)
+	guard err == nil else return "", err
+	defer file.Close()
+	hash := sha256.New()
+	_, err = io.Copy(hash, file)
+	guard err == nil else return "", err
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func verifyExplicitTokenizerMatchesTarget(cfg shippingConfig, targetTokenizer string) error {
+	if !cfg.TokenizerExplicit {
+		return nil
+	}
+	explicitSHA, err := sha256File(cfg.Tokenizer)
+	guard err == nil else return err
+	targetSHA, err := sha256File(targetTokenizer)
+	guard err == nil else return err
+	guard explicitSHA == targetSHA else return fmt.Errorf("EOS_SHIP_TOKENIZER sha256 %s does not match bootstrap-extracted tokenizer %s sha256 %s", explicitSHA, targetTokenizer, targetSHA)
+	return nil
+}
+
+func buildRepairScoreSpectrum(cfg shippingConfig, label string, trainPath string, evalPath string, manifestPath string, extraHardNegative string) error {
+	fullPath := strings.TrimSuffix(trainPath, ".train.jsonl") + ".full.jsonl"
+	excludedPath := strings.TrimSuffix(trainPath, ".train.jsonl") + ".excluded.jsonl"
+	args := []string{
+		"scripts/build_retrieval_beir_score_spectrum.py",
+		"--dataset-root", filepath.Join(cfg.DatasetRoot, "raw"),
+		"--datasets", getenv("EOS_SHIP_REPAIR_DATASETS", "scifact,nfcorpus,fiqa"),
+		"--split", getenv("EOS_SHIP_REPAIR_SPLIT", "train"),
+		"--output-full-jsonl", fullPath,
+		"--output-train-jsonl", trainPath,
+		"--output-eval-jsonl", evalPath,
+		"--excluded-jsonl", excludedPath,
+		"--manifest", manifestPath,
+		"--bm25-negatives", getenv("EOS_SHIP_REPAIR_BM25_NEGATIVES", "12"),
+		"--extra-negatives", getenv("EOS_SHIP_REPAIR_MODEL_NEGATIVES", "12"),
+		"--eval-count", getenv("EOS_SHIP_REPAIR_EVAL_ROWS", "256"),
+	}
+	if extraHardNegative != "" {
+		if _, err := os.Stat(extraHardNegative); err == nil {
+			args = append(args, "--extra-hard-negative-jsonl", extraHardNegative)
+		}
+	}
+	return runCmd(cfg, label, filepath.Base(manifestPath)+".log", "python3", args)
+}
+
+func initRepairStageAArtifact(cfg shippingConfig, stageDir string, artifact string) error {
+	err := runCmd(cfg, "Initialize Stage A trainable package from inference bootstrap", cfg.StageAID+".init.log", cfg.EosBin, []string{
+		"init-model",
+		"--bootstrap-from-inference", cfg.BootstrapArtifact,
+		artifact,
+	})
+	guard err == nil else return err
+	tokenizer := filepath.Join(stageDir, cfg.ModelName+".tokenizer.mll")
+	_, err = os.Stat(tokenizer)
+	guard err == nil else return fmt.Errorf("bootstrap-from-inference did not write target tokenizer: %s", tokenizer)
+	return verifyExplicitTokenizerMatchesTarget(cfg, tokenizer)
+}
+
+func runRepairTrainingStage(cfg shippingConfig, label string, runID string, trainJSONL string, evalJSONL string, initialArtifact string, initFromInference bool, extraArgs []string) error {
+	stageDir := filepath.Join(cfg.RunRoot, runID)
+	err := os.MkdirAll(filepath.Join(stageDir, "logs"), 0o755)
+	guard err == nil else return err
+	artifact := filepath.Join(stageDir, cfg.ModelName+".mll")
+	if initFromInference {
+		err = initRepairStageAArtifact(cfg, stageDir, artifact)
+		guard err == nil else return err
+	} else {
+		err = copyPretrainedPackage(initialArtifact, artifact, cfg.ModelName)
+		guard err == nil else return err
+		if cfg.TokenizerExplicit {
+			tokenizer, err := tokenizerForArtifact(cfg, artifact)
+			guard err == nil else return err
+			err = verifyExplicitTokenizerMatchesTarget(cfg, tokenizer)
+			guard err == nil else return err
+		}
+	}
+	tokenizer, err := tokenizerForArtifact(cfg, artifact)
+	guard err == nil else return err
+	args := []string{
+		"train-embed",
+		"--score-spectrum-train",
+		"--allow-research-only-score-spectrum",
+		"--score-spectrum-eval", evalJSONL,
+		"--score-spectrum-loss-mode", getenv("EOS_SHIP_SCORE_SPECTRUM_LOSS_MODE", "hard_soft_recovery"),
+		"--score-spectrum-recovery-weight", getenv("EOS_SHIP_SCORE_SPECTRUM_RECOVERY_WEIGHT", "1"),
+		"--score-spectrum-recovery-top-k", getenv("EOS_SHIP_SCORE_SPECTRUM_RECOVERY_TOP_K", "4"),
+		"--score-spectrum-max-batch-candidates", strconv.Itoa(cfg.ScoreSpectrumMaxBatchCandidates),
+		"--score-spectrum-activation-microbatch-size", strconv.Itoa(cfg.ScoreSpectrumActivationMicrobatchSize),
+		"--metrics-json", filepath.Join(stageDir, "train.metrics.json"),
+		"--seed", getenv("EOS_SHIP_SEED", "5"),
+		"--temperature", getenv("EOS_SHIP_TEMPERATURE", "0.05"),
+		"--select-metric", getenv("EOS_SHIP_SCORE_SPECTRUM_SELECT_METRIC", "score_spectrum_any_positive_top1"),
+		"--eval-every", "999",
+		"--restore-best=false",
+		"--progress-every", getenv("EOS_SHIP_PROGRESS_EVERY", "25"),
+		"--tokenizer", tokenizer,
+	}
+	args = append(args, extraArgs...)
+	args = append(args, artifact, trainJSONL)
+	// Repair stages use packed compact training only when explicitly enabled.
+	// The current production bootstrap is legacy_tied_v1, so the default route
+	// is the legacy host path with an activation microbatch hint. A future
+	// compact artifact can opt into resident training via the shipping-only
+	// override; the trainer's fail-closed checks remain authoritative.
+	residentTrain := "0"
+	if cfg.TrainEnableCompactResidentTrain {
+		residentTrain = "1"
+	}
+	trainCommand := []string{
+		"EOS_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN=" + residentTrain,
+		"EOS_TRAIN_ENABLE_COMPACT_PACKED_FORWARD=0",
+		cfg.EosBin,
+	}
+	trainCommand = append(trainCommand, args...)
+	err = runCmd(cfg, label, runID+".train.log", "env", trainCommand)
+	guard err == nil else return err
+	sealed := filepath.Join(stageDir, cfg.ModelName+".sealed.mll")
+	err = runCmd(cfg, "Export sealed artifact for "+runID, runID+".export.log", cfg.EosBin, []string{"export-mll", artifact, sealed})
+	guard err == nil else return err
+	err = runCmd(cfg, "Inspect sealed artifact for "+runID, runID+".inspect.log", cfg.EosBin, []string{"inspect", sealed})
+	guard err == nil else return err
+	return nil
+}
+
+func runStageRetrievalEval(cfg shippingConfig, label string, stageDir string, sealedArtifact string) (string, error) {
+	runID := "retrieval-eval"
+	err := runCmd(cfg, label, filepath.Base(stageDir)+".retrieval-eval.log", "env", []string{
+		"EOS_REPO_ROOT=" + cfg.Root,
+		"EOS_DATASET_ROOT=" + cfg.DatasetRoot,
+		"EOS_EVAL_ARTIFACT=" + sealedArtifact,
+		"EOS_EVAL_RUN_ROOT=" + filepath.Join(stageDir, "retrieval"),
+		"EOS_EVAL_RUN_ID=" + runID,
+		"EOS_EVAL_DATASETS=scifact,nfcorpus,fiqa",
+		"EOS_EVAL_BM25_BASELINE=1",
+		"EOS_GATE_BM25_BASELINE=0",
+		"ferrous-wheel", "run", "scripts/eval_manta_embed_v1_retrieval.fw",
+	})
+	guard err == nil else return "", err
+	return filepath.Join(stageDir, "retrieval", runID, "leaderboard.tsv"), nil
+}
+
+func readScoresFromLeaderboard(path string) (map[string]retrievalScore, error) {
+	f, err := os.Open(path)
+	guard err == nil else return nil, err
+	defer f.Close()
+	scores := map[string]retrievalScore{}
+	scanner := bufio.NewScanner(f)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		if lineNo == 1 {
+			continue
+		}
+		fields := strings.Split(scanner.Text(), "\t")
+		if len(fields) < 10 || fields[1] == "bm25" {
+			continue
+		}
+		ndcg, err := strconv.ParseFloat(fields[6], 64)
+		guard err == nil else return nil, err
+		mrr, err := strconv.ParseFloat(fields[7], 64)
+		guard err == nil else return nil, err
+		r10, err := strconv.ParseFloat(fields[8], 64)
+		guard err == nil else return nil, err
+		r100, err := strconv.ParseFloat(fields[9], 64)
+		guard err == nil else return nil, err
+		scores[fields[0]] = retrievalScore{Dataset: fields[0], Backend: fields[1], NDCGAt10: ndcg, MRRAt10: mrr, RecallAt10: r10, RecallAt100: r100}
+	}
+	guard scanner.Err() == nil else return nil, scanner.Err()
+	return scores, nil
+}
+
+func gateStageARepairScores(cfg shippingConfig, scores map[string]retrievalScore) error {
+	required := []string{"scifact", "nfcorpus", "fiqa"}
+	baselines := map[string]float64{
+		"scifact": cfg.BaselineSciFactNDCG10,
+		"nfcorpus": cfg.BaselineNFCorpusNDCG10,
+		"fiqa": cfg.BaselineFiQANDCG10,
+	}
+	floors := map[string]float64{
+		"scifact": cfg.MinSciFactNDCG10,
+		"nfcorpus": cfg.MinNFCorpusNDCG10,
+		"fiqa": cfg.MinFiQANDCG10,
+	}
+	total := 0.0
+	baselineTotal := 0.0
+	for _, dataset := range required {
+		score, ok := scores[dataset]
+		guard ok else return fmt.Errorf("missing Stage A retrieval score for %s", dataset)
+		total += score.NDCGAt10
+		baselineTotal += baselines[dataset]
+		guard score.NDCGAt10 >= floors[dataset] else return fmt.Errorf("Stage A %s ndcg@10 %.6f < floor %.6f", dataset, score.NDCGAt10, floors[dataset])
+		minProtected := baselines[dataset] - cfg.MaxStageARegression
+		guard score.NDCGAt10 >= minProtected else return fmt.Errorf("Stage A %s ndcg@10 %.6f regressed more than %.6f from baseline %.6f", dataset, score.NDCGAt10, cfg.MaxStageARegression, baselines[dataset])
+	}
+	mean := total / 3
+	baselineMean := baselineTotal / 3
+	fmt.Println(f"stage_a_ndcg@10 mean={mean} baseline_mean={baselineMean}")
+	guard mean >= cfg.MinMeanNDCG10 else return fmt.Errorf("Stage A mean ndcg@10 %.6f < floor %.6f", mean, cfg.MinMeanNDCG10)
+	guard mean >= baselineMean-cfg.StageAMeanSlack else return fmt.Errorf("Stage A mean ndcg@10 %.6f < baseline mean %.6f - slack %.6f", mean, baselineMean, cfg.StageAMeanSlack)
+	return nil
+}
+
+func runRepairPipeline(cfg shippingConfig) (shippingConfig, error) {
+	err := writeRelaxedThresholds(cfg.RelaxedThresholds)
+	guard err == nil else return cfg, err
+	err = runCmd(cfg, "Build eos CLI for repair pipeline", "go-build-eos.log", "go", []string{"build", "-trimpath", "-o", cfg.EosBin, "./cmd/eos"})
+	guard err == nil else return cfg, err
+	err = buildRepairScoreSpectrum(cfg, "Materialize Stage A qrels/BM25 score-spectrum rows", cfg.RepairStageATrain, cfg.RepairStageAEval, cfg.RepairStageAManifest, "")
+	guard err == nil else return cfg, err
+	err = runRepairTrainingStage(cfg, "Stage A repair: bootstrap score-spectrum continuation", cfg.StageAID, cfg.RepairStageATrain, cfg.RepairStageAEval, cfg.BootstrapArtifact, true, []string{
+		"--epochs", getenv("EOS_SHIP_STAGE_A_EPOCHS", "1"),
+		"--batch-size", getenv("EOS_SHIP_STAGE_A_BATCH_SIZE", "64"),
+		"--lr", getenv("EOS_SHIP_STAGE_A_LR", "0.000000025"),
+	})
+	guard err == nil else return cfg, err
+	stageASealed := filepath.Join(cfg.StageADir, cfg.ModelName+".sealed.mll")
+	leaderboard, err := runStageRetrievalEval(cfg, "Stage A strict retrieval gate", cfg.StageADir, stageASealed)
+	guard err == nil else return cfg, err
+	stageAScores, err := readScoresFromLeaderboard(leaderboard)
+	guard err == nil else return cfg, err
+	err = gateStageARepairScores(cfg, stageAScores)
+	guard err == nil else return cfg, err
+
+	err = mineModelHardNegatives(cfg)
+	guard err == nil else return cfg, err
+	modelHard := filepath.Join(cfg.ProcessedDir, "train-model-hard-negatives.jsonl")
+	err = buildRepairScoreSpectrum(cfg, "Materialize Stage B qrels/BM25/model score-spectrum rows", cfg.RepairStageBTrain, cfg.RepairStageBEval, cfg.RepairStageBManifest, modelHard)
+	guard err == nil else return cfg, err
+	stageAArtifact := filepath.Join(cfg.StageADir, cfg.ModelName+".mll")
+	err = runRepairTrainingStage(cfg, "Stage B repair: deduped BM25+model score-spectrum continuation", cfg.StageBID, cfg.RepairStageBTrain, cfg.RepairStageBEval, stageAArtifact, false, []string{
+		"--epochs", getenv("EOS_SHIP_STAGE_B_EPOCHS", "1"),
+		"--batch-size", getenv("EOS_SHIP_STAGE_B_BATCH_SIZE", "64"),
+		"--lr", getenv("EOS_SHIP_STAGE_B_LR", "0.000000025"),
+	})
+	guard err == nil else return cfg, err
+
+	cfg.FinalTrainArtifact = filepath.Join(cfg.StageBDir, cfg.ModelName+".mll")
+	cfg.FinalSealedArtifact = filepath.Join(cfg.StageBDir, cfg.ModelName+".sealed.mll")
+	cfg.FinalTokenizer = filepath.Join(cfg.StageBDir, cfg.ModelName+".tokenizer.mll")
+	err = runFinalEval(cfg)
+	guard err == nil else return cfg, err
+	scores, err := readFinalScores(cfg)
+	guard err == nil else return cfg, err
+	err = gateFinalScores(cfg, scores)
+	guard err == nil else return cfg, err
+	if cfg.InstallCorkScrew {
+		err = installCorkScrewAssets(cfg)
+		guard err == nil else return cfg, err
+	}
+	return cfg, nil
+}
+
 func runPipeline(cfg shippingConfig) (shippingConfig, error) {
+	if cfg.RepairMode {
+		return runRepairPipeline(cfg)
+	}
 	err := writeRelaxedThresholds(cfg.RelaxedThresholds)
 	guard err == nil else return cfg, err
 	err = buildMixedPretrainBEIR(cfg)

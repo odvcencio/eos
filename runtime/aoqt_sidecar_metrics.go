@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -18,6 +19,7 @@ type AOQTSidecarRunMetrics struct {
 	Schema                     string                                 `json:"schema"`
 	Plan                       AOQTSidecarWorkPlan                    `json:"plan"`
 	Inputs                     AOQTSidecarRunMetricInputs             `json:"inputs"`
+	SplitBinding               *AOQTSidecarDevSplitBinding            `json:"split_binding,omitempty"`
 	Topology                   AOQTSidecarTopologyBinding             `json:"topology"`
 	ObjectiveContract          AOQTSidecarObjectiveContract           `json:"objective_contract"`
 	LegalGates                 AOQTSidecarLegalGates                  `json:"legal_gates"`
@@ -186,6 +188,10 @@ func NewAOQTSidecarRunMetrics(set AOQTSidecarCalibrationSet, summary AOQTSidecar
 	if err != nil {
 		return AOQTSidecarRunMetrics{}, err
 	}
+	reservedStage := "Stage2B score-spectrum TurboQuant STE adapter"
+	if isAOQTV7R5ActualCoordinateMode(summary.OptimizerMode) {
+		reservedStage = "V7-r5 actual-coordinate full train; dev-only, no Adam/STE/package"
+	}
 	metrics := AOQTSidecarRunMetrics{
 		Schema: AOQTSidecarMetricsSchema,
 		Plan:   summary.Plan,
@@ -202,7 +208,7 @@ func NewAOQTSidecarRunMetrics(set AOQTSidecarCalibrationSet, summary AOQTSidecar
 		LegalGates:                 set.Manifest.LegalGates,
 		Summary:                    summary,
 		QualityClaim:               false,
-		ReservedStage:              "Stage2B score-spectrum TurboQuant STE adapter",
+		ReservedStage:              reservedStage,
 		TrainingContract:           set.Manifest.TrainingContract,
 		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
 	}
@@ -224,6 +230,100 @@ func (m AOQTSidecarRunMetrics) Validate() error {
 	}
 	if err := validateAOQTSidecarTrainingContractBinding(m.TrainingContract, m.CandidateEligibilityPolicy, m.Summary.TrainingContract, m.Summary.CandidateEligibilityPolicy); err != nil {
 		return fmt.Errorf("AOQT metrics training contract: %w", err)
+	}
+	if m.SplitBinding != nil {
+		if err := m.SplitBinding.Validate(); err != nil {
+			return fmt.Errorf("AOQT metrics split_binding: %w", err)
+		}
+		if m.SplitBinding.MaterializedManifestSHA256 != m.Inputs.DatasetManifestSHA256 {
+			return fmt.Errorf("AOQT metrics split_binding materialized_manifest_sha256 must match inputs.dataset_manifest_sha256")
+		}
+		if m.SplitBinding.MaterializedRowCount != m.Plan.RowCount {
+			return fmt.Errorf("AOQT metrics split_binding materialized_row_count must match plan.row_count")
+		}
+		if m.SplitBinding.TrainRowCount != m.Plan.RowCount {
+			return fmt.Errorf("AOQT metrics split_binding train_row_count must match plan.row_count")
+		}
+	}
+	if m.Plan.ForwardConsistencyProbeRequired != m.Summary.ForwardConsistencyProbeRequired {
+		return fmt.Errorf("AOQT metrics plan and summary forward_consistency_probe_required must match")
+	}
+	if m.Plan.ActualDirectionProbeRequired != m.Summary.ActualDirectionProbeRequired {
+		return fmt.Errorf("AOQT metrics plan and summary actual_direction_probe_required must match")
+	}
+	if m.Plan.ActualCoordinateTrainRequired != m.Summary.ActualCoordinateTrainRequired || m.Plan.ActualCoordinateFullTrainRequired != m.Summary.ActualCoordinateFullTrainRequired {
+		return fmt.Errorf("AOQT metrics plan and summary actual-coordinate full-train flags must match")
+	}
+	if m.Plan.OptimizerMode == AOQTSidecarOptimizerModeV7R2DevTrustRegion {
+		if !m.Plan.ForwardConsistencyProbeRequired {
+			return fmt.Errorf("AOQT V7-r2 metrics require a forward-consistency probe")
+		}
+		if m.Summary.ForwardConsistencyProbe == nil || !m.Summary.ForwardConsistencyProbe.Passed {
+			return fmt.Errorf("AOQT V7-r2 metrics require a passed forward-consistency probe")
+		}
+		if err := m.Summary.ForwardConsistencyProbe.ValidateBound(); err != nil {
+			return err
+		}
+		if m.Summary.ForwardConsistencyProbe.Binding.SplitBinding == nil {
+			return fmt.Errorf("AOQT V7-r2 metrics require a probe split binding")
+		}
+		if m.SplitBinding != nil && !reflect.DeepEqual(m.SplitBinding, m.Summary.ForwardConsistencyProbe.Binding.SplitBinding) {
+			return fmt.Errorf("AOQT V7-r2 metrics split binding must exactly match probe binding")
+		}
+	} else if !m.Plan.ForwardConsistencyProbeRequired && m.Summary.ForwardConsistencyProbe != nil {
+		return fmt.Errorf("AOQT non-r2 metrics must not include a forward-consistency probe")
+	}
+	if m.Plan.OptimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+		if !m.Plan.ActualDirectionProbeRequired {
+			return fmt.Errorf("AOQT V7-r3 metrics require an actual-direction probe")
+		}
+		if m.Summary.ActualDirectionProbe == nil || !m.Summary.ActualDirectionProbe.Passed {
+			return fmt.Errorf("AOQT V7-r3 metrics require a passed actual-direction probe")
+		}
+		if err := m.Summary.ActualDirectionProbe.ValidateBound(); err != nil {
+			return err
+		}
+		if m.Summary.ActualDirectionProbe.Binding.SplitBinding == nil {
+			return fmt.Errorf("AOQT V7-r3 metrics require an actual-direction probe split binding")
+		}
+		if m.SplitBinding != nil && !reflect.DeepEqual(m.SplitBinding, m.Summary.ActualDirectionProbe.Binding.SplitBinding) {
+			return fmt.Errorf("AOQT V7-r3 metrics split binding must exactly match actual-direction probe binding")
+		}
+		probeSHA, err := m.Summary.ActualDirectionProbe.SHA256()
+		if err != nil {
+			return err
+		}
+		if probeSHA != m.Summary.ActualDirectionProbeSHA256 {
+			return fmt.Errorf("AOQT actual-direction probe sha256 mismatch")
+		}
+	} else if !m.Plan.ActualDirectionProbeRequired && (m.Summary.ActualDirectionProbe != nil || strings.TrimSpace(m.Summary.ActualDirectionProbeSHA256) != "") {
+		return fmt.Errorf("AOQT non-r3 metrics must not include an actual-direction probe")
+	}
+	if isAOQTV7R5ActualCoordinateMode(m.Plan.OptimizerMode) {
+		if !m.Plan.ActualCoordinateTrainRequired || !m.Plan.ActualCoordinateFullTrainRequired {
+			return fmt.Errorf("AOQT V7-r5 metrics require actual-coordinate full training flags")
+		}
+		if m.Summary.ActualCoordinateTrain == nil {
+			return fmt.Errorf("AOQT V7-r5 metrics require an actual-coordinate full-training receipt")
+		}
+		if err := m.Summary.ActualCoordinateTrain.Validate(); err != nil {
+			return err
+		}
+		if strings.TrimSpace(m.Summary.ActualCoordinateTrain.Binding.CanonicalR4ReceiptPath) == "" {
+			return fmt.Errorf("AOQT V7-r5 metrics require a bound canonical r4 receipt path")
+		}
+		if err := m.Summary.ActualCoordinateTrain.ValidateBound(); err != nil {
+			return err
+		}
+		trainSHA, err := m.Summary.ActualCoordinateTrain.SHA256()
+		if err != nil {
+			return err
+		}
+		if trainSHA != m.Summary.ActualCoordinateTrainSHA256 {
+			return fmt.Errorf("AOQT actual-coordinate full-training receipt sha256 mismatch")
+		}
+	} else if m.Summary.ActualCoordinateTrain != nil || strings.TrimSpace(m.Summary.ActualCoordinateTrainSHA256) != "" {
+		return fmt.Errorf("AOQT non-r5 metrics must not include an actual-coordinate full-training receipt")
 	}
 	if err := m.Topology.Validate(); err != nil {
 		return err
@@ -342,6 +442,11 @@ func ValidateAOQTSidecarCandidateEligibility(metrics AOQTSidecarRunMetrics, poli
 	}
 	if metrics.Summary.OptimizerDiagnostics != nil && metrics.Summary.OptimizerDiagnostics.AcceptedSteps <= 0 {
 		return fmt.Errorf("AOQT candidate eligibility requires at least one accepted safe optimizer step")
+	}
+	if isAOQTV7DevOptimizerMode(metrics.Plan.OptimizerMode) ||
+		isAOQTV7DevOptimizerMode(metrics.Summary.OptimizerMode) ||
+		(metrics.Summary.OptimizerDiagnostics != nil && metrics.Summary.OptimizerDiagnostics.DevOnly) {
+		return fmt.Errorf("AOQT candidate eligibility rejects dev-only optimizer artifacts")
 	}
 	if metrics.Summary.QualityClaim || metrics.QualityClaim {
 		return fmt.Errorf("AOQT candidate eligibility cannot be based on a quality claim")
@@ -510,6 +615,117 @@ func validateAOQTSidecarSummaryPlan(summary AOQTSidecarTrainSummary, manifest AO
 	return nil
 }
 
+func validateAOQTV7R5OptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSidecarTrainSummary, diagnostics AOQTSidecarOptimizerDiagnostics) error {
+	if !diagnostics.DevOnly || !isAOQTV7R5ActualCoordinateMode(diagnostics.OptimizerMode) {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics must be dev-only and use the V7-r5 mode")
+	}
+	if summary.ActualCoordinateTrain == nil {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics require a full-training receipt")
+	}
+	if err := summary.ActualCoordinateTrain.Validate(); err != nil {
+		return err
+	}
+	trainSHA, err := summary.ActualCoordinateTrain.SHA256()
+	if err != nil {
+		return err
+	}
+	if trainSHA != summary.ActualCoordinateTrainSHA256 {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics full-training receipt sha256 mismatch")
+	}
+	if strings.TrimSpace(summary.OptimizerDiagnosticsSHA256) == "" {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics sha256 is required")
+	}
+	diagnosticsSHA, err := diagnostics.SHA256()
+	if err != nil {
+		return err
+	}
+	if diagnosticsSHA != summary.OptimizerDiagnosticsSHA256 {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics sha256 mismatch")
+	}
+	if plan.StepCount != AOQTV7R5ActualCoordinateTrainMaxSteps || diagnostics.PlannedSteps != plan.StepCount || diagnostics.MaxAttemptsPerStep != AOQTV7R5ActualCoordinateTrainMaxCandidatesPerStep {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics step/attempt bounds are invalid")
+	}
+	if diagnostics.AttemptedSteps < 0 || diagnostics.AttemptedSteps > diagnostics.PlannedSteps || diagnostics.AcceptedSteps != summary.Steps || diagnostics.AcceptedSteps < 0 || diagnostics.AcceptedSteps > diagnostics.AttemptedSteps {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics step accounting is invalid")
+	}
+	trainReceipt := summary.ActualCoordinateTrain
+	if diagnostics.AttemptedSteps != trainReceipt.AttemptedSteps || diagnostics.AcceptedSteps != trainReceipt.AcceptedSteps || diagnostics.AcceptedSteps != trainReceipt.Steps || diagnostics.CoordinateSearchPlanCount != trainReceipt.SearchCount || diagnostics.ProposalAttempts != trainReceipt.FullCandidateEvaluationCount {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics does not match full-training receipt accounting")
+	}
+	if diagnostics.ProposalAttempts != diagnostics.AcceptedProposals+diagnostics.RejectedProposals || diagnostics.AcceptedProposals != diagnostics.AcceptedSteps || diagnostics.Backtracks != diagnostics.RejectedProposals {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal accounting is invalid")
+	}
+	if diagnostics.AdamProposalAttempts != 0 || diagnostics.AdamAcceptedProposals != 0 || diagnostics.AdamRejectedProposals != 0 {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics must not contain Adam proposals")
+	}
+	if diagnostics.CoordinateProposalAttempts != diagnostics.ProposalAttempts || diagnostics.CoordinateAcceptedProposals != diagnostics.AcceptedProposals || diagnostics.CoordinateRejectedProposals != diagnostics.RejectedProposals {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics coordinate proposal accounting is invalid")
+	}
+	if diagnostics.CoordinateSearchPlanCount != diagnostics.AttemptedSteps || diagnostics.CoordinateSearchStrategy != AOQTV7R5ActualCoordinateTrainSearchStrategy || diagnostics.CoordinateTopAngles != AOQTV7R4ActualCoordinateProbeTopAngles || diagnostics.CoordinateMagnitudeCount != AOQTV7R4ActualCoordinateProbeMagnitudeCount || diagnostics.CoordinateBlockCount != 0 || diagnostics.CoordinateSearchLearningRate != float32(0.01) {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics coordinate search contract is invalid")
+	}
+	if diagnostics.TrustRegionRadius != 0 || diagnostics.TrustRegionProposalAttempts != 0 || diagnostics.TrustRegionAcceptedBlocks != 0 || diagnostics.TrustRegionAcceptedSingles != 0 || diagnostics.TrustRegionMaxMovedAngles != 0 || diagnostics.TrustRegionMaxMagnitude != 0 || diagnostics.TrustRegionAcceptedMagnitude != 0 || diagnostics.TrustRegionMovedAngleIndices != nil || diagnostics.TrustRegionAcceptedSingleRule != "" {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics must not contain trust-region proposals")
+	}
+	if diagnostics.ProposalReceipts == nil || len(*diagnostics.ProposalReceipts) != diagnostics.ProposalAttempts {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal receipts must cover every full candidate evaluation")
+	}
+	// A failed precondition can produce a valid r5 receipt before any fresh
+	// search is committed (for example, a non-finite full baseline).  Keep
+	// that fail-closed artifact honest without pretending a search/step ran.
+	if !summary.ActualCoordinateTrain.Passed && summary.ActualCoordinateTrain.AttemptedSteps == 0 {
+		if diagnostics.AttemptedSteps != 0 || diagnostics.AcceptedSteps != 0 || diagnostics.ProposalAttempts != 0 || diagnostics.AcceptedProposals != 0 || diagnostics.RejectedProposals != 0 || diagnostics.Backtracks != 0 || diagnostics.ExhaustedSteps != 0 || diagnostics.CoordinateSearchPlanCount != 0 {
+			return fmt.Errorf("AOQT V7-r5 precondition failure has non-zero optimizer accounting")
+		}
+		return nil
+	}
+	// A terminal failure may occur after one or more committed steps (for
+	// example, the post-step full-baseline evaluation can fail).  Those steps
+	// are complete and durable, but the fixed two-step plan is intentionally
+	// not reported as exhausted: no unattempted step was searched.  Accept this
+	// exact partial-terminal shape while retaining the strict zero-safe-step
+	// accounting below.
+	terminalPartialFailure := !summary.ActualCoordinateTrain.Passed &&
+		diagnostics.ExhaustedSteps == 0 &&
+		diagnostics.AttemptedSteps == diagnostics.AcceptedSteps &&
+		diagnostics.AttemptedSteps < diagnostics.PlannedSteps
+	if err := validateAOQTOptimizerProposalReceipts(diagnostics, "AOQT V7-r5 optimizer diagnostics"); err != nil {
+		return err
+	}
+	if diagnostics.ProposalReceipts != nil {
+		for i, receipt := range *diagnostics.ProposalReceipts {
+			if receipt.Kind != aoqtProposalKindCoordinate {
+				return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal_receipts[%d] must be coordinate proposals", i)
+			}
+			if receipt.CoordinateSearchStrategy != AOQTV7R5ActualCoordinateTrainSearchStrategy {
+				return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal_receipts[%d] coordinate search strategy is invalid", i)
+			}
+			if receipt.ProposalBlockSize != 1 || receipt.ProposalMagnitude <= 0 || !isFinite32(receipt.ProposalMagnitude) {
+				return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal_receipts[%d] must record one finite positive scalar coordinate", i)
+			}
+			if receipt.MovedAngleCount > 1 {
+				return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal_receipts[%d] moved more than one coordinate", i)
+			}
+			if receipt.Accepted && receipt.MovedAngleCount != 1 {
+				return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal_receipts[%d] accepted proposal must move exactly one coordinate", i)
+			}
+			if receipt.DirectionSource != "" || receipt.EndpointOrdinal != 0 || receipt.EndpointHashSHA256 != "" || receipt.RequestedDirectionSHA256 != "" || receipt.ActualDirectionSHA256 != "" || receipt.ActualDirectionProbeSHA256 != "" {
+				return fmt.Errorf("AOQT V7-r5 optimizer diagnostics proposal_receipts[%d] must not contain probe provenance", i)
+			}
+		}
+	}
+	if diagnostics.RejectionDiagnostics.CandidateEvaluations != diagnostics.RejectedProposals {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics rejection diagnostics do not cover rejected candidates")
+	}
+	if diagnostics.ExhaustedSteps < 0 || diagnostics.ExhaustedSteps > 1 || (diagnostics.ExhaustedSteps == 0 && diagnostics.AttemptedSteps != diagnostics.PlannedSteps && !terminalPartialFailure) || (diagnostics.ExhaustedSteps == 1 && diagnostics.AcceptedSteps+1 != diagnostics.AttemptedSteps) {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics exhausted-step accounting is invalid")
+	}
+	if diagnostics.TrustRegionMaxMovedAngles > 1 {
+		return fmt.Errorf("AOQT V7-r5 optimizer diagnostics may move at most one coordinate per proposal")
+	}
+	return nil
+}
+
 func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSidecarTrainSummary) error {
 	if summary.OptimizerDiagnostics == nil {
 		return fmt.Errorf("AOQT optimizer diagnostics are required for non-plan AOQT summaries")
@@ -518,6 +734,52 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 		return fmt.Errorf("AOQT metrics v2 non-plan summaries require at least one active protected objective component")
 	}
 	diagnostics := *summary.OptimizerDiagnostics
+	if isAOQTV7R5ActualCoordinateMode(plan.OptimizerMode) {
+		return validateAOQTV7R5OptimizerDiagnostics(plan, summary, diagnostics)
+	}
+	if plan.ForwardConsistencyProbeRequired != summary.ForwardConsistencyProbeRequired {
+		return fmt.Errorf("AOQT optimizer diagnostics probe-required flag must match plan and summary")
+	}
+	if plan.OptimizerMode == AOQTSidecarOptimizerModeV7R2DevTrustRegion {
+		if !summary.ForwardConsistencyProbeRequired || summary.ForwardConsistencyProbe == nil || !summary.ForwardConsistencyProbe.Passed {
+			return fmt.Errorf("AOQT V7-r2 optimizer diagnostics require a passed forward-consistency probe")
+		}
+		if err := summary.ForwardConsistencyProbe.Validate(); err != nil {
+			return err
+		}
+		probeSHA, err := summary.ForwardConsistencyProbe.SHA256()
+		if err != nil {
+			return err
+		}
+		if probeSHA != summary.ForwardConsistencyProbeSHA256 {
+			return fmt.Errorf("AOQT forward-consistency probe sha256 mismatch")
+		}
+	} else if summary.ForwardConsistencyProbe != nil || strings.TrimSpace(summary.ForwardConsistencyProbeSHA256) != "" {
+		return fmt.Errorf("AOQT non-r2 optimizer diagnostics must not include a forward-consistency probe")
+	}
+	if plan.ActualDirectionProbeRequired != summary.ActualDirectionProbeRequired {
+		return fmt.Errorf("AOQT optimizer diagnostics actual-direction probe-required flag must match plan and summary")
+	}
+	if plan.OptimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+		if !summary.ActualDirectionProbeRequired || summary.ActualDirectionProbe == nil || !summary.ActualDirectionProbe.Passed {
+			return fmt.Errorf("AOQT V7-r3 optimizer diagnostics require a passed actual-direction probe")
+		}
+		if err := summary.ActualDirectionProbe.Validate(); err != nil {
+			return err
+		}
+		probeSHA, err := summary.ActualDirectionProbe.SHA256()
+		if err != nil {
+			return err
+		}
+		if probeSHA != summary.ActualDirectionProbeSHA256 {
+			return fmt.Errorf("AOQT actual-direction probe sha256 mismatch")
+		}
+		if err := validateAOQTActualDirectionProposalProvenance(*summary.ActualDirectionProbe, summary.ActualDirectionProbeSHA256, diagnostics, "AOQT optimizer diagnostics"); err != nil {
+			return err
+		}
+	} else if summary.ActualDirectionProbe != nil || strings.TrimSpace(summary.ActualDirectionProbeSHA256) != "" {
+		return fmt.Errorf("AOQT non-r3 optimizer diagnostics must not include an actual-direction probe")
+	}
 	if err := validateAOQTOptimizerPathDiagnostics(diagnostics, "AOQT optimizer diagnostics"); err != nil {
 		return err
 	}
@@ -544,10 +806,51 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 		{"coordinate_top_angles", diagnostics.CoordinateTopAngles},
 		{"coordinate_magnitude_count", diagnostics.CoordinateMagnitudeCount},
 		{"coordinate_block_count", diagnostics.CoordinateBlockCount},
+		{"trust_region_proposal_attempts", diagnostics.TrustRegionProposalAttempts},
+		{"trust_region_accepted_blocks", diagnostics.TrustRegionAcceptedBlocks},
+		{"trust_region_accepted_singles", diagnostics.TrustRegionAcceptedSingles},
+		{"trust_region_max_moved_angles", diagnostics.TrustRegionMaxMovedAngles},
 	} {
 		if item.value < 0 {
 			return fmt.Errorf("AOQT optimizer diagnostics %s must be non-negative", item.name)
 		}
+	}
+	if plan.OptimizerMode != summary.OptimizerMode || plan.OptimizerMode != diagnostics.OptimizerMode {
+		return fmt.Errorf("AOQT optimizer diagnostics optimizer_mode must match plan and summary")
+	}
+	switch diagnostics.OptimizerMode {
+	case "":
+		if diagnostics.DevOnly || diagnostics.TrustRegionRadius != 0 || diagnostics.TrustRegionProposalAttempts != 0 || diagnostics.TrustRegionAcceptedBlocks != 0 || diagnostics.TrustRegionAcceptedSingles != 0 || diagnostics.TrustRegionMaxMovedAngles != 0 || diagnostics.TrustRegionMaxMagnitude != 0 || diagnostics.TrustRegionAcceptedMagnitude != 0 || diagnostics.TrustRegionMovedAngleIndices != nil || diagnostics.TrustRegionAcceptedSingleRule != "" {
+			return fmt.Errorf("AOQT optimizer diagnostics dev trust-region fields require explicit dev optimizer mode")
+		}
+	case AOQTSidecarOptimizerModeV7DevTrustRegion, AOQTSidecarOptimizerModeV7R2DevTrustRegion, AOQTSidecarOptimizerModeV7R3DevActualDirection:
+		if !diagnostics.DevOnly {
+			return fmt.Errorf("AOQT optimizer diagnostics dev-only flag is required for V7 dev trust-region mode")
+		}
+		if diagnostics.TrustRegionAcceptedSingleRule != "" && diagnostics.TrustRegionAcceptedSingleRule != AOQTSidecarV7AcceptedSingleCoordinateRule {
+			return fmt.Errorf("AOQT optimizer diagnostics trust_region_accepted_single_coordinate_rule is unsupported")
+		}
+		if diagnostics.TrustRegionProposalAttempts != diagnostics.CoordinateProposalAttempts {
+			return fmt.Errorf("AOQT optimizer diagnostics trust_region_proposal_attempts = %d, want coordinate_proposal_attempts %d", diagnostics.TrustRegionProposalAttempts, diagnostics.CoordinateProposalAttempts)
+		}
+		if diagnostics.TrustRegionAcceptedBlocks+diagnostics.TrustRegionAcceptedSingles != diagnostics.CoordinateAcceptedProposals {
+			return fmt.Errorf("AOQT optimizer diagnostics trust-region accepted proposal accounting mismatch")
+		}
+		if diagnostics.TrustRegionMovedAngleIndices != nil {
+			for i, index := range *diagnostics.TrustRegionMovedAngleIndices {
+				if index < 0 || index >= plan.AngleCount {
+					return fmt.Errorf("AOQT optimizer diagnostics trust_region_moved_angle_indices[%d] = %d outside [0,%d)", i, index, plan.AngleCount)
+				}
+				if i > 0 && index <= (*diagnostics.TrustRegionMovedAngleIndices)[i-1] {
+					return fmt.Errorf("AOQT optimizer diagnostics trust_region_moved_angle_indices must be strictly increasing")
+				}
+			}
+		}
+	default:
+		return fmt.Errorf("AOQT optimizer diagnostics optimizer_mode %q is unsupported", diagnostics.OptimizerMode)
+	}
+	if !isFinite32(diagnostics.TrustRegionRadius) || !isFinite32(diagnostics.TrustRegionMaxMagnitude) || !isFinite32(diagnostics.TrustRegionAcceptedMagnitude) {
+		return fmt.Errorf("AOQT optimizer diagnostics trust-region magnitudes must be finite")
 	}
 	if diagnostics.PlannedSteps != plan.StepCount {
 		return fmt.Errorf("AOQT optimizer diagnostics planned_steps = %d, want plan step_count %d", diagnostics.PlannedSteps, plan.StepCount)
@@ -612,14 +915,26 @@ func validateAOQTOptimizerDiagnostics(plan AOQTSidecarWorkPlan, summary AOQTSide
 		}
 	}
 	if diagnostics.CoordinateSearchPlanCount > 0 {
-		if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail {
-			return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, aoqtCoordinateSearchStrategyProtectedConeMicroTail)
+		wantStrategy := aoqtCoordinateSearchStrategyProtectedConeMicroTail
+		wantMagnitudeCount := aoqtTransactionalCoordinateMicroTailMagnitudeCount
+		if diagnostics.OptimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+			wantStrategy = aoqtCoordinateSearchStrategyV7R3ActualDirection
+			wantMagnitudeCount = AOQTV7R3ActualDirectionProbeMagnitudeCount
+		} else if isAOQTV7DevOptimizerMode(diagnostics.OptimizerMode) {
+			wantStrategy = aoqtCoordinateSearchStrategyV7DevTrustRegion
+			wantMagnitudeCount = aoqtTransactionalCoordinateMagnitudeCount
+		}
+		if diagnostics.CoordinateSearchStrategy != wantStrategy {
+			return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_strategy = %q, want %q", diagnostics.CoordinateSearchStrategy, wantStrategy)
 		}
 		if diagnostics.CoordinateTopAngles <= 0 || diagnostics.CoordinateTopAngles > aoqtTransactionalCoordinateTopAngles {
 			return fmt.Errorf("AOQT optimizer diagnostics coordinate_top_angles = %d outside expected range", diagnostics.CoordinateTopAngles)
 		}
-		if diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
-			return fmt.Errorf("AOQT optimizer diagnostics protected coordinate_magnitude_count = %d, want exact micro-tail count %d", diagnostics.CoordinateMagnitudeCount, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+		if diagnostics.CoordinateMagnitudeCount != wantMagnitudeCount {
+			if diagnostics.OptimizerMode == "" {
+				return fmt.Errorf("AOQT optimizer diagnostics protected coordinate_magnitude_count = %d, want exact micro-tail count %d", diagnostics.CoordinateMagnitudeCount, wantMagnitudeCount)
+			}
+			return fmt.Errorf("AOQT optimizer diagnostics protected coordinate_magnitude_count = %d, want exact count %d for strategy %s", diagnostics.CoordinateMagnitudeCount, wantMagnitudeCount, wantStrategy)
 		}
 		if !isFinite32(diagnostics.CoordinateSearchLearningRate) || diagnostics.CoordinateSearchLearningRate <= 0 {
 			return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_learning_rate must be finite and positive")
@@ -708,7 +1023,7 @@ func validateAOQTProtectedCoordinateSearchAudit(plan AOQTSidecarWorkPlan, weight
 		} else if payload.LearningRate != chainLearningRate {
 			return fmt.Errorf("AOQT optimizer diagnostics coordinate audit[%d] learning_rate = %.9g differs from fixed chain learning_rate %.9g", i, payload.LearningRate, chainLearningRate)
 		}
-		if err := validateAOQTProtectedCoordinateSearchAuditPayload(payload, plan.AngleCount, plan.LearningRate, weights); err != nil {
+		if err := validateAOQTProtectedCoordinateSearchAuditPayload(payload, plan.AngleCount, plan.LearningRate, weights, diagnostics.OptimizerMode); err != nil {
 			return fmt.Errorf("AOQT optimizer diagnostics coordinate audit[%d]: %w", i, err)
 		}
 		wantHash := sha256AOQTCoordinateSearchChainEntry(previousHash, rawAudit)
@@ -739,6 +1054,9 @@ func validateAOQTProtectedCoordinateSearchAudit(plan AOQTSidecarWorkPlan, weight
 	if final.LearningRate != diagnostics.CoordinateSearchLearningRate {
 		return fmt.Errorf("AOQT optimizer diagnostics coordinate_search_learning_rate = %.9g, audit learning_rate = %.9g", diagnostics.CoordinateSearchLearningRate, final.LearningRate)
 	}
+	if final.TrustRegionRadius != diagnostics.TrustRegionRadius {
+		return fmt.Errorf("AOQT optimizer diagnostics trust_region_radius = %.9g, audit trust_region_radius = %.9g", diagnostics.TrustRegionRadius, final.TrustRegionRadius)
+	}
 	return nil
 }
 
@@ -763,9 +1081,20 @@ func decodeAOQTCoordinateSearchStringChain(raw, label string) ([]string, error) 
 	return chain, nil
 }
 
-func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSearchAuditPayload, angleCount int, expectedLearningRate float32, weights AOQTSidecarRowWeights) error {
-	if payload.Strategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail {
-		return fmt.Errorf("strategy = %q, want protected strategy %q", payload.Strategy, aoqtCoordinateSearchStrategyProtectedConeMicroTail)
+func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSearchAuditPayload, angleCount int, expectedLearningRate float32, weights AOQTSidecarRowWeights, optimizerMode string) error {
+	wantStrategy := aoqtCoordinateSearchStrategyProtectedConeMicroTail
+	devMode := isAOQTV7DevOptimizerMode(optimizerMode)
+	actualDirectionMode := optimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection
+	if actualDirectionMode {
+		wantStrategy = aoqtCoordinateSearchStrategyV7R3ActualDirection
+	} else if devMode {
+		wantStrategy = aoqtCoordinateSearchStrategyV7DevTrustRegion
+	}
+	if payload.Strategy != wantStrategy {
+		return fmt.Errorf("strategy = %q, want protected strategy %q", payload.Strategy, wantStrategy)
+	}
+	if payload.DevOnly != devMode {
+		return fmt.Errorf("dev_only = %t, want %t for optimizer mode %q", payload.DevOnly, devMode, optimizerMode)
 	}
 	if !isFinite32(payload.LearningRate) || payload.LearningRate <= 0 {
 		return fmt.Errorf("learning_rate must be finite and positive")
@@ -828,21 +1157,57 @@ func validateAOQTProtectedCoordinateSearchAuditPayload(payload aoqtCoordinateSea
 	if len(expectedMagnitudes) != aoqtTransactionalCoordinateMagnitudeCount {
 		return fmt.Errorf("protected learning_rate produces %d finite positive magnitudes, want full intended schedule of %d", len(expectedMagnitudes), aoqtTransactionalCoordinateMagnitudeCount)
 	}
-	expectedMicroTail := aoqtCoordinateSearchMicroTail(expectedMagnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+	microTailSource := expectedMagnitudes
+	if actualDirectionMode {
+		if payload.TrustRegionRadius != expectedLearningRate || payload.TrustRegionRadius != AOQTV7R3ActualDirectionProbeLearningRate {
+			return fmt.Errorf("actual-direction trust-region radius must equal fixed learning rate 0.01")
+		}
+		microTailSource = aoqtV7R3ActualDirectionMagnitudes()
+	} else if devMode {
+		if payload.TrustRegionRadius <= 0 || !isFinite32(payload.TrustRegionRadius) || payload.TrustRegionRadius > AOQTSidecarHardMaxAngleCap {
+			return fmt.Errorf("dev trust-region radius must be finite, positive, and <= hard max %.9g", AOQTSidecarHardMaxAngleCap)
+		}
+		microTailSource = aoqtCoordinateSearchMagnitudes(payload.TrustRegionRadius)
+	}
+	expectedMicroTail := aoqtCoordinateSearchMicroTail(microTailSource, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
 	if len(expectedMicroTail) != aoqtTransactionalCoordinateMicroTailMagnitudeCount || !aoqtFloat32SlicesEqual(expectedMicroTail, payload.MicroTailMagnitudes) {
 		return fmt.Errorf("protected learning_rate does not bind the exact micro-tail schedule")
 	}
-	if len(payload.Magnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount || len(payload.MicroTailMagnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
-		return fmt.Errorf("protected micro-tail magnitude counts = %d/%d, want %d", len(payload.Magnitudes), len(payload.MicroTailMagnitudes), aoqtTransactionalCoordinateMicroTailMagnitudeCount)
-	}
-	if !aoqtFloat32SlicesEqual(payload.Magnitudes, payload.MicroTailMagnitudes) {
-		return fmt.Errorf("protected magnitudes do not exactly match micro-tail magnitudes")
-	}
-	if !aoqtFloat32SlicesEqual(payload.BlockMagnitudes, payload.MicroTailMagnitudes) {
-		return fmt.Errorf("protected block magnitudes do not exactly match micro-tail magnitudes")
+	if actualDirectionMode {
+		if len(payload.Magnitudes) != AOQTV7R3ActualDirectionProbeMagnitudeCount || !aoqtFloat32SlicesEqual(payload.Magnitudes, microTailSource) {
+			return fmt.Errorf("actual-direction magnitudes do not bind the fixed six-value schedule")
+		}
+		if !aoqtFloat32SlicesEqual(payload.BlockMagnitudes, payload.Magnitudes) || !aoqtFloat32SlicesEqual(payload.MicroTailMagnitudes, payload.Magnitudes) {
+			return fmt.Errorf("actual-direction block and micro-tail magnitudes must match the fixed schedule")
+		}
+	} else if devMode {
+		if len(payload.Magnitudes) != aoqtTransactionalCoordinateMagnitudeCount || !aoqtFloat32SlicesEqual(payload.Magnitudes, microTailSource) {
+			return fmt.Errorf("dev trust-region magnitudes do not bind the full projected schedule")
+		}
+		if !aoqtFloat32SlicesEqual(payload.BlockMagnitudes, payload.Magnitudes) {
+			return fmt.Errorf("dev trust-region block magnitudes do not match full schedule")
+		}
+	} else {
+		if payload.TrustRegionRadius != 0 {
+			return fmt.Errorf("production protected audit must not declare a trust-region radius")
+		}
+		if len(payload.Magnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount || len(payload.MicroTailMagnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+			return fmt.Errorf("protected micro-tail magnitude counts = %d/%d, want %d", len(payload.Magnitudes), len(payload.MicroTailMagnitudes), aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+		}
+		if !aoqtFloat32SlicesEqual(payload.Magnitudes, payload.MicroTailMagnitudes) {
+			return fmt.Errorf("protected magnitudes do not exactly match micro-tail magnitudes")
+		}
+		if !aoqtFloat32SlicesEqual(payload.BlockMagnitudes, payload.MicroTailMagnitudes) {
+			return fmt.Errorf("protected block magnitudes do not exactly match micro-tail magnitudes")
+		}
 	}
 	if len(payload.ReverseMagnitudes) != 0 {
 		return fmt.Errorf("protected reverse magnitude count = %d, want 0", len(payload.ReverseMagnitudes))
+	}
+	if actualDirectionMode {
+		if !aoqtIntSlicesEqual(payload.GlobalSigns, aoqtV7R3ActualDirectionGlobalSigns()) || payload.ActualDirectionAuthority != AOQTV7R3ActualDirectionProbeDirectionSource || payload.EndpointCount != AOQTV7R3ActualDirectionProbeEndpointCount {
+			return fmt.Errorf("actual-direction audit authority/sign/endpoint metadata does not bind the fixed probe contract")
+		}
 	}
 	for i, magnitude := range payload.MicroTailMagnitudes {
 		if !isFinite32(magnitude) || magnitude <= 0 {

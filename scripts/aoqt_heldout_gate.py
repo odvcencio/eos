@@ -134,6 +134,7 @@ PRODUCTION_TRUSTED_WORKLOAD_REGISTRY: dict[str, Any] = {
             "qid_set_sha256": "7a7ee595b288753a46162e1daec8631d3a77300b1d550afdc8c67325d59fbe33",
             "query_count": 648,
             "qrels_pair_count": 1706,
+            "relevant_pair_count": 1706,
             "corpus_path_suffix": "datasets/manta-embed-v1/raw/fiqa/fiqa/corpus.jsonl",
             "corpus_sha256": "ff593e4df9933955dc3af83be0c3fa28ac7465f627e08c2e53593e734d506517",
             "queries_path_suffix": "datasets/manta-embed-v1/raw/fiqa/fiqa/queries.jsonl",
@@ -145,6 +146,7 @@ PRODUCTION_TRUSTED_WORKLOAD_REGISTRY: dict[str, Any] = {
             "qid_set_sha256": "6778186887db52ede15d04f15607996335fa40e40492404290b378c7c2b7b374",
             "query_count": 323,
             "qrels_pair_count": 12334,
+            "relevant_pair_count": 12334,
             "corpus_path_suffix": "datasets/manta-embed-v1/raw/nfcorpus/nfcorpus/corpus.jsonl",
             "corpus_sha256": "10cc83ef1826b1425e6a87090b5140b39b27755d5a27e48215a88611c899991f",
             "queries_path_suffix": "datasets/manta-embed-v1/raw/nfcorpus/nfcorpus/queries.jsonl",
@@ -156,6 +158,7 @@ PRODUCTION_TRUSTED_WORKLOAD_REGISTRY: dict[str, Any] = {
             "qid_set_sha256": "baa4c5ec793edbb5173815db5afbca79aca7f32c9498be84b4de3363f7e82d71",
             "query_count": 300,
             "qrels_pair_count": 339,
+            "relevant_pair_count": 339,
             "corpus_path_suffix": "datasets/manta-embed-v1/raw/scifact/scifact/corpus.jsonl",
             "corpus_sha256": "dec31c8182f3d744c7d2c09423756fd1d17cbef75808db13ba01cc0aab4d1ac6",
             "queries_path_suffix": "datasets/manta-embed-v1/raw/scifact/scifact/queries.jsonl",
@@ -628,8 +631,8 @@ def parse_corpus_ids(path: Path, label: str) -> set[str]:
         if not line.strip():
             continue
         node = _strict_load(line, f"{label}:{line_number}")
-        if not isinstance(node, dict) or set(node) - {"_id", "title", "text"}:
-            raise GateContractError(f"{label}:{line_number}: corpus rows must be native _id/title/text records")
+        if not isinstance(node, dict) or set(node) - {"_id", "title", "text", "metadata"}:
+            raise GateContractError(f"{label}:{line_number}: corpus rows must be native _id/title/text records with optional metadata")
         doc_id = require_string(node.get("_id"), f"{label}:{line_number}._id")
         if any(char.isspace() for char in doc_id) or doc_id in ids:
             raise GateContractError(f"{label}:{line_number}: corpus document identity is invalid or duplicated")
@@ -1842,7 +1845,7 @@ def _validate_production_registry_binding(
         spec = require_mapping(domains[domain], f"{label}.registry.domains.{domain}")
         required = {
             "qrels_path_suffix", "qrels_sha256", "qid_set_sha256", "query_count",
-            "qrels_pair_count", "corpus_path_suffix", "corpus_sha256",
+            "qrels_pair_count", "relevant_pair_count", "corpus_path_suffix", "corpus_sha256",
             "queries_path_suffix", "queries_sha256",
         }
         if set(spec) != required:
@@ -1858,11 +1861,13 @@ def _validate_production_registry_binding(
         expected_queries_sha = require_sha256(spec["queries_sha256"], f"{label}.registry.{domain}.queries_sha256")
         expected_query_count = require_integer(spec["query_count"], f"{label}.registry.{domain}.query_count", minimum=1)
         expected_pair_count = require_integer(spec["qrels_pair_count"], f"{label}.registry.{domain}.qrels_pair_count", minimum=1)
+        expected_relevant_pair_count = require_integer(spec["relevant_pair_count"], f"{label}.registry.{domain}.relevant_pair_count", minimum=1)
         if (
             actual_qrels["sha256"] != expected_sha
             or actual_qrels["qid_set_sha256"] != expected_qid_sha
             or actual_qrels["query_count"] != expected_query_count
             or actual_qrels["qrels_pair_count"] != expected_pair_count
+            or actual_qrels["relevant_pair_count"] != expected_relevant_pair_count
         ):
             raise GateContractError(f"{label}: registry qrels identity/count mismatch for {domain}")
         if actual_dataset["corpus"]["sha256"] != expected_corpus_sha or actual_dataset["queries"]["sha256"] != expected_queries_sha:
@@ -1876,6 +1881,7 @@ def _validate_production_registry_binding(
             or approved["query_count_by_domain"][domain] != expected_query_count
             or approved["qrels_sha256_by_domain"][domain] != expected_sha
             or approved["qrels_query_count_by_domain"][domain] != expected_query_count
+            or approved["relevant_pair_count_by_domain"][domain] != expected_relevant_pair_count
             or approved["corpus_sha256_by_domain"][domain] != expected_corpus_sha
             or approved["queries_sha256_by_domain"][domain] != expected_queries_sha
         ):
@@ -2679,7 +2685,7 @@ def _parse_native_result(metrics_path: Path, tsv_path: Path, per_query_path: Pat
     dataset = frozen_info["source"]["dataset_by_domain"][domain]
     if inputs.get("corpus_path") != dataset["corpus"]["path"] or inputs.get("corpus_sha256") != dataset["corpus"]["sha256"] or inputs.get("queries_path") != dataset["queries"]["path"] or inputs.get("queries_sha256") != dataset["queries"]["sha256"] or inputs.get("qrels_path") != frozen_info["qrels"][domain]["path"] or inputs.get("qrels_sha256") != frozen_info["qrels"][domain]["sha256"] or inputs.get("workload_sha256") != frozen_info["workload"]["sha256"] or inputs.get("approved_workload_sha256") != frozen_info["approved_workload"]["sha256"]:
         raise GateContractError(f"{role}/{domain}: native metrics dataset/qrels binding mismatch")
-    if inputs.get("queries") != frozen_info["qrels"][domain]["query_count"] or inputs.get("relevant_pairs") != frozen_info["qrels"][domain]["qrels_pair_count"]:
+    if inputs.get("queries") != frozen_info["qrels"][domain]["query_count"] or inputs.get("relevant_pairs") != frozen_info["qrels"][domain]["relevant_pair_count"]:
         raise GateContractError(f"{role}/{domain}: native metrics workload counts mismatch")
     config = require_mapping(metrics["config"], f"{role}/{domain}.native_metrics.config")
     if config.get("dimension") != DIMENSION or config.get("split") != HELDOUT_SPLIT or config.get("score_mode") != "turboquant_ip_prepared" or config.get("package_mode") != "native_mll_sibling" or config.get("batch_size") != BATCH_SIZE or config.get("top_k") != TOP_K or config.get("per_query_top_k") != TOP_K or config.get("bits") != [Q3_BITS, Q5_BITS] or config.get("quantizer_seed") != TURBOQUANT_SEED or config.get("max_docs", 0) != 0 or config.get("max_queries", 0) != 0 or config.get("rerank_overfetch", []) != [] or config.get("rerank_bits", 0) != 0 or config.get("allow_research_only_aoqt") is not (role == "candidate"):
@@ -2729,7 +2735,8 @@ def _parse_native_result(metrics_path: Path, tsv_path: Path, per_query_path: Pat
         if qid not in qrels["rels"] or qid in per_query_rows[bits]:
             raise GateContractError(f"{role}/{domain}.per-query:{line_number}: qid set is not exactly the frozen workload")
         rels = qrels["rels"][qid]
-        if row["relevant_count"] != len(rels):
+        positive_relevant_count = sum(1 for value in rels.values() if value > 0)
+        if row["relevant_count"] != positive_relevant_count:
             raise GateContractError(f"{role}/{domain}.per-query:{line_number}: relevant-count mismatch")
         compact_top = row["top_k"]
         dense_top = row["dense_top_k"]

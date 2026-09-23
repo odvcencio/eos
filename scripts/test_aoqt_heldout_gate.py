@@ -200,12 +200,15 @@ def main():
         q3 = quality(compact3, rels)
         q5 = quality(compact5, rels)
         dq = quality(dense, rels)
+        relevant_count = sum(1 for v in rels.values() if v > 0)
+        if MODE == "full-per-query-relevant-count":
+            relevant_count = len(rels)
         dense_values.append(dq)
         aggregates[3].append(q3)
         aggregates[5].append(q5)
         for bits, compact, q in ((3, compact3, q3), (5, compact5, q5)):
             row = {
-                "schema": "manta.embedding_turboquant_retrieval_per_query.v1", "dataset": domain, "query_id": qid, "method": f"turboquant_ip_b{bits}", "bits": bits, "scoring_surface": "turboquant_ip_prepared", "quantizer_seed": 5581486560434873699, "relevant_count": sum(1 for v in rels.values() if v > 0), "first_relevant_rank": next(rank for rank, d, _r in compact if d in rels), "quality": q, "dense_quality": dq,
+                "schema": "manta.embedding_turboquant_retrieval_per_query.v1", "dataset": domain, "query_id": qid, "method": f"turboquant_ip_b{bits}", "bits": bits, "scoring_surface": "turboquant_ip_prepared", "quantizer_seed": 5581486560434873699, "relevant_count": relevant_count, "first_relevant_rank": next(rank for rank, d, rel in compact if d in rels and rel > 0), "quality": q, "dense_quality": dq,
                 "top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in compact], "dense_top_k": [{"rank": r, "doc_id": d, "score": float(1.0 / r), "relevance": rel} for r, d, rel in dense], "gate_binding": binding, "runtime_binding": runtime,
             }
             if MODE != "omit-boundary" and not bad_nf and domain == "nfcorpus" and qid in frozen["approved_workload"]["descriptor"]["nfcorpus_boundary_qids"]:
@@ -224,9 +227,12 @@ def main():
         q = {"ndcg_at_10": avg(aggregates[bits], "ndcg_at_10"), "recall_at_100": avg(aggregates[bits], "recall_at_100")}
         native_rows.append({"bits": bits, "method": f"turboquant_ip_b{bits}", "quality": q, "ndcg_at_10_delta": 0.0, "recall_at_100_delta": 0.0})
     corpus_count = sum(1 for line in (dataset_dir / "corpus.jsonl").read_text().splitlines() if line.strip())
+    relevant_pairs = sum(1 for rels in rels_by_qid.values() for value in rels.values() if value > 0)
+    if MODE == "full-metric-relevant-pairs":
+        relevant_pairs = sum(len(rels) for rels in rels_by_qid.values())
     payload = {
         "schema": "manta.embedding_turboquant_retrieval_metrics.v1", "dataset": domain, "artifact": str(package.resolve()), "backend": "mock-native",
-        "inputs": {"corpus_path": str((dataset_dir / "corpus.jsonl").resolve()), "corpus_sha256": file_digest(dataset_dir / "corpus.jsonl"), "queries_path": str((dataset_dir / "queries.jsonl").resolve()), "queries_sha256": file_digest(dataset_dir / "queries.jsonl"), "qrels_path": str(qpath.resolve()), "qrels_sha256": file_digest(qpath), "workload_sha256": frozen["workload"]["sha256"], "approved_workload_sha256": frozen["approved_workload"]["sha256"], "documents": corpus_count, "queries": len(rels_by_qid), "relevant_pairs": sum(len(rels) for rels in rels_by_qid.values()), "scored_pairs": 120 * len(rels_by_qid)},
+        "inputs": {"corpus_path": str((dataset_dir / "corpus.jsonl").resolve()), "corpus_sha256": file_digest(dataset_dir / "corpus.jsonl"), "queries_path": str((dataset_dir / "queries.jsonl").resolve()), "queries_sha256": file_digest(dataset_dir / "queries.jsonl"), "qrels_path": str(qpath.resolve()), "qrels_sha256": file_digest(qpath), "workload_sha256": frozen["workload"]["sha256"], "approved_workload_sha256": frozen["approved_workload"]["sha256"], "documents": corpus_count, "queries": len(rels_by_qid), "relevant_pairs": relevant_pairs, "scored_pairs": 120 * len(rels_by_qid)},
         "config": {"dimension": 384, "split": "test", "score_mode": "turboquant_ip_prepared", "package_mode": "native_mll_sibling", "batch_size": 64, "top_k": 120, "per_query_top_k": 120, "bits": [3, 5], "quantizer_seed": 5581486560434873699, "max_docs": 0, "max_queries": 0, "rerank_overfetch": [], "rerank_bits": 0, "allow_research_only_aoqt": candidate},
         "dense": {"quality": dense}, "rows": native_rows, "gate_binding": binding, "runtime_binding": runtime,
     }
@@ -305,7 +311,11 @@ class Fixture:
             write_raw(dataset / "corpus.jsonl", "".join(json.dumps({"_id": doc_id}) + "\n" for doc_id in corpus_ids))
             write_raw(dataset / "queries.jsonl", '{"_id":"q"}\n')
             write_json(dataset / "manifest.json", {"schema": gate.DATASET_SCHEMA, "domain": domain, "dataset_id": domain, "split": gate.HELDOUT_SPLIT, "corpus_sha256": gate.sha256_file(dataset / "corpus.jsonl"), "queries_sha256": gate.sha256_file(dataset / "queries.jsonl")})
-            write_raw(self.qrels[domain], "query-id\tcorpus-id\tscore\n" + "\n".join(f"{qid}\trel-{qid}\t1" for qid in self.qids[domain]) + "\n")
+            qrel_lines = []
+            for qid in self.qids[domain]:
+                qrel_lines.append(f"{qid}\trel-{qid}\t1")
+                qrel_lines.append(f"{qid}\tdoc-{qid}-120\t0")
+            write_raw(self.qrels[domain], "query-id\tcorpus-id\tscore\n" + "\n".join(qrel_lines) + "\n")
         qrels_records = {domain: record(path) for domain, path in self.qrels.items()}
         dataset_records = {domain: {"dataset_id": domain, "dataset_dir": str(self.datasets[domain]), "corpus": record(self.datasets[domain] / "corpus.jsonl"), "queries": record(self.datasets[domain] / "queries.jsonl"), "manifest": record(self.datasets[domain] / "manifest.json")} for domain in gate.DOMAINS}
         compatibility = gate.sha256_bytes(b"fixture-compatibility")
@@ -355,6 +365,136 @@ class AOQTHeldoutGateTest(unittest.TestCase):
     def fixture(self) -> Fixture:
         return Fixture(Path(tempfile.mkdtemp())).build()
 
+    def test_corpus_metadata_is_accepted_and_ignored_for_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "corpus.jsonl"
+            write_raw(
+                path,
+                "\n".join(
+                    [
+                        json.dumps({"_id": "doc-a", "title": "A", "text": "alpha", "metadata": {"source": "fixture"}}),
+                        json.dumps({"_id": "doc-b", "metadata": {"nested": {"ignored": True}}}),
+                    ]
+                )
+                + "\n",
+            )
+            self.assertEqual(gate.parse_corpus_ids(path, "fixture.corpus"), {"doc-a", "doc-b"})
+
+    def test_corpus_unknown_extra_field_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "corpus.jsonl"
+            write_raw(path, json.dumps({"_id": "doc-a", "metadata": {}, "unexpected": True}) + "\n")
+            with self.assertRaisesRegex(gate.GateError, "corpus rows must be native"):
+                gate.parse_corpus_ids(path, "fixture.corpus")
+
+    def test_corpus_bad_and_duplicate_ids_are_still_rejected(self) -> None:
+        cases = {
+            "nonobject": "[\"doc-a\"]\n",
+            "missing": json.dumps({"metadata": {}}) + "\n",
+            "nonstring": json.dumps({"_id": 7, "metadata": {}}) + "\n",
+            "empty": json.dumps({"_id": "", "metadata": {}}) + "\n",
+            "whitespace": json.dumps({"_id": "doc a", "metadata": {}}) + "\n",
+            "duplicate": "\n".join([json.dumps({"_id": "doc-a", "metadata": {}}), json.dumps({"_id": "doc-a", "metadata": {}})]) + "\n",
+        }
+        for name, contents in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as raw:
+                path = Path(raw) / "corpus.jsonl"
+                write_raw(path, contents)
+                with self.assertRaisesRegex(gate.GateError, "corpus rows|document identity|_id"):
+                    gate.parse_corpus_ids(path, f"fixture.{name}.corpus")
+
+    def test_qrels_document_membership_failure_remains_after_metadata_acceptance(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            corpus = root / "corpus.jsonl"
+            queries = root / "queries.jsonl"
+            qrels_path = root / "qrels.tsv"
+            package = root / "package.mll"
+            metrics = root / "metrics.json"
+            tsv = root / "metrics.tsv"
+            per_query = root / "per-query.jsonl"
+            write_raw(corpus, json.dumps({"_id": "doc-present", "metadata": {"accepted": True}}) + "\n")
+            write_raw(queries, json.dumps({"_id": "query-a"}) + "\n")
+            write_raw(qrels_path, "query-id\tcorpus-id\tscore\nquery-a\tdoc-missing\t1\n")
+            write_raw(package, "package")
+            write_raw(tsv, "dataset\trow\nfixture\tdense\n")
+            write_raw(per_query, "{}\n")
+            qrels = gate.parse_qrels(qrels_path, "fixture.qrels")
+            gate_binding = {"schema": gate.GATE_BINDING_SCHEMA, "gate_id": "fixture-gate"}
+            gate_binding["binding_sha256"] = gate.digest_without(gate_binding, "binding_sha256")
+            runtime_binding = {"schema": gate.RUNTIME_BINDING_SCHEMA, "producer": "eos-native-runtime-resolved-inputs"}
+            runtime_binding["binding_sha256"] = gate.digest_without(runtime_binding, "binding_sha256")
+            frozen_info = {
+                "source": {
+                    "dataset_by_domain": {
+                        "fiqa": {
+                            "corpus": {"path": str(corpus.resolve()), "sha256": gate.sha256_file(corpus)},
+                            "queries": {"path": str(queries.resolve()), "sha256": gate.sha256_file(queries)},
+                        }
+                    }
+                },
+                "qrels": {"fiqa": {**qrels, "path": str(qrels_path.resolve())}},
+                "workload": {"sha256": "a" * 64},
+                "approved_workload": {"sha256": "b" * 64},
+                "anchor": {"path": str(package.resolve())},
+            }
+            write_json(
+                metrics,
+                {
+                    "schema": gate.NATIVE_METRICS_SCHEMA,
+                    "dataset": "fiqa",
+                    "artifact": str(package.resolve()),
+                    "backend": "fixture",
+                    "inputs": {
+                        "corpus_path": str(corpus.resolve()),
+                        "corpus_sha256": gate.sha256_file(corpus),
+                        "queries_path": str(queries.resolve()),
+                        "queries_sha256": gate.sha256_file(queries),
+                        "qrels_path": str(qrels_path.resolve()),
+                        "qrels_sha256": qrels["sha256"],
+                        "workload_sha256": frozen_info["workload"]["sha256"],
+                        "approved_workload_sha256": frozen_info["approved_workload"]["sha256"],
+                        "queries": qrels["query_count"],
+                        "relevant_pairs": qrels["qrels_pair_count"],
+                    },
+                    "config": {
+                        "dimension": gate.DIMENSION,
+                        "split": gate.HELDOUT_SPLIT,
+                        "score_mode": "turboquant_ip_prepared",
+                        "package_mode": "native_mll_sibling",
+                        "batch_size": gate.BATCH_SIZE,
+                        "top_k": gate.TOP_K,
+                        "per_query_top_k": gate.TOP_K,
+                        "bits": [gate.Q3_BITS, gate.Q5_BITS],
+                        "quantizer_seed": gate.TURBOQUANT_SEED,
+                        "max_docs": 0,
+                        "max_queries": 0,
+                        "rerank_overfetch": [],
+                        "rerank_bits": 0,
+                        "allow_research_only_aoqt": False,
+                    },
+                    "dense": {"quality": {"ndcg_at_10": 0.0, "recall_at_100": 0.0}},
+                    "rows": [
+                        {"bits": gate.Q3_BITS, "method": "turboquant_ip_b3"},
+                        {"bits": gate.Q5_BITS, "method": "turboquant_ip_b5"},
+                    ],
+                    "gate_binding": gate_binding,
+                    "runtime_binding": runtime_binding,
+                },
+            )
+            with self.assertRaisesRegex(gate.GateError, "frozen qrels contain documents absent from the frozen corpus"):
+                gate._parse_native_result(
+                    metrics,
+                    tsv,
+                    per_query,
+                    frozen_info=frozen_info,
+                    role="anchor",
+                    domain="fiqa",
+                    gate_binding=gate_binding,
+                    runtime_binding=runtime_binding,
+                    production=False,
+                )
+
     def test_run_executes_fresh_native_harness_and_passes_thresholds(self) -> None:
         f = self.fixture()
         frozen = f.freeze()
@@ -366,6 +506,35 @@ class AOQTHeldoutGateTest(unittest.TestCase):
         self.assertGreaterEqual(report["macro"]["q3_ndcg_at_10_delta"], gate.THRESHOLDS["q3_macro_ndcg_at_10_delta_min"])
         self.assertEqual(len(report["commands"]), gate.RESULT_OUTPUT_COUNT)
         self.assertTrue(Path(report["attestation_path"]).is_file())
+
+    def test_native_positive_relevance_counts_are_distinct_from_full_qrels_pairs(self) -> None:
+        f = self.fixture()
+        parsed = gate.parse_qrels(f.qrels["fiqa"], "fixture.fiqa.qrels")
+        self.assertEqual(parsed["qrels_pair_count"], 4)
+        self.assertEqual(parsed["relevant_pair_count"], 2)
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "normal"}, clear=False):
+            report = gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+        metrics_path = Path(report["run_dir"]) / "anchor.fiqa.metrics.json"
+        per_query_path = Path(report["run_dir"]) / "anchor.fiqa.per-query.jsonl"
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        self.assertEqual(metrics["inputs"]["relevant_pairs"], 2)
+        rows = [json.loads(line) for line in per_query_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual({row["relevant_count"] for row in rows}, {1})
+
+    def test_native_metric_relevant_pairs_must_be_positive_only(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "full-metric-relevant-pairs"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "native metrics workload counts mismatch"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
+
+    def test_native_per_query_relevant_count_must_be_positive_only(self) -> None:
+        f = self.fixture()
+        frozen = f.freeze()
+        with mock.patch.dict(os.environ, {"MOCK_MODE": "full-per-query-relevant-count"}, clear=False):
+            with self.assertRaisesRegex(gate.GateError, "relevant-count mismatch"):
+                gate.run_harness(f.frozen_path, **f.run_kwargs(frozen))
 
     def test_legacy_attest_import_is_disabled(self) -> None:
         with self.assertRaisesRegex(gate.GateError, "receipt import is disabled"):
@@ -461,6 +630,7 @@ class AOQTHeldoutGateTest(unittest.TestCase):
                     "qid_set_sha256": qrels[domain]["qid_set_sha256"],
                     "query_count": qrels[domain]["query_count"],
                     "qrels_pair_count": qrels[domain]["qrels_pair_count"],
+                    "relevant_pair_count": qrels[domain]["relevant_pair_count"],
                     "corpus_path_suffix": str((f.datasets[domain] / "corpus.jsonl").resolve()).lstrip("/"),
                     "corpus_sha256": datasets[domain]["corpus"]["sha256"],
                     "queries_path_suffix": str((f.datasets[domain] / "queries.jsonl").resolve()).lstrip("/"),
@@ -476,6 +646,8 @@ class AOQTHeldoutGateTest(unittest.TestCase):
                 "rank_window": [80, 120],
             },
         }
+        self.assertEqual({domain: qrels[domain]["qrels_pair_count"] for domain in gate.DOMAINS}, {domain: 4 for domain in gate.DOMAINS})
+        self.assertEqual(approved["relevant_pair_count_by_domain"], {domain: 2 for domain in gate.DOMAINS})
         with mock.patch.object(gate, "PRODUCTION_TRUSTED_WORKLOAD_REGISTRY", registry):
             gate._validate_production_registry_binding(approved, qrels, datasets, exclusions, label="synthetic.production")
 

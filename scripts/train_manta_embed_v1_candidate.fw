@@ -33,6 +33,7 @@ type candidateConfig struct {
 	PackageTokenizerPath string
 	TokenizerCorpus     string
 	NoTokenizer         bool
+	RepairMode          bool
 	QualityTarget       string
 	ThresholdsEnv       string
 	TrainMode           string
@@ -46,6 +47,8 @@ type candidateConfig struct {
 	HiddenDim           string
 	EncoderRepeats      string
 	InitSeed            string
+	InitialArtifact     string
+	InitialArtifactSHA256 string
 	BootstrapArtifact   string
 	WeightBits          string
 	Epochs              string
@@ -71,6 +74,9 @@ type candidateConfig struct {
 	ClearTurboQuantRankMargin string
 	TurboQuantRankMarginObjectives string
 	TurboQuantRankMargin string
+	TurboQuantRankMarginLoss string
+	TurboQuantRankMarginReduction string
+	TurboQuantRankMarginTau string
 	EvalEvery           string
 	EvalEverySteps      string
 	Patience            string
@@ -84,6 +90,16 @@ type candidateConfig struct {
 	TrainRetrievalEvalBatchSize string
 	TrainRetrievalEvalTopK string
 	TrainRetrievalEvalTokenizer string
+	ScoreSpectrumTrain  string
+	AllowResearchOnlyScoreSpectrum string
+	ScoreSpectrumEval   string
+	ScoreSpectrumLossMode string
+	ScoreSpectrumRecoveryWeight string
+	ScoreSpectrumRecoveryMargin string
+	ScoreSpectrumRecoveryTopK string
+	ScoreSpectrumRecoveryTau string
+	ScoreSpectrumMaxBatchCandidates string
+	ScoreSpectrumActivationMicrobatchSize string
 	MinFreq             string
 	MinChars            string
 	MaxPairs            string
@@ -125,6 +141,7 @@ Common knobs:
   EOS_ENCODER_REPEATS=2
   EOS_INITIAL_ARTIFACT=/path/to/previous-stage/eos-embed-v1.mll
   EOS_BOOTSTRAP_ARTIFACT=/path/to/same-family/eos-embed-v1.mll
+  EOS_SHIP_REPAIR_MODE=1
   EOS_EPOCHS=3
   EOS_BATCH_SIZE=1024
   EOS_LR=0.005
@@ -143,6 +160,16 @@ Common knobs:
   EOS_HARD_NEGATIVE_TRAIN=1
   EOS_HARD_NEGATIVES_PER_QUERY=1
   EOS_HARD_NEGATIVE_SOURCE_WEIGHTS=scifact=1,nfcorpus=2,fiqa=2
+  EOS_SCORE_SPECTRUM_TRAIN=1
+  EOS_ALLOW_RESEARCH_ONLY_SCORE_SPECTRUM=1
+  EOS_SCORE_SPECTRUM_EVAL=/path/to/score-spectrum-eval.jsonl
+  EOS_SCORE_SPECTRUM_LOSS_MODE=hard_soft_recovery
+  EOS_SCORE_SPECTRUM_RECOVERY_WEIGHT=1
+  EOS_SCORE_SPECTRUM_RECOVERY_MARGIN=0.05
+  EOS_SCORE_SPECTRUM_RECOVERY_TOP_K=4
+  EOS_SCORE_SPECTRUM_RECOVERY_TAU=0.05
+  EOS_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES=4096
+  EOS_SCORE_SPECTRUM_ACTIVATION_MICROBATCH_SIZE=0
   EOS_TRAIN_ENABLE_FAST_GELU=1
   EOS_QUALITY_TARGET=retrieval
   EOS_GATE_BM25_BASELINE=1
@@ -176,6 +203,11 @@ func envEnabled(name string) bool {
 func configBool(value string) bool {
 	value = strings.ToLower(strings.TrimSpace(value))
 	return value == "1" || value == "true" || value == "yes" || value == "on"
+}
+
+func configNonZero(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && value != "0" && value != "0.0" && value != "0.00"
 }
 
 func step(label string) {
@@ -543,10 +575,12 @@ func runMetricsDiagnosis(cfg candidateConfig, label string, logName string, metr
 }
 
 func runRetrievalEval(cfg candidateConfig) error {
+	evalRunID := cfg.RunID + "-retrieval"
 	args := []string{
 		"EOS_REPO_ROOT=" + cfg.Root,
 		"EOS_EVAL_ARTIFACT=" + cfg.SealedArtifact,
 		"EOS_EVAL_RUN_ROOT=" + filepath.Join(cfg.RunDir, "retrieval"),
+		"EOS_EVAL_RUN_ID=" + evalRunID,
 	}
 	if cfg.ThresholdsEnv != "" {
 		args = append(args, "EOS_THRESHOLDS_ENV="+cfg.ThresholdsEnv)
@@ -578,6 +612,10 @@ func retrievalEvalEnvValue(cfg candidateConfig, name string) (string, bool) {
 		return "1.0", true
 	}
 	return "", false
+}
+
+func trainRetrievalEvalConfigured(cfg candidateConfig) bool {
+	return cfg.TrainRetrievalEvalDir != "" && cfg.TrainRetrievalEvalTokenizer != ""
 }
 
 func renderCommand(name string, args []string) string {
@@ -713,6 +751,8 @@ func writeManifest(cfg candidateConfig, status string) error {
     "mode": %s,
     "pairwise_train": %s,
     "hard_negative_train": %s,
+    "score_spectrum_train": %s,
+    "allow_research_only_score_spectrum": %s,
     "hard_negatives_per_query": %s,
     "hard_negative_source_weights": %s,
     "epochs": %s,
@@ -726,6 +766,14 @@ func writeManifest(cfg candidateConfig, status string) error {
     "teacher_source_temperatures": %s,
     "teacher_source_weights": %s,
     "teacher_score_normalization": %s,
+    "score_spectrum_eval": %s,
+    "score_spectrum_loss_mode": %s,
+    "score_spectrum_recovery_weight": %s,
+    "score_spectrum_recovery_margin": %s,
+    "score_spectrum_recovery_top_k": %s,
+    "score_spectrum_recovery_tau": %s,
+    "score_spectrum_max_batch_candidates": %s,
+    "score_spectrum_activation_microbatch_size": %s,
     "matryoshka_dims": %s,
     "matryoshka_weights": %s,
     "clear_turboquant_prefix": %s,
@@ -738,6 +786,9 @@ func writeManifest(cfg candidateConfig, status string) error {
     "clear_turboquant_rank_margin": %s,
     "turboquant_rank_margin_objectives": %s,
     "turboquant_rank_margin": %s,
+    "turboquant_rank_margin_loss": %s,
+    "turboquant_rank_margin_reduction": %s,
+    "turboquant_rank_margin_tau": %s,
     "select_metric": %s,
     "quality_target": %s,
     "eval_every": %s,
@@ -752,6 +803,8 @@ func writeManifest(cfg candidateConfig, status string) error {
     "tokenizer": %s,
     "package_tokenizer": %s,
     "tokenizer_corpus": %s,
+    "initial_artifact": %s,
+    "initial_artifact_sha256": %s,
     "bootstrap_artifact": %s,
     "thresholds_env": %s
   },
@@ -762,6 +815,9 @@ func writeManifest(cfg candidateConfig, status string) error {
     "train_metrics_json": %s,
     "final_eval_metrics_json": %s,
     "hard_eval_metrics_json": %s,
+    "retrieval_eval_run_id": %s,
+    "retrieval_eval_run_dir": %s,
+    "retrieval_eval_leaderboard": %s,
     "logs": %s,
     "datasets_sha256": %s,
     "artifacts_sha256": %s
@@ -786,6 +842,8 @@ func writeManifest(cfg candidateConfig, status string) error {
 		jsonString(cfg.TrainMode),
 		jsonBool(envEnabled("EOS_PAIRWISE_TRAIN") || cfg.PairwiseTrain == "1" || strings.ToLower(cfg.PairwiseTrain) == "true"),
 		jsonBool(hardNegativeTrainEnabled(cfg)),
+		jsonBool(scoreSpectrumTrainEnabled(cfg)),
+		jsonBool(configBool(cfg.AllowResearchOnlyScoreSpectrum)),
 		cfg.HardNegativesPerQuery,
 		jsonString(cfg.HardNegativeSourceWeights),
 		cfg.Epochs,
@@ -799,6 +857,14 @@ func writeManifest(cfg candidateConfig, status string) error {
 		jsonString(cfg.TeacherSourceTemperatures),
 		jsonString(cfg.TeacherSourceWeights),
 		jsonString(cfg.TeacherScoreNormalization),
+		jsonString(cfg.ScoreSpectrumEval),
+		jsonString(cfg.ScoreSpectrumLossMode),
+		cfg.ScoreSpectrumRecoveryWeight,
+		cfg.ScoreSpectrumRecoveryMargin,
+		cfg.ScoreSpectrumRecoveryTopK,
+		cfg.ScoreSpectrumRecoveryTau,
+		cfg.ScoreSpectrumMaxBatchCandidates,
+		cfg.ScoreSpectrumActivationMicrobatchSize,
 		jsonString(cfg.MatryoshkaDims),
 		jsonString(cfg.MatryoshkaWeights),
 		jsonBool(configBool(cfg.ClearTurboQuantPrefix)),
@@ -811,6 +877,9 @@ func writeManifest(cfg candidateConfig, status string) error {
 		jsonBool(configBool(cfg.ClearTurboQuantRankMargin)),
 		jsonString(cfg.TurboQuantRankMarginObjectives),
 		jsonString(cfg.TurboQuantRankMargin),
+		jsonString(cfg.TurboQuantRankMarginLoss),
+		jsonString(cfg.TurboQuantRankMarginReduction),
+		jsonString(cfg.TurboQuantRankMarginTau),
 		jsonString(cfg.SelectMetric),
 		jsonString(cfg.QualityTarget),
 		cfg.EvalEvery,
@@ -823,6 +892,8 @@ func writeManifest(cfg candidateConfig, status string) error {
 		jsonString(cfg.TokenizerPath),
 		jsonString(cfg.PackageTokenizerPath),
 		jsonString(cfg.TokenizerCorpus),
+		jsonString(cfg.InitialArtifact),
+		jsonString(cfg.InitialArtifactSHA256),
 		jsonString(cfg.BootstrapArtifact),
 		jsonString(cfg.ThresholdsEnv),
 		jsonString(cfg.Artifact),
@@ -831,6 +902,9 @@ func writeManifest(cfg candidateConfig, status string) error {
 		jsonString(cfg.TrainMetricsJSON),
 		jsonString(cfg.FinalEvalMetricsJSON),
 		jsonString(cfg.HardEvalMetricsJSON),
+		jsonString(cfg.RunID+"-retrieval"),
+		jsonString(filepath.Join(cfg.RunDir, "retrieval", cfg.RunID+"-retrieval")),
+		jsonString(filepath.Join(cfg.RunDir, "retrieval", cfg.RunID+"-retrieval", "leaderboard.tsv")),
 		jsonString(cfg.LogDir),
 		jsonString(cfg.DatasetSHAFile),
 		jsonString(cfg.ArtifactSHAFile),
@@ -952,6 +1026,7 @@ func prepareConfig(root string) (candidateConfig, error) {
 		HiddenDim:           getenv("EOS_HIDDEN_DIM", "256"),
 		EncoderRepeats:      getenv("EOS_ENCODER_REPEATS", "2"),
 		InitSeed:            getenv("EOS_INIT_SEED", "1"),
+		InitialArtifact:     getenv("EOS_INITIAL_ARTIFACT", ""),
 		BootstrapArtifact:   getenv("EOS_BOOTSTRAP_ARTIFACT", ""),
 		WeightBits:          getenv("EOS_WEIGHT_BITS", "8"),
 		Epochs:              getenv("EOS_EPOCHS", "3"),
@@ -977,12 +1052,15 @@ func prepareConfig(root string) (candidateConfig, error) {
 		ClearTurboQuantRankMargin: getenv("EOS_CLEAR_TURBOQUANT_RANK_MARGIN", ""),
 		TurboQuantRankMarginObjectives: getenv("EOS_TURBOQUANT_RANK_MARGIN_OBJECTIVES", ""),
 		TurboQuantRankMargin: getenv("EOS_TURBOQUANT_RANK_MARGIN", ""),
+		TurboQuantRankMarginLoss: getenv("EOS_TURBOQUANT_RANK_MARGIN_LOSS", ""),
+		TurboQuantRankMarginReduction: getenv("EOS_TURBOQUANT_RANK_MARGIN_REDUCTION", ""),
+		TurboQuantRankMarginTau: getenv("EOS_TURBOQUANT_RANK_MARGIN_TAU", ""),
 		EvalEvery:           getenv("EOS_EVAL_EVERY", "1"),
 		EvalEverySteps:      getenv("EOS_EVAL_EVERY_STEPS", "0"),
 		Patience:            getenv("EOS_PATIENCE", "3"),
 		RestoreBest:         getenv("EOS_RESTORE_BEST", "true"),
 		MinDelta:            getenv("EOS_MIN_DELTA", "0"),
-		SelectMetric:        getenv("EOS_SELECT_METRIC", "score_margin"),
+		SelectMetric:        getenv("EOS_SELECT_METRIC", ""),
 		TrainRetrievalEvalDir: getenv("EOS_TRAIN_RETRIEVAL_EVAL_DIR", ""),
 		TrainRetrievalEvalSplit: getenv("EOS_TRAIN_RETRIEVAL_EVAL_SPLIT", ""),
 		TrainRetrievalEvalMaxDocs: getenv("EOS_TRAIN_RETRIEVAL_EVAL_MAX_DOCS", ""),
@@ -990,6 +1068,16 @@ func prepareConfig(root string) (candidateConfig, error) {
 		TrainRetrievalEvalBatchSize: getenv("EOS_TRAIN_RETRIEVAL_EVAL_BATCH_SIZE", ""),
 		TrainRetrievalEvalTopK: getenv("EOS_TRAIN_RETRIEVAL_EVAL_TOP_K", ""),
 		TrainRetrievalEvalTokenizer: getenv("EOS_TRAIN_RETRIEVAL_EVAL_TOKENIZER", ""),
+		ScoreSpectrumTrain:  getenv("EOS_SCORE_SPECTRUM_TRAIN", "0"),
+		AllowResearchOnlyScoreSpectrum: getenv("EOS_ALLOW_RESEARCH_ONLY_SCORE_SPECTRUM", "0"),
+		ScoreSpectrumEval:   getenv("EOS_SCORE_SPECTRUM_EVAL", ""),
+		ScoreSpectrumLossMode: getenv("EOS_SCORE_SPECTRUM_LOSS_MODE", ""),
+		ScoreSpectrumRecoveryWeight: getenv("EOS_SCORE_SPECTRUM_RECOVERY_WEIGHT", "0"),
+		ScoreSpectrumRecoveryMargin: getenv("EOS_SCORE_SPECTRUM_RECOVERY_MARGIN", "0"),
+		ScoreSpectrumRecoveryTopK: getenv("EOS_SCORE_SPECTRUM_RECOVERY_TOP_K", "0"),
+		ScoreSpectrumRecoveryTau: getenv("EOS_SCORE_SPECTRUM_RECOVERY_TAU", "0"),
+		ScoreSpectrumMaxBatchCandidates: getenv("EOS_SCORE_SPECTRUM_MAX_BATCH_CANDIDATES", "0"),
+		ScoreSpectrumActivationMicrobatchSize: getenv("EOS_SCORE_SPECTRUM_ACTIVATION_MICROBATCH_SIZE", "0"),
 		PairwiseTrain:       getenv("EOS_PAIRWISE_TRAIN", "0"),
 		HardNegativeTrain:   getenv("EOS_HARD_NEGATIVE_TRAIN", "0"),
 		HardNegativesPerQuery: getenv("EOS_HARD_NEGATIVES_PER_QUERY", "1"),
@@ -1010,6 +1098,7 @@ func prepareConfig(root string) (candidateConfig, error) {
 		FinalEvalMetricsJSON: filepath.Join(runDir, "final-eval.metrics.json"),
 		HardEvalMetricsJSON:  filepath.Join(runDir, "hard-eval.metrics.json"),
 		NoTokenizer:          envEnabled("EOS_NO_TOKENIZER"),
+		RepairMode:           envEnabled("EOS_SHIP_REPAIR_MODE"),
 	}
 
 	err = os.WriteFile(cfg.DatasetSHAFile, []byte(""), 0o644)
@@ -1028,16 +1117,33 @@ func prepareConfig(root string) (candidateConfig, error) {
 	cfg.PackageTokenizerPath = os.Getenv("EOS_PACKAGE_TOKENIZER")
 	cfg.TokenizerCorpus = os.Getenv("EOS_TOKENIZER_CORPUS")
 	cfg.ThresholdsEnv = thresholdsEnv
+	if cfg.SelectMetric == "" {
+		if trainRetrievalEvalConfigured(cfg) {
+			cfg.SelectMetric = "retrieval_ndcg"
+		} else {
+			cfg.SelectMetric = "score_margin"
+		}
+	}
 	guard cfg.QualityTarget == "pairwise" || cfg.QualityTarget == "retrieval" || cfg.QualityTarget == "both" else return candidateConfig{}, fmt.Errorf("EOS_QUALITY_TARGET must be pairwise, retrieval, or both")
-	guard !(pairwiseTrainEnabled(cfg) && hardNegativeTrainEnabled(cfg)) else return candidateConfig{}, fmt.Errorf("choose EOS_PAIRWISE_TRAIN or EOS_HARD_NEGATIVE_TRAIN, not both")
+	trainModeCount := 0
+	for _, enabled := range []bool{pairwiseTrainEnabled(cfg), hardNegativeTrainEnabled(cfg), scoreSpectrumTrainEnabled(cfg)} {
+		if enabled {
+			trainModeCount++
+		}
+	}
+	guard trainModeCount <= 1 else return candidateConfig{}, fmt.Errorf("choose only one of EOS_PAIRWISE_TRAIN, EOS_HARD_NEGATIVE_TRAIN, or EOS_SCORE_SPECTRUM_TRAIN")
 	guard !(cfg.NoTokenizer && cfg.TokenizerPath != "") else return candidateConfig{}, fmt.Errorf("set either EOS_NO_TOKENIZER or EOS_TOKENIZER, not both")
 	guard !(cfg.NoTokenizer && cfg.TokenizerCorpus != "") else return candidateConfig{}, fmt.Errorf("set either EOS_NO_TOKENIZER or EOS_TOKENIZER_CORPUS, not both")
-	guard !(cfg.NoTokenizer && envEnabled("EOS_PRETOKENIZE_JSONL")) else return candidateConfig{}, fmt.Errorf("set either EOS_NO_TOKENIZER or EOS_PRETOKENIZE_JSONL, not both")
+	guard !(cfg.NoTokenizer && envEnabled("EOS_PRETOKENIZE_JSONL") && !scoreSpectrumTrainEnabled(cfg)) else return candidateConfig{}, fmt.Errorf("set either EOS_NO_TOKENIZER or EOS_PRETOKENIZE_JSONL, not both")
 	guard !(retrievalQualityTarget(cfg) && cfg.NoTokenizer && cfg.PackageTokenizerPath == "") else return candidateConfig{}, fmt.Errorf("EOS_QUALITY_TARGET=%s with EOS_NO_TOKENIZER requires EOS_PACKAGE_TOKENIZER so the sealed .mll can embed raw retrieval text", cfg.QualityTarget)
+	guard !(configBool(cfg.AllowResearchOnlyScoreSpectrum) && !scoreSpectrumTrainEnabled(cfg)) else return candidateConfig{}, fmt.Errorf("EOS_ALLOW_RESEARCH_ONLY_SCORE_SPECTRUM requires EOS_SCORE_SPECTRUM_TRAIN=1")
+	guard !(cfg.ScoreSpectrumEval != "" && !scoreSpectrumTrainEnabled(cfg)) else return candidateConfig{}, fmt.Errorf("EOS_SCORE_SPECTRUM_EVAL requires EOS_SCORE_SPECTRUM_TRAIN=1")
+	guard !((cfg.ScoreSpectrumLossMode != "" || configNonZero(cfg.ScoreSpectrumRecoveryWeight) || configNonZero(cfg.ScoreSpectrumRecoveryMargin) || configNonZero(cfg.ScoreSpectrumRecoveryTopK) || configNonZero(cfg.ScoreSpectrumRecoveryTau)) && !scoreSpectrumTrainEnabled(cfg)) else return candidateConfig{}, fmt.Errorf("EOS_SCORE_SPECTRUM_* recovery options require EOS_SCORE_SPECTRUM_TRAIN=1")
 
 	if cfg.Corpus != "" {
 		guard cfg.TrainJSONL == "" && cfg.EvalJSONL == "" else return candidateConfig{}, fmt.Errorf("choose EOS_CORPUS or EOS_TRAIN_JSONL/EOS_EVAL_JSONL, not both")
 		guard !hardNegativeTrainEnabled(cfg) else return candidateConfig{}, fmt.Errorf("EOS_HARD_NEGATIVE_TRAIN requires prepared labeled-pair JSONL, not EOS_CORPUS")
+		guard !scoreSpectrumTrainEnabled(cfg) else return candidateConfig{}, fmt.Errorf("EOS_SCORE_SPECTRUM_TRAIN requires prepared score-spectrum JSONL, not EOS_CORPUS")
 		cfg.Corpus, err = requireFile(cfg.Corpus, "EOS_CORPUS")
 		guard err == nil else return candidateConfig{}, err
 		err = rejectTmpPath("corpus", cfg.Corpus)
@@ -1099,6 +1205,14 @@ func prepareConfig(root string) (candidateConfig, error) {
 		err = appendSHA256(cfg.DatasetSHAFile, cfg.TrainRetrievalEvalTokenizer)
 		guard err == nil else return candidateConfig{}, err
 	}
+	if cfg.ScoreSpectrumEval != "" {
+		cfg.ScoreSpectrumEval, err = requireFile(cfg.ScoreSpectrumEval, "EOS_SCORE_SPECTRUM_EVAL")
+		guard err == nil else return candidateConfig{}, err
+		err = rejectTmpPath("score-spectrum eval dataset", cfg.ScoreSpectrumEval)
+		guard err == nil else return candidateConfig{}, err
+		err = appendSHA256(cfg.DatasetSHAFile, cfg.ScoreSpectrumEval)
+		guard err == nil else return candidateConfig{}, err
+	}
 	if cfg.TokenizerCorpus != "" {
 		guard cfg.TokenizerPath == "" else return candidateConfig{}, fmt.Errorf("set either EOS_TOKENIZER or EOS_TOKENIZER_CORPUS, not both")
 		cfg.TokenizerCorpus, err = requireFile(cfg.TokenizerCorpus, "EOS_TOKENIZER_CORPUS")
@@ -1110,6 +1224,24 @@ func prepareConfig(root string) (candidateConfig, error) {
 	}
 	if cfg.ThresholdsEnv != "" {
 		err = appendSHA256(cfg.DatasetSHAFile, cfg.ThresholdsEnv)
+		guard err == nil else return candidateConfig{}, err
+	}
+	if cfg.InitialArtifact != "" {
+		cfg.InitialArtifact, err = requireFile(cfg.InitialArtifact, "EOS_INITIAL_ARTIFACT")
+		guard err == nil else return candidateConfig{}, err
+		err = rejectTmpPath("initial artifact", cfg.InitialArtifact)
+		guard err == nil else return candidateConfig{}, err
+		cfg.InitialArtifactSHA256, err = sha256File(cfg.InitialArtifact)
+		guard err == nil else return candidateConfig{}, err
+		err = appendSHA256(cfg.DatasetSHAFile, cfg.InitialArtifact)
+		guard err == nil else return candidateConfig{}, err
+	}
+	if cfg.BootstrapArtifact != "" {
+		cfg.BootstrapArtifact, err = requireFile(cfg.BootstrapArtifact, "EOS_BOOTSTRAP_ARTIFACT")
+		guard err == nil else return candidateConfig{}, err
+		err = rejectTmpPath("bootstrap artifact", cfg.BootstrapArtifact)
+		guard err == nil else return candidateConfig{}, err
+		err = appendSHA256(cfg.DatasetSHAFile, cfg.BootstrapArtifact)
 		guard err == nil else return candidateConfig{}, err
 	}
 
@@ -1186,6 +1318,30 @@ func trainCommonArgs(cfg candidateConfig) []string {
 	if cfg.TrainRetrievalEvalTokenizer != "" {
 		args = append(args, "--retrieval-eval-tokenizer", cfg.TrainRetrievalEvalTokenizer)
 	}
+	if cfg.ScoreSpectrumEval != "" {
+		args = append(args, "--score-spectrum-eval", cfg.ScoreSpectrumEval)
+	}
+	if cfg.ScoreSpectrumLossMode != "" {
+		args = append(args, "--score-spectrum-loss-mode", cfg.ScoreSpectrumLossMode)
+	}
+	if configNonZero(cfg.ScoreSpectrumRecoveryWeight) {
+		args = append(args, "--score-spectrum-recovery-weight", cfg.ScoreSpectrumRecoveryWeight)
+	}
+	if configNonZero(cfg.ScoreSpectrumRecoveryMargin) {
+		args = append(args, "--score-spectrum-recovery-margin", cfg.ScoreSpectrumRecoveryMargin)
+	}
+	if configNonZero(cfg.ScoreSpectrumRecoveryTopK) {
+		args = append(args, "--score-spectrum-recovery-top-k", cfg.ScoreSpectrumRecoveryTopK)
+	}
+	if configNonZero(cfg.ScoreSpectrumRecoveryTau) {
+		args = append(args, "--score-spectrum-recovery-tau", cfg.ScoreSpectrumRecoveryTau)
+	}
+	if configNonZero(cfg.ScoreSpectrumMaxBatchCandidates) {
+		args = append(args, "--score-spectrum-max-batch-candidates", cfg.ScoreSpectrumMaxBatchCandidates)
+	}
+	if scoreSpectrumTrainEnabled(cfg) && configNonZero(cfg.ScoreSpectrumActivationMicrobatchSize) {
+		args = append(args, "--score-spectrum-activation-microbatch-size", cfg.ScoreSpectrumActivationMicrobatchSize)
+	}
 	if cfg.TurboQuantPrefixSeed != "" {
 		args = append(args, "--turboquant-prefix-seed", cfg.TurboQuantPrefixSeed)
 	}
@@ -1204,6 +1360,15 @@ func trainCommonArgs(cfg candidateConfig) []string {
 	if cfg.TurboQuantRankMargin != "" {
 		args = append(args, "--turboquant-rank-margin", cfg.TurboQuantRankMargin)
 	}
+	if cfg.TurboQuantRankMarginLoss != "" {
+		args = append(args, "--turboquant-rank-margin-loss", cfg.TurboQuantRankMarginLoss)
+	}
+	if cfg.TurboQuantRankMarginReduction != "" {
+		args = append(args, "--turboquant-rank-margin-reduction", cfg.TurboQuantRankMarginReduction)
+	}
+	if cfg.TurboQuantRankMarginTau != "" {
+		args = append(args, "--turboquant-rank-margin-tau", cfg.TurboQuantRankMarginTau)
+	}
 	return args
 }
 
@@ -1215,6 +1380,10 @@ func hardNegativeTrainEnabled(cfg candidateConfig) bool {
 	return envEnabled("EOS_HARD_NEGATIVE_TRAIN") || cfg.HardNegativeTrain == "1" || strings.ToLower(cfg.HardNegativeTrain) == "true"
 }
 
+func scoreSpectrumTrainEnabled(cfg candidateConfig) bool {
+	return envEnabled("EOS_SCORE_SPECTRUM_TRAIN") || cfg.ScoreSpectrumTrain == "1" || strings.ToLower(cfg.ScoreSpectrumTrain) == "true"
+}
+
 func pairwiseQualityTarget(cfg candidateConfig) bool {
 	return cfg.QualityTarget == "pairwise" || cfg.QualityTarget == "both"
 }
@@ -1224,6 +1393,12 @@ func retrievalQualityTarget(cfg candidateConfig) bool {
 }
 
 func applyCandidateRuntimeEnv(cfg candidateConfig) {
+	// Candidate runs inherit an explicit resident default of off. A caller may
+	// still request the route deliberately (for a compatible compact artifact);
+	// in that case the trainer's fail-closed backend checks remain authoritative.
+	if strings.TrimSpace(os.Getenv("EOS_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN")) == "" {
+		os.Setenv("EOS_TRAIN_ENABLE_COMPACT_RESIDENT_TRAIN", "0")
+	}
 	if !envEnabled("EOS_TRAIN_DISABLE_ACTIVATION_ACCEL") && cfg.ActivationAccel != "" {
 		os.Setenv("EOS_TRAIN_ENABLE_ACTIVATION_ACCEL", cfg.ActivationAccel)
 	}
@@ -1248,11 +1423,10 @@ func runCandidate(cfg candidateConfig) (candidateConfig, error) {
 	err = runCmd(cfg, "Build manta CLI", "go-build.log", "go", []string{"build", "-trimpath", "-o", cfg.MantaBin, "./cmd/eos"})
 	guard err == nil else return cfg, err
 
-	let initialArtifact = os.Getenv("EOS_INITIAL_ARTIFACT")
-	if initialArtifact != "" {
+	if cfg.InitialArtifact != "" {
 		step("Copy pretrained artifact as starting point")
-		fmt.Println(f"+ cp -a {initialArtifact} {cfg.Artifact}")
-		err = copyPretrainedArtifact(initialArtifact, cfg.Artifact, cfg.ModelName)
+		fmt.Println(f"+ cp -a {cfg.InitialArtifact} {cfg.Artifact}")
+		err = copyPretrainedArtifact(cfg.InitialArtifact, cfg.Artifact, cfg.ModelName)
 		guard err == nil else return cfg, err
 	} else {
 		initArgs := []string{
@@ -1302,7 +1476,7 @@ func runCandidate(cfg candidateConfig) (candidateConfig, error) {
 	if cfg.TrainMode == "prepared_jsonl" && trainTokenizer == "" && tokenizerForEval != "" {
 		trainTokenizer = tokenizerForEval
 	}
-	if cfg.TrainMode == "prepared_jsonl" && tokenizerForEval != "" && envEnabled("EOS_PRETOKENIZE_JSONL") {
+	if cfg.TrainMode == "prepared_jsonl" && tokenizerForEval != "" && envEnabled("EOS_PRETOKENIZE_JSONL") && !scoreSpectrumTrainEnabled(cfg) {
 		trainTokenizeMode := "contrastive"
 		if pairwiseTrainEnabled(cfg) {
 			trainTokenizeMode = "pair"
@@ -1392,13 +1566,22 @@ func runCandidate(cfg candidateConfig) (candidateConfig, error) {
 			if cfg.HardNegativeSourceWeights != "" {
 				args = append(args, "--hard-negative-source-weights", cfg.HardNegativeSourceWeights)
 			}
+		} else if scoreSpectrumTrainEnabled(cfg) {
+			args = append(args, "--score-spectrum-train")
+			if configBool(cfg.AllowResearchOnlyScoreSpectrum) {
+				args = append(args, "--allow-research-only-score-spectrum")
+			}
 		}
 		if trainTokenizer != "" {
 			args = append(args, "--tokenizer", trainTokenizer)
 		} else if tokenJSONLForRun {
 			args = append(args, "--no-tokenizer")
 		}
-		args = append(args, cfg.Artifact, trainJSONLForRun, evalJSONLForRun)
+		if scoreSpectrumTrainEnabled(cfg) {
+			args = append(args, cfg.Artifact, trainJSONLForRun)
+		} else {
+			args = append(args, cfg.Artifact, trainJSONLForRun, evalJSONLForRun)
+		}
 		planArgs := append([]string{"train-embed", "--plan-only"}, common...)
 		if pairwiseTrainEnabled(cfg) {
 			planArgs = append(planArgs, "--pairwise-train")
@@ -1407,13 +1590,22 @@ func runCandidate(cfg candidateConfig) (candidateConfig, error) {
 			if cfg.HardNegativeSourceWeights != "" {
 				planArgs = append(planArgs, "--hard-negative-source-weights", cfg.HardNegativeSourceWeights)
 			}
+		} else if scoreSpectrumTrainEnabled(cfg) {
+			planArgs = append(planArgs, "--score-spectrum-train")
+			if configBool(cfg.AllowResearchOnlyScoreSpectrum) {
+				planArgs = append(planArgs, "--allow-research-only-score-spectrum")
+			}
 		}
 		if trainTokenizer != "" {
 			planArgs = append(planArgs, "--tokenizer", trainTokenizer)
 		} else if tokenJSONLForRun {
 			planArgs = append(planArgs, "--no-tokenizer")
 		}
-		planArgs = append(planArgs, cfg.Artifact, trainJSONLForRun, evalJSONLForRun)
+		if scoreSpectrumTrainEnabled(cfg) {
+			planArgs = append(planArgs, cfg.Artifact, trainJSONLForRun)
+		} else {
+			planArgs = append(planArgs, cfg.Artifact, trainJSONLForRun, evalJSONLForRun)
+		}
 		err = runCmd(cfg, "Plan prepared JSONL training workload", "train-plan.log", cfg.MantaBin, planArgs)
 		guard err == nil else return cfg, err
 		err = runCmd(cfg, "Train "+cfg.ModelName+" from prepared JSONL", "train.log", cfg.MantaBin, args)
@@ -1449,12 +1641,27 @@ func runCandidate(cfg candidateConfig) (candidateConfig, error) {
 	evalCandidate, err := copyPackageForEval(cfg, "validation")
 	guard err == nil else return cfg, err
 	evalArgs := []string{"train-embed", "--eval-only", "--metrics-json", cfg.FinalEvalMetricsJSON, "--seed", cfg.InitSeed}
+	scoreSpectrumEvalOnly := scoreSpectrumTrainEnabled(cfg) && cfg.ScoreSpectrumEval != ""
+	if scoreSpectrumEvalOnly {
+		evalArgs = append(evalArgs, "--score-spectrum-train")
+		if configBool(cfg.AllowResearchOnlyScoreSpectrum) {
+			evalArgs = append(evalArgs, "--allow-research-only-score-spectrum")
+		}
+		evalArgs = append(evalArgs, "--score-spectrum-eval", cfg.ScoreSpectrumEval)
+		if configNonZero(cfg.ScoreSpectrumActivationMicrobatchSize) {
+			evalArgs = append(evalArgs, "--score-spectrum-activation-microbatch-size", cfg.ScoreSpectrumActivationMicrobatchSize)
+		}
+	}
 	if evalTokenizer != "" {
 		evalArgs = append(evalArgs, "--tokenizer", evalTokenizer)
 	} else if tokenJSONLForRun {
 		evalArgs = append(evalArgs, "--no-tokenizer")
 	}
-	evalArgs = append(evalArgs, evalCandidate, evalJSONLForRun)
+	if scoreSpectrumEvalOnly {
+		evalArgs = append(evalArgs, evalCandidate, trainJSONLForRun)
+	} else {
+		evalArgs = append(evalArgs, evalCandidate, evalJSONLForRun)
+	}
 	err = runCmd(cfg, "Final validation eval-only", "final-eval.log", cfg.MantaBin, evalArgs)
 	guard err == nil else return cfg, err
 	err = runMetricsDiagnosis(cfg, "Final validation metrics diagnosis", "final-eval-diagnosis.log", cfg.FinalEvalMetricsJSON)
@@ -1467,12 +1674,26 @@ func runCandidate(cfg candidateConfig) (candidateConfig, error) {
 		hardCandidate, err := copyPackageForEval(cfg, "hard")
 		guard err == nil else return cfg, err
 		hardArgs := []string{"train-embed", "--eval-only", "--metrics-json", cfg.HardEvalMetricsJSON, "--seed", cfg.InitSeed}
+		if scoreSpectrumEvalOnly {
+			hardArgs = append(hardArgs, "--score-spectrum-train")
+			if configBool(cfg.AllowResearchOnlyScoreSpectrum) {
+				hardArgs = append(hardArgs, "--allow-research-only-score-spectrum")
+			}
+			hardArgs = append(hardArgs, "--score-spectrum-eval", cfg.ScoreSpectrumEval)
+			if configNonZero(cfg.ScoreSpectrumActivationMicrobatchSize) {
+				hardArgs = append(hardArgs, "--score-spectrum-activation-microbatch-size", cfg.ScoreSpectrumActivationMicrobatchSize)
+			}
+		}
 		if evalTokenizer != "" {
 			hardArgs = append(hardArgs, "--tokenizer", evalTokenizer)
 		} else if tokenJSONLForRun {
 			hardArgs = append(hardArgs, "--no-tokenizer")
 		}
-		hardArgs = append(hardArgs, hardCandidate, hardEvalJSONLForRun)
+		if scoreSpectrumEvalOnly {
+			hardArgs = append(hardArgs, hardCandidate, trainJSONLForRun)
+		} else {
+			hardArgs = append(hardArgs, hardCandidate, hardEvalJSONLForRun)
+		}
 		err = runCmd(cfg, "Hard holdout eval-only", "hard-eval.log", cfg.MantaBin, hardArgs)
 		guard err == nil else return cfg, err
 		gateMetrics = cfg.HardEvalMetricsJSON

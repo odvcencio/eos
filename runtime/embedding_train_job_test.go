@@ -252,6 +252,109 @@ func TestTrainEmbeddingPackageFromTextContrastiveFiles(t *testing.T) {
 	}
 }
 
+func TestTrainEmbeddingPackageFromContrastiveFilesScoreSpectrumUsesFileSource(t *testing.T) {
+	trainer := newTinyTrainableEmbeddingTrainer(t, 0.05)
+	path := writeTinyTrainingPackage(t, trainer)
+	trainPath := filepath.Join(t.TempDir(), "score-spectrum.tokens.jsonl")
+	rows := []EmbeddingScoreSpectrumExample{
+		{
+			QueryTokens:             []int32{0},
+			QueryMask:               []int32{1},
+			CandidateIDs:            []string{"p0", "n0"},
+			CandidateTokens:         [][]int32{{0}, {1}},
+			CandidateMasks:          [][]int32{{1}, {1}},
+			PositiveIndexes:         []int{0},
+			HardNegativeEligible:    []bool{false, true},
+			TargetProbabilities:     []float32{1, 0},
+			ReleaseTrainAllowed:     true,
+			CommercialUseAllowed:    true,
+			TrainAllowedForResearch: false,
+		},
+		{
+			QueryTokens:             []int32{1},
+			QueryMask:               []int32{1},
+			CandidateIDs:            []string{"p1", "n1", "n2"},
+			CandidateTokens:         [][]int32{{1}, {0}, {2}},
+			CandidateMasks:          [][]int32{{1}, {1}, {1}},
+			PositiveIndexes:         []int{0},
+			HardNegativeEligible:    []bool{false, true, true},
+			TargetProbabilities:     []float32{1, 0, 0},
+			ReleaseTrainAllowed:     true,
+			CommercialUseAllowed:    true,
+			TrainAllowedForResearch: false,
+		},
+	}
+	if err := WriteEmbeddingScoreSpectrumExamplesFile(trainPath, rows); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	summary, _, err := TrainEmbeddingPackageFromContrastiveFiles(path, trainPath, "", EmbeddingTrainRunConfig{
+		Epochs:                          1,
+		BatchSize:                       2,
+		Shuffle:                         false,
+		ScoreSpectrumTrain:              true,
+		ScoreSpectrumMaxBatchCandidates: 2,
+	})
+	if err != nil {
+		t.Fatalf("train tokenized score-spectrum package: %v", err)
+	}
+	if summary.Workload.TrainBatchesPerEpoch != 2 || summary.Workload.ActualTrainPairs != 5 || summary.Workload.ActualTrainExamples != 2 {
+		t.Fatalf("score-spectrum workload = %+v, want two batches and all five candidates", summary.Workload)
+	}
+}
+
+func TestTrainEmbeddingPackageFromTextContrastiveFilesScoreSpectrumUsesFileSource(t *testing.T) {
+	trainer := newTinyTrainableEmbeddingTrainer(t, 0.05)
+	path := writeTinyTrainingPackage(t, trainer)
+	tokenizerPath := DefaultTokenizerPath(path)
+	if err := (TokenizerFile{
+		Version: TokenizerFileVersion,
+		Tokens:  []string{"a", "b", "c"},
+	}).WriteFile(tokenizerPath); err != nil {
+		t.Fatalf("write tokenizer: %v", err)
+	}
+	trainPath := filepath.Join(t.TempDir(), "score-spectrum.text.jsonl")
+	rows := []EmbeddingTextScoreSpectrumExample{
+		{
+			Query:                   "a",
+			CandidateIDs:            []string{"p0", "n0"},
+			Candidates:              []string{"a", "b"},
+			PositiveIndexes:         []int{0},
+			HardNegativeEligible:    []bool{false, true},
+			TargetProbabilities:     []float32{1, 0},
+			ReleaseTrainAllowed:     true,
+			CommercialUseAllowed:    true,
+			TrainAllowedForResearch: false,
+		},
+		{
+			Query:                   "b",
+			CandidateIDs:            []string{"p1", "n1", "n2"},
+			Candidates:              []string{"b", "a", "c"},
+			PositiveIndexes:         []int{0},
+			HardNegativeEligible:    []bool{false, true, true},
+			TargetProbabilities:     []float32{1, 0, 0},
+			ReleaseTrainAllowed:     true,
+			CommercialUseAllowed:    true,
+			TrainAllowedForResearch: false,
+		},
+	}
+	if err := WriteEmbeddingTextScoreSpectrumExamplesFile(trainPath, rows); err != nil {
+		t.Fatalf("write text score-spectrum dataset: %v", err)
+	}
+	summary, _, err := TrainEmbeddingPackageFromTextContrastiveFiles(path, tokenizerPath, trainPath, "", EmbeddingTrainRunConfig{
+		Epochs:                          1,
+		BatchSize:                       2,
+		Shuffle:                         false,
+		ScoreSpectrumTrain:              true,
+		ScoreSpectrumMaxBatchCandidates: 2,
+	})
+	if err != nil {
+		t.Fatalf("train text score-spectrum package: %v", err)
+	}
+	if summary.Workload.TrainBatchesPerEpoch != 2 || summary.Workload.ActualTrainPairs != 5 || summary.Workload.ActualTrainExamples != 2 {
+		t.Fatalf("text score-spectrum workload = %+v, want two batches and all five candidates", summary.Workload)
+	}
+}
+
 func TestTrainEmbeddingPackageFromCorpusFile(t *testing.T) {
 	trainer := newTinyTrainableEncoderEmbeddingTrainer(t, 0.02)
 	path := writeTinyTrainingPackage(t, trainer)

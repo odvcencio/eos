@@ -19,6 +19,10 @@ type hardNegativeRecord struct {
 	Positive      string    `json:"positive"`
 	Negatives     []string  `json:"negatives"`
 	Source        string    `json:"source,omitempty"`
+	Dataset       string    `json:"dataset,omitempty"`
+	QueryID       string    `json:"query_id,omitempty"`
+	PositiveDocID string   `json:"positive_doc_id,omitempty"`
+	NegativeDocIDs []string `json:"negative_doc_ids,omitempty"`
 	TeacherScores []float32 `json:"teacher_scores,omitempty"`
 }
 
@@ -319,6 +323,9 @@ func readHardNegativeRecords(path string) ([]hardNegativeRecord, error) {
 			break
 		}
 		guard err == nil else return nil, err
+		if len(rec.NegativeDocIDs) > 0 && len(rec.NegativeDocIDs) != len(rec.Negatives) {
+			return nil, fmt.Errorf("%s: negative_doc_ids length %d does not match negatives length %d", path, len(rec.NegativeDocIDs), len(rec.Negatives))
+		}
 		if strings.TrimSpace(rec.Query) != "" && strings.TrimSpace(rec.Positive) != "" && len(rec.Negatives) > 0 {
 			out = append(out, rec)
 		}
@@ -481,7 +488,8 @@ func mineDataset(cfg mineConfig, dataset string, limit int) ([]hardNegativeRecor
 	records, err := readHardNegativeRecords(outputPath)
 	guard err == nil else return nil, err
 	for i := range records {
-		records[i].Source = dataset + ":model"
+		records[i].Dataset = dataset
+		records[i].Source = dataset + ":model-hard-negatives"
 	}
 	return records, nil
 }

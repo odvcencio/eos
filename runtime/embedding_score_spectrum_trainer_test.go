@@ -3,6 +3,7 @@ package eosruntime
 import (
 	"math"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -27,6 +28,7 @@ func TestEmbeddingTrainerTrainScoreSpectrumStep(t *testing.T) {
 	if trainer.step != 1 {
 		t.Fatalf("step = %d, want 1", trainer.step)
 	}
+
 }
 
 func TestEmbeddingTrainerTrainScoreSpectrumStepFoldsSelectedOnlyPositive(t *testing.T) {
@@ -363,6 +365,171 @@ func TestEmbeddingTrainerScoreSpectrumRecoveryChangesLossAndGradients(t *testing
 	}
 }
 
+func TestEmbeddingTrainerScoreSpectrumBaseLossWeightScalesBaseBranch(t *testing.T) {
+	queries := []*embeddingEncodedSequence{{pooled: []float32{1, 0}}}
+	candidates := []*embeddingEncodedSequence{
+		{pooled: []float32{1, 0}},
+		{pooled: []float32{0, 1}},
+		{pooled: []float32{-1, 0}},
+	}
+	example := EmbeddingScoreSpectrumExample{
+		PositiveIndexes:      []int{0},
+		HardNegativeEligible: []bool{false, true, true},
+		TargetProbabilities:  []float32{1, 0, 0},
+	}
+	cfg := EmbeddingTrainConfig{
+		Temperature:               1,
+		ScoreSpectrumLossMode:     ScoreSpectrumLossModeHardSoft,
+		ScoreSpectrumRecoveryTopK: 4,
+		ScoreSpectrumRecoveryTau:  1,
+	}
+	baseQueryGrads := [][]float32{{0, 0}}
+	baseCandidateGrads := [][]float32{{0, 0}, {0, 0}, {0, 0}}
+	baseLoss, _, _, err := accumulateScoreSpectrumGrads(queries, candidates, []embeddingCandidateSpan{{Start: 0, End: 3}}, []EmbeddingScoreSpectrumExample{example}, cfg, baseQueryGrads, baseCandidateGrads)
+	if err != nil {
+		t.Fatalf("base score-spectrum grads: %v", err)
+	}
+
+	for _, weight := range []float32{0.25, 2} {
+		t.Run(strconv.FormatFloat(float64(weight), 'g', -1, 32), func(t *testing.T) {
+			weighted := example
+			weighted.BaseLossWeight = float32Ptr(weight)
+			queryGrads := [][]float32{{0, 0}}
+			candidateGrads := [][]float32{{0, 0}, {0, 0}, {0, 0}}
+			loss, _, _, err := accumulateScoreSpectrumGrads(queries, candidates, []embeddingCandidateSpan{{Start: 0, End: 3}}, []EmbeddingScoreSpectrumExample{weighted}, cfg, queryGrads, candidateGrads)
+			if err != nil {
+				t.Fatalf("weighted score-spectrum grads: %v", err)
+			}
+			assertClose32(t, loss, baseLoss*weight, 1e-6, "loss")
+			for i := range queryGrads[0] {
+				assertClose32(t, queryGrads[0][i], baseQueryGrads[0][i]*weight, 1e-6, "query grad")
+			}
+			for row := range candidateGrads {
+				for col := range candidateGrads[row] {
+					assertClose32(t, candidateGrads[row][col], baseCandidateGrads[row][col]*weight, 1e-6, "candidate grad")
+				}
+			}
+		})
+	}
+}
+
+func TestEmbeddingTrainerScoreSpectrumBaseLossWeightZeroKeepsAuxDenominatorExact(t *testing.T) {
+	queries := []*embeddingEncodedSequence{{pooled: []float32{1, 0}}}
+	candidates := []*embeddingEncodedSequence{
+		{pooled: []float32{1, 0}},
+		{pooled: []float32{0, 1}},
+	}
+	example := EmbeddingScoreSpectrumExample{
+		RowID:                    "aux-only",
+		Source:                   "unit",
+		CandidateIDs:             []string{"p", "n"},
+		CandidateSources:         []string{"qrel", "q3"},
+		QrelGains:                []float32{1, 0},
+		PositiveIndexes:          []int{0},
+		HardNegativeEligible:     []bool{false, false},
+		TargetProbabilities:      []float32{1, 0},
+		BaseLossWeight:           float32Ptr(0),
+		TurboQuantTopKLossWeight: float32Ptr(1),
+	}
+	cfg := EmbeddingTrainConfig{
+		Temperature:                1,
+		TurboQuantTopKObjectives:   []TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.04}},
+		TurboQuantTopKLoss:         TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKCutoff:       2,
+		TurboQuantTopKTau:          0.05,
+		TurboQuantTopKNegativeMask: TurboQuantTopKNegativeMaskAll,
+		ScoreSpectrumLossMode:      ScoreSpectrumLossModeHardSoft,
+		ScoreSpectrumRecoveryTopK:  4,
+		ScoreSpectrumRecoveryTau:   1,
+	}
+	queryGrads := [][]float32{{0, 0}}
+	candidateGrads := [][]float32{{0, 0}, {0, 0}}
+	loss, _, pairs, err := accumulateScoreSpectrumGrads(queries, candidates, []embeddingCandidateSpan{{Start: 0, End: 2}}, []EmbeddingScoreSpectrumExample{example}, cfg, queryGrads, candidateGrads)
+	if err != nil {
+		t.Fatalf("aux-only score-spectrum grads: %v", err)
+	}
+	wantQueryGrads := [][]float32{{0, 0}}
+	wantCandidateGrads := [][]float32{{0, 0}, {0, 0}}
+	wantLoss, _, wantPairs, err := accumulateTurboQuantPreparedIPTopKScoreSpectrumRowGrads(queries, candidates, embeddingCandidateSpan{Start: 0, End: 2}, 0, example, cfg.TurboQuantTopKObjectives, cfg, 1, 1, cfg.TurboQuantTopKCutoff, cfg.TurboQuantTopKTau, cfg.TurboQuantTopKMargin, cfg.TurboQuantTopKNegativeMask, 1.04, wantQueryGrads, wantCandidateGrads)
+	if err != nil {
+		t.Fatalf("direct aux score-spectrum grads: %v", err)
+	}
+	if pairs != 2+wantPairs {
+		t.Fatalf("pairs = %d, want dense scoring count plus aux pairs %d", pairs, 2+wantPairs)
+	}
+	assertClose32(t, loss, wantLoss, 1e-6, "aux-only loss")
+	for i := range queryGrads[0] {
+		assertClose32(t, queryGrads[0][i], wantQueryGrads[0][i], 1e-6, "query aux grad")
+	}
+	for row := range candidateGrads {
+		for col := range candidateGrads[row] {
+			assertClose32(t, candidateGrads[row][col], wantCandidateGrads[row][col], 1e-6, "candidate aux grad")
+		}
+	}
+}
+
+func TestEmbeddingTrainerScoreSpectrumBaseLossWeightZeroBypassesRecoveryHardNegativeRequirement(t *testing.T) {
+	example := EmbeddingScoreSpectrumExample{
+		RowID:                    "aux-only-no-hard",
+		Source:                   "unit",
+		QueryTokens:              []int32{0},
+		QueryMask:                []int32{1},
+		CandidateIDs:             []string{"p", "n"},
+		CandidateSources:         []string{"qrel", "q3"},
+		QrelGains:                []float32{1, 0},
+		CandidateTokens:          [][]int32{{0}, {1}},
+		CandidateMasks:           [][]int32{{1}, {1}},
+		PositiveIndexes:          []int{0},
+		HardNegativeEligible:     []bool{false, false},
+		TargetProbabilities:      []float32{1, 0},
+		BaseLossWeight:           float32Ptr(0),
+		TurboQuantTopKLossWeight: float32Ptr(1),
+		CommercialUseAllowed:     true,
+	}
+	cfg := EmbeddingTrainRunConfig{
+		Epochs:                      1,
+		BatchSize:                   1,
+		TurboQuantTopKObjectives:    []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.04}},
+		TurboQuantTopKLoss:          TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKCutoff:        2,
+		TurboQuantTopKNegativeMask:  TurboQuantTopKNegativeMaskAll,
+		ScoreSpectrumLossMode:       ScoreSpectrumLossModeRecovery,
+		ScoreSpectrumRecoveryWeight: 1,
+		ScoreSpectrumRecoveryTopK:   1,
+		ScoreSpectrumRecoveryTau:    0.25,
+	}
+	if _, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum([]EmbeddingScoreSpectrumExample{example}, nil, cfg); err != nil {
+		t.Fatalf("aux-only recovery fit: %v", err)
+	}
+	activeBase := example
+	activeBase.BaseLossWeight = nil
+	_, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum([]EmbeddingScoreSpectrumExample{activeBase}, nil, cfg)
+	if err == nil || !strings.Contains(err.Error(), "recovery loss requires at least one eligible hard-negative candidate") {
+		t.Fatalf("active-base recovery error = %v, want missing hard-negative rejection", err)
+	}
+}
+
+func TestEmbeddingTrainerScoreSpectrumBaseLossWeightZeroWithoutEffectiveAuxFails(t *testing.T) {
+	example := EmbeddingScoreSpectrumExample{
+		RowID:                   "runtime-no-objective",
+		Source:                  "unit",
+		QueryTokens:             []int32{0},
+		QueryMask:               []int32{1},
+		CandidateTokens:         [][]int32{{0}, {1}},
+		CandidateMasks:          [][]int32{{1}, {1}},
+		PositiveIndexes:         []int{0},
+		HardNegativeEligible:    []bool{false, true},
+		TargetProbabilities:     []float32{1, 0},
+		BaseLossWeight:          float32Ptr(0),
+		CommercialUseAllowed:    true,
+		TrainAllowedForResearch: false,
+	}
+	_, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).TrainScoreSpectrumStep([]EmbeddingScoreSpectrumExample{example})
+	if err == nil || !strings.Contains(err.Error(), "row_id=\"runtime-no-objective\"") || !strings.Contains(err.Error(), "source=\"unit\"") || !strings.Contains(err.Error(), "no active objective") {
+		t.Fatalf("error = %v, want current-config no-active-objective diagnostics", err)
+	}
+}
+
 func TestEmbeddingTrainerScoreSpectrumRecoveryFoldsSelectedOnlyPositive(t *testing.T) {
 	selected := 0
 	batch := []EmbeddingScoreSpectrumExample{{
@@ -388,6 +555,383 @@ func TestEmbeddingTrainerScoreSpectrumRecoveryFoldsSelectedOnlyPositive(t *testi
 	}
 	if metrics.Loss <= 0 || trainer.step != 1 {
 		t.Fatalf("metrics/step = %+v/%d, want positive loss and one update", metrics, trainer.step)
+	}
+}
+
+func TestEmbeddingTrainerScoreSpectrumTurboQuantTopKLambdaNDCGUsesQrelGainsAndMasks(t *testing.T) {
+	example := EmbeddingScoreSpectrumExample{
+		QueryTokens:             []int32{0},
+		QueryMask:               []int32{1},
+		CandidateIDs:            []string{"q3-neg", "strong", "weak", "bm25-neg"},
+		CandidateSources:        []string{"q3", "qrel", "qrel", "bm25"},
+		QrelGains:               []float32{0, 2, 1, 0},
+		CandidateTokens:         [][]int32{{1}, {0}, {2}, {1}},
+		CandidateMasks:          [][]int32{{1}, {1}, {1}, {1}},
+		PositiveIndexes:         []int{1, 2},
+		HardNegativeEligible:    []bool{true, false, false, true},
+		TargetProbabilities:     []float32{0, 0.7, 0.3, 0},
+		CommercialUseAllowed:    true,
+		TrainAllowedForResearch: false,
+	}
+	if got := scoreSpectrumTopKStaticEligiblePairCount(example, TurboQuantTopKNegativeMaskQ3); got != 3 {
+		t.Fatalf("q3 static pairs = %d, want 3", got)
+	}
+	if got := scoreSpectrumTopKStaticEligiblePairCount(example, TurboQuantTopKNegativeMaskBM25); got != 3 {
+		t.Fatalf("bm25 static pairs = %d, want 3", got)
+	}
+	if got := scoreSpectrumTopKStaticEligiblePairCount(example, TurboQuantTopKNegativeMaskHard); got != 5 {
+		t.Fatalf("hard static pairs = %d, want 5", got)
+	}
+	allExample := example
+	allExample.CandidateIDs = []string{"q3-neg", "strong", "weak", "bm25-neg", "unmarked-neg"}
+	allExample.CandidateSources = []string{"q3", "qrel", "qrel", "bm25", "manual"}
+	allExample.QrelGains = []float32{0, 2, 1, 0, 0}
+	allExample.CandidateTokens = [][]int32{{1}, {0}, {2}, {1}, {2}}
+	allExample.CandidateMasks = [][]int32{{1}, {1}, {1}, {1}, {1}}
+	allExample.HardNegativeEligible = []bool{true, false, false, true, false}
+	allExample.TargetProbabilities = []float32{0, 0.7, 0.3, 0, 0}
+	if got := scoreSpectrumTopKStaticEligiblePairCount(allExample, TurboQuantTopKNegativeMaskHard); got != 5 {
+		t.Fatalf("hard static pairs with unmarked lower = %d, want 5", got)
+	}
+	if got := scoreSpectrumTopKStaticEligiblePairCount(allExample, TurboQuantTopKNegativeMaskAll); got != 7 {
+		t.Fatalf("all static pairs with unmarked lower = %d, want 7", got)
+	}
+
+	trainer := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	trainer.config.TurboQuantTopKObjectives = []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.5}}
+	trainer.config.TurboQuantTopKLoss = TurboQuantTopKLossLambdaNDCG
+	trainer.config.TurboQuantTopKCutoff = 2
+	trainer.config.TurboQuantTopKTau = 0.05
+	trainer.config.TurboQuantTopKNegativeMask = TurboQuantTopKNegativeMaskQ3
+	metrics, err := trainer.TrainScoreSpectrumStep([]EmbeddingScoreSpectrumExample{example})
+	if err != nil {
+		t.Fatalf("train score-spectrum top-k step: %v", err)
+	}
+	if metrics.BatchSize != 7 {
+		t.Fatalf("batch size = %d, want 4 dense candidates + 3 q3 top-k label pairs", metrics.BatchSize)
+	}
+	if metrics.Loss < 0 || math.IsNaN(float64(metrics.Loss)) || math.IsInf(float64(metrics.Loss), 0) {
+		t.Fatalf("loss = %f, want finite non-negative", metrics.Loss)
+	}
+	if trainer.step != 1 {
+		t.Fatalf("step = %d, want 1", trainer.step)
+	}
+
+	disabled := example
+	disabled.TurboQuantTopKLossWeight = float32Ptr(0)
+	disabledTrainer := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	disabledTrainer.config.TurboQuantTopKObjectives = trainer.config.TurboQuantTopKObjectives
+	disabledTrainer.config.TurboQuantTopKLoss = trainer.config.TurboQuantTopKLoss
+	disabledTrainer.config.TurboQuantTopKCutoff = trainer.config.TurboQuantTopKCutoff
+	disabledTrainer.config.TurboQuantTopKTau = trainer.config.TurboQuantTopKTau
+	disabledTrainer.config.TurboQuantTopKNegativeMask = trainer.config.TurboQuantTopKNegativeMask
+	disabledMetrics, err := disabledTrainer.TrainScoreSpectrumStep([]EmbeddingScoreSpectrumExample{disabled})
+	if err != nil {
+		t.Fatalf("train score-spectrum top-k disabled row: %v", err)
+	}
+	if disabledMetrics.BatchSize != 4 {
+		t.Fatalf("disabled-row batch size = %d, want 4 dense candidates and zero top-k label pairs", disabledMetrics.BatchSize)
+	}
+}
+
+func TestEmbeddingTrainerFitScoreSpectrumTurboQuantTopKWorkloadAndFullDimValidation(t *testing.T) {
+	batch := []EmbeddingScoreSpectrumExample{{
+		QueryTokens:             []int32{0},
+		QueryMask:               []int32{1},
+		CandidateIDs:            []string{"n", "p2", "p1"},
+		CandidateSources:        []string{"q3", "qrel", "qrel"},
+		QrelGains:               []float32{0, 2, 1},
+		CandidateTokens:         [][]int32{{1}, {0}, {2}},
+		CandidateMasks:          [][]int32{{1}, {1}, {1}},
+		PositiveIndexes:         []int{1, 2},
+		HardNegativeEligible:    []bool{true, false, false},
+		TargetProbabilities:     []float32{0, 0.8, 0.2},
+		CommercialUseAllowed:    true,
+		TrainAllowedForResearch: false,
+	}}
+	cfg := EmbeddingTrainRunConfig{
+		Epochs:                     1,
+		BatchSize:                  1,
+		TurboQuantTopKObjectives:   []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.5}},
+		TurboQuantTopKLoss:         TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKCutoff:       2,
+		TurboQuantTopKTau:          0.05,
+		TurboQuantTopKNegativeMask: TurboQuantTopKNegativeMaskQ3,
+	}
+	summary, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, cfg)
+	if err != nil {
+		t.Fatalf("fit score-spectrum top-k: %v", err)
+	}
+	if summary.Workload.PlannedTrainPairs != 6 || summary.Workload.ActualTrainPairs != 6 {
+		t.Fatalf("planned/actual train pairs = %d/%d, want 6", summary.Workload.PlannedTrainPairs, summary.Workload.ActualTrainPairs)
+	}
+	if got := summary.Config.TurboQuantTopKNegativeMask; got != TurboQuantTopKNegativeMaskQ3 {
+		t.Fatalf("top-k mask = %q, want q3", got)
+	}
+
+	disabled := batch
+	disabled[0].TurboQuantTopKLossWeight = float32Ptr(0)
+	summary, err = newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(disabled, nil, cfg)
+	if err != nil {
+		t.Fatalf("fit score-spectrum disabled top-k row: %v", err)
+	}
+	if summary.Workload.PlannedTrainPairs != 3 || summary.Workload.ActualTrainPairs != 3 {
+		t.Fatalf("disabled-row planned/actual train pairs = %d/%d, want 3", summary.Workload.PlannedTrainPairs, summary.Workload.ActualTrainPairs)
+	}
+
+	cfg.TurboQuantTopKObjectives = []TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.5}}
+	_, err = newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, cfg)
+	if err == nil || !strings.Contains(err.Error(), "must equal served embedding dimension") {
+		t.Fatalf("error = %v, want full-dim top-k rejection", err)
+	}
+}
+
+func TestEmbeddingTrainerFitScoreSpectrumTurboQuantTopKRecallBranchAccounting(t *testing.T) {
+	batch := []EmbeddingScoreSpectrumExample{{
+		QueryTokens:                    []int32{0},
+		QueryMask:                      []int32{1},
+		CandidateIDs:                   []string{"p", "q3-neg", "bm25-neg"},
+		CandidateSources:               []string{"qrel", "q3", "bm25"},
+		QrelGains:                      []float32{1, 0, 0},
+		CandidateTokens:                [][]int32{{0}, {1}, {2}},
+		CandidateMasks:                 [][]int32{{1}, {1}, {1}},
+		PositiveIndexes:                []int{0},
+		HardNegativeEligible:           []bool{false, true, true},
+		TargetProbabilities:            []float32{1, 0, 0},
+		TurboQuantTopKLossWeight:       float32Ptr(0),
+		TurboQuantTopKRecallLossWeight: nil,
+		CommercialUseAllowed:           true,
+		TrainAllowedForResearch:        false,
+	}}
+	cfg := EmbeddingTrainRunConfig{
+		Epochs:                           1,
+		BatchSize:                        1,
+		TurboQuantTopKObjectives:         []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.5}},
+		TurboQuantTopKLoss:               TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKCutoff:             2,
+		TurboQuantTopKTau:                0.05,
+		TurboQuantTopKNegativeMask:       TurboQuantTopKNegativeMaskQ3,
+		TurboQuantTopKRecallWeight:       0.25,
+		TurboQuantTopKRecallCutoff:       100,
+		TurboQuantTopKRecallTau:          0.07,
+		TurboQuantTopKRecallMargin:       0.01,
+		TurboQuantTopKRecallNegativeMask: TurboQuantTopKNegativeMaskBM25,
+	}
+	summary, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, cfg)
+	if err != nil {
+		t.Fatalf("fit score-spectrum top-k recall: %v", err)
+	}
+	if summary.Workload.PlannedTrainPairs != 4 || summary.Workload.ActualTrainPairs != 4 || summary.FinalTrain.BatchSize != 1 {
+		t.Fatalf("workload/final train = %+v final=%+v, want 3 dense + 1 recall pair and 1 example", summary.Workload, summary.FinalTrain)
+	}
+	if summary.Config.TurboQuantTopKRecallWeight != 0.25 || summary.Config.TurboQuantTopKRecallCutoff != 100 || summary.Config.TurboQuantTopKRecallTau != 0.07 || summary.Config.TurboQuantTopKRecallMargin != 0.01 || summary.Config.TurboQuantTopKRecallNegativeMask != TurboQuantTopKNegativeMaskBM25 {
+		t.Fatalf("summary recall config = %+v, want exact configured recall branch", summary.Config)
+	}
+
+	batch[0].TurboQuantTopKRecallLossWeight = float32Ptr(0)
+	summary, err = newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, cfg)
+	if err != nil {
+		t.Fatalf("fit score-spectrum disabled top-k recall row: %v", err)
+	}
+	if summary.Workload.PlannedTrainPairs != 3 || summary.Workload.ActualTrainPairs != 3 {
+		t.Fatalf("disabled recall workload = %+v, want only dense candidates", summary.Workload)
+	}
+}
+
+func TestEmbeddingTrainerFitScoreSpectrumTurboQuantTopKRecallDefaultCutoffIncludesLatePairs(t *testing.T) {
+	candidateIDs := make([]string, 12)
+	candidateSources := make([]string, 12)
+	qrelGains := make([]float32, 12)
+	candidateTokens := make([][]int32, 12)
+	candidateMasks := make([][]int32, 12)
+	hardNegativeEligible := make([]bool, 12)
+	targetProbabilities := make([]float32, 12)
+	for i := range candidateIDs {
+		candidateIDs[i] = "n" + strconv.Itoa(i)
+		candidateSources[i] = "manual"
+		candidateTokens[i] = []int32{int32(i % 3)}
+		candidateMasks[i] = []int32{1}
+	}
+	candidateIDs[10] = "p-late"
+	candidateSources[10] = "qrel"
+	qrelGains[10] = 1
+	targetProbabilities[10] = 1
+	candidateIDs[11] = "bm25-tail"
+	candidateSources[11] = "bm25"
+	hardNegativeEligible[11] = true
+
+	batch := []EmbeddingScoreSpectrumExample{{
+		QueryTokens:                    []int32{0},
+		QueryMask:                      []int32{1},
+		CandidateIDs:                   candidateIDs,
+		CandidateSources:               candidateSources,
+		QrelGains:                      qrelGains,
+		CandidateTokens:                candidateTokens,
+		CandidateMasks:                 candidateMasks,
+		PositiveIndexes:                []int{10},
+		HardNegativeEligible:           hardNegativeEligible,
+		TargetProbabilities:            targetProbabilities,
+		TurboQuantTopKLossWeight:       float32Ptr(0),
+		TurboQuantTopKRecallLossWeight: nil,
+		CommercialUseAllowed:           true,
+		TrainAllowedForResearch:        false,
+	}}
+	cfg := EmbeddingTrainRunConfig{
+		Epochs:                           1,
+		BatchSize:                        1,
+		TurboQuantTopKObjectives:         []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.5}},
+		TurboQuantTopKLoss:               TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKCutoff:             2,
+		TurboQuantTopKNegativeMask:       TurboQuantTopKNegativeMaskQ3,
+		TurboQuantTopKRecallWeight:       0.25,
+		TurboQuantTopKRecallNegativeMask: TurboQuantTopKNegativeMaskBM25,
+	}
+	defaultCutoffSummary, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, cfg)
+	if err != nil {
+		t.Fatalf("fit score-spectrum default top-k recall cutoff: %v", err)
+	}
+	if defaultCutoffSummary.Config.TurboQuantTopKRecallCutoff != 100 {
+		t.Fatalf("default recall cutoff = %d, want 100", defaultCutoffSummary.Config.TurboQuantTopKRecallCutoff)
+	}
+	if defaultCutoffSummary.Workload.PlannedTrainPairs != 13 || defaultCutoffSummary.Workload.ActualTrainPairs != 13 {
+		t.Fatalf("default recall cutoff workload = %+v, want 12 dense + 1 late recall pair", defaultCutoffSummary.Workload)
+	}
+
+	cfg.TurboQuantTopKRecallCutoff = 10
+	narrowCutoffSummary, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, cfg)
+	if err != nil {
+		t.Fatalf("fit score-spectrum explicit narrow top-k recall cutoff: %v", err)
+	}
+	if narrowCutoffSummary.Config.TurboQuantTopKRecallCutoff != 10 {
+		t.Fatalf("narrow recall cutoff = %d, want explicit 10", narrowCutoffSummary.Config.TurboQuantTopKRecallCutoff)
+	}
+}
+
+func TestEmbeddingTrainerScoreSpectrumTurboQuantTopKRecallDisabledMatchesLegacyTopK(t *testing.T) {
+	example := EmbeddingScoreSpectrumExample{
+		QueryTokens:             []int32{0},
+		QueryMask:               []int32{1},
+		CandidateIDs:            []string{"p", "q3-neg"},
+		CandidateSources:        []string{"qrel", "q3"},
+		QrelGains:               []float32{1, 0},
+		CandidateTokens:         [][]int32{{0}, {1}},
+		CandidateMasks:          [][]int32{{1}, {1}},
+		PositiveIndexes:         []int{0},
+		HardNegativeEligible:    []bool{false, true},
+		TargetProbabilities:     []float32{1, 0},
+		CommercialUseAllowed:    true,
+		TrainAllowedForResearch: false,
+	}
+	baseTrainer := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	baseTrainer.config.TurboQuantTopKObjectives = []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.5}}
+	baseTrainer.config.TurboQuantTopKLoss = TurboQuantTopKLossLambdaNDCG
+	baseTrainer.config.TurboQuantTopKCutoff = 2
+	baseTrainer.config.TurboQuantTopKTau = 0.05
+	baseTrainer.config.TurboQuantTopKNegativeMask = TurboQuantTopKNegativeMaskQ3
+	baseMetrics, err := baseTrainer.TrainScoreSpectrumStep([]EmbeddingScoreSpectrumExample{example})
+	if err != nil {
+		t.Fatalf("base top-k train: %v", err)
+	}
+
+	recallDisabledTrainer := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	recallDisabledTrainer.config = baseTrainer.config
+	recallDisabledTrainer.config.TurboQuantTopKRecallWeight = 0
+	recallDisabledMetrics, err := recallDisabledTrainer.TrainScoreSpectrumStep([]EmbeddingScoreSpectrumExample{example})
+	if err != nil {
+		t.Fatalf("recall-disabled top-k train: %v", err)
+	}
+	if recallDisabledMetrics.Loss != baseMetrics.Loss || recallDisabledMetrics.AverageScore != baseMetrics.AverageScore || recallDisabledMetrics.BatchSize != baseMetrics.BatchSize {
+		t.Fatalf("recall-disabled metrics = %+v, want legacy %+v", recallDisabledMetrics, baseMetrics)
+	}
+}
+
+func TestEmbeddingTrainerFitScoreSpectrumTurboQuantTopKPreservesSeedAndTelemetry(t *testing.T) {
+	batch := []EmbeddingScoreSpectrumExample{{
+		QueryTokens:             []int32{0},
+		QueryMask:               []int32{1},
+		CandidateIDs:            []string{"p", "hn", "unmarked"},
+		CandidateSources:        []string{"qrel", "q3", "manual"},
+		QrelGains:               []float32{1, 0, 0},
+		CandidateTokens:         [][]int32{{0}, {1}, {2}},
+		CandidateMasks:          [][]int32{{1}, {1}, {1}},
+		PositiveIndexes:         []int{0},
+		HardNegativeEligible:    []bool{false, true, false},
+		TargetProbabilities:     []float32{1, 0, 0},
+		CommercialUseAllowed:    true,
+		TrainAllowedForResearch: false,
+	}}
+	trainer := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	trainer.config.TurboQuantPrefixBits = []int{2}
+	trainer.config.TurboQuantPrefixWeight = 0.25
+	trainer.config.TurboQuantPrefixSeed = 1234
+	var progress []EmbeddingTrainProgress
+	summary, err := trainer.FitScoreSpectrum(batch, nil, EmbeddingTrainRunConfig{
+		Epochs:                     1,
+		BatchSize:                  1,
+		TurboQuantTopKObjectives:   []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.5}},
+		TurboQuantTopKLoss:         TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKNegativeMask: TurboQuantTopKNegativeMaskAll,
+		TurboQuantPrefixSeed:       1234,
+		ProgressEverySteps:         1,
+		Progress:                   func(update EmbeddingTrainProgress) { progress = append(progress, update) },
+	})
+	if err != nil {
+		t.Fatalf("fit score-spectrum top-k seed/telemetry: %v", err)
+	}
+	if summary.Config.TurboQuantPrefixSeed != 1234 || trainer.config.TurboQuantPrefixSeed != 1234 {
+		t.Fatalf("prefix seed summary/trainer = %d/%d, want 1234", summary.Config.TurboQuantPrefixSeed, trainer.config.TurboQuantPrefixSeed)
+	}
+	if len(summary.Config.TurboQuantPrefixBits) != 0 || len(trainer.config.TurboQuantPrefixBits) != 0 {
+		t.Fatalf("prefix bits summary/trainer = %v/%v, want isolated", summary.Config.TurboQuantPrefixBits, trainer.config.TurboQuantPrefixBits)
+	}
+	if summary.Workload.PlannedTrainPairs != 5 || summary.Workload.ActualTrainPairs != 5 {
+		t.Fatalf("planned/actual pairs = %d/%d, want 5", summary.Workload.PlannedTrainPairs, summary.Workload.ActualTrainPairs)
+	}
+	if len(progress) == 0 {
+		t.Fatalf("expected score-spectrum progress")
+	}
+	if progress[0].FirstSpanCandidates != 3 || progress[0].BatchPairs != 5 {
+		t.Fatalf("first progress candidates/pairs = %d/%d, want 3/5", progress[0].FirstSpanCandidates, progress[0].BatchPairs)
+	}
+	artifactPath := filepath.Join(t.TempDir(), "tiny_train_embed_q8.mll")
+	paths, err := trainer.WriteTrainingPackage(artifactPath)
+	if err != nil {
+		t.Fatalf("write training package: %v", err)
+	}
+	manifest, err := ReadEmbeddingTrainManifestFile(paths.TrainManifestPath)
+	if err != nil {
+		t.Fatalf("read train manifest: %v", err)
+	}
+	if manifest.Config.TurboQuantPrefixSeed != 1234 {
+		t.Fatalf("manifest prefix seed = %d, want 1234", manifest.Config.TurboQuantPrefixSeed)
+	}
+	checkpoint, err := ReadEmbeddingTrainCheckpointFile(paths.CheckpointPath)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	if checkpoint.Config.TurboQuantPrefixSeed != 1234 {
+		t.Fatalf("checkpoint prefix seed = %d, want 1234", checkpoint.Config.TurboQuantPrefixSeed)
+	}
+	reloaded, err := LoadEmbeddingTrainerPackage(artifactPath)
+	if err != nil {
+		t.Fatalf("reload training package: %v", err)
+	}
+	if reloaded.config.TurboQuantPrefixSeed != 1234 {
+		t.Fatalf("reloaded prefix seed = %d, want 1234", reloaded.config.TurboQuantPrefixSeed)
+	}
+}
+
+func TestEmbeddingTrainerFitScoreSpectrumRejectsNoAuthorizedUseRows(t *testing.T) {
+	batch := tinyEmbeddingScoreSpectrumDataset()
+	batch[0].ReleaseTrainAllowed = false
+	batch[0].CommercialUseAllowed = false
+	batch[0].TrainAllowedForResearch = false
+	_, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitScoreSpectrum(batch, nil, EmbeddingTrainRunConfig{
+		Epochs:    1,
+		BatchSize: 1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "no authorized training use") {
+		t.Fatalf("fit no-authorized-use error = %v, want fail-closed legal gate", err)
 	}
 }
 
@@ -689,6 +1233,34 @@ func TestEstimateScoreSpectrumTrainWorkloadCountsRowLocalCandidates(t *testing.T
 	}
 	if workload.TrainPairsPerEpoch != 4 || workload.PlannedTrainPairs != 8 {
 		t.Fatalf("train pairs per epoch/planned = %d/%d, want 4/8", workload.TrainPairsPerEpoch, workload.PlannedTrainPairs)
+	}
+}
+
+func TestEstimateScoreSpectrumTrainWorkloadCountsAuxOnlyRows(t *testing.T) {
+	trainSet := tinyEmbeddingScoreSpectrumDataset()
+	trainSet[1].BaseLossWeight = float32Ptr(0)
+	workload := EstimateScoreSpectrumTrainWorkload(trainSet, 0, EmbeddingTrainRunConfig{
+		Epochs:                     1,
+		BatchSize:                  2,
+		TurboQuantTopKObjectives:   []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.04}},
+		TurboQuantTopKLoss:         TurboQuantTopKLossLambdaNDCG,
+		TurboQuantTopKNegativeMask: TurboQuantTopKNegativeMaskHard,
+	})
+	if workload.ScoreSpectrumAuxOnlyRows != 1 {
+		t.Fatalf("aux-only rows = %d, want 1", workload.ScoreSpectrumAuxOnlyRows)
+	}
+}
+
+func TestScoreSpectrumActivationMicrobatchRunConfig(t *testing.T) {
+	if err := validateScoreSpectrumRunConfig(EmbeddingTrainRunConfig{ScoreSpectrumActivationMicrobatchSize: 8, ScoreSpectrumRecoveryTopK: 1, ScoreSpectrumRecoveryTau: 1}); err != nil {
+		t.Fatalf("positive activation microbatch config rejected: %v", err)
+	}
+	if err := validateScoreSpectrumRunConfig(EmbeddingTrainRunConfig{ScoreSpectrumActivationMicrobatchSize: -1}); err == nil || !strings.Contains(err.Error(), "score_spectrum_activation_microbatch_size") {
+		t.Fatalf("negative activation microbatch config error = %v, want non-negative rejection", err)
+	}
+	got := normalizedScoreSpectrumRunConfig(EmbeddingTrainRunConfig{ScoreSpectrumActivationMicrobatchSize: 8})
+	if got.ScoreSpectrumActivationMicrobatchSize != 8 {
+		t.Fatalf("normalized activation microbatch size = %d, want 8", got.ScoreSpectrumActivationMicrobatchSize)
 	}
 }
 

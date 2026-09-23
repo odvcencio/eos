@@ -414,6 +414,44 @@ func TestRunTrainAOQTSidecarRejectsMissingResearchAuthorization(t *testing.T) {
 	}
 }
 
+func TestRunTrainAOQTSidecarRejectsUnauthorizedV7DevMode(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	_, err := captureRunOutputAndError(t, append([]string{
+		"train-aoqt-sidecar",
+		"--allow-research-only-aoqt",
+		"--optimizer-mode", eosruntime.AOQTSidecarOptimizerModeV7DevTrustRegion,
+		"--dev-output-dir", t.TempDir(),
+		"--metrics-json", filepath.Join(t.TempDir(), "aoqt.metrics.json"),
+		"--max-steps", "1",
+	}, fixture.args...))
+	if err == nil || !strings.Contains(err.Error(), "requires explicit dev-only authorization") {
+		t.Fatalf("unauthorized V7 dev mode error = %v, want dev authorization rejection", err)
+	}
+}
+
+func TestRunTrainAOQTSidecarRejectsMixedV7DevAndPackageOutput(t *testing.T) {
+	fixture := writeTinyAOQTTrainCLIFixture(t)
+	root := t.TempDir()
+	splitPath := filepath.Join(root, "split.json")
+	writeJSONForTest(t, splitPath, map[string]any{"schema": "eos.aoqt.v7_dev_split_manifest.v1", "folds": []map[string]string{{"name": "fold-0"}}})
+	_, err := captureRunOutputAndError(t, append([]string{
+		"train-aoqt-sidecar",
+		"--allow-research-only-aoqt",
+		"--allow-dev-aoqt-v7",
+		"--optimizer-mode", eosruntime.AOQTSidecarOptimizerModeV7DevTrustRegion,
+		"--dev-output-dir", filepath.Join(root, "dev"),
+		"--output", filepath.Join(root, "candidate.mll"),
+		"--split-manifest", splitPath,
+		"--expected-split-manifest-sha256", sha256FileForCLITest(t, splitPath),
+		"--fold-id", "fold-0",
+		"--metrics-json", filepath.Join(root, "aoqt.metrics.json"),
+		"--max-steps", "1",
+	}, fixture.args...))
+	if err == nil || !strings.Contains(err.Error(), "dev-only training writes dev evidence only") {
+		t.Fatalf("mixed V7 dev/package output error = %v, want package output rejection", err)
+	}
+}
+
 func TestRunTrainAOQTSidecarPlanOnlyRejectsOutputPackage(t *testing.T) {
 	fixture := writeTinyAOQTTrainCLIFixture(t)
 	_, err := captureRunOutputAndError(t, append([]string{
@@ -950,7 +988,8 @@ func TestWriteTurboQuantRetrievalMetricsTSVIncludesLatencyColumns(t *testing.T) 
 	}
 	text := string(data)
 	for _, want := range []string{
-		"query_latency_p50_ms\tquery_latency_p95_ms\tquery_latency_p99_ms\tquery_latency_max_ms",
+		"rerank_storage\trerank_bits",
+		"scores_per_second\tcandidate_count\tcandidates_scored\tcandidates_pruned\tpruning_supported\tpruning_used\tcandidate_decisions_per_second\tquery_latency_p50_ms",
 		"\t0.100000\t0.200000\t0.300000\t0.400000\t",
 		"\t0.500000\t0.600000\t0.700000\t0.800000\t",
 	} {
@@ -962,7 +1001,7 @@ func TestWriteTurboQuantRetrievalMetricsTSVIncludesLatencyColumns(t *testing.T) 
 
 func TestRunPlanMultiVectorStorageWritesTSVAndJSON(t *testing.T) {
 	jsonPath := filepath.Join(t.TempDir(), "multivector-storage.json")
-	output := captureRunOutput(t, []string{
+	output, err := captureRunOutputAndError(t, []string{
 		"plan-multivector-storage",
 		"--dim", "128",
 		"--baseline-dim", "3072",
@@ -1014,7 +1053,7 @@ func TestRunPlanMultiVectorStorageWritesTSVAndJSON(t *testing.T) {
 
 func TestRunPlanMultiVectorStorageAccountsForVectorOverhead(t *testing.T) {
 	jsonPath := filepath.Join(t.TempDir(), "multivector-storage-overhead.json")
-	output := captureRunOutput(t, []string{
+	output, err := captureRunOutputAndError(t, []string{
 		"plan-multivector-storage",
 		"--dim", "128",
 		"--baseline-dim", "3072",
@@ -1183,6 +1222,42 @@ func TestRunPlanMultiVectorStorageRejectsNegativePackedObjectOverhead(t *testing
 	}
 }
 
+func TestRunEvalRetrievalTurboQuantResearchLoaderRequiresGateBinding(t *testing.T) {
+	for _, key := range []string{
+		"EOS_AOQT_GATE_BINDING_JSON",
+		"EOS_AOQT_GATE_BINDING_SHA256",
+		"EOS_AOQT_GATE_NONCE",
+		"EOS_AOQT_FROZEN_MANIFEST_SHA256",
+		"EOS_AOQT_FROZEN_MANIFEST_PATH",
+	} {
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+	}
+	err := run([]string{"eval-retrieval-turboquant", "--allow-research-only-aoqt", "/missing/candidate.mll", "/missing/dataset"})
+	if err == nil || !strings.Contains(err.Error(), "--allow-research-only-aoqt requires an AOQT gate binding") {
+		t.Fatalf("research-only AOQT eval error = %v, want gate-binding requirement", err)
+	}
+}
+
+func TestRunEvalRetrievalTurboQuantDefaultDoesNotRequestResearchLoader(t *testing.T) {
+	for _, key := range []string{
+		"EOS_AOQT_GATE_BINDING_JSON",
+		"EOS_AOQT_GATE_BINDING_SHA256",
+		"EOS_AOQT_GATE_NONCE",
+		"EOS_AOQT_FROZEN_MANIFEST_SHA256",
+		"EOS_AOQT_FROZEN_MANIFEST_PATH",
+	} {
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatalf("unset %s: %v", key, err)
+		}
+	}
+	err := run([]string{"eval-retrieval-turboquant", "/missing/candidate.mll", "/missing/dataset"})
+	if err == nil || strings.Contains(err.Error(), "research-only") {
+		t.Fatalf("default TurboQuant eval error = %v, want ordinary loader/path failure", err)
+	}
+}
+
 func TestRunEvalRetrievalMultiVectorTurboQuantWritesMetrics(t *testing.T) {
 	dir := t.TempDir()
 	qrelsDir := filepath.Join(dir, "qrels")
@@ -1246,13 +1321,13 @@ func TestRunEvalRetrievalMultiVectorTurboQuantWritesMetrics(t *testing.T) {
 			t.Fatalf("output missing %q\n%s", want, output)
 		}
 	}
-	data, err := os.ReadFile(metricsPath)
+	metricsData, err := os.ReadFile(metricsPath)
 	if err != nil {
 		t.Fatalf("read metrics: %v", err)
 	}
 	var metrics eosruntime.TurboQuantMultiVectorRetrievalEvalMetrics
-	if err := json.Unmarshal(data, &metrics); err != nil {
-		t.Fatalf("decode metrics: %v\n%s", err, data)
+	if err := json.Unmarshal(metricsData, &metrics); err != nil {
+		t.Fatalf("decode metrics: %v\n%s", err, metricsData)
 	}
 	if metrics.Schema != eosruntime.TurboQuantMultiVectorRetrievalEvalMetricsSchema || metrics.Artifact != "unit-cache" || metrics.Backend != "unit" {
 		t.Fatalf("metrics identity = %+v", metrics)
@@ -1686,6 +1761,300 @@ func TestRunInitModelBootstrapFromCopiesOverlap(t *testing.T) {
 	}
 	if _, err := eosruntime.LoadEmbeddingTrainerPackage(targetPath); err != nil {
 		t.Fatalf("reload bootstrapped package: %v", err)
+	}
+}
+
+func TestRunInitModelBootstrapFromInferenceCopiesSealedWeights(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source-inference.mll")
+	if err := run([]string{
+		"init-model",
+		"--vocab-size", "8",
+		"--max-seq", "8",
+		"--embedding-dim", "2",
+		"--hidden-dim", "4",
+		"--seed", "7",
+		sourcePath,
+	}); err != nil {
+		t.Fatalf("run source init-model: %v", err)
+	}
+	sourceWeights, err := eosruntime.ReadWeightFile(eosruntime.DefaultWeightFilePath(sourcePath))
+	if err != nil {
+		t.Fatalf("read source weights: %v", err)
+	}
+	sealedPath := filepath.Join(dir, "source-inference.sealed.mll")
+	if err := run([]string{"export-mll", sourcePath, sealedPath}); err != nil {
+		t.Fatalf("run export-mll: %v", err)
+	}
+
+	targetPath := filepath.Join(dir, "target-inference.mll")
+	output := captureRunOutput(t, []string{
+		"init-model",
+		"--seed", "11",
+		"--bootstrap-from-inference", sealedPath,
+		targetPath,
+	})
+	if !strings.Contains(output, "bootstrap inference: "+sealedPath) {
+		t.Fatalf("init-model output missing bootstrap inference path\noutput:\n%s", output)
+	}
+	targetCheckpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(eosruntime.DefaultEmbeddingCheckpointPath(targetPath))
+	if err != nil {
+		t.Fatalf("read target checkpoint: %v", err)
+	}
+	for i, got := range targetCheckpoint.TokenEmbedding.F32 {
+		if want := sourceWeights.Weights["token_embedding"].F32[i]; got != want {
+			t.Fatalf("target token embedding[%d] = %f, want sealed inference %f", i, got, want)
+		}
+	}
+	if targetCheckpoint.Step != 0 {
+		t.Fatalf("target step = %d, want 0", targetCheckpoint.Step)
+	}
+	for i, got := range targetCheckpoint.TokenMoment1.F32 {
+		if got != 0 {
+			t.Fatalf("target token moment 1[%d] = %f, want zero", i, got)
+		}
+	}
+}
+
+func TestRunInitModelBootstrapFromInferenceRejectsGraphOverrides(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source-inference-overrides.mll")
+	if err := run([]string{
+		"init-model",
+		"--vocab-size", "8",
+		"--max-seq", "8",
+		"--embedding-dim", "2",
+		"--hidden-dim", "4",
+		sourcePath,
+	}); err != nil {
+		t.Fatalf("run source init-model: %v", err)
+	}
+	sealedPath := filepath.Join(dir, "source-inference-overrides.sealed.mll")
+	if err := run([]string{"export-mll", sourcePath, sealedPath}); err != nil {
+		t.Fatalf("run export-mll: %v", err)
+	}
+
+	err := run([]string{
+		"init-model",
+		"--vocab-size", "8",
+		"--bootstrap-from-inference", sealedPath,
+		filepath.Join(dir, "target-inference-overrides.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected graph override rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-from-inference preserves the sealed source graph") {
+		t.Fatalf("error = %q, want graph-preserving override rejection", got)
+	}
+}
+
+func TestRunInitModelBootstrapFromInferenceWidenAllowsDimsAndZeroTails(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source-inference-widen.mll")
+	if err := run([]string{
+		"init-model",
+		"--vocab-size", "8",
+		"--max-seq", "8",
+		"--embedding-dim", "2",
+		"--hidden-dim", "4",
+		sourcePath,
+	}); err != nil {
+		t.Fatalf("run source init-model: %v", err)
+	}
+	sealedPath := filepath.Join(dir, "source-inference-widen.sealed.mll")
+	if err := run([]string{"export-mll", sourcePath, sealedPath}); err != nil {
+		t.Fatalf("run export-mll: %v", err)
+	}
+
+	targetPath := filepath.Join(dir, "target-inference-widen.mll")
+	output := captureRunOutput(t, []string{
+		"init-model",
+		"--bootstrap-from-inference", sealedPath,
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--hidden-dim", "5",
+		"--bootstrap-tail-init", "zero",
+		targetPath,
+	})
+	if !strings.Contains(output, "bootstrap inference: "+sealedPath) ||
+		!strings.Contains(output, "bootstrap inference widen: model_dim=3 hidden_dim=5 tail_init=zero") {
+		t.Fatalf("init-model output missing widen summary\noutput:\n%s", output)
+	}
+	manifest, err := eosruntime.ReadEmbeddingManifestFile(eosruntime.DefaultEmbeddingManifestPath(targetPath))
+	if err != nil {
+		t.Fatalf("read target manifest: %v", err)
+	}
+	if manifest.ModelDim != 3 || manifest.OutputDim != 3 || manifest.FFNDim != 5 || manifest.HeadDim != 3 {
+		t.Fatalf("target manifest dims = model:%d output:%d ffn:%d head:%d, want 3/3/5/3", manifest.ModelDim, manifest.OutputDim, manifest.FFNDim, manifest.HeadDim)
+	}
+	checkpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(eosruntime.DefaultEmbeddingCheckpointPath(targetPath))
+	if err != nil {
+		t.Fatalf("read target checkpoint: %v", err)
+	}
+	if got := checkpoint.TokenEmbedding.Shape; len(got) != 2 || got[0] != 8 || got[1] != 3 {
+		t.Fatalf("target token shape = %v, want [8 3]", got)
+	}
+	for row := 0; row < 8; row++ {
+		if got := checkpoint.TokenEmbedding.F32[row*3+2]; got != 0 {
+			t.Fatalf("token zero tail[%d,2] = %f, want 0", row, got)
+		}
+	}
+
+	projectionTailPath := filepath.Join(dir, "target-inference-widen-projection-tail.mll")
+	projectionTailOutput := captureRunOutput(t, []string{
+		"init-model",
+		"--bootstrap-from-inference", sealedPath,
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--hidden-dim", "5",
+		"--bootstrap-tail-init", "projection-tail",
+		"--bootstrap-tail-scale", "0.04",
+		projectionTailPath,
+	})
+	if !strings.Contains(projectionTailOutput, "bootstrap inference widen: model_dim=3 hidden_dim=5 tail_init=projection-tail") ||
+		!strings.Contains(projectionTailOutput, "bootstrap projection tail scale: 0.040000") {
+		t.Fatalf("init-model output missing projection-tail summary\noutput:\n%s", projectionTailOutput)
+	}
+}
+
+func TestRunInitModelBootstrapFromInferenceWidenRejectsMissingSourceAndUntiedOutput(t *testing.T) {
+	dir := t.TempDir()
+	err := run([]string{
+		"init-model",
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--hidden-dim", "5",
+		filepath.Join(dir, "missing-source.mll"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--bootstrap-from-inference-widen requires --bootstrap-from-inference") {
+		t.Fatalf("missing source error = %v, want widen/source rejection", err)
+	}
+
+	sourcePath := filepath.Join(dir, "source-inference-widen-output.mll")
+	if err := run([]string{
+		"init-model",
+		"--vocab-size", "8",
+		"--max-seq", "8",
+		"--embedding-dim", "2",
+		"--hidden-dim", "4",
+		sourcePath,
+	}); err != nil {
+		t.Fatalf("run source init-model: %v", err)
+	}
+	sealedPath := filepath.Join(dir, "source-inference-widen-output.sealed.mll")
+	if err := run([]string{"export-mll", sourcePath, sealedPath}); err != nil {
+		t.Fatalf("run export-mll: %v", err)
+	}
+	err = run([]string{
+		"init-model",
+		"--bootstrap-from-inference", sealedPath,
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--output-dim", "2",
+		"--hidden-dim", "5",
+		filepath.Join(dir, "bad-output.mll"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--output-dim to match --model-dim") {
+		t.Fatalf("untied output error = %v, want output/model tie rejection", err)
+	}
+}
+
+func TestRunInitModelRejectsBootstrapTailInitWithoutInferenceWiden(t *testing.T) {
+	err := run([]string{
+		"init-model",
+		"--bootstrap-tail-init", "zero",
+		filepath.Join(t.TempDir(), "target.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected tail-init without widen rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-init requires --bootstrap-from-inference-widen") {
+		t.Fatalf("error = %q, want tail-init/widen rejection", got)
+	}
+}
+
+func TestRunInitModelRejectsBootstrapTailScaleWithoutInferenceWiden(t *testing.T) {
+	err := run([]string{
+		"init-model",
+		"--bootstrap-tail-scale", "0.03",
+		filepath.Join(t.TempDir(), "target.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected tail-scale without widen rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-scale requires --bootstrap-from-inference-widen") {
+		t.Fatalf("error = %q, want tail-scale/widen rejection", got)
+	}
+}
+
+func TestRunInitModelRejectsUnknownBootstrapTailInit(t *testing.T) {
+	err := run([]string{
+		"init-model",
+		"--bootstrap-from-inference", filepath.Join(t.TempDir(), "sealed.mll"),
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--hidden-dim", "5",
+		"--bootstrap-tail-init", "gaussian",
+		filepath.Join(t.TempDir(), "target.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected unknown tail-init rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-init must be zero, random, or projection-tail") {
+		t.Fatalf("error = %q, want tail-init value rejection", got)
+	}
+}
+
+func TestRunInitModelRejectsBootstrapTailScaleWithoutProjectionTail(t *testing.T) {
+	err := run([]string{
+		"init-model",
+		"--bootstrap-from-inference", filepath.Join(t.TempDir(), "sealed.mll"),
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--hidden-dim", "5",
+		"--bootstrap-tail-init", "random",
+		"--bootstrap-tail-scale", "0.03",
+		filepath.Join(t.TempDir(), "target.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected tail-scale without projection-tail rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-scale requires --bootstrap-tail-init projection-tail") {
+		t.Fatalf("error = %q, want tail-scale/projection-tail rejection", got)
+	}
+}
+
+func TestRunInitModelRejectsInvalidProjectionTailScale(t *testing.T) {
+	err := run([]string{
+		"init-model",
+		"--bootstrap-from-inference", filepath.Join(t.TempDir(), "sealed.mll"),
+		"--bootstrap-from-inference-widen",
+		"--model-dim", "3",
+		"--hidden-dim", "5",
+		"--bootstrap-tail-init", "projection-tail",
+		"--bootstrap-tail-scale", "0.11",
+		filepath.Join(t.TempDir(), "target.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected invalid projection-tail scale rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-scale must be finite and in (0, 0.10]") {
+		t.Fatalf("error = %q, want projection-tail scale rejection", got)
+	}
+}
+
+func TestRunInitModelRejectsMixedBootstrapSources(t *testing.T) {
+	err := run([]string{
+		"init-model",
+		"--bootstrap-from", filepath.Join(t.TempDir(), "trainable.mll"),
+		"--bootstrap-from-inference", filepath.Join(t.TempDir(), "sealed.mll"),
+		filepath.Join(t.TempDir(), "target.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected mixed bootstrap source rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-from and --bootstrap-from-inference are mutually exclusive") {
+		t.Fatalf("error = %q, want mutual exclusion rejection", got)
 	}
 }
 
@@ -2676,6 +3045,86 @@ func TestRunEvalRetrievalVectorsWritesMetricsJSON(t *testing.T) {
 	}
 }
 
+func TestRunTransformAOQTVectorsWritesBindingSidecar(t *testing.T) {
+	dir := t.TempDir()
+	transform := tinyMainTestAOQTTransform(t, 2, 0)
+	transformPath := filepath.Join(dir, "transform.json")
+	if err := transform.WriteFile(transformPath); err != nil {
+		t.Fatalf("write transform: %v", err)
+	}
+	docVectorsPath := filepath.Join(dir, "doc-vectors.jsonl")
+	queryVectorsPath := filepath.Join(dir, "query-vectors.jsonl")
+	if err := os.WriteFile(docVectorsPath, []byte(`{"_id":"d1","role":"document","embedding":[1,0]}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write doc vectors: %v", err)
+	}
+	if err := os.WriteFile(queryVectorsPath, []byte(`{"_id":"q1","role":"query","embedding":[0,1]}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write query vectors: %v", err)
+	}
+	outDoc := filepath.Join(dir, "out-doc-vectors.jsonl")
+	outQuery := filepath.Join(dir, "out-query-vectors.jsonl")
+	sidecar := filepath.Join(dir, "binding.json")
+	output := captureRunOutput(t, []string{
+		"transform-aoqt-vectors",
+		"--transform", transformPath,
+		"--doc-vectors", docVectorsPath,
+		"--query-vectors", queryVectorsPath,
+		"--out-doc-vectors", outDoc,
+		"--out-query-vectors", outQuery,
+		"--sidecar-json", sidecar,
+		"--expected-dim", "2",
+		"--expected-stages", "1",
+		"--expected-pairs-per-stage", "1",
+		"--expected-angle-count", "1",
+		"--dataset", "toy",
+		"--artifact", "candidate",
+	})
+	if !strings.Contains(output, "transformed AOQT vectors: dataset=toy docs=1 queries=1 dim=2") || !strings.Contains(output, "sidecar: "+sidecar) {
+		t.Fatalf("unexpected output:\n%s", output)
+	}
+	var binding eosruntime.AOQTVectorCacheTransformBinding
+	data, err := os.ReadFile(sidecar)
+	if err != nil {
+		t.Fatalf("read sidecar: %v", err)
+	}
+	if err := json.Unmarshal(data, &binding); err != nil {
+		t.Fatalf("decode sidecar: %v", err)
+	}
+	if binding.Schema != eosruntime.AOQTVectorCacheTransformBindingSchema || binding.Dataset != "toy" || binding.Artifact != "candidate" {
+		t.Fatalf("binding identity = %+v", binding)
+	}
+	if binding.Inputs.DocVectorSHA256 == "" || binding.Outputs.DocVectorSHA256 == "" || binding.Topology.AnglesSHA256 == "" {
+		t.Fatalf("binding hashes missing: %+v", binding)
+	}
+}
+
+func tinyMainTestAOQTTransform(t *testing.T, dim int, angle float64) eosruntime.AOQTGivensTransform {
+	t.Helper()
+	transform := eosruntime.AOQTGivensTransform{
+		Version: eosruntime.AOQTTransformVersion,
+		Kind:    eosruntime.EmbeddingPostPoolTransformAOQTGivens,
+		Dim:     dim,
+		Seed:    191,
+		Stages: []eosruntime.AOQTStage{{
+			Pairs:  [][2]int{{0, 1}},
+			Angles: []float32{float32(angle)},
+		}},
+	}
+	pairings, err := transform.PairingsSHA256()
+	if err != nil {
+		t.Fatalf("pairings: %v", err)
+	}
+	angles, err := transform.AnglesSHA256()
+	if err != nil {
+		t.Fatalf("angles: %v", err)
+	}
+	orth, err := transform.OrthogonalityFrobeniusPerDim()
+	if err != nil {
+		t.Fatalf("orthogonality: %v", err)
+	}
+	transform.Audit = eosruntime.AOQTAuditInfo{PairingsSHA256: pairings, AnglesSHA256: angles, Orthogonality: &orth}
+	return transform
+}
+
 func TestRunEvalRetrievalVectorsHybridWritesMetricsJSON(t *testing.T) {
 	dir := t.TempDir()
 	datasetDir := filepath.Join(dir, "dataset")
@@ -3246,10 +3695,20 @@ func TestRunEvalRetrievalVectorsTurboQuantWritesMetricsJSONAndTSV(t *testing.T) 
 	if err := os.MkdirAll(filepath.Join(datasetDir, "qrels"), 0o755); err != nil {
 		t.Fatalf("mkdir dataset: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(datasetDir, "corpus.jsonl"), []byte(
-		`{"_id":"d1","text":"alpha"}`+"\n"+
-			`{"_id":"d2","text":"beta"}`+"\n"+
-			`{"_id":"d3","text":"gamma"}`+"\n"), 0o644); err != nil {
+	var corpus strings.Builder
+	for i := 1; i <= 102; i++ {
+		text := "distractor"
+		switch i {
+		case 1:
+			text = "alpha"
+		case 2:
+			text = "beta"
+		case 3:
+			text = "gamma"
+		}
+		fmt.Fprintf(&corpus, `{"_id":"d%d","text":%q}`+"\n", i, text)
+	}
+	if err := os.WriteFile(filepath.Join(datasetDir, "corpus.jsonl"), []byte(corpus.String()), 0o644); err != nil {
 		t.Fatalf("write corpus: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(datasetDir, "queries.jsonl"), []byte(
@@ -3262,10 +3721,20 @@ func TestRunEvalRetrievalVectorsTurboQuantWritesMetricsJSONAndTSV(t *testing.T) 
 	}
 	docVectorsPath := filepath.Join(dir, "doc-vectors.jsonl")
 	queryVectorsPath := filepath.Join(dir, "query-vectors.jsonl")
-	if err := os.WriteFile(docVectorsPath, []byte(
-		`{"_id":"d1","embedding":[1,0,0,0,0,0,0,0]}`+"\n"+
-			`{"_id":"d2","embedding":[0,1,0,0,0,0,0,0]}`+"\n"+
-			`{"_id":"d3","embedding":[0,0,1,0,0,0,0,0]}`+"\n"), 0o644); err != nil {
+	var docVectors strings.Builder
+	for i := 1; i <= 102; i++ {
+		embedding := "[0,0,0,1,0,0,0,0]"
+		switch i {
+		case 1:
+			embedding = "[1,0,0,0,0,0,0,0]"
+		case 2:
+			embedding = "[0,1,0,0,0,0,0,0]"
+		case 3:
+			embedding = "[0,0,1,0,0,0,0,0]"
+		}
+		fmt.Fprintf(&docVectors, `{"_id":"d%d","embedding":%s}`+"\n", i, embedding)
+	}
+	if err := os.WriteFile(docVectorsPath, []byte(docVectors.String()), 0o644); err != nil {
 		t.Fatalf("write doc vectors: %v", err)
 	}
 	if err := os.WriteFile(queryVectorsPath, []byte(
@@ -3286,6 +3755,9 @@ func TestRunEvalRetrievalVectorsTurboQuantWritesMetricsJSONAndTSV(t *testing.T) 
 		"--query-vectors", queryVectorsPath,
 		"--bits", "8",
 		"--quantizer-seed", "123",
+		"--rerank-overfetch", "101",
+		"--rerank-storage", eosruntime.TurboQuantRerankStorageCompactReconstruct,
+		"--rerank-bits", "4",
 		"--metrics-json", metricsPath,
 		"--metrics-tsv", metricsTSVPath,
 		"--per-query-jsonl", perQueryPath,
@@ -3296,6 +3768,7 @@ func TestRunEvalRetrievalVectorsTurboQuantWritesMetricsJSONAndTSV(t *testing.T) 
 		"retrieval vectors turboquant: dataset=tiny backend=bge-cache",
 		"dense: ndcg@10=1.000000 ndcg@100=1.000000 map@10=1.000000 recall@100=1.000000",
 		"q8: ndcg@10=",
+		"q8-rerank101-q4: ndcg@10=",
 		"metrics: " + metricsPath,
 		"metrics_tsv: " + metricsTSVPath,
 		"per_query: " + perQueryPath,
@@ -3321,8 +3794,14 @@ func TestRunEvalRetrievalVectorsTurboQuantWritesMetricsJSONAndTSV(t *testing.T) 
 	if metrics.Config.QuantizerSeed != 123 {
 		t.Fatalf("quantizer seed metadata = config:%+v rows:%+v", metrics.Config, metrics.Rows)
 	}
-	if metrics.Dense.Quality.NDCGAt10 != 1 || len(metrics.Rows) != 1 || metrics.Rows[0].Bits != 8 {
+	if metrics.Config.RerankBits != 4 {
+		t.Fatalf("rerank bits metadata = config:%+v rows:%+v", metrics.Config, metrics.Rows)
+	}
+	if metrics.Dense.Quality.NDCGAt10 != 1 || len(metrics.Rows) != 2 || metrics.Rows[0].Bits != 8 {
 		t.Fatalf("metrics = %+v", metrics)
+	}
+	if metrics.Rows[1].Method != "turboquant_ip_b8_overfetch101_reconstruct_rerank_b4" || metrics.Rows[1].RerankBits != 4 || metrics.Rows[1].RerankOverfetch != 101 {
+		t.Fatalf("rerank row = %+v", metrics.Rows[1])
 	}
 	tsv, err := os.ReadFile(metricsTSVPath)
 	if err != nil {
@@ -3331,21 +3810,34 @@ func TestRunEvalRetrievalVectorsTurboQuantWritesMetricsJSONAndTSV(t *testing.T) 
 	if !strings.Contains(string(tsv), "tiny\tquantized\t8\tturboquant_ip_b8") {
 		t.Fatalf("metrics TSV missing q8 row:\n%s", string(tsv))
 	}
+	if !strings.Contains(string(tsv), "tiny\tquantized_rerank\t8\tturboquant_ip_b8_overfetch101_reconstruct_rerank_b4") {
+		t.Fatalf("metrics TSV missing mixed-width rerank row:\n%s", string(tsv))
+	}
 	perQueryData, err := os.ReadFile(perQueryPath)
 	if err != nil {
 		t.Fatalf("read per-query JSONL: %v", err)
 	}
 	perQueryLines := strings.Split(strings.TrimSpace(string(perQueryData)), "\n")
-	if len(perQueryLines) != 2 {
-		t.Fatalf("per-query lines = %d, want one q8 row per query\n%s", len(perQueryLines), perQueryData)
+	if len(perQueryLines) != 4 {
+		t.Fatalf("per-query lines = %d, want q8 direct and rerank rows per query\n%s", len(perQueryLines), perQueryData)
 	}
+	seenMethods := map[string]int{}
 	for _, line := range perQueryLines {
 		var row eosruntime.TurboQuantRetrievalPerQueryRow
 		if err := json.Unmarshal([]byte(line), &row); err != nil {
 			t.Fatalf("decode per-query row: %v\n%s", err, line)
 		}
-		if row.Schema != eosruntime.TurboQuantRetrievalPerQuerySchema || row.Dataset != "tiny" || row.Method != "turboquant_ip_b8" || row.Bits != 8 || row.QuantizerSeed != 123 || len(row.TopK) == 0 {
+		if row.Schema != eosruntime.TurboQuantRetrievalPerQuerySchema || row.Dataset != "tiny" || row.Bits != 8 || row.QuantizerSeed != 123 || len(row.TopK) == 0 {
 			t.Fatalf("per-query row = %+v", row)
+		}
+		if row.Method == "turboquant_ip_b8_overfetch101_reconstruct_rerank_b4" && row.RerankBits != 4 {
+			t.Fatalf("mixed-width per-query row rerank_bits = %d, want 4: %+v", row.RerankBits, row)
+		}
+		seenMethods[row.Method]++
+	}
+	for _, method := range []string{"turboquant_ip_b8", "turboquant_ip_b8_overfetch101_reconstruct_rerank_b4"} {
+		if seenMethods[method] != 2 {
+			t.Fatalf("per-query method counts = %+v, want two %s rows", seenMethods, method)
 		}
 	}
 }
@@ -4904,12 +5396,12 @@ func TestRunTrainEmbedExplicitZeroTeacherLossOverridesCheckpoint(t *testing.T) {
 	if err := run([]string{"train-embed", "--hard-negative-train", "--hard-negatives-per-query", "1", "--epochs", "1", "--batch-size", "2", "--teacher-loss-weight", "0", "--metrics-json", metricsPath, path, trainPath}); err != nil {
 		t.Fatalf("run train-embed: %v", err)
 	}
-	data, err := os.ReadFile(metricsPath)
+	metricsData, err := os.ReadFile(metricsPath)
 	if err != nil {
 		t.Fatalf("read metrics: %v", err)
 	}
 	var metrics trainMetricsJSON
-	if err := json.Unmarshal(data, &metrics); err != nil {
+	if err := json.Unmarshal(metricsData, &metrics); err != nil {
 		t.Fatalf("unmarshal metrics: %v", err)
 	}
 	if metrics.Config.TeacherLossWeight != 0 {
@@ -4998,7 +5490,7 @@ func TestRunTrainEmbedAcceptsTurboQuantRankMarginObjectives(t *testing.T) {
 	if err := eosruntime.WriteEmbeddingHardNegativeExamplesFile(trainPath, examples); err != nil {
 		t.Fatalf("write train dataset: %v", err)
 	}
-	if err := run([]string{"train-embed", "--hard-negative-train", "--epochs", "1", "--batch-size", "2", "--contrastive-loss", "grouped_infonce", "--matryoshka-dims", "2", "--turboquant-rank-margin-objectives", "2:2=0.25", "--turboquant-prefix-score-mode", "prepared-ip", "--metrics-json", metricsPath, path, trainPath}); err != nil {
+	if err := run([]string{"train-embed", "--hard-negative-train", "--epochs", "1", "--batch-size", "2", "--contrastive-loss", "grouped_infonce", "--matryoshka-dims", "2", "--turboquant-rank-margin-objectives", "2:2=0.25", "--turboquant-rank-margin-loss", "softplus", "--turboquant-rank-margin-reduction", "mean_eligible", "--turboquant-rank-margin-tau", "0.05", "--turboquant-prefix-score-mode", "prepared-ip", "--metrics-json", metricsPath, path, trainPath}); err != nil {
 		t.Fatalf("run train-embed turboquant rank-margin objectives: %v", err)
 	}
 	checkpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(eosruntime.DefaultEmbeddingCheckpointPath(path))
@@ -5011,19 +5503,25 @@ func TestRunTrainEmbedAcceptsTurboQuantRankMarginObjectives(t *testing.T) {
 	if checkpoint.Config.TurboQuantRankMargin != 0.02 {
 		t.Fatalf("turboquant rank margin = %f, want default 0.02", checkpoint.Config.TurboQuantRankMargin)
 	}
+	if checkpoint.Config.TurboQuantRankMarginLoss != eosruntime.TurboQuantRankMarginLossSoftplus || checkpoint.Config.TurboQuantRankMarginReduction != eosruntime.TurboQuantRankMarginReductionMeanEligible || checkpoint.Config.TurboQuantRankMarginTau != 0.05 {
+		t.Fatalf("checkpoint rank-margin shape = %q/%q/%f, want softplus/mean_eligible/0.05", checkpoint.Config.TurboQuantRankMarginLoss, checkpoint.Config.TurboQuantRankMarginReduction, checkpoint.Config.TurboQuantRankMarginTau)
+	}
 	if checkpoint.Config.TurboQuantPrefixScoreMode != eosruntime.TurboQuantPrefixScoreModePreparedIP {
 		t.Fatalf("score mode = %q, want prepared_ip", checkpoint.Config.TurboQuantPrefixScoreMode)
 	}
-	data, err := os.ReadFile(metricsPath)
+	metricsData, err := os.ReadFile(metricsPath)
 	if err != nil {
 		t.Fatalf("read metrics: %v", err)
 	}
 	var metrics trainMetricsJSON
-	if err := json.Unmarshal(data, &metrics); err != nil {
+	if err := json.Unmarshal(metricsData, &metrics); err != nil {
 		t.Fatalf("unmarshal metrics: %v", err)
 	}
 	if got := metrics.Config.TurboQuantRankMarginObjectives; len(got) != 1 || got[0].Dim != 2 || got[0].BitWidth != 2 || got[0].Weight != 0.25 {
 		t.Fatalf("metrics turboquant rank-margin objectives = %+v", got)
+	}
+	if metrics.Config.TurboQuantRankMarginLoss != eosruntime.TurboQuantRankMarginLossSoftplus || metrics.Config.TurboQuantRankMarginReduction != eosruntime.TurboQuantRankMarginReductionMeanEligible || metrics.Config.TurboQuantRankMarginTau != 0.05 {
+		t.Fatalf("metrics rank-margin shape = %q/%q/%f, want softplus/mean_eligible/0.05", metrics.Config.TurboQuantRankMarginLoss, metrics.Config.TurboQuantRankMarginReduction, metrics.Config.TurboQuantRankMarginTau)
 	}
 	if metrics.Workload.TrainPairsPerEpoch != 10 {
 		t.Fatalf("metrics train pairs/epoch = %d, want base grouped+matryoshka+rank-margin pairs", metrics.Workload.TrainPairsPerEpoch)
@@ -5055,12 +5553,12 @@ func TestRunTrainEmbedAcceptsTurboQuantCompactObjectives(t *testing.T) {
 	if got := checkpoint.Config.TurboQuantCompactObjectives; len(got) != 1 || got[0].Dim != 2 || got[0].BitWidth != 2 || got[0].Weight != 0.25 {
 		t.Fatalf("turboquant compact objectives = %+v", got)
 	}
-	data, err := os.ReadFile(metricsPath)
+	metricsData, err := os.ReadFile(metricsPath)
 	if err != nil {
 		t.Fatalf("read metrics: %v", err)
 	}
 	var metrics trainMetricsJSON
-	if err := json.Unmarshal(data, &metrics); err != nil {
+	if err := json.Unmarshal(metricsData, &metrics); err != nil {
 		t.Fatalf("unmarshal metrics: %v", err)
 	}
 	if got := metrics.Config.TurboQuantCompactObjectives; len(got) != 1 || got[0].Dim != 2 || got[0].BitWidth != 2 || got[0].Weight != 0.25 {
@@ -6178,6 +6676,116 @@ func TestRunTrainEmbedEvalOnlyWritesMetricsJSON(t *testing.T) {
 	}
 }
 
+func TestWriteTrainMetricsJSONCreatesNestedParentAtomically(t *testing.T) {
+	dir := t.TempDir()
+	metricsPath := filepath.Join(dir, "nested", "metrics", "train.metrics.json")
+	if err := writeTrainMetricsJSON(metricsPath, "train-embed", "train", "model.mll", "model.tokenizer.mll", eosruntime.EmbeddingTrainRunSummary{}, eosruntime.EmbeddingTrainPackagePaths{}, nil); err != nil {
+		t.Fatalf("write nested train metrics JSON: %v", err)
+	}
+	data, err := os.ReadFile(metricsPath)
+	if err != nil {
+		t.Fatalf("read metrics JSON: %v", err)
+	}
+	var got trainMetricsJSON
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode metrics JSON: %v\n%s", err, string(data))
+	}
+	if got.Schema != "manta.embedding_train_metrics.v1" || got.Command != "train-embed" || got.Mode != "train" || got.Artifact != "model.mll" {
+		t.Fatalf("unexpected metrics identity: %+v", got)
+	}
+	assertNoTrainMetricsTempFiles(t, filepath.Dir(metricsPath))
+}
+
+func TestWriteTrainMetricsJSONCurrentDirPath(t *testing.T) {
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get wd: %v", err)
+	}
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir temp dir: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chdir(originalDir); err != nil {
+			t.Fatalf("restore wd: %v", err)
+		}
+	})
+	if err := writeTrainMetricsJSON("train.metrics.json", "train-embed", "eval", "model.mll", "", eosruntime.EmbeddingTrainRunSummary{}, eosruntime.EmbeddingTrainPackagePaths{}, nil); err != nil {
+		t.Fatalf("write current-dir train metrics JSON: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "train.metrics.json"))
+	if err != nil {
+		t.Fatalf("read current-dir metrics JSON: %v", err)
+	}
+	var got trainMetricsJSON
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode current-dir metrics JSON: %v\n%s", err, string(data))
+	}
+	if got.Mode != "eval" {
+		t.Fatalf("mode = %q, want eval", got.Mode)
+	}
+	assertNoTrainMetricsTempFiles(t, dir)
+}
+
+func TestWriteTrainMetricsJSONParentAsFileFailsWithoutReplacing(t *testing.T) {
+	dir := t.TempDir()
+	parentPath := filepath.Join(dir, "metrics-parent")
+	parentBytes := []byte("not a directory")
+	if err := os.WriteFile(parentPath, parentBytes, 0o644); err != nil {
+		t.Fatalf("write parent file: %v", err)
+	}
+	err := writeTrainMetricsJSON(filepath.Join(parentPath, "train.metrics.json"), "train-embed", "train", "model.mll", "", eosruntime.EmbeddingTrainRunSummary{}, eosruntime.EmbeddingTrainPackagePaths{}, nil)
+	if err == nil {
+		t.Fatal("write unexpectedly succeeded with file parent")
+	}
+	data, readErr := os.ReadFile(parentPath)
+	if readErr != nil {
+		t.Fatalf("read parent file after failure: %v", readErr)
+	}
+	if string(data) != string(parentBytes) {
+		t.Fatalf("parent file changed after failure: %q", data)
+	}
+}
+
+func TestWriteTrainMetricsJSONRenameFailurePreservesDestinationAndCleansTemp(t *testing.T) {
+	dir := t.TempDir()
+	metricsPath := filepath.Join(dir, "train.metrics.json")
+	originalBytes := []byte("existing metrics\n")
+	if err := os.WriteFile(metricsPath, originalBytes, 0o644); err != nil {
+		t.Fatalf("write existing metrics: %v", err)
+	}
+	originalRename := renameTrainMetricsFile
+	renameTrainMetricsFile = func(oldPath, newPath string) error {
+		return fmt.Errorf("forced rename failure")
+	}
+	t.Cleanup(func() {
+		renameTrainMetricsFile = originalRename
+	})
+	err := writeTrainMetricsJSON(metricsPath, "train-embed", "train", "model.mll", "", eosruntime.EmbeddingTrainRunSummary{}, eosruntime.EmbeddingTrainPackagePaths{}, nil)
+	if err == nil || !strings.Contains(err.Error(), "forced rename failure") {
+		t.Fatalf("rename failure error = %v, want forced rename failure", err)
+	}
+	data, readErr := os.ReadFile(metricsPath)
+	if readErr != nil {
+		t.Fatalf("read existing metrics after failure: %v", readErr)
+	}
+	if string(data) != string(originalBytes) {
+		t.Fatalf("destination changed after rename failure: %q", data)
+	}
+	assertNoTrainMetricsTempFiles(t, dir)
+}
+
+func assertNoTrainMetricsTempFiles(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, ".*.tmp"))
+	if err != nil {
+		t.Fatalf("glob temp metrics files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("unexpected orphan metrics temp files: %v", matches)
+	}
+}
+
 func TestTrainMetricsPayloadIncludesEffectiveLearningRateAndMovement(t *testing.T) {
 	payload := trainMetricsPayload(
 		"train-embed",
@@ -7268,6 +7876,121 @@ func TestRunTrainEmbedPlanOnlyCountsGroupedTextHardNegativeEvalPairs(t *testing.
 	}
 }
 
+func TestRunTrainEmbedPlanOnlyCountsRankMarginByRowsNotNegatives(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	tokenizer := eosruntime.TokenizerFile{
+		Version: eosruntime.TokenizerFileVersion,
+		Tokens:  []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "a", "b", "c", "d", "e"},
+	}
+	dir := t.TempDir()
+	tokenizerPath := filepath.Join(dir, "tokenizer.mll")
+	if err := tokenizer.WriteFile(tokenizerPath); err != nil {
+		t.Fatalf("write tokenizer: %v", err)
+	}
+	trainPath := filepath.Join(dir, "train-hard.jsonl")
+	if err := eosruntime.WriteEmbeddingTextHardNegativeExamplesFile(trainPath, []eosruntime.EmbeddingTextHardNegativeExample{
+		{Query: "ab", Positive: "ab", Negatives: []string{"cd", "a", "e"}},
+		{Query: "bc", Positive: "bc", Negatives: []string{"de", "b", "a"}},
+	}); err != nil {
+		t.Fatalf("write grouped train hard negatives: %v", err)
+	}
+
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--tokenizer", tokenizerPath,
+		"--hard-negative-train",
+		"--hard-negatives-per-query", "3",
+		"--epochs", "1",
+		"--batch-size", "2",
+		"--contrastive-loss", "grouped_infonce",
+		"--matryoshka-dims", "3",
+		"--turboquant-rank-margin-objectives", "3:2=0.25",
+		"--turboquant-prefix-score-mode", "prepared-ip",
+		path,
+		trainPath,
+	})
+	for _, want := range []string{
+		"train=2 hard_negative_grouped_infonce examples",
+		"steps/epoch=1",
+		"train_pairs/epoch=10",
+		"pairs(planned=10 actual=0)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("hard-negative rank-margin plan-only output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunTrainEmbedPlanOnlyCountsRankMarginMeanEligibleByNegatives(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	tokenizer := eosruntime.TokenizerFile{
+		Version: eosruntime.TokenizerFileVersion,
+		Tokens:  []string{"[PAD]", "[UNK]", "[CLS]", "[SEP]", "a", "b", "c", "d", "e"},
+	}
+	dir := t.TempDir()
+	tokenizerPath := filepath.Join(dir, "tokenizer.mll")
+	if err := tokenizer.WriteFile(tokenizerPath); err != nil {
+		t.Fatalf("write tokenizer: %v", err)
+	}
+	trainPath := filepath.Join(dir, "train-hard.jsonl")
+	if err := eosruntime.WriteEmbeddingTextHardNegativeExamplesFile(trainPath, []eosruntime.EmbeddingTextHardNegativeExample{
+		{Query: "ab", Positive: "ab", Negatives: []string{"cd", "a", "e"}},
+		{Query: "bc", Positive: "bc", Negatives: []string{"de", "b", "a"}},
+	}); err != nil {
+		t.Fatalf("write grouped train hard negatives: %v", err)
+	}
+
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--tokenizer", tokenizerPath,
+		"--hard-negative-train",
+		"--hard-negatives-per-query", "3",
+		"--epochs", "1",
+		"--batch-size", "2",
+		"--contrastive-loss", "grouped_infonce",
+		"--matryoshka-dims", "3",
+		"--turboquant-rank-margin-objectives", "3:2=0.25",
+		"--turboquant-rank-margin-loss", "softplus",
+		"--turboquant-rank-margin-reduction", "mean_eligible",
+		"--turboquant-rank-margin-tau", "0.05",
+		"--turboquant-prefix-score-mode", "prepared-ip",
+		path,
+		trainPath,
+	})
+	for _, want := range []string{
+		"train=2 hard_negative_grouped_infonce examples",
+		"steps/epoch=1",
+		"train_pairs/epoch=14",
+		"pairs(planned=14 actual=0)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("hard-negative mean-eligible rank-margin plan-only output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunTrainEmbedRejectsRankMarginShapeWithoutObjectives(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	trainPath := filepath.Join(t.TempDir(), "train.jsonl")
+	if err := eosruntime.WriteEmbeddingPairExamplesFile(trainPath, []eosruntime.EmbeddingPairExample{
+		{LeftTokens: []int32{1}, RightTokens: []int32{1}, Target: 1},
+	}); err != nil {
+		t.Fatalf("write train examples: %v", err)
+	}
+	_, err := captureRunOutputAndError(t, []string{"train-embed", "--hard-negative-train", "--turboquant-rank-margin-loss", "softplus", path, trainPath})
+	if err == nil || !strings.Contains(err.Error(), "require --turboquant-rank-margin-objectives") {
+		t.Fatalf("rank-margin shape without objectives error = %v", err)
+	}
+}
+
 func TestRunTrainEmbedRejectsScoreSpectrumMutualExclusion(t *testing.T) {
 	path := writeTrainableArtifact(t)
 	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum.jsonl")
@@ -7350,6 +8073,111 @@ func TestRunTrainEmbedListwiseGeometryPlanOnlyAndValidation(t *testing.T) {
 	_, err = captureRunOutputAndError(t, []string{"train-embed", "--tokenizer", tokenizerPath, "--listwise-geometry-train", "--allow-research-only-listwise-geometry", "--epochs", "1", "--batch-size", "1", path, trainPath})
 	if err == nil || !strings.Contains(err.Error(), "must be explicitly research-only") {
 		t.Fatalf("allow research with non-research row error = %v, want strict listwise rejection", err)
+	}
+}
+
+func TestRunTrainEmbedListwiseGeometryTurboQuantCompactPlanTrainAndValidation(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	checkpointPath := eosruntime.DefaultEmbeddingCheckpointPath(path)
+	checkpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(checkpointPath)
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	checkpoint.Config.MatryoshkaDims = []int{2}
+	checkpoint.Config.MatryoshkaWeights = []float32{1}
+	checkpoint.Config.TurboQuantPrefixBits = []int{2}
+	checkpoint.Config.TurboQuantPrefixWeight = 0.25
+	checkpoint.Config.TurboQuantRankMarginObjectives = []eosruntime.TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.5}}
+	checkpoint.Config.TurboQuantRankMargin = 0.02
+	checkpoint.Config.TurboQuantCompactObjectives = []eosruntime.TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.25}}
+	checkpoint.Config.TurboQuantPrefixSeed = 11
+	if err := checkpoint.WriteFile(checkpointPath); err != nil {
+		t.Fatalf("write inherited checkpoint: %v", err)
+	}
+	mod, err := eosartifact.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read artifact: %v", err)
+	}
+	packageManifest, err := eosruntime.BuildPackageManifest(eosruntime.PackageTraining, mod, map[string]string{
+		"artifact":           path,
+		"embedding_manifest": eosruntime.DefaultEmbeddingManifestPath(path),
+		"weights":            eosruntime.DefaultWeightFilePath(path),
+		"memory_plan":        eosruntime.DefaultMemoryPlanPath(path),
+		"train_manifest":     eosruntime.DefaultEmbeddingTrainManifestPath(path),
+		"checkpoint":         checkpointPath,
+		"train_profile":      eosruntime.DefaultEmbeddingTrainProfilePath(path),
+	})
+	if err != nil {
+		t.Fatalf("build package manifest: %v", err)
+	}
+	if err := packageManifest.WriteFile(eosruntime.DefaultPackageManifestPath(path)); err != nil {
+		t.Fatalf("write package manifest: %v", err)
+	}
+	tokenizer := eosruntime.TokenizerFile{
+		Version: eosruntime.TokenizerFileVersion,
+		Tokens:  []string{"[UNK]", "a", "b"},
+	}
+	tokenizerPath := filepath.Join(t.TempDir(), "tokenizer.mll")
+	if err := tokenizer.WriteFile(tokenizerPath); err != nil {
+		t.Fatalf("write tokenizer: %v", err)
+	}
+	trainPath := writeTinyCLIListwiseGeometryJSONL(t, false)
+
+	output := captureRunOutput(t, []string{"train-embed", "--plan-only", "--tokenizer", tokenizerPath, "--listwise-geometry-train", "--epochs", "1", "--batch-size", "1", "--turboquant-compact-objectives", "fullDim:3=0.5", "--max-listwise-train-pairs", "8", path, trainPath})
+	for _, want := range []string{
+		"train=1 listwise_geometry examples",
+		"train_pairs/epoch=8",
+		"pairs(planned=8 actual=0)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("listwise compact plan output missing %q\noutput:\n%s", want, output)
+		}
+	}
+	_, err = captureRunOutputAndError(t, []string{"train-embed", "--tokenizer", tokenizerPath, "--listwise-geometry-train", "--epochs", "1", "--batch-size", "1", "--turboquant-compact-objectives", "2:3=0.5", path, trainPath})
+	if err == nil || !strings.Contains(err.Error(), "must equal full embedding dim 3") {
+		t.Fatalf("subdim compact error = %v, want full-dim listwise rejection", err)
+	}
+
+	metricsPath := filepath.Join(t.TempDir(), "listwise-compact.metrics.json")
+	output = captureRunOutput(t, []string{"train-embed", "--tokenizer", tokenizerPath, "--listwise-geometry-train", "--epochs", "1", "--batch-size", "1", "--turboquant-compact-objectives", "fullDim:3=0.5", "--turboquant-prefix-seed", "17", "--max-listwise-train-pairs", "8", "--metrics-json", metricsPath, path, trainPath})
+	if !strings.Contains(output, "train_pairs/epoch=8") || !strings.Contains(output, "pairs(planned=8 actual=8)") {
+		t.Fatalf("listwise compact train output unexpected:\n%s", output)
+	}
+	data, err := os.ReadFile(metricsPath)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	var metrics trainMetricsJSON
+	if err := json.Unmarshal(data, &metrics); err != nil {
+		t.Fatalf("unmarshal metrics: %v", err)
+	}
+	if got := metrics.Config.TurboQuantCompactObjectives; len(got) != 1 || got[0].Dim != 3 || got[0].BitWidth != 3 || got[0].Weight != 0.5 {
+		t.Fatalf("metrics compact objectives = %+v, want resolved fullDim q3", got)
+	}
+	if metrics.Workload.TrainPairsPerEpoch != 8 || metrics.Workload.PlannedTrainPairs != 8 || metrics.Workload.ActualTrainPairs != 8 || metrics.Workload.PlannedTotalPairs != 8 || metrics.Workload.ActualTotalPairs != 8 {
+		t.Fatalf("metrics workload = %+v, want exact dense+compact accounting", metrics.Workload)
+	}
+	checkpoint, err = eosruntime.ReadEmbeddingTrainCheckpointFile(checkpointPath)
+	if err != nil {
+		t.Fatalf("read trained checkpoint: %v", err)
+	}
+	if got := checkpoint.Config.TurboQuantCompactObjectives; len(got) != 1 || got[0].Dim != 3 || got[0].BitWidth != 3 || got[0].Weight != 0.5 {
+		t.Fatalf("checkpoint compact objectives = %+v, want resolved fullDim q3", got)
+	}
+	if len(checkpoint.Config.MatryoshkaDims) != 0 || len(checkpoint.Config.TurboQuantPrefixBits) != 0 || len(checkpoint.Config.TurboQuantRankMarginObjectives) != 0 {
+		t.Fatalf("checkpoint inherited incompatible objectives not cleared: %+v", checkpoint.Config)
+	}
+	manifest, err := eosruntime.ReadPackageManifestFile(eosruntime.DefaultPackageManifestPath(path))
+	if err != nil {
+		t.Fatalf("read package manifest: %v", err)
+	}
+	for _, want := range []string{"matryoshka", "turboquant_prefix_bits", "turboquant_rank_margin_objectives", "turboquant_compact_objectives", "turboquant_prefix_seed"} {
+		if !hasTrainObjectiveNameForTest(manifest.ListwiseGeometry.IsolatedInheritedObjectives, want) {
+			t.Fatalf("package isolated inherited objectives = %v, missing %q", manifest.ListwiseGeometry.IsolatedInheritedObjectives, want)
+		}
 	}
 }
 
@@ -7501,6 +8329,288 @@ func TestRunTrainEmbedPlanOnlyScoreSpectrumWorkload(t *testing.T) {
 	}
 }
 
+func TestRunTrainEmbedPlanOnlyScoreSpectrumTurboQuantTopKWorkload(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum-topk.jsonl")
+	data := "" +
+		`{"row_id":"r0","query_tokens":[1],"candidate_ids":["q3-neg","strong","weak","bm25-neg"],"candidate_sources":["q3","qrel","qrel","bm25"],"qrel_gains":[0,2,1,0],"candidate_tokens":[[1],[2],[3],[4]],"positive_indexes":[1,2],"hard_negative_eligible":[true,false,false,true],"target_probabilities":[0,0.7,0.3,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n" +
+		`{"row_id":"r1","query_tokens":[2],"candidate_ids":["p","q3-neg"],"candidate_sources":["qrel","q3"],"qrel_gains":[1,0],"candidate_tokens":[[2],[1]],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"turboquant_topk_loss_weight":0,"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum top-k dataset: %v", err)
+	}
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--score-spectrum-train",
+		"--no-tokenizer",
+		"--shuffle=false",
+		"--epochs", "1",
+		"--batch-size", "2",
+		"--turboquant-topk-objectives", "fullDim:3=0.5",
+		"--turboquant-topk-loss", "lambdandcg",
+		"--turboquant-topk-cutoff", "2",
+		"--turboquant-topk-tau", "0.05",
+		"--turboquant-topk-negative-mask", "q3",
+		path,
+		trainPath,
+	})
+	for _, want := range []string{
+		"train=2 score_spectrum_grouped examples",
+		"train_pairs/epoch=9",
+		"pairs(planned=9 actual=0)",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("score-spectrum top-k plan output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunTrainEmbedScoreSpectrumTurboQuantTopKSeedMetricsAndCheckpoint(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	dir := t.TempDir()
+	trainPath := filepath.Join(dir, "train-score-spectrum-topk.jsonl")
+	metricsPath := filepath.Join(dir, "metrics.json")
+	data := `{"row_id":"r0","query_tokens":[1],"candidate_ids":["p","q3-neg","unmarked"],"candidate_sources":["qrel","q3","other"],"qrel_gains":[1,0,0],"candidate_tokens":[[1],[2],[3]],"positive_indexes":[0],"hard_negative_eligible":[false,true,false],"target_probabilities":[1,0,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum top-k dataset: %v", err)
+	}
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--score-spectrum-train",
+		"--no-tokenizer",
+		"--shuffle=false",
+		"--epochs", "1",
+		"--batch-size", "1",
+		"--turboquant-topk-objectives", "fullDim:2=0.5",
+		"--turboquant-topk-loss", "lambdandcg",
+		"--turboquant-topk-negative-mask", "all",
+		"--turboquant-prefix-seed", "4242",
+		"--metrics-json", metricsPath,
+		path,
+		trainPath,
+	})
+	if !strings.Contains(output, "pairs(planned=5 actual=5)") {
+		t.Fatalf("top-k train output missing planned/actual pairs=5:\n%s", output)
+	}
+	metricsBytes, err := os.ReadFile(metricsPath)
+	if err != nil {
+		t.Fatalf("read metrics: %v", err)
+	}
+	var metrics trainMetricsJSON
+	if err := json.Unmarshal(metricsBytes, &metrics); err != nil {
+		t.Fatalf("unmarshal metrics: %v", err)
+	}
+	if metrics.Config.TurboQuantPrefixSeed != 4242 {
+		t.Fatalf("metrics prefix seed = %d, want 4242", metrics.Config.TurboQuantPrefixSeed)
+	}
+	if metrics.Config.TurboQuantTopKNegativeMask != eosruntime.TurboQuantTopKNegativeMaskAll {
+		t.Fatalf("metrics top-k mask = %q, want all", metrics.Config.TurboQuantTopKNegativeMask)
+	}
+	if metrics.Workload.TrainPairsPerEpoch != 5 || metrics.Workload.ActualTrainPairs != 5 {
+		t.Fatalf("metrics train pairs per epoch/actual = %d/%d, want 5/5", metrics.Workload.TrainPairsPerEpoch, metrics.Workload.ActualTrainPairs)
+	}
+	checkpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(eosruntime.DefaultEmbeddingCheckpointPath(path))
+	if err != nil {
+		t.Fatalf("read checkpoint: %v", err)
+	}
+	if checkpoint.Config.TurboQuantPrefixSeed != 4242 {
+		t.Fatalf("checkpoint prefix seed = %d, want 4242", checkpoint.Config.TurboQuantPrefixSeed)
+	}
+	manifest, err := eosruntime.ReadEmbeddingTrainManifestFile(eosruntime.DefaultEmbeddingTrainManifestPath(path))
+	if err != nil {
+		t.Fatalf("read train manifest: %v", err)
+	}
+	if manifest.Config.TurboQuantPrefixSeed != 4242 {
+		t.Fatalf("manifest prefix seed = %d, want 4242", manifest.Config.TurboQuantPrefixSeed)
+	}
+}
+
+func TestRunTrainEmbedPlanOnlyScoreSpectrumTurboQuantTopKRecallWorkload(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum-topk-recall.jsonl")
+	data := "" +
+		`{"row_id":"r0","query_tokens":[1],"candidate_ids":["p","q3-neg","bm25-neg"],"candidate_sources":["qrel","q3","bm25"],"qrel_gains":[1,0,0],"candidate_tokens":[[1],[2],[3]],"positive_indexes":[0],"hard_negative_eligible":[false,true,true],"target_probabilities":[1,0,0],"turboquant_topk_loss_weight":0,"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n" +
+		`{"row_id":"r1","query_tokens":[2],"candidate_ids":["p","q3-neg","bm25-neg"],"candidate_sources":["qrel","q3","bm25"],"qrel_gains":[1,0,0],"candidate_tokens":[[2],[1],[3]],"positive_indexes":[0],"hard_negative_eligible":[false,true,true],"target_probabilities":[1,0,0],"turboquant_topk_recall_loss_weight":0,"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum top-k recall dataset: %v", err)
+	}
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--score-spectrum-train",
+		"--no-tokenizer",
+		"--shuffle=false",
+		"--epochs", "1",
+		"--batch-size", "2",
+		"--turboquant-topk-objectives", "fullDim:3=0.5",
+		"--turboquant-topk-loss", "lambdandcg",
+		"--turboquant-topk-cutoff", "2",
+		"--turboquant-topk-negative-mask", "q3",
+		"--turboquant-topk-recall-weight", "0.25",
+		"--turboquant-topk-recall-cutoff", "100",
+		"--turboquant-topk-recall-tau", "0.07",
+		"--turboquant-topk-recall-margin", "0.01",
+		"--turboquant-topk-recall-negative-mask", "bm25",
+		path,
+		trainPath,
+	})
+	for _, want := range []string{
+		"train=2 score_spectrum_grouped examples",
+		"train_pairs/epoch=8",
+		"pairs(planned=8 actual=0)",
+		"turboquant_topk_recall=weight:0.25 cutoff:100 tau:0.07 margin:0.01 mask:bm25",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("score-spectrum top-k recall plan output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunTrainEmbedPlanOnlyScoreSpectrumTurboQuantTopKRecallDefaultCutoff(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum-topk-recall-default-cutoff.jsonl")
+	data := `{"row_id":"r0","query_tokens":[1],"candidate_ids":["n0","n1","n2","n3","n4","n5","n6","n7","n8","n9","p-late","bm25-tail"],"candidate_sources":["other","other","other","other","other","other","other","other","other","other","qrel","bm25"],"qrel_gains":[0,0,0,0,0,0,0,0,0,0,1,0],"candidate_tokens":[[1],[2],[3],[1],[2],[3],[1],[2],[3],[1],[2],[3]],"positive_indexes":[10],"hard_negative_eligible":[false,false,false,false,false,false,false,false,false,false,false,true],"target_probabilities":[0,0,0,0,0,0,0,0,0,0,1,0],"turboquant_topk_loss_weight":0,"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum top-k recall dataset: %v", err)
+	}
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--score-spectrum-train",
+		"--no-tokenizer",
+		"--shuffle=false",
+		"--epochs", "1",
+		"--batch-size", "1",
+		"--turboquant-topk-objectives", "fullDim:3=0.5",
+		"--turboquant-topk-loss", "lambdandcg",
+		"--turboquant-topk-cutoff", "2",
+		"--turboquant-topk-negative-mask", "q3",
+		"--turboquant-topk-recall-weight", "0.25",
+		"--turboquant-topk-recall-negative-mask", "bm25",
+		path,
+		trainPath,
+	})
+	for _, want := range []string{
+		"train=1 score_spectrum_grouped examples",
+		"train_pairs/epoch=13",
+		"pairs(planned=13 actual=0)",
+		"turboquant_topk_recall=weight:0.25 cutoff:100 tau:0.05 margin:0 mask:bm25",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("score-spectrum top-k recall default-cutoff plan output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestRunTrainEmbedScoreSpectrumRejectsDetachedTurboQuantTopKRecallFlags(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum-topk-recall-invalid.jsonl")
+	data := `{"row_id":"r0","query_tokens":[1],"candidate_ids":["p","n"],"candidate_sources":["qrel","q3"],"qrel_gains":[1,0],"candidate_tokens":[[1],[2]],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	output, err := captureRunOutputAndError(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--score-spectrum-train",
+		"--no-tokenizer",
+		"--turboquant-topk-objectives", "fullDim:3=0.5",
+		"--turboquant-topk-recall-cutoff", "100",
+		path,
+		trainPath,
+	})
+	if err == nil {
+		t.Fatalf("run unexpectedly succeeded; output:\n%s", output)
+	}
+	if !strings.Contains(err.Error(), "require --turboquant-topk-recall-weight") {
+		t.Fatalf("error = %v, want detached recall flag rejection; output:\n%s", err, output)
+	}
+}
+
+func TestRunTrainEmbedScoreSpectrumRejectsNoAuthorizedUseRows(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
+		t.Fatalf("run init-train: %v", err)
+	}
+	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum-noauth.jsonl")
+	data := `{"row_id":"r0","query_tokens":[1],"candidate_tokens":[[1],[2]],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	_, err := captureRunOutputAndError(t, []string{"train-embed", "--score-spectrum-train", "--no-tokenizer", "--epochs", "1", "--batch-size", "1", path, trainPath})
+	if err == nil || !strings.Contains(err.Error(), "no authorized training use") {
+		t.Fatalf("no-authorized-use error = %v, want fail-closed legal gate", err)
+	}
+}
+
+func TestRunTrainEmbedPlanOnlyScoreSpectrumCountsLargeRowsWithoutMaterializingCorpus(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	trainPath := filepath.Join(t.TempDir(), "large-score-spectrum.jsonl")
+	largePadding := strings.Repeat("x", 2_300_000)
+	data := "" +
+		fmt.Sprintf(`{"row_id":"r0","query_tokens":[1],"candidate_tokens":[[1],[2]],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false,"padding":%q}`+"\n", largePadding) +
+		`{"row_id":"r1","query_tokens":[2],"candidate_tokens":[[2],[3]],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n" +
+		`{"row_id":"r2","query_tokens":[3],"candidate_tokens":[[3],[1],[2]],"positive_indexes":[0],"hard_negative_eligible":[false,true,true],"target_probabilities":[1,0,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n" +
+		`{"row_id":"r3","query_tokens":[4],"candidate_tokens":[[1],[2],[3],[4]],"positive_indexes":[0],"hard_negative_eligible":[false,true,true,true],"target_probabilities":[1,0,0,0],"release_train_allowed":true,"commercial_use_allowed":true,"train_allowed_for_research":false}` + "\n"
+	if err := os.WriteFile(trainPath, []byte(data), 0o644); err != nil {
+		t.Fatalf("write large score-spectrum dataset: %v", err)
+	}
+	output := captureRunOutput(t, []string{
+		"train-embed",
+		"--plan-only",
+		"--score-spectrum-train",
+		"--no-tokenizer",
+		"--shuffle=false",
+		"--epochs", "2",
+		"--batch-size", "2",
+		"--score-spectrum-max-batch-candidates", "4",
+		"--score-spectrum-activation-microbatch-size", "2",
+		path,
+		trainPath,
+	})
+	for _, want := range []string{
+		"train=4 score_spectrum_grouped examples",
+		"steps/epoch=3",
+		"train_pairs/epoch=11",
+		"pairs(planned=22 actual=0)",
+		"score_spectrum_activation_microbatch=2",
+	} {
+		if !strings.Contains(output, want) {
+			t.Fatalf("large score-spectrum plan output missing %q\noutput:\n%s", want, output)
+		}
+	}
+}
+
+func TestFormatTrainWorkloadReportsScoreSpectrumAuxOnlyRows(t *testing.T) {
+	got := formatTrainWorkloadWithScoreSpectrumConfig(eosruntime.EmbeddingTrainWorkload{
+		TrainMode:                "score_spectrum_grouped",
+		TrainExamples:            2,
+		BatchSize:                1,
+		TrainBatchesPerEpoch:     2,
+		TrainPairsPerEpoch:       5,
+		PlannedTotalPairs:        5,
+		ScoreSpectrumAuxOnlyRows: 1,
+	}, eosruntime.EmbeddingTrainRunConfig{ScoreSpectrumActivationMicrobatchSize: 2})
+	if !strings.Contains(got, "score_spectrum_aux_only_rows=1") {
+		t.Fatalf("formatted workload = %q, want aux-only row diagnostic", got)
+	}
+}
+
 func TestRunTrainEmbedScoreSpectrumNativeEvalAndRecoveryFlags(t *testing.T) {
 	path := writeTrainableArtifact(t)
 	if err := run([]string{"init-train", "--dim", "D=4", "--dim", "E=3", path}); err != nil {
@@ -7530,6 +8640,8 @@ func TestRunTrainEmbedScoreSpectrumNativeEvalAndRecoveryFlags(t *testing.T) {
 		"--score-spectrum-recovery-margin", "0.05",
 		"--score-spectrum-recovery-top-k", "1",
 		"--score-spectrum-recovery-tau", "0.05",
+		"--score-spectrum-max-batch-candidates", "3",
+		"--score-spectrum-activation-microbatch-size", "2",
 		"--select-metric", "score_spectrum_any_positive_top1",
 		"--no-tokenizer",
 		"--epochs", "1",
@@ -7543,9 +8655,11 @@ func TestRunTrainEmbedScoreSpectrumNativeEvalAndRecoveryFlags(t *testing.T) {
 	}
 	var got struct {
 		Config struct {
-			ScoreSpectrumLossMode       string  `json:"score_spectrum_loss_mode"`
-			ScoreSpectrumRecoveryWeight float32 `json:"score_spectrum_recovery_weight"`
-			ScoreSpectrumRecoveryTopK   int     `json:"score_spectrum_recovery_top_k"`
+			ScoreSpectrumLossMode                 string  `json:"score_spectrum_loss_mode"`
+			ScoreSpectrumRecoveryWeight           float32 `json:"score_spectrum_recovery_weight"`
+			ScoreSpectrumRecoveryTopK             int     `json:"score_spectrum_recovery_top_k"`
+			ScoreSpectrumMaxBatchCandidates       int     `json:"score_spectrum_max_batch_candidates"`
+			ScoreSpectrumActivationMicrobatchSize int     `json:"score_spectrum_activation_microbatch_size"`
 		} `json:"config"`
 		FinalScoreSpectrumEval *struct {
 			RowCount                   int `json:"row_count"`
@@ -7563,7 +8677,7 @@ func TestRunTrainEmbedScoreSpectrumNativeEvalAndRecoveryFlags(t *testing.T) {
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("decode metrics: %v\n%s", err, data)
 	}
-	if got.Config.ScoreSpectrumLossMode != "hard_soft_recovery" || got.Config.ScoreSpectrumRecoveryWeight != 1.25 || got.Config.ScoreSpectrumRecoveryTopK != 1 {
+	if got.Config.ScoreSpectrumLossMode != "hard_soft_recovery" || got.Config.ScoreSpectrumRecoveryWeight != 1.25 || got.Config.ScoreSpectrumRecoveryTopK != 1 || got.Config.ScoreSpectrumMaxBatchCandidates != 3 || got.Config.ScoreSpectrumActivationMicrobatchSize != 2 {
 		t.Fatalf("score-spectrum config JSON = %+v, want recovery flags", got.Config)
 	}
 	if got.FinalScoreSpectrumEval == nil || got.FinalScoreSpectrumEval.RowCount != 2 || got.FinalScoreSpectrumEval.CandidateCount != 4 {
@@ -7586,6 +8700,73 @@ func TestRunTrainEmbedRejectsInvalidScoreSpectrumRecoveryFlags(t *testing.T) {
 	_, err := captureRunOutputAndError(t, []string{"train-embed", "--score-spectrum-train", "--score-spectrum-loss-mode", "recovery", "--score-spectrum-recovery-top-k", "-1", "--no-tokenizer", path, trainPath})
 	if err == nil || !strings.Contains(err.Error(), "score-spectrum-recovery-top-k") {
 		t.Fatalf("invalid recovery top-k error = %v, want rejection", err)
+	}
+}
+
+func TestRunTrainEmbedRejectsNegativeScoreSpectrumActivationMicrobatchSize(t *testing.T) {
+	path := writeTrainableArtifact(t)
+	trainPath := filepath.Join(t.TempDir(), "train-score-spectrum.jsonl")
+	if err := eosruntime.WriteEmbeddingScoreSpectrumExamplesFile(trainPath, tinyCLIScoreSpectrumExamples(false)); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	_, err := captureRunOutputAndError(t, []string{"train-embed", "--score-spectrum-train", "--score-spectrum-activation-microbatch-size", "-1", "--no-tokenizer", path, trainPath})
+	if err == nil || !strings.Contains(err.Error(), "score-spectrum-activation-microbatch-size") {
+		t.Fatalf("invalid activation microbatch error = %v, want rejection", err)
+	}
+}
+
+func TestTrainRunConfigPayloadEmitsZeroScoreSpectrumActivationMicrobatchSize(t *testing.T) {
+	payload := trainRunConfigPayload(eosruntime.EmbeddingTrainRunConfig{}, 0)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal train config payload: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode train config payload: %v", err)
+	}
+	value, ok := raw["score_spectrum_activation_microbatch_size"]
+	if !ok {
+		t.Fatalf("train config payload omitted zero activation microbatch size: %s", data)
+	}
+	if got, ok := value.(float64); !ok || got != 0 {
+		t.Fatalf("zero activation microbatch payload = %#v, want numeric zero", value)
+	}
+}
+
+func TestTrainRunConfigPayloadSerializesResearchOnlyScoreSpectrumOptIn(t *testing.T) {
+	payload := trainRunConfigPayload(eosruntime.EmbeddingTrainRunConfig{
+		AllowResearchOnlyScoreSpectrum: true,
+	}, 0)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal train config payload: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode train config payload: %v", err)
+	}
+	value, ok := raw["allow_research_only_score_spectrum"]
+	if !ok {
+		t.Fatalf("train config payload omitted score-spectrum research opt-in: %s", data)
+	}
+	if got, ok := value.(bool); !ok || !got {
+		t.Fatalf("score-spectrum research opt-in payload = %#v, want true", value)
+	}
+}
+
+func TestTrainRunConfigPayloadOmitsDefaultResearchOnlyScoreSpectrumOptIn(t *testing.T) {
+	payload := trainRunConfigPayload(eosruntime.EmbeddingTrainRunConfig{}, 0)
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal train config payload: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("decode train config payload: %v", err)
+	}
+	if value, ok := raw["allow_research_only_score_spectrum"]; ok {
+		t.Fatalf("default score-spectrum research opt-in payload = %#v in %s, want omitted", value, data)
 	}
 }
 
@@ -7644,6 +8825,15 @@ func writeTinyCLIListwiseGeometryJSONL(t *testing.T, researchOnly bool) string {
 		t.Fatalf("write listwise geometry dataset: %v", err)
 	}
 	return path
+}
+
+func hasTrainObjectiveNameForTest(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestRunTokenizeEmbedHardNegativeMode(t *testing.T) {

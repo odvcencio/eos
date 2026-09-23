@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"os"
 	"runtime/debug"
-	"sort"
 	"time"
 
 	"m31labs.dev/eos/runtime/backend"
@@ -134,6 +133,9 @@ func (t *EmbeddingTrainer) FitVectorDistill(
 		return EmbeddingTrainRunSummary{}, err
 	}
 	cfg = t.syncTrainRunObjectiveConfig(cfg)
+	if err := validateTurboQuantTopKScoreSpectrumOnlyRunConfig(cfg, "vector-distill"); err != nil {
+		return EmbeddingTrainRunSummary{}, err
+	}
 	previousDeferredSync := t.deferOptimizerSync
 	t.deferOptimizerSync = optimizerSyncMode == VectorDistillOptimizerSyncDeferred
 	defer func() {
@@ -695,115 +697,13 @@ func (t *EmbeddingTrainer) trainVectorDistillBatchResidentWithScratch(
 }
 
 func (t *EmbeddingTrainer) runVectorDistillResidentForward(inputs []embeddingSequenceInput, forward *embeddingForwardWeights) (*vectorDistillResidentForward, error) {
-	if t == nil || forward == nil || forward.compact == nil {
-		return nil, fmt.Errorf("compact resident train forward requires compact weights")
-	}
-	t.compactForwardSelected = false
-	compactForward := forward.compact
-	if err := t.prepareCompactTrainAccelerator(compactForward); err != nil {
-		return nil, err
-	}
-	out := &vectorDistillResidentForward{
-		uniqueForInput: make([]int, len(inputs)),
-		stepID:         uint64(t.step + 1),
-	}
-	sequenceCache := map[string]int{}
-	groupOrder := make([]int, 0)
-	groups := map[int][]int{}
-	tokensByUnique := make([][]int32, 0, len(inputs))
-	masksByUnique := make([][]int32, 0, len(inputs))
-	rolesByUnique := make([]int32, 0, len(inputs))
-	for i, input := range inputs {
-		mask, err := t.prepareMask(input.tokens, input.mask)
-		if err != nil {
-			return nil, fmt.Errorf("%s: %w", embeddingSequenceInputLabel(input, i), err)
-		}
-		normalizedMask := normalizeCompactForwardMask(mask)
-		key := embeddingBatchSequenceKey(input.tokens, normalizedMask, input.role)
-		unique, ok := sequenceCache[key]
-		if !ok {
-			unique = len(tokensByUnique)
-			sequenceCache[key] = unique
-			tokensByUnique = append(tokensByUnique, append([]int32(nil), input.tokens...))
-			masksByUnique = append(masksByUnique, normalizedMask)
-			rolesByUnique = append(rolesByUnique, input.role)
-			seqLen := len(input.tokens)
-			if _, exists := groups[seqLen]; !exists {
-				groupOrder = append(groupOrder, seqLen)
-			}
-			groups[seqLen] = append(groups[seqLen], unique)
-		}
-		out.uniqueForInput[i] = unique
-	}
-	sort.Ints(groupOrder)
-	refs, err := t.compactForwardResidentRefs(compactForward)
+	encodeStart := time.Now()
+	out, err := t.runCompactResidentForward(inputs, forward)
 	if err != nil {
 		return nil, err
 	}
-	out.refs = refs
-	for _, seqLen := range groupOrder {
-		uniqueSlots := groups[seqLen]
-		req := backend.CompactTrainForwardRequest{
-			Shape:        t.compactForwardShape(compactForward, len(uniqueSlots), seqLen),
-			Tokens:       make([][]int32, len(uniqueSlots)),
-			Masks:        make([][]int32, len(uniqueSlots)),
-			Roles:        make([]int32, len(uniqueSlots)),
-			ResidentRefs: refs,
-			GELUMode:     compactForwardGELUMode(),
-			StepID:       out.stepID,
-		}
-		for i, unique := range uniqueSlots {
-			req.Tokens[i] = tokensByUnique[unique]
-			req.Masks[i] = masksByUnique[unique]
-			req.Roles[i] = rolesByUnique[unique]
-		}
-		if preflight, ok := t.compactTrainAccel.(backend.CompactTrainPreflight); ok {
-			if err := preflight.PreflightCompactTrainForward(req); err != nil {
-				return nil, fmt.Errorf("compact resident train forward preflight T=%d B=%d: %w", seqLen, len(uniqueSlots), err)
-			}
-		}
-		out.buckets = append(out.buckets, vectorDistillResidentBucket{seqLen: seqLen, uniqueSlots: uniqueSlots, req: req})
-	}
-	if len(out.buckets) == 0 {
-		return nil, fmt.Errorf("compact resident train has no exact-length buckets")
-	}
-	if err := t.compactTrainAccel.BeginCompactTrainStep(out.stepID, refs); err != nil {
-		return nil, fmt.Errorf("compact resident train begin step: %w", err)
-	}
-	began := true
-	defer func() {
-		if began {
-			_ = t.compactTrainAccel.AbortCompactTrainStep(out.stepID)
-		}
-	}()
-	out.uniqueEncoded = make([]*embeddingEncodedSequence, len(tokensByUnique))
-	encodeStart := time.Now()
-	for bi := range out.buckets {
-		bucket := &out.buckets[bi]
-		result, err := t.compactTrainAccel.RunCompactTrainForward(bucket.req)
-		if err != nil {
-			_ = t.releaseVectorDistillResidentHandles(out)
-			return nil, fmt.Errorf("compact resident train forward T=%d B=%d: %w", bucket.seqLen, len(bucket.uniqueSlots), err)
-		}
-		bucket.handle = result.Handle
-		bucket.pooled = result.Pooled
-		if result.Pooled == nil || len(result.Pooled.Shape) != 2 || result.Pooled.Shape[0] != len(bucket.uniqueSlots) || result.Pooled.Shape[1] != bucket.req.Shape.OutputDim {
-			_ = t.releaseVectorDistillResidentHandles(out)
-			return nil, fmt.Errorf("compact resident train forward T=%d B=%d pooled shape %v, want [%d %d]", bucket.seqLen, len(bucket.uniqueSlots), tensorShapeForError(result.Pooled), len(bucket.uniqueSlots), bucket.req.Shape.OutputDim)
-		}
-		for row, unique := range bucket.uniqueSlots {
-			start := row * bucket.req.Shape.OutputDim
-			end := start + bucket.req.Shape.OutputDim
-			out.uniqueEncoded[unique] = &embeddingEncodedSequence{
-				pooled: append([]float32(nil), result.Pooled.F32[start:end]...),
-				tokens: tokensByUnique[unique],
-				role:   rolesByUnique[unique],
-			}
-		}
-	}
 	t.vectorDistillPhases.EncodeNanos += time.Since(encodeStart).Nanoseconds()
 	t.vectorDistillPhases.EncodeCalls++
-	began = false
 	return out, nil
 }
 
