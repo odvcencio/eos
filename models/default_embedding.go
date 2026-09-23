@@ -2,6 +2,7 @@ package models
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,28 +17,32 @@ const DefaultEmbeddingModelName = "eos-embed-v1"
 // DefaultEmbeddingPackageConfig controls Eos's built-in default
 // embedding-model package initialization.
 type DefaultEmbeddingPackageConfig struct {
-	Name               string
-	VocabSize          int
-	MaxSequence        int
-	Architecture       string
-	ModelDim           int
-	OutputDim          int
-	EmbeddingDim       int
-	HiddenDim          int
-	AttentionHeads     int
-	EncoderRepeats     int
-	Seed               int64
-	LearningRate       float32
-	WeightDecay        float32
-	WeightBits         int
-	WeightDType        string
-	Optimizer          string
-	ContrastiveLoss    string
-	Temperature        float32
-	GroupedLossWeight  float32
-	TeacherLossWeight  float32
-	TeacherTemperature float32
-	BootstrapFrom      string
+	Name                    string
+	VocabSize               int
+	MaxSequence             int
+	Architecture            string
+	ModelDim                int
+	OutputDim               int
+	EmbeddingDim            int
+	HiddenDim               int
+	AttentionHeads          int
+	EncoderRepeats          int
+	Seed                    int64
+	LearningRate            float32
+	WeightDecay             float32
+	WeightBits              int
+	WeightDType             string
+	Optimizer               string
+	ContrastiveLoss         string
+	Temperature             float32
+	GroupedLossWeight       float32
+	TeacherLossWeight       float32
+	TeacherTemperature      float32
+	BootstrapFrom           string
+	BootstrapFromInference  string
+	BootstrapInferenceWiden bool
+	BootstrapTailInit       string
+	BootstrapTailScale      float64
 }
 
 // InitDefaultEmbeddingPackage compiles Eos's default trainable embedding
@@ -46,12 +51,52 @@ func InitDefaultEmbeddingPackage(path string, cfg DefaultEmbeddingPackageConfig)
 	if path == "" {
 		return eosruntime.EmbeddingTrainPackagePaths{}, fmt.Errorf("output artifact path is required")
 	}
+	raw := cfg
 	cfg = cfg.normalized()
+	if cfg.BootstrapInferenceWiden && raw.OutputDim > 0 && raw.OutputDim != cfg.ModelDim {
+		return eosruntime.EmbeddingTrainPackagePaths{}, fmt.Errorf("--bootstrap-from-inference-widen requires --output-dim to match --model-dim; got output_dim=%d model_dim=%d", raw.OutputDim, cfg.ModelDim)
+	}
+	if !cfg.BootstrapInferenceWiden && strings.TrimSpace(raw.BootstrapTailInit) != "" {
+		return eosruntime.EmbeddingTrainPackagePaths{}, fmt.Errorf("--bootstrap-tail-init requires --bootstrap-from-inference-widen")
+	}
+	if !cfg.BootstrapInferenceWiden && raw.BootstrapTailScale != 0 {
+		return eosruntime.EmbeddingTrainPackagePaths{}, fmt.Errorf("--bootstrap-tail-scale requires --bootstrap-from-inference-widen")
+	}
 	if err := cfg.validate(); err != nil {
 		return eosruntime.EmbeddingTrainPackagePaths{}, err
 	}
+	if cfg.BootstrapFrom != "" && cfg.BootstrapFromInference != "" {
+		return eosruntime.EmbeddingTrainPackagePaths{}, fmt.Errorf("--bootstrap-from and --bootstrap-from-inference are mutually exclusive")
+	}
+	if cfg.BootstrapInferenceWiden && cfg.BootstrapFromInference == "" {
+		return eosruntime.EmbeddingTrainPackagePaths{}, fmt.Errorf("--bootstrap-from-inference-widen requires --bootstrap-from-inference")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return eosruntime.EmbeddingTrainPackagePaths{}, err
+	}
+	if cfg.BootstrapFromInference != "" {
+		initOpts := eosruntime.EmbeddingTrainInitOptions{
+			Seed:                    cfg.Seed,
+			BootstrapInferenceWiden: cfg.BootstrapInferenceWiden,
+			BootstrapTailInit:       cfg.BootstrapTailInit,
+			BootstrapTailScale:      cfg.BootstrapTailScale,
+		}
+		if cfg.BootstrapInferenceWiden {
+			if err := validateBootstrapFromInferenceWidenOverrides(raw, cfg); err != nil {
+				return eosruntime.EmbeddingTrainPackagePaths{}, err
+			}
+			initOpts.ShapeSizes = map[string]int{
+				"D": cfg.ModelDim,
+				"H": cfg.HiddenDim,
+				"O": cfg.OutputDim,
+				"E": cfg.OutputDim,
+			}
+		} else {
+			if err := validateBootstrapFromInferenceGraphOverrides(raw); err != nil {
+				return eosruntime.EmbeddingTrainPackagePaths{}, err
+			}
+		}
+		return eosruntime.InitializeEmbeddingTrainerPackageFromSealedInference(path, cfg.BootstrapFromInference, cfg.trainConfig(), initOpts)
 	}
 
 	moduleName := moduleNameForModel(cfg.Name)
@@ -77,14 +122,78 @@ func InitDefaultEmbeddingPackage(path string, cfg DefaultEmbeddingPackageConfig)
 		return eosruntime.EmbeddingTrainPackagePaths{}, err
 	}
 	return eosruntime.InitializeEmbeddingTrainerPackageWithManifest(path, manifest, cfg.trainConfig(), eosruntime.EmbeddingTrainInitOptions{
-		Seed:                  cfg.Seed,
-		BootstrapArtifactPath: cfg.BootstrapFrom,
+		Seed:                   cfg.Seed,
+		BootstrapArtifactPath:  cfg.BootstrapFrom,
+		BootstrapInferencePath: cfg.BootstrapFromInference,
 		ShapeSizes: map[string]int{
 			"D": cfg.ModelDim,
 			"H": cfg.HiddenDim,
 			"O": cfg.OutputDim,
 		},
 	})
+}
+
+func validateBootstrapFromInferenceGraphOverrides(cfg DefaultEmbeddingPackageConfig) error {
+	if cfg.Name != "" ||
+		cfg.VocabSize != 0 ||
+		cfg.MaxSequence != 0 ||
+		cfg.Architecture != "" ||
+		cfg.ModelDim != 0 ||
+		cfg.OutputDim != 0 ||
+		cfg.EmbeddingDim != 0 ||
+		cfg.HiddenDim != 0 ||
+		cfg.WeightDType != "" ||
+		cfg.AttentionHeads != 0 ||
+		cfg.EncoderRepeats != 0 {
+		return fmt.Errorf("--bootstrap-from-inference preserves the sealed source graph; omit graph-shaping flags such as --name, --vocab-size, --max-seq, --architecture, --model-dim, --embedding-dim, --output-dim, --hidden-dim, --weight-dtype, --attention-heads, and --encoder-repeats")
+	}
+	return nil
+}
+
+func validateBootstrapFromInferenceWidenOverrides(raw, cfg DefaultEmbeddingPackageConfig) error {
+	if raw.BootstrapFromInference == "" {
+		return fmt.Errorf("--bootstrap-from-inference-widen requires --bootstrap-from-inference")
+	}
+	if raw.ModelDim <= 0 || raw.HiddenDim <= 0 {
+		return fmt.Errorf("--bootstrap-from-inference-widen requires --model-dim and --hidden-dim")
+	}
+	if raw.OutputDim > 0 && raw.OutputDim != cfg.ModelDim {
+		return fmt.Errorf("--bootstrap-from-inference-widen requires --output-dim to match --model-dim; got output_dim=%d model_dim=%d", raw.OutputDim, cfg.ModelDim)
+	}
+	if raw.EmbeddingDim > 0 && raw.EmbeddingDim != cfg.ModelDim {
+		return fmt.Errorf("--bootstrap-from-inference-widen requires --embedding-dim to match --model-dim; got embedding_dim=%d model_dim=%d", raw.EmbeddingDim, cfg.ModelDim)
+	}
+	if raw.Name != "" ||
+		raw.VocabSize != 0 ||
+		raw.MaxSequence != 0 ||
+		raw.Architecture != "" ||
+		raw.WeightDType != "" ||
+		raw.AttentionHeads != 0 ||
+		raw.EncoderRepeats != 0 {
+		return fmt.Errorf("--bootstrap-from-inference-widen preserves the sealed source graph and tokenizer; only --model-dim, --embedding-dim, --output-dim, --hidden-dim, seed/training flags, --bootstrap-tail-init, and --bootstrap-tail-scale may be supplied")
+	}
+	tailInit := eosruntimeTailInit(raw.BootstrapTailInit)
+	switch tailInit {
+	case "zero", "random":
+		if raw.BootstrapTailScale != 0 {
+			return fmt.Errorf("--bootstrap-tail-scale requires --bootstrap-tail-init projection-tail")
+		}
+	case "projection-tail":
+		if raw.BootstrapTailScale != 0 && (math.IsNaN(raw.BootstrapTailScale) || math.IsInf(raw.BootstrapTailScale, 0) || raw.BootstrapTailScale <= 0 || raw.BootstrapTailScale > 0.10) {
+			return fmt.Errorf("--bootstrap-tail-scale must be finite and in (0, 0.10] for projection-tail, got %g", raw.BootstrapTailScale)
+		}
+	default:
+		return fmt.Errorf("--bootstrap-tail-init must be zero, random, or projection-tail, got %q", raw.BootstrapTailInit)
+	}
+	return nil
+}
+
+func eosruntimeTailInit(mode string) string {
+	mode = strings.TrimSpace(strings.ToLower(mode))
+	if mode == "" {
+		return "zero"
+	}
+	return mode
 }
 
 // DefaultEmbeddingManifest returns the serving/training contract for the

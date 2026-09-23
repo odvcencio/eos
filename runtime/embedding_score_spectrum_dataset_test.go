@@ -53,21 +53,25 @@ func TestEmbeddingTextScoreSpectrumRoundTripPreservesExtraFieldsAndGates(t *test
 	selected := 0
 	examples := []EmbeddingTextScoreSpectrumExample{
 		{
-			RowID:                   "r1",
-			Source:                  "msmarco",
-			Query:                   "query",
-			CandidateIDs:            []string{"p", "n"},
-			Candidates:              []string{"positive", "negative"},
-			PositiveIndexes:         []int{0},
-			SelectedPositiveIndex:   &selected,
-			HardNegativeEligible:    []bool{false, true},
-			TargetProbabilities:     []float32{0.75, 0.25},
-			HardLossWeight:          0.4,
-			SoftLossWeight:          0.6,
-			RecoveryLossWeight:      0.7,
-			TrainPolicy:             "score-spectrum-native-eval-test",
-			TrainAllowedForResearch: true,
-			SourceArtifactHash:      "sha256:abc",
+			RowID:                    "r1",
+			Source:                   "msmarco",
+			Query:                    "query",
+			CandidateIDs:             []string{"p", "n"},
+			CandidateSources:         []string{"qrel", "q3"},
+			QrelGains:                []float32{2, 0},
+			Candidates:               []string{"positive", "negative"},
+			PositiveIndexes:          []int{0},
+			SelectedPositiveIndex:    &selected,
+			HardNegativeEligible:     []bool{false, true},
+			TargetProbabilities:      []float32{0.75, 0.25},
+			BaseLossWeight:           float32Ptr(0),
+			HardLossWeight:           0.4,
+			SoftLossWeight:           0.6,
+			RecoveryLossWeight:       0.7,
+			TurboQuantTopKLossWeight: float32Ptr(0),
+			TrainPolicy:              "score-spectrum-native-eval-test",
+			TrainAllowedForResearch:  true,
+			SourceArtifactHash:       "sha256:abc",
 			ExtraFields: map[string]json.RawMessage{
 				"artifact_name": json.RawMessage(`"score-spectrum"`),
 				"raw_scores":    json.RawMessage(`{"teacher":[1,0]}`),
@@ -82,8 +86,11 @@ func TestEmbeddingTextScoreSpectrumRoundTripPreservesExtraFieldsAndGates(t *test
 	if err != nil {
 		t.Fatalf("read score-spectrum dataset: %v", err)
 	}
-	if len(got) != 1 || got[0].SourceArtifactHash != "sha256:abc" || got[0].HardLossWeight != 0.4 || got[0].SoftLossWeight != 0.6 || got[0].RecoveryLossWeight != 0.7 || got[0].TrainPolicy != "score-spectrum-native-eval-test" {
+	if len(got) != 1 || got[0].SourceArtifactHash != "sha256:abc" || got[0].BaseLossWeight == nil || *got[0].BaseLossWeight != 0 || got[0].HardLossWeight != 0.4 || got[0].SoftLossWeight != 0.6 || got[0].RecoveryLossWeight != 0.7 || got[0].TurboQuantTopKLossWeight == nil || *got[0].TurboQuantTopKLossWeight != 0 || got[0].TrainPolicy != "score-spectrum-native-eval-test" {
 		t.Fatalf("round trip = %+v, want weights and hash preserved", got)
+	}
+	if got[0].CandidateSources[0] != "qrel" || got[0].CandidateSources[1] != "q3" || got[0].QrelGains[0] != 2 || got[0].QrelGains[1] != 0 {
+		t.Fatalf("candidate annotations = sources %+v gains %+v, want preserved", got[0].CandidateSources, got[0].QrelGains)
 	}
 	if got[0].SelectedPositiveIndex == nil || *got[0].SelectedPositiveIndex != 0 {
 		t.Fatalf("selected_positive_index = %v, want 0", got[0].SelectedPositiveIndex)
@@ -102,8 +109,115 @@ func TestEmbeddingTextScoreSpectrumRoundTripPreservesExtraFieldsAndGates(t *test
 	if row["artifact_name"] != "score-spectrum" || row["release_train_allowed"] != false || row["commercial_use_allowed"] != false || row["train_allowed_for_research"] != true {
 		t.Fatalf("output row = %+v, want extra provenance and research gates", row)
 	}
-	if row["selected_positive_index"] != float64(0) || row["recovery_loss_weight"] != 0.7 || row["train_policy"] != "score-spectrum-native-eval-test" {
-		t.Fatalf("output row = %+v, want selected positive and recovery provenance", row)
+	if row["selected_positive_index"] != float64(0) || row["base_loss_weight"] != float64(0) || row["recovery_loss_weight"] != 0.7 || row["turboquant_topk_loss_weight"] != float64(0) || row["train_policy"] != "score-spectrum-native-eval-test" {
+		t.Fatalf("output row = %+v, want selected positive and row-local weight provenance", row)
+	}
+}
+
+func TestEmbeddingTextScoreSpectrumBaseLossWeightOmittedAndNullDefaultEffectiveOne(t *testing.T) {
+	opts := EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true}
+	for _, tc := range []struct {
+		name string
+		row  string
+	}{
+		{
+			name: "omitted",
+			row:  `{"row_id":"omitted","source":"unit","query":"q","candidate_doc_ids":["p","n"],"candidate_texts":["positive","negative"],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
+		},
+		{
+			name: "null",
+			row:  `{"row_id":"null","source":"unit","query":"q","candidate_doc_ids":["p","n"],"candidate_texts":["positive","negative"],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"base_loss_weight":null,"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "score-spectrum.jsonl")
+			if err := os.WriteFile(path, []byte(tc.row+"\n"), 0o644); err != nil {
+				t.Fatalf("write score-spectrum dataset: %v", err)
+			}
+			got, err := ReadEmbeddingTextScoreSpectrumExamplesFile(path, opts)
+			if err != nil {
+				t.Fatalf("read score-spectrum dataset: %v", err)
+			}
+			if got[0].BaseLossWeight != nil || scoreSpectrumEffectiveBaseLossWeight(got[0].BaseLossWeight) != 1 {
+				t.Fatalf("base_loss_weight = %v effective=%g, want nil/effective 1", got[0].BaseLossWeight, scoreSpectrumEffectiveBaseLossWeight(got[0].BaseLossWeight))
+			}
+		})
+	}
+}
+
+func TestEmbeddingTextScoreSpectrumRejectsInvalidBaseLossWeightWithRowDiagnostics(t *testing.T) {
+	opts := EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true}
+	path := filepath.Join(t.TempDir(), "score-spectrum.jsonl")
+	row := `{"row_id":"bad-base","source":"unit","query":"q","candidate_doc_ids":["p","n"],"candidate_texts":["positive","negative"],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"base_loss_weight":-0.25,"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}` + "\n"
+	if err := os.WriteFile(path, []byte(row), 0o644); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	_, err := ReadEmbeddingTextScoreSpectrumExamplesFile(path, opts)
+	if err == nil || !strings.Contains(err.Error(), "row_id=\"bad-base\"") || !strings.Contains(err.Error(), "source=\"unit\"") || !strings.Contains(err.Error(), "base_loss_weight") {
+		t.Fatalf("error = %v, want base weight row/source diagnostics", err)
+	}
+}
+
+func TestEmbeddingScoreSpectrumRejectsNonFiniteBaseLossWeightWithRowDiagnostics(t *testing.T) {
+	opts := EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true}
+	for _, tc := range []struct {
+		name  string
+		value float32
+	}{
+		{name: "nan", value: float32(math.NaN())},
+		{name: "positive-inf", value: float32(math.Inf(1))},
+		{name: "negative-inf", value: float32(math.Inf(-1))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := WriteEmbeddingScoreSpectrumExamplesFile(filepath.Join(t.TempDir(), "score-spectrum.jsonl"), []EmbeddingScoreSpectrumExample{{
+				RowID:                   "nonfinite-base",
+				Source:                  "unit",
+				QueryTokens:             []int32{1},
+				CandidateTokens:         [][]int32{{1}, {2}},
+				PositiveIndexes:         []int{0},
+				HardNegativeEligible:    []bool{false, true},
+				TargetProbabilities:     []float32{1, 0},
+				BaseLossWeight:          float32Ptr(tc.value),
+				TrainAllowedForResearch: true,
+			}}, opts)
+			if err == nil || !strings.Contains(err.Error(), "row_id=\"nonfinite-base\"") || !strings.Contains(err.Error(), "source=\"unit\"") || !strings.Contains(err.Error(), "base_loss_weight must be finite") {
+				t.Fatalf("error = %v, want non-finite base_loss_weight row/source diagnostics", err)
+			}
+		})
+	}
+}
+
+func TestEmbeddingTextScoreSpectrumRejectsNoActiveObjectiveBaseZero(t *testing.T) {
+	opts := EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true}
+	path := filepath.Join(t.TempDir(), "score-spectrum.jsonl")
+	row := `{"row_id":"no-objective","source":"unit","query":"q","candidate_doc_ids":["p","n"],"candidate_texts":["positive","negative"],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[1,0],"base_loss_weight":0,"turboquant_topk_loss_weight":0,"turboquant_topk_recall_loss_weight":0,"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}` + "\n"
+	if err := os.WriteFile(path, []byte(row), 0o644); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	_, err := ReadEmbeddingTextScoreSpectrumExamplesFile(path, opts)
+	if err == nil || !strings.Contains(err.Error(), "row_id=\"no-objective\"") || !strings.Contains(err.Error(), "source=\"unit\"") || !strings.Contains(err.Error(), "requires a positive") {
+		t.Fatalf("error = %v, want no-active-objective row/source diagnostics", err)
+	}
+}
+
+func TestEmbeddingTextScoreSpectrumBackfillsCandidateAnnotations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "score-spectrum.jsonl")
+	data := `{"query":"q","candidate_doc_ids":["p","n"],"candidate_texts":["positive","negative"],"positive_indexes":[0],"hard_negative_eligible":[false,true],"target_probabilities":[0.7,0.3],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}` + "\n"
+	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
+		t.Fatalf("write score-spectrum dataset: %v", err)
+	}
+	got, err := ReadEmbeddingTextScoreSpectrumExamplesFile(path, EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true})
+	if err != nil {
+		t.Fatalf("read score-spectrum dataset: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("rows = %d, want 1", len(got))
+	}
+	if got[0].CandidateSources[0] != "qrel" || got[0].CandidateSources[1] != "other" {
+		t.Fatalf("candidate sources = %+v, want qrel/other fallback", got[0].CandidateSources)
+	}
+	if got[0].QrelGains[0] != 1 || got[0].QrelGains[1] != 0 {
+		t.Fatalf("qrel gains = %+v, want binary fallback", got[0].QrelGains)
 	}
 }
 
@@ -253,6 +367,22 @@ func TestEmbeddingTextScoreSpectrumValidationRejectsAlignmentAndProbabilityError
 			name: "negative recovery weight",
 			row:  `{"query":"q","candidate_doc_ids":["p","n"],"candidate_texts":["p","n"],"positive_indexes":[0],"target_probabilities":[0.7,0.3],"recovery_loss_weight":-0.1,"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
 		},
+		{
+			name: "candidate sources length mismatch",
+			row:  `{"query":"q","candidate_doc_ids":["p","n"],"candidate_sources":["qrel"],"candidate_texts":["p","n"],"positive_indexes":[0],"qrel_gains":[1,0],"target_probabilities":[0.7,0.3],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
+		},
+		{
+			name: "unsupported candidate source",
+			row:  `{"query":"q","candidate_doc_ids":["p","n"],"candidate_sources":["qrel","dense"],"candidate_texts":["p","n"],"positive_indexes":[0],"qrel_gains":[1,0],"target_probabilities":[0.7,0.3],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
+		},
+		{
+			name: "positive zero qrel gain",
+			row:  `{"query":"q","candidate_doc_ids":["p","n"],"candidate_sources":["qrel","bm25"],"candidate_texts":["p","n"],"positive_indexes":[0],"qrel_gains":[0,0],"target_probabilities":[0.7,0.3],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
+		},
+		{
+			name: "negative positive qrel gain",
+			row:  `{"query":"q","candidate_doc_ids":["p","n"],"candidate_sources":["qrel","bm25"],"candidate_texts":["p","n"],"positive_indexes":[0],"qrel_gains":[1,0.5],"target_probabilities":[0.7,0.3],"release_train_allowed":false,"commercial_use_allowed":false,"train_allowed_for_research":true}`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -281,6 +411,7 @@ func TestTokenizeEmbeddingTextScoreSpectrumExamplesPreservesAlignment(t *testing
 			SelectedPositiveIndex:   &selected,
 			HardNegativeEligible:    []bool{false, true},
 			TargetProbabilities:     []float32{0.8, 0.2},
+			BaseLossWeight:          float32Ptr(0.5),
 			RecoveryLossWeight:      0.25,
 			TrainPolicy:             "policy-a",
 			TrainAllowedForResearch: true,
@@ -298,8 +429,8 @@ func TestTokenizeEmbeddingTextScoreSpectrumExamplesPreservesAlignment(t *testing
 	if got[0].PositiveIndexes[0] != 0 || got[0].HardNegativeEligible[0] || !got[0].HardNegativeEligible[1] {
 		t.Fatalf("labels = positives %+v hard %+v, want aligned labels", got[0].PositiveIndexes, got[0].HardNegativeEligible)
 	}
-	if got[0].SelectedPositiveIndex == nil || *got[0].SelectedPositiveIndex != 0 || got[0].RecoveryLossWeight != 0.25 || got[0].TrainPolicy != "policy-a" {
-		t.Fatalf("selected/recovery/policy = %v/%v/%q, want preserved", got[0].SelectedPositiveIndex, got[0].RecoveryLossWeight, got[0].TrainPolicy)
+	if got[0].SelectedPositiveIndex == nil || *got[0].SelectedPositiveIndex != 0 || got[0].BaseLossWeight == nil || *got[0].BaseLossWeight != 0.5 || got[0].RecoveryLossWeight != 0.25 || got[0].TrainPolicy != "policy-a" {
+		t.Fatalf("selected/base/recovery/policy = %v/%v/%v/%q, want preserved", got[0].SelectedPositiveIndex, got[0].BaseLossWeight, got[0].RecoveryLossWeight, got[0].TrainPolicy)
 	}
 	if math.Abs(float64(got[0].TargetProbabilities[0]-0.8)) > 1e-6 || math.Abs(float64(got[0].TargetProbabilities[1]-0.2)) > 1e-6 {
 		t.Fatalf("target probabilities = %+v, want preserved", got[0].TargetProbabilities)
@@ -311,21 +442,25 @@ func TestEmbeddingScoreSpectrumTokenizedRoundTrip(t *testing.T) {
 	selected := 0
 	examples := []EmbeddingScoreSpectrumExample{
 		{
-			RowID:                   "r1",
-			Source:                  "tokenized",
-			QueryTokens:             []int32{1, 2},
-			QueryMask:               []int32{1, 1},
-			CandidateIDs:            []string{"p", "n"},
-			CandidateTokens:         [][]int32{{3}, {4}},
-			CandidateMasks:          [][]int32{{1}, {1}},
-			PositiveIndexes:         []int{0},
-			SelectedPositiveIndex:   &selected,
-			HardNegativeEligible:    []bool{false, true},
-			TargetProbabilities:     []float32{0.9, 0.1},
-			RecoveryLossWeight:      0.35,
-			TrainPolicy:             "tokenized-policy",
-			TrainAllowedForResearch: true,
-			SourceArtifactHash:      "sha256:def",
+			RowID:                    "r1",
+			Source:                   "tokenized",
+			QueryTokens:              []int32{1, 2},
+			QueryMask:                []int32{1, 1},
+			CandidateIDs:             []string{"p", "n"},
+			CandidateSources:         []string{"qrel", "bm25"},
+			QrelGains:                []float32{3, 0},
+			CandidateTokens:          [][]int32{{3}, {4}},
+			CandidateMasks:           [][]int32{{1}, {1}},
+			PositiveIndexes:          []int{0},
+			SelectedPositiveIndex:    &selected,
+			HardNegativeEligible:     []bool{false, true},
+			TargetProbabilities:      []float32{0.9, 0.1},
+			BaseLossWeight:           float32Ptr(2),
+			RecoveryLossWeight:       0.35,
+			TurboQuantTopKLossWeight: float32Ptr(0.25),
+			TrainPolicy:              "tokenized-policy",
+			TrainAllowedForResearch:  true,
+			SourceArtifactHash:       "sha256:def",
 		},
 	}
 	opts := EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true}
@@ -336,8 +471,11 @@ func TestEmbeddingScoreSpectrumTokenizedRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read tokenized score-spectrum dataset: %v", err)
 	}
-	if len(got) != 1 || got[0].CandidateIDs[0] != "p" || got[0].SourceArtifactHash != "sha256:def" || got[0].RecoveryLossWeight != 0.35 || got[0].TrainPolicy != "tokenized-policy" {
+	if len(got) != 1 || got[0].CandidateIDs[0] != "p" || got[0].SourceArtifactHash != "sha256:def" || got[0].BaseLossWeight == nil || *got[0].BaseLossWeight != 2 || got[0].RecoveryLossWeight != 0.35 || got[0].TurboQuantTopKLossWeight == nil || *got[0].TurboQuantTopKLossWeight != 0.25 || got[0].TrainPolicy != "tokenized-policy" {
 		t.Fatalf("tokenized round trip = %+v, want metadata preserved", got)
+	}
+	if got[0].CandidateSources[0] != "qrel" || got[0].CandidateSources[1] != "bm25" || got[0].QrelGains[0] != 3 || got[0].QrelGains[1] != 0 {
+		t.Fatalf("tokenized annotations = sources %+v gains %+v, want preserved", got[0].CandidateSources, got[0].QrelGains)
 	}
 	if got[0].SelectedPositiveIndex == nil || *got[0].SelectedPositiveIndex != 0 {
 		t.Fatalf("selected_positive_index = %v, want 0", got[0].SelectedPositiveIndex)
@@ -411,7 +549,7 @@ func TestEmbeddingScoreSpectrumTokenizedFoldsSelectedPositiveIndex(t *testing.T)
 	}
 }
 
-func TestEmbeddingScoreSpectrumTokenizedValidationRejectsSelectedPositiveAndRecoveryWeight(t *testing.T) {
+func TestEmbeddingScoreSpectrumTokenizedValidationRejectsSelectedPositiveAndRowWeights(t *testing.T) {
 	opts := EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: true}
 	cases := []struct {
 		name   string
@@ -443,6 +581,18 @@ func TestEmbeddingScoreSpectrumTokenizedValidationRejectsSelectedPositiveAndReco
 				example.RecoveryLossWeight = float32(math.Inf(1))
 			},
 		},
+		{
+			name: "negative turboquant topk weight",
+			mutate: func(example *EmbeddingScoreSpectrumExample) {
+				example.TurboQuantTopKLossWeight = float32Ptr(-0.1)
+			},
+		},
+		{
+			name: "nonfinite turboquant topk weight",
+			mutate: func(example *EmbeddingScoreSpectrumExample) {
+				example.TurboQuantTopKLossWeight = float32Ptr(float32(math.Inf(1)))
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -463,6 +613,10 @@ func TestEmbeddingScoreSpectrumTokenizedValidationRejectsSelectedPositiveAndReco
 			}
 		})
 	}
+}
+
+func float32Ptr(value float32) *float32 {
+	return &value
 }
 
 func assertFloat32SumNearOne(t *testing.T, values []float32) {

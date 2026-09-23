@@ -62,13 +62,13 @@ func TrainEmbeddingPackageFromContrastiveFiles(artifactPath, trainPath, evalPath
 		return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("vector distillation training requires text tokenization; remove --no-tokenizer or set --tokenizer")
 	}
 	if cfg.ScoreSpectrumTrain {
-		var trainSet []EmbeddingScoreSpectrumExample
+		var trainSource EmbeddingScoreSpectrumExampleSource
 		if !cfg.EvalOnly {
-			trainSet, err = ReadEmbeddingScoreSpectrumExamplesFile(trainPath, EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
+			trainSource, err = OpenEmbeddingScoreSpectrumSource(trainPath, EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
 			if err != nil {
-				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("read train score-spectrum dataset: %w", err)
+				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("open train score-spectrum dataset: %w", err)
 			}
-			trainer.SetScoreSpectrumLineage(ScoreSpectrumPolicyFromExamples(trainSet))
+			defer trainSource.Close()
 		}
 		var evalPairs []EmbeddingPairExample
 		if evalPath != "" {
@@ -83,7 +83,7 @@ func TrainEmbeddingPackageFromContrastiveFiles(artifactPath, trainPath, evalPath
 				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("read score-spectrum eval dataset: %w", err)
 			}
 		}
-		summary, err := trainer.FitScoreSpectrum(trainSet, evalPairs, cfg)
+		summary, err := trainer.FitScoreSpectrumSource(trainSource, evalPairs, cfg)
 		if err != nil {
 			return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, err
 		}
@@ -228,17 +228,13 @@ func TrainEmbeddingPackageFromTextContrastiveFiles(artifactPath, tokenizerPath, 
 	}
 	tokenCache := embeddingTextTokenCache{}
 	if cfg.ScoreSpectrumTrain {
-		var trainSet []EmbeddingScoreSpectrumExample
+		var trainSource EmbeddingScoreSpectrumExampleSource
 		if !cfg.EvalOnly {
-			trainText, err := ReadEmbeddingTextScoreSpectrumExamplesFile(trainPath, EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
+			trainSource, err = OpenEmbeddingTextScoreSpectrumSource(trainPath, tokenizer, EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
 			if err != nil {
-				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("read train text score-spectrum dataset: %w", err)
+				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("open train text score-spectrum dataset: %w", err)
 			}
-			trainSet, err = TokenizeEmbeddingTextScoreSpectrumExamples(trainText, tokenizer, EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
-			if err != nil {
-				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("tokenize train score-spectrum dataset: %w", err)
-			}
-			trainer.SetScoreSpectrumLineage(ScoreSpectrumPolicyFromExamples(trainSet))
+			defer trainSource.Close()
 		}
 		var evalPairs []EmbeddingPairExample
 		if evalPath != "" {
@@ -261,7 +257,7 @@ func TrainEmbeddingPackageFromTextContrastiveFiles(artifactPath, tokenizerPath, 
 				return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, fmt.Errorf("tokenize score-spectrum eval dataset: %w", err)
 			}
 		}
-		summary, err := trainer.FitScoreSpectrum(trainSet, evalPairs, cfg)
+		summary, err := trainer.FitScoreSpectrumSource(trainSource, evalPairs, cfg)
 		if err != nil {
 			return EmbeddingTrainRunSummary{}, EmbeddingTrainPackagePaths{}, err
 		}
@@ -622,6 +618,14 @@ func ScoreSpectrumPolicyFromExamples(examples []EmbeddingScoreSpectrumExample) E
 	}
 	sort.Strings(policy.SourceArtifactHashes)
 	return policy
+}
+
+// EstimateScoreSpectrumSourceTrainWorkload returns score-spectrum workload
+// counts from a random-access source without decoding or retaining row
+// payloads. It is intended for CLI plan-only paths and other callers that
+// need exact candidate accounting for file-backed datasets.
+func EstimateScoreSpectrumSourceTrainWorkload(source EmbeddingScoreSpectrumExampleSource, pairwiseEvalExamples, scoreSpectrumEvalExamples, evalExamples int, cfg EmbeddingTrainRunConfig) EmbeddingTrainWorkload {
+	return estimateScoreSpectrumSourceTrainWorkload(source, pairwiseEvalExamples, scoreSpectrumEvalExamples, evalExamples, cfg)
 }
 
 func ListwiseGeometryPolicyFromBatches(batches []EmbeddingTokenizedListwiseGeometryBatch) EmbeddingListwiseGeometryPolicy {

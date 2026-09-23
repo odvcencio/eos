@@ -1185,7 +1185,7 @@ func main() {
 	}
 
 	mseBytes, signBytes := turboquant.IPQuantizedSizes(dim, *bits)
-	quantizedVectorBytes := int64(mseBytes + signBytes + 4)
+	quantizedVectorBytes := int64(mseBytes + signBytes + 8)
 	insertCount := len(children)
 	if *layout == "single_parent_vectors" {
 		insertCount = parentCount

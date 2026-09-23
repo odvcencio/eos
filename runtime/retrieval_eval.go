@@ -48,6 +48,25 @@ type RetrievalEvalConfig struct {
 	PerQueryJSONLPath    string
 	AllowMissingRelevant bool
 	QuantizerSeed        int64
+	// GateBindingJSON carries the canonical, nonce-bound AOQT evaluator
+	// binding supplied by the quality-gate launcher. It is intentionally an
+	// opaque JSON string so large integer values (notably the quantizer seed)
+	// survive the native output round trip without float64 conversion. An
+	// empty value keeps ordinary, non-gate retrieval evaluation backward
+	// compatible; a non-empty value is validated before native outputs are
+	// written.
+	GateBindingJSON string
+	// GateBindingMetricsJSONPath and GateBindingMetricsTSVPath identify the
+	// output paths bound by GateBindingJSON. They are only consulted when a
+	// gate binding is present; ordinary retrieval evaluation leaves them
+	// empty and retains its existing behavior.
+	GateBindingMetricsJSONPath string
+	GateBindingMetricsTSVPath  string
+	// AllowResearchOnlyAOQT opts the TurboQuant evaluator into the explicit
+	// research-only AOQT loader. It is false by default and is meaningful only
+	// for a gate-bound candidate evaluation; ordinary retrieval remains on the
+	// release-clean embedding loader.
+	AllowResearchOnlyAOQT bool
 	// RerankBits requests an independent TurboQuant bit width for
 	// TurboQuantRerankStorageCompactReconstruct reranking: a second
 	// IPQuantizer (same seed, same dim, RerankBits wide) quantizes the

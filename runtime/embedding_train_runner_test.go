@@ -82,6 +82,38 @@ func TestContrastiveLengthBucketWindowHandlesSingletonBatch(t *testing.T) {
 	}
 }
 
+func TestScoreSpectrumBatchStepErrorIncludesSourceRowsAndIDs(t *testing.T) {
+	order := make([]int, 84)
+	for i := range order {
+		order[i] = i
+	}
+	err := scoreSpectrumBatchStepError(
+		21,
+		scoreSpectrumBatchSpan{start: 80, end: 84},
+		order,
+		[]EmbeddingScoreSpectrumExample{
+			{RowID: "nfcorpus:PLAIN-189:r4-broad-gap-dualcut"},
+			{RowID: "nfcorpus:PLAIN-20:r4-broad-gap-dualcut"},
+			{RowID: "nfcorpus:PLAIN-203:r4-broad-gap-dualcut"},
+			{RowID: "nfcorpus:PLAIN-204:r4-broad-gap-dualcut"},
+		},
+		fmt.Errorf("score-spectrum row 3: recovery loss requires at least one eligible hard-negative candidate"),
+	)
+	if err == nil {
+		t.Fatal("scoreSpectrumBatchStepError returned nil")
+	}
+	text := err.Error()
+	for _, want := range []string{
+		"score-spectrum batch 21 source rows 80..83",
+		"nfcorpus:PLAIN-204:r4-broad-gap-dualcut",
+		"score-spectrum row 3: recovery loss requires at least one eligible hard-negative candidate",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("error = %q, want containing %q", text, want)
+		}
+	}
+}
+
 func TestEstimateContrastiveTrainWorkloadWithTurboQuantPrefixObjectives(t *testing.T) {
 	workload := EstimateContrastiveTrainWorkload(512, 128, EmbeddingTrainRunConfig{
 		Epochs:         1,
@@ -180,6 +212,46 @@ func TestEstimateHardNegativeTrainWorkloadWithTurboQuantRankMarginObjectives(t *
 	}
 }
 
+func TestEstimateHardNegativeTrainWorkloadRankMarginCountsRowsNotNegatives(t *testing.T) {
+	cfg := NormalizeEmbeddingTrainRunConfigForEmbeddingDim(EmbeddingTrainRunConfig{
+		Epochs:          1,
+		BatchSize:       4,
+		ContrastiveLoss: "grouped_infonce",
+		MatryoshkaDims:  []int{384},
+		TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{
+			{Dim: 384, BitWidth: 3, Weight: 0.1},
+		},
+	}, 384)
+	workload := EstimateHardNegativeTrainWorkload(48, 7, 0, cfg)
+	if workload.TrainBatchesPerEpoch != 12 {
+		t.Fatalf("train batches/epoch = %d, want 12", workload.TrainBatchesPerEpoch)
+	}
+	if workload.TrainPairsPerEpoch != 432 || workload.PlannedTrainPairs != 432 || workload.PlannedTotalPairs != 432 {
+		t.Fatalf("train pair accounting = per_epoch:%d planned:%d total:%d, want 432/432/432", workload.TrainPairsPerEpoch, workload.PlannedTrainPairs, workload.PlannedTotalPairs)
+	}
+}
+
+func TestEstimateHardNegativeTrainWorkloadRankMarginMeanEligibleCountsNegatives(t *testing.T) {
+	cfg := NormalizeEmbeddingTrainRunConfigForEmbeddingDim(EmbeddingTrainRunConfig{
+		Epochs:                        1,
+		BatchSize:                     4,
+		ContrastiveLoss:               "grouped_infonce",
+		MatryoshkaDims:                []int{384},
+		TurboQuantRankMarginLoss:      TurboQuantRankMarginLossSoftplus,
+		TurboQuantRankMarginReduction: TurboQuantRankMarginReductionMeanEligible,
+		TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{
+			{Dim: 384, BitWidth: 3, Weight: 0.1},
+		},
+	}, 384)
+	workload := EstimateHardNegativeTrainWorkload(48, 7, 0, cfg)
+	if workload.TrainBatchesPerEpoch != 12 {
+		t.Fatalf("train batches/epoch = %d, want 12", workload.TrainBatchesPerEpoch)
+	}
+	if workload.TrainPairsPerEpoch != 720 || workload.PlannedTrainPairs != 720 || workload.PlannedTotalPairs != 720 {
+		t.Fatalf("train pair accounting = per_epoch:%d planned:%d total:%d, want 720/720/720", workload.TrainPairsPerEpoch, workload.PlannedTrainPairs, workload.PlannedTotalPairs)
+	}
+}
+
 func TestEstimateHardNegativeTrainWorkloadWithTurboQuantCompactObjectives(t *testing.T) {
 	workload := EstimateHardNegativeTrainWorkload(128, 1, 0, EmbeddingTrainRunConfig{
 		Epochs:          1,
@@ -238,6 +310,136 @@ func TestTurboQuantRankMarginHardNegativeCountsEligibleRows(t *testing.T) {
 	if loss <= 0 {
 		t.Fatalf("rank-margin loss = %f, want positive hinge loss", loss)
 	}
+}
+
+func TestTurboQuantRankMarginSoftplusMeanEligibleAllNegativesReceiveGradient(t *testing.T) {
+	queries := []*embeddingEncodedSequence{{pooled: []float32{1, 0, 0}}}
+	candidates := []*embeddingEncodedSequence{
+		{pooled: []float32{1, 0, 0}},
+		{pooled: []float32{0.9, 0.1, 0}},
+		{pooled: []float32{0.8, 0, 0.2}},
+		{pooled: []float32{0.7, 0.2, 0.1}},
+	}
+	spans := []embeddingCandidateSpan{{Start: 0, End: 4}}
+	queryGrads := newEmbeddingPooledGradBuffers(queries)
+	candidateGrads := newEmbeddingPooledGradBuffers(candidates)
+	loss, _, pairs := accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates, spans, nil, EmbeddingTrainConfig{
+		MatryoshkaDims: []int{3},
+		TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{
+			{Dim: 3, BitWidth: 8, Weight: 1},
+		},
+		TurboQuantRankMargin:          0.5,
+		TurboQuantRankMarginLoss:      TurboQuantRankMarginLossSoftplus,
+		TurboQuantRankMarginReduction: TurboQuantRankMarginReductionMeanEligible,
+		TurboQuantRankMarginTau:       0.2,
+		TurboQuantPrefixScoreMode:     TurboQuantPrefixScoreModePreparedIP,
+		TurboQuantPrefixSeed:          DefaultTurboQuantMultiVectorQuantizerSeed,
+	}, queryGrads, candidateGrads)
+	if pairs != 3 {
+		t.Fatalf("rank-margin pairs = %d, want all three eligible negatives", pairs)
+	}
+	if !(loss > 0) || math.IsNaN(float64(loss)) || math.IsInf(float64(loss), 0) {
+		t.Fatalf("rank-margin softplus loss = %f, want finite positive", loss)
+	}
+	for i := 1; i < len(candidateGrads); i++ {
+		norm := l2norm(candidateGrads[i])
+		if !(norm > 0) || math.IsNaN(float64(norm)) || math.IsInf(float64(norm), 0) {
+			t.Fatalf("candidate %d grad norm = %f, want finite positive", i, norm)
+		}
+	}
+}
+
+func TestTurboQuantRankMarginSoftplusMeanEligibleExcludesTeacherTies(t *testing.T) {
+	queries := []*embeddingEncodedSequence{{pooled: []float32{1, 0, 0}}}
+	candidates := []*embeddingEncodedSequence{
+		{pooled: []float32{1, 0, 0}},
+		{pooled: []float32{0.9, 0.1, 0}},
+		{pooled: []float32{0.8, 0, 0.2}},
+		{pooled: []float32{0.7, 0.2, 0.1}},
+	}
+	spans := []embeddingCandidateSpan{{Start: 0, End: 4}}
+	teacherScores := [][]float32{{1, 0.9, 1, 0.1}}
+	queryGrads := newEmbeddingPooledGradBuffers(queries)
+	candidateGrads := newEmbeddingPooledGradBuffers(candidates)
+	_, _, pairs := accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates, spans, teacherScores, EmbeddingTrainConfig{
+		MatryoshkaDims: []int{3},
+		TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{
+			{Dim: 3, BitWidth: 8, Weight: 1},
+		},
+		TurboQuantRankMarginLoss:      TurboQuantRankMarginLossSoftplus,
+		TurboQuantRankMarginReduction: TurboQuantRankMarginReductionMeanEligible,
+		TurboQuantRankMarginTau:       0.2,
+		TurboQuantPrefixScoreMode:     TurboQuantPrefixScoreModePreparedIP,
+		TurboQuantPrefixSeed:          DefaultTurboQuantMultiVectorQuantizerSeed,
+	}, queryGrads, candidateGrads)
+	if pairs != 2 {
+		t.Fatalf("rank-margin pairs = %d, want two teacher-eligible negatives", pairs)
+	}
+	if norm := l2norm(candidateGrads[2]); norm != 0 {
+		t.Fatalf("teacher-tied candidate grad norm = %f, want zero", norm)
+	}
+}
+
+func TestTurboQuantRankMarginSoftplusMeanEligibleReconstructCosineFinite(t *testing.T) {
+	queries := []*embeddingEncodedSequence{{pooled: []float32{1, 0, 0}}}
+	candidates := []*embeddingEncodedSequence{
+		{pooled: []float32{1, 0, 0}},
+		{pooled: []float32{0.8, 0.2, 0}},
+		{pooled: []float32{0.7, 0, 0.3}},
+		{pooled: []float32{0.6, 0.3, 0.1}},
+	}
+	spans := []embeddingCandidateSpan{{Start: 0, End: 4}}
+	queryGrads := newEmbeddingPooledGradBuffers(queries)
+	candidateGrads := newEmbeddingPooledGradBuffers(candidates)
+	loss, _, pairs := accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates, spans, nil, EmbeddingTrainConfig{
+		MatryoshkaDims: []int{3},
+		TurboQuantRankMarginObjectives: []TurboQuantPrefixObjective{
+			{Dim: 3, BitWidth: 8, Weight: 1},
+		},
+		TurboQuantRankMargin:          0.5,
+		TurboQuantRankMarginLoss:      TurboQuantRankMarginLossSoftplus,
+		TurboQuantRankMarginReduction: TurboQuantRankMarginReductionMeanEligible,
+		TurboQuantRankMarginTau:       0.2,
+		TurboQuantPrefixSeed:          DefaultTurboQuantMultiVectorQuantizerSeed,
+	}, queryGrads, candidateGrads)
+	if pairs != 3 {
+		t.Fatalf("rank-margin pairs = %d, want all three eligible negatives", pairs)
+	}
+	if !(loss > 0) || math.IsNaN(float64(loss)) || math.IsInf(float64(loss), 0) {
+		t.Fatalf("rank-margin reconstruct softplus loss = %f, want finite positive", loss)
+	}
+	for i := 1; i < len(candidateGrads); i++ {
+		norm := l2norm(candidateGrads[i])
+		if !(norm > 0) || math.IsNaN(float64(norm)) || math.IsInf(float64(norm), 0) {
+			t.Fatalf("candidate %d grad norm = %f, want finite positive", i, norm)
+		}
+	}
+}
+
+func TestTurboQuantRankMarginSoftplusScaleMatchesFiniteDifference(t *testing.T) {
+	posScore := float32(0.2)
+	negScore := float32(0.55)
+	margin := float32(0.1)
+	tau := float32(0.2)
+	loss, _, scale := turboQuantRankMarginLossScoreScale(posScore, negScore, margin, TurboQuantRankMarginLossSoftplus, tau)
+	if !(loss > 0) || !(scale > 0) {
+		t.Fatalf("softplus loss/scale = %f/%f, want positive", loss, scale)
+	}
+	eps := float32(1e-3)
+	lossPlus, _, _ := turboQuantRankMarginLossScoreScale(posScore, negScore+eps, margin, TurboQuantRankMarginLossSoftplus, tau)
+	lossMinus, _, _ := turboQuantRankMarginLossScoreScale(posScore, negScore-eps, margin, TurboQuantRankMarginLossSoftplus, tau)
+	numeric := (lossPlus - lossMinus) / (2 * eps)
+	if math.Abs(float64(numeric-scale)) > 1e-3 {
+		t.Fatalf("softplus dloss/dneg numeric=%f analytic=%f", numeric, scale)
+	}
+}
+
+func l2norm(values []float32) float32 {
+	sum := float32(0)
+	for _, value := range values {
+		sum += value * value
+	}
+	return float32(math.Sqrt(float64(sum)))
 }
 
 func TestTurboQuantCompactHardNegativeUsesPreparedIPAndTeacherTargets(t *testing.T) {
@@ -2163,6 +2365,57 @@ func TestEmbeddingTrainerFitContrastiveEvalOnlySkipsInheritedTurboQuantRankMargi
 	}
 	if summary.Config.TurboQuantRankMargin != 0 {
 		t.Fatalf("summary rank-margin = %f, want 0 for eval-only", summary.Config.TurboQuantRankMargin)
+	}
+}
+
+func TestEmbeddingTrainerTurboQuantTopKRejectsNonScoreSpectrumModes(t *testing.T) {
+	topK := []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 2, Weight: 0.25}}
+	for _, tt := range []struct {
+		name string
+		run  func(*EmbeddingTrainer) error
+	}{
+		{
+			name: "pairwise explicit",
+			run: func(trainer *EmbeddingTrainer) error {
+				_, err := trainer.Fit(tinyEmbeddingPairDataset(), nil, EmbeddingTrainRunConfig{
+					Epochs:                   1,
+					BatchSize:                2,
+					TurboQuantTopKObjectives: topK,
+					TurboQuantTopKLoss:       TurboQuantTopKLossLambdaNDCG,
+				})
+				return err
+			},
+		},
+		{
+			name: "contrastive inherited",
+			run: func(trainer *EmbeddingTrainer) error {
+				trainer.config.TurboQuantTopKObjectives = topK
+				trainer.config.TurboQuantTopKLoss = TurboQuantTopKLossLambdaNDCG
+				_, err := trainer.FitContrastive(tinyEmbeddingContrastiveDataset(), nil, EmbeddingTrainRunConfig{
+					Epochs:    1,
+					BatchSize: 2,
+				})
+				return err
+			},
+		},
+		{
+			name: "hard-negative explicit",
+			run: func(trainer *EmbeddingTrainer) error {
+				_, err := trainer.FitHardNegatives(tinyEmbeddingHardNegativeDataset(), nil, EmbeddingTrainRunConfig{
+					Epochs:                   1,
+					BatchSize:                2,
+					HardNegativesPerQuery:    1,
+					TurboQuantTopKObjectives: topK,
+					TurboQuantTopKLoss:       TurboQuantTopKLossLambdaNDCG,
+				})
+				return err
+			},
+		},
+	} {
+		err := tt.run(newTinyTrainable3DEmbeddingTrainer(t, 0.05))
+		if err == nil || !strings.Contains(err.Error(), "score-spectrum training") {
+			t.Fatalf("%s: error = %v, want score-spectrum-only rejection", tt.name, err)
+		}
 	}
 }
 

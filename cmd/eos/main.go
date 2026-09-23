@@ -215,6 +215,18 @@ func run(args []string) error {
 		return runMaterializeAOQTSidecar(args[1:])
 	case "train-aoqt-sidecar":
 		return runTrainAOQTSidecar(args[1:])
+	case "screen-aoqt-v7-r6", "screen-aoqt-sidecar-v7-r6":
+		return runScreenAOQTV7R6(args[1:])
+	case "screen-aoqt-v8-constrained-basis", "screen-aoqt-sidecar-v8-constrained-basis":
+		return runScreenAOQTV8ConstrainedBasis(args[1:])
+	case "screen-aoqt-v9-active-set-nullspace", "screen-aoqt-sidecar-v9-active-set-nullspace":
+		return runScreenAOQTV9ActiveSetNullspace(args[1:])
+	case "screen-aoqt-v10-residual-lowrank", "screen-aoqt-sidecar-v10-residual-lowrank":
+		return runScreenAOQTResidualLowRank(args[1:])
+	case "screen-aoqt-v10b-gradient-svd", "screen-aoqt-sidecar-v10b-gradient-svd":
+		return runScreenAOQTV10bGradientSVD(args[1:])
+	case "transform-aoqt-vectors":
+		return runTransformAOQTVectors(args[1:])
 	case "plan-multivector-storage":
 		return runPlanMultiVectorStorage(args[1:])
 	case "train-embed":
@@ -1327,6 +1339,58 @@ func runEvalRetrievalHybrid(args []string) error {
 	return nil
 }
 
+func runTransformAOQTVectors(args []string) error {
+	fs := flag.NewFlagSet("transform-aoqt-vectors", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	transformPath := fs.String("transform", "", "AOQT Givens transform JSON sidecar")
+	docVectorsPath := fs.String("doc-vectors", "", "input document vector cache JSONL")
+	queryVectorsPath := fs.String("query-vectors", "", "input query vector cache JSONL")
+	outDocVectorsPath := fs.String("out-doc-vectors", "", "output transformed document vector cache JSONL")
+	outQueryVectorsPath := fs.String("out-query-vectors", "", "output transformed query vector cache JSONL")
+	sidecarPath := fs.String("sidecar-json", "", "output hash/topology binding sidecar JSON")
+	expectedDim := fs.Int("expected-dim", 384, "required AOQT transform dimension; use 0 to disable")
+	expectedStages := fs.Int("expected-stages", 8, "required AOQT stage count; use 0 to disable")
+	expectedPairsPerStage := fs.Int("expected-pairs-per-stage", 192, "required pairs per stage; use 0 to disable")
+	expectedAngleCount := fs.Int("expected-angle-count", 1536, "required total angle count; use 0 to disable")
+	datasetName := fs.String("dataset", "", "dataset name for binding output")
+	artifactLabel := fs.String("artifact", "", "artifact/model label for binding output")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *transformPath == "" || *docVectorsPath == "" || *queryVectorsPath == "" || *outDocVectorsPath == "" || *outQueryVectorsPath == "" || *sidecarPath == "" {
+		return fmt.Errorf("usage: eos transform-aoqt-vectors --transform transform.json --doc-vectors docs.jsonl --query-vectors queries.jsonl --out-doc-vectors out-docs.jsonl --out-query-vectors out-queries.jsonl --sidecar-json binding.json")
+	}
+	binding, err := eosruntime.TransformAOQTRetrievalVectorCaches(eosruntime.AOQTVectorCacheTransformConfig{
+		TransformPath:      *transformPath,
+		DocVectorPath:      *docVectorsPath,
+		QueryVectorPath:    *queryVectorsPath,
+		OutputDocPath:      *outDocVectorsPath,
+		OutputQueryPath:    *outQueryVectorsPath,
+		SidecarPath:        *sidecarPath,
+		ExpectedDim:        *expectedDim,
+		ExpectedStages:     *expectedStages,
+		ExpectedPairsStage: *expectedPairsPerStage,
+		ExpectedAngleCount: *expectedAngleCount,
+		Dataset:            *datasetName,
+		Artifact:           *artifactLabel,
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("transformed AOQT vectors: dataset=%s docs=%d queries=%d dim=%d stages=%d angles=%d\n",
+		binding.Dataset,
+		binding.Outputs.DocVectorCount,
+		binding.Outputs.QueryVectorCount,
+		binding.Topology.Dim,
+		binding.Topology.StageCount,
+		binding.Topology.AngleCount,
+	)
+	fmt.Printf("doc_vectors: %s\n", binding.Outputs.DocVectorPath)
+	fmt.Printf("query_vectors: %s\n", binding.Outputs.QueryVectorPath)
+	fmt.Printf("sidecar: %s\n", *sidecarPath)
+	return nil
+}
+
 func runEvalRetrievalVectorsHybrid(args []string) error {
 	fs := flag.NewFlagSet("eval-retrieval-vectors-hybrid", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -1880,6 +1944,7 @@ func runEvalRetrievalTurboQuant(args []string) error {
 	metricsTSVPath := fs.String("metrics-tsv", "", "write compact dense/quantized metrics TSV")
 	perQueryPath := fs.String("per-query-jsonl", "", "write one compact TurboQuant retrieval diagnostics JSONL row per evaluated query and method")
 	perQueryTopK := fs.Int("per-query-top-k", 0, "optional retrieval depth for per-query diagnostics only; metrics still use --top-k")
+	allowResearchOnlyAOQT := fs.Bool("allow-research-only-aoqt", false, "allow a gate-bound candidate package with research-only AOQT lineage (candidate gate use only)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -1903,26 +1968,42 @@ func runEvalRetrievalTurboQuant(args []string) error {
 	if *datasetName == "" {
 		*datasetName = filepath.Base(datasetDir)
 	}
+	gateBindingJSON, err := eosruntime.LoadTurboQuantGateBindingFromEnvironment()
+	if err != nil {
+		return err
+	}
+	if *allowResearchOnlyAOQT && gateBindingJSON == "" {
+		return fmt.Errorf("--allow-research-only-aoqt requires an AOQT gate binding")
+	}
 
 	rt := eosruntime.New(cuda.New(), metal.New(), vulkan.New(), directml.New(), webgpu.New())
-	model, err := rt.LoadEmbeddingPackage(context.Background(), artifactPath)
+	var model *eosruntime.EmbeddingModel
+	if *allowResearchOnlyAOQT {
+		model, err = rt.LoadAOQTResearchEmbeddingPackage(context.Background(), artifactPath)
+	} else {
+		model, err = rt.LoadEmbeddingPackage(context.Background(), artifactPath)
+	}
 	if err != nil {
 		return err
 	}
 	metrics, err := eosruntime.EvaluateTurboQuantRetrievalWithRerankStorage(context.Background(), model, eosruntime.RetrievalEvalConfig{
-		DatasetName:       *datasetName,
-		ArtifactPath:      artifactPath,
-		CorpusPath:        corpusPath,
-		QueriesPath:       queriesPath,
-		QrelsPath:         *qrelsPath,
-		BatchSize:         *batchSize,
-		TopK:              *topK,
-		PerQueryTopK:      *perQueryTopK,
-		MaxDocs:           *maxDocs,
-		MaxQueries:        *maxQueries,
-		PerQueryJSONLPath: *perQueryPath,
-		QuantizerSeed:     *quantizerSeed,
-		RerankBits:        *rerankBits,
+		DatasetName:                *datasetName,
+		ArtifactPath:               artifactPath,
+		CorpusPath:                 corpusPath,
+		QueriesPath:                queriesPath,
+		QrelsPath:                  *qrelsPath,
+		BatchSize:                  *batchSize,
+		TopK:                       *topK,
+		PerQueryTopK:               *perQueryTopK,
+		MaxDocs:                    *maxDocs,
+		MaxQueries:                 *maxQueries,
+		PerQueryJSONLPath:          *perQueryPath,
+		QuantizerSeed:              *quantizerSeed,
+		GateBindingJSON:            gateBindingJSON,
+		GateBindingMetricsJSONPath: *metricsPath,
+		GateBindingMetricsTSVPath:  *metricsTSVPath,
+		AllowResearchOnlyAOQT:      *allowResearchOnlyAOQT,
+		RerankBits:                 *rerankBits,
 	}, bits, rerankOverfetch, *rerankStorage)
 	if err != nil {
 		return err
@@ -1997,6 +2078,7 @@ func runEvalRetrievalVectorsTurboQuant(args []string) error {
 	quantizerSeed := fs.Int64("quantizer-seed", eosruntime.DefaultTurboQuantMultiVectorQuantizerSeed, "TurboQuant IP quantizer seed for deterministic rows")
 	rerankOverfetchRaw := fs.String("rerank-overfetch", "", "optional comma-separated TurboQuant candidate depths to rerank, e.g. 200,500")
 	rerankStorage := fs.String("rerank-storage", eosruntime.TurboQuantRerankStorageDense, "rerank storage for --rerank-overfetch: dense, compact-reconstruct, or fp16")
+	rerankBits := fs.Int("rerank-bits", 0, "optional independent TurboQuant bit width (2..8) for a --rerank-storage=compact-reconstruct sidecar rerank; 0 disables and reranks from the primary codes as before")
 	metricsPath := fs.String("metrics-json", "", "write TurboQuant retrieval metrics JSON")
 	metricsTSVPath := fs.String("metrics-tsv", "", "write compact dense/quantized metrics TSV")
 	perQueryPath := fs.String("per-query-jsonl", "", "write one compact TurboQuant retrieval diagnostics JSONL row per evaluated query and method")
@@ -2038,6 +2120,7 @@ func runEvalRetrievalVectorsTurboQuant(args []string) error {
 		MaxQueries:        *maxQueries,
 		PerQueryJSONLPath: *perQueryPath,
 		QuantizerSeed:     *quantizerSeed,
+		RerankBits:        *rerankBits,
 	}, bits, rerankOverfetch, *rerankStorage)
 	if err != nil {
 		return err
@@ -2065,6 +2148,9 @@ func runEvalRetrievalVectorsTurboQuant(args []string) error {
 		label := fmt.Sprintf("q%d", row.Bits)
 		if row.RerankOverfetch > 0 {
 			label = fmt.Sprintf("q%d-rerank%d", row.Bits, row.RerankOverfetch)
+			if row.RerankBits > 0 {
+				label = fmt.Sprintf("q%d-rerank%d-q%d", row.Bits, row.RerankOverfetch, row.RerankBits)
+			}
 		}
 		fmt.Printf("%s: ndcg@10=%.6f delta=%+.6f recall@100=%.6f delta=%+.6f vector_bytes=%d total_vector_bytes=%d compression=%.2fx total_compression=%.2fx scores/s=%.2f query_p95_ms=%.3f\n",
 			label,
@@ -2212,76 +2298,109 @@ func runEvalRetrievalMultiVectorTurboQuant(args []string) error {
 
 func writeTurboQuantRetrievalMetricsTSV(path string, metrics eosruntime.TurboQuantRetrievalEvalMetrics) error {
 	var b strings.Builder
-	b.WriteString("dataset\trow\tbits\tmethod\trerank_overfetch\trerank_storage\tndcg_at_10\tndcg_at_100\tmrr_at_10\tprecision_at_1\tprecision_at_5\tprecision_at_10\thit_at_1\thit_at_5\thit_at_10\tmap_at_10\tmap_at_100\trecall_at_10\trecall_at_100\tndcg_at_10_delta\trecall_at_100_delta\tvector_bytes\tdense_vector_bytes\trerank_sidecar_bytes\ttotal_vector_bytes\tcompression_ratio\ttotal_compression_ratio\tscores_per_second\tquery_latency_p50_ms\tquery_latency_p95_ms\tquery_latency_p99_ms\tquery_latency_max_ms\tdocs_per_second\trerank_scores\n")
-	fmt.Fprintf(&b, "%s\tdense\t\tfloat32\t\t\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t\t\t%d\t%d\t0\t%d\t%.6f\t%.6f\t%.2f\t%.6f\t%.6f\t%.6f\t%.6f\t\t\n",
+	b.WriteString("dataset\trow\tbits\tmethod\trerank_overfetch\trerank_storage\trerank_bits\tndcg_at_10\tndcg_at_100\tmrr_at_10\tprecision_at_1\tprecision_at_5\tprecision_at_10\thit_at_1\thit_at_5\thit_at_10\tmap_at_10\tmap_at_100\trecall_at_10\trecall_at_100\tndcg_at_10_delta\trecall_at_100_delta\tvector_bytes\tdense_vector_bytes\trerank_sidecar_bytes\ttotal_vector_bytes\tcompression_ratio\ttotal_compression_ratio\tscores_per_second\tcandidate_count\tcandidates_scored\tcandidates_pruned\tpruning_supported\tpruning_used\tcandidate_decisions_per_second\tquery_latency_p50_ms\tquery_latency_p95_ms\tquery_latency_p99_ms\tquery_latency_max_ms\tdocs_per_second\trerank_scores\n")
+	b.WriteString(strings.Join([]string{
 		metrics.Dataset,
-		metrics.Dense.Quality.NDCGAt10,
-		metrics.Dense.Quality.NDCGAt100,
-		metrics.Dense.Quality.MRRAt10,
-		metrics.Dense.Quality.PrecisionAt1,
-		metrics.Dense.Quality.PrecisionAt5,
-		metrics.Dense.Quality.PrecisionAt10,
-		metrics.Dense.Quality.HitAt1,
-		metrics.Dense.Quality.HitAt5,
-		metrics.Dense.Quality.HitAt10,
-		metrics.Dense.Quality.MAPAt10,
-		metrics.Dense.Quality.MAPAt100,
-		metrics.Dense.Quality.RecallAt10,
-		metrics.Dense.Quality.RecallAt100,
-		metrics.Dense.VectorBytes,
-		metrics.Dense.VectorBytes,
-		metrics.Dense.VectorBytes,
-		1.0,
-		1.0,
-		metrics.Dense.ScoresPerSecond,
-		metrics.Dense.QueryLatency.P50MS,
-		metrics.Dense.QueryLatency.P95MS,
-		metrics.Dense.QueryLatency.P99MS,
-		metrics.Dense.QueryLatency.MaxMS,
-	)
+		"dense",
+		"",
+		"float32",
+		"",
+		"",
+		"",
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.NDCGAt10),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.NDCGAt100),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.MRRAt10),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.PrecisionAt1),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.PrecisionAt5),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.PrecisionAt10),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.HitAt1),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.HitAt5),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.HitAt10),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.MAPAt10),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.MAPAt100),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.RecallAt10),
+		fmt.Sprintf("%.6f", metrics.Dense.Quality.RecallAt100),
+		"",
+		"",
+		strconv.FormatInt(metrics.Dense.VectorBytes, 10),
+		strconv.FormatInt(metrics.Dense.VectorBytes, 10),
+		"0",
+		strconv.FormatInt(metrics.Dense.VectorBytes, 10),
+		"1.000000",
+		"1.000000",
+		fmt.Sprintf("%.2f", metrics.Dense.ScoresPerSecond),
+		"",
+		"",
+		"",
+		"",
+		"",
+		"",
+		fmt.Sprintf("%.6f", metrics.Dense.QueryLatency.P50MS),
+		fmt.Sprintf("%.6f", metrics.Dense.QueryLatency.P95MS),
+		fmt.Sprintf("%.6f", metrics.Dense.QueryLatency.P99MS),
+		fmt.Sprintf("%.6f", metrics.Dense.QueryLatency.MaxMS),
+		"",
+		"",
+	}, "\t"))
+	b.WriteByte('\n')
 	for _, row := range metrics.Rows {
 		rowKind := "quantized"
 		if row.RerankOverfetch > 0 {
 			rowKind = "quantized_rerank"
 		}
-		fmt.Fprintf(&b, "%s\t%s\t%d\t%s\t%d\t%s\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%.6f\t%+.6f\t%+.6f\t%d\t%d\t%d\t%d\t%.6f\t%.6f\t%.2f\t%.6f\t%.6f\t%.6f\t%.6f\t%.2f\t%d\n",
+		b.WriteString(strings.Join([]string{
 			metrics.Dataset,
 			rowKind,
-			row.Bits,
+			strconv.Itoa(row.Bits),
 			row.Method,
-			row.RerankOverfetch,
+			strconv.Itoa(row.RerankOverfetch),
 			row.RerankStorage,
-			row.Quality.NDCGAt10,
-			row.Quality.NDCGAt100,
-			row.Quality.MRRAt10,
-			row.Quality.PrecisionAt1,
-			row.Quality.PrecisionAt5,
-			row.Quality.PrecisionAt10,
-			row.Quality.HitAt1,
-			row.Quality.HitAt5,
-			row.Quality.HitAt10,
-			row.Quality.MAPAt10,
-			row.Quality.MAPAt100,
-			row.Quality.RecallAt10,
-			row.Quality.RecallAt100,
-			row.NDCGAt10Delta,
-			row.RecallAt100Delta,
-			row.VectorBytes,
-			row.DenseVectorBytes,
-			row.RerankSidecarBytes,
-			row.TotalVectorBytes,
-			row.CompressionRatio,
-			row.TotalCompression,
-			row.ScoresPerSecond,
-			row.QueryLatency.P50MS,
-			row.QueryLatency.P95MS,
-			row.QueryLatency.P99MS,
-			row.QueryLatency.MaxMS,
-			row.DocsPerSecond,
-			row.RerankScores,
-		)
+			optionalInt(row.RerankBits),
+			fmt.Sprintf("%.6f", row.Quality.NDCGAt10),
+			fmt.Sprintf("%.6f", row.Quality.NDCGAt100),
+			fmt.Sprintf("%.6f", row.Quality.MRRAt10),
+			fmt.Sprintf("%.6f", row.Quality.PrecisionAt1),
+			fmt.Sprintf("%.6f", row.Quality.PrecisionAt5),
+			fmt.Sprintf("%.6f", row.Quality.PrecisionAt10),
+			fmt.Sprintf("%.6f", row.Quality.HitAt1),
+			fmt.Sprintf("%.6f", row.Quality.HitAt5),
+			fmt.Sprintf("%.6f", row.Quality.HitAt10),
+			fmt.Sprintf("%.6f", row.Quality.MAPAt10),
+			fmt.Sprintf("%.6f", row.Quality.MAPAt100),
+			fmt.Sprintf("%.6f", row.Quality.RecallAt10),
+			fmt.Sprintf("%.6f", row.Quality.RecallAt100),
+			fmt.Sprintf("%+.6f", row.NDCGAt10Delta),
+			fmt.Sprintf("%+.6f", row.RecallAt100Delta),
+			strconv.FormatInt(row.VectorBytes, 10),
+			strconv.FormatInt(row.DenseVectorBytes, 10),
+			strconv.FormatInt(row.RerankSidecarBytes, 10),
+			strconv.FormatInt(row.TotalVectorBytes, 10),
+			fmt.Sprintf("%.6f", row.CompressionRatio),
+			fmt.Sprintf("%.6f", row.TotalCompression),
+			fmt.Sprintf("%.2f", row.ScoresPerSecond),
+			strconv.FormatInt(row.CandidateCount, 10),
+			strconv.FormatInt(row.CandidatesScored, 10),
+			strconv.FormatInt(row.CandidatesPruned, 10),
+			strconv.FormatBool(row.PruningSupported),
+			strconv.FormatBool(row.PruningUsed),
+			fmt.Sprintf("%.2f", row.CandidateDecisionsPerSecond),
+			fmt.Sprintf("%.6f", row.QueryLatency.P50MS),
+			fmt.Sprintf("%.6f", row.QueryLatency.P95MS),
+			fmt.Sprintf("%.6f", row.QueryLatency.P99MS),
+			fmt.Sprintf("%.6f", row.QueryLatency.MaxMS),
+			fmt.Sprintf("%.2f", row.DocsPerSecond),
+			strconv.FormatInt(row.RerankScores, 10),
+		}, "\t"))
+		b.WriteByte('\n')
 	}
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func optionalInt(value int) string {
+	if value == 0 {
+		return ""
+	}
+	return strconv.Itoa(value)
 }
 
 func writeTurboQuantMultiVectorRetrievalMetricsTSV(path string, metrics eosruntime.TurboQuantMultiVectorRetrievalEvalMetrics) error {
@@ -4965,6 +5084,10 @@ func runInitModel(args []string) error {
 	var teacherLossWeight float64
 	var teacherTemperature float64
 	var bootstrapFrom string
+	var bootstrapFromInference string
+	var bootstrapFromInferenceWiden bool
+	var bootstrapTailInit string
+	var bootstrapTailScale float64
 	fs.StringVar(&name, "name", "", "model name")
 	fs.IntVar(&vocabSize, "vocab-size", 0, "tokenizer vocab size")
 	fs.IntVar(&maxSequence, "max-seq", 0, "maximum token sequence length")
@@ -4979,7 +5102,7 @@ func runInitModel(args []string) error {
 	fs.Float64Var(&learningRate, "lr", 0, "trainer learning rate")
 	fs.Float64Var(&weightDecay, "weight-decay", 0, "trainer weight decay")
 	fs.IntVar(&weightBits, "weight-bits", 0, "forward fake-quant bits")
-	fs.StringVar(&weightDType, "weight-dtype", "q8", "trainable weight dtype: q8 or q4")
+	fs.StringVar(&weightDType, "weight-dtype", "", "trainable weight dtype: q8 or q4 (default q8)")
 	fs.StringVar(&optimizer, "optimizer", "", "optimizer name")
 	fs.StringVar(&contrastiveLoss, "contrastive-loss", "", "contrastive loss: pair_mse, infonce, grouped_infonce, or hybrid_infonce")
 	fs.Float64Var(&temperature, "temperature", 0, "contrastive softmax temperature")
@@ -4987,11 +5110,18 @@ func runInitModel(args []string) error {
 	fs.Float64Var(&teacherLossWeight, "teacher-loss-weight", 0, "teacher score distillation weight for hard-negative training")
 	fs.Float64Var(&teacherTemperature, "teacher-temperature", 0, "teacher score softmax temperature for hard-negative distillation")
 	fs.StringVar(&bootstrapFrom, "bootstrap-from", "", "initialize overlapping model weights from an existing embedding artifact/package; uses its sibling .embed-train.mll checkpoint")
+	fs.StringVar(&bootstrapFromInference, "bootstrap-from-inference", "", "initialize exact-compatible trainable weights from a sealed inference embedding .mll")
+	fs.BoolVar(&bootstrapFromInferenceWiden, "bootstrap-from-inference-widen", false, "preserve a sealed inference graph/tokenizer while widening only model D and FFN H")
+	fs.StringVar(&bootstrapTailInit, "bootstrap-tail-init", "", "tail initialization for --bootstrap-from-inference-widen: zero, random, or projection-tail (default zero)")
+	fs.Float64Var(&bootstrapTailScale, "bootstrap-tail-scale", 0, "projection-tail noise scale for --bootstrap-tail-init=projection-tail; 0 uses default 0.03")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if fs.NArg() < 1 || fs.Arg(0) == "" {
 		return fmt.Errorf("usage: eos init-model [flags] <artifact.mll>")
+	}
+	if bootstrapFrom != "" && bootstrapFromInference != "" {
+		return fmt.Errorf("--bootstrap-from and --bootstrap-from-inference are mutually exclusive")
 	}
 	if learningRate < 0 {
 		return fmt.Errorf("lr must be non-negative")
@@ -5016,28 +5146,32 @@ func runInitModel(args []string) error {
 	}
 	path := fs.Arg(0)
 	paths, err := models.InitDefaultEmbeddingPackage(path, models.DefaultEmbeddingPackageConfig{
-		Name:               name,
-		VocabSize:          vocabSize,
-		MaxSequence:        maxSequence,
-		Architecture:       architecture,
-		ModelDim:           modelDim,
-		OutputDim:          outputDim,
-		EmbeddingDim:       embeddingDim,
-		HiddenDim:          hiddenDim,
-		AttentionHeads:     attentionHeads,
-		EncoderRepeats:     encoderRepeats,
-		Seed:               seed,
-		LearningRate:       float32(learningRate),
-		WeightDecay:        float32(weightDecay),
-		WeightBits:         weightBits,
-		WeightDType:        weightDType,
-		Optimizer:          optimizer,
-		ContrastiveLoss:    contrastiveLoss,
-		Temperature:        float32(temperature),
-		GroupedLossWeight:  float32(groupedLossWeight),
-		TeacherLossWeight:  float32(teacherLossWeight),
-		TeacherTemperature: float32(teacherTemperature),
-		BootstrapFrom:      bootstrapFrom,
+		Name:                    name,
+		VocabSize:               vocabSize,
+		MaxSequence:             maxSequence,
+		Architecture:            architecture,
+		ModelDim:                modelDim,
+		OutputDim:               outputDim,
+		EmbeddingDim:            embeddingDim,
+		HiddenDim:               hiddenDim,
+		AttentionHeads:          attentionHeads,
+		EncoderRepeats:          encoderRepeats,
+		Seed:                    seed,
+		LearningRate:            float32(learningRate),
+		WeightDecay:             float32(weightDecay),
+		WeightBits:              weightBits,
+		WeightDType:             weightDType,
+		Optimizer:               optimizer,
+		ContrastiveLoss:         contrastiveLoss,
+		Temperature:             float32(temperature),
+		GroupedLossWeight:       float32(groupedLossWeight),
+		TeacherLossWeight:       float32(teacherLossWeight),
+		TeacherTemperature:      float32(teacherTemperature),
+		BootstrapFrom:           bootstrapFrom,
+		BootstrapFromInference:  bootstrapFromInference,
+		BootstrapInferenceWiden: bootstrapFromInferenceWiden,
+		BootstrapTailInit:       bootstrapTailInit,
+		BootstrapTailScale:      bootstrapTailScale,
 	})
 	if err != nil {
 		return err
@@ -5066,6 +5200,23 @@ func runInitModel(args []string) error {
 	fmt.Printf("checkpoint: %s\n", paths.CheckpointPath)
 	if bootstrapFrom != "" {
 		fmt.Printf("bootstrap: %s\n", bootstrapFrom)
+	}
+	if bootstrapFromInference != "" {
+		fmt.Printf("bootstrap inference: %s\n", bootstrapFromInference)
+		if bootstrapFromInferenceWiden {
+			tailInit := bootstrapTailInit
+			if tailInit == "" {
+				tailInit = "zero"
+			}
+			fmt.Printf("bootstrap inference widen: model_dim=%d hidden_dim=%d tail_init=%s\n", manifest.ModelDim, manifest.FFNDim, tailInit)
+			if strings.TrimSpace(strings.ToLower(tailInit)) == "projection-tail" {
+				tailScale := bootstrapTailScale
+				if tailScale == 0 {
+					tailScale = 0.03
+				}
+				fmt.Printf("bootstrap projection tail scale: %.6f\n", tailScale)
+			}
+		}
 	}
 	fmt.Printf("profile: %s\n", paths.TrainProfilePath)
 	return nil
@@ -5318,6 +5469,8 @@ func runTrainEmbed(args []string) error {
 	var scoreSpectrumRecoveryMargin float64
 	var scoreSpectrumRecoveryTopK int
 	var scoreSpectrumRecoveryTau float64
+	var scoreSpectrumMaxBatchCandidates int
+	var scoreSpectrumActivationMicrobatchSize int
 	var hardNegativesPerQuery int
 	var hardNegativeSourceWeights string
 	var metricsJSONPath string
@@ -5342,6 +5495,20 @@ func runTrainEmbed(args []string) error {
 	var clearTurboQuantRankMargin bool
 	var turboQuantRankMarginObjectives string
 	var turboQuantRankMargin float64
+	var turboQuantRankMarginLoss string
+	var turboQuantRankMarginReduction string
+	var turboQuantRankMarginTau float64
+	var turboQuantTopKObjectives string
+	var turboQuantTopKLoss string
+	var turboQuantTopKCutoff int
+	var turboQuantTopKTau float64
+	var turboQuantTopKMargin float64
+	var turboQuantTopKNegativeMask string
+	var turboQuantTopKRecallWeight float64
+	var turboQuantTopKRecallCutoff int
+	var turboQuantTopKRecallTau float64
+	var turboQuantTopKRecallMargin float64
+	var turboQuantTopKRecallNegativeMask string
 	var retrievalEvalDir string
 	var retrievalEvalSplit string
 	var retrievalEvalMaxDocs int
@@ -5386,6 +5553,8 @@ func runTrainEmbed(args []string) error {
 	fs.Float64Var(&scoreSpectrumRecoveryMargin, "score-spectrum-recovery-margin", 0, "non-negative recovery margin for score-spectrum training")
 	fs.IntVar(&scoreSpectrumRecoveryTopK, "score-spectrum-recovery-top-k", 0, "top-k hardest eligible negatives for score-spectrum recovery loss (default 4)")
 	fs.Float64Var(&scoreSpectrumRecoveryTau, "score-spectrum-recovery-tau", 0, "positive temperature for score-spectrum recovery loss")
+	fs.IntVar(&scoreSpectrumMaxBatchCandidates, "score-spectrum-max-batch-candidates", 0, "maximum score-spectrum candidates materialized in one optimizer batch (0 = unlimited)")
+	fs.IntVar(&scoreSpectrumActivationMicrobatchSize, "score-spectrum-activation-microbatch-size", 0, "maximum score-spectrum activation sequences processed per resident microbatch (0 = route default)")
 	fs.IntVar(&hardNegativesPerQuery, "hard-negatives-per-query", 1, "maximum explicit negatives to attach to each query-positive example")
 	fs.StringVar(&hardNegativeSourceWeights, "hard-negative-source-weights", "", "comma-separated source=weight hard-negative batch mix, for example scifact=2,nfcorpus=1,fiqa=2")
 	fs.StringVar(&metricsJSONPath, "metrics-json", "", "write machine-readable run metrics JSON to this path")
@@ -5410,6 +5579,20 @@ func runTrainEmbed(args []string) error {
 	fs.BoolVar(&clearTurboQuantRankMargin, "clear-turboquant-rank-margin", false, "clear inherited TurboQuant rank-margin objectives for continuation hard-negative training")
 	fs.StringVar(&turboQuantRankMarginObjectives, "turboquant-rank-margin-objectives", "", "comma-separated TurboQuant hard-negative rank-margin objectives as dim:bit=weight, for example 128:4=0.1")
 	fs.Float64Var(&turboQuantRankMargin, "turboquant-rank-margin", 0, "TurboQuant hard-negative rank-margin target (default 0.02 when objectives are enabled)")
+	fs.StringVar(&turboQuantRankMarginLoss, "turboquant-rank-margin-loss", "", "TurboQuant hard-negative rank-margin loss: squared_hinge (default) or softplus")
+	fs.StringVar(&turboQuantRankMarginReduction, "turboquant-rank-margin-reduction", "", "TurboQuant hard-negative rank-margin negative reduction: hardest (default) or mean_eligible")
+	fs.Float64Var(&turboQuantRankMarginTau, "turboquant-rank-margin-tau", 0, "positive temperature for TurboQuant rank-margin softplus loss")
+	fs.StringVar(&turboQuantTopKObjectives, "turboquant-topk-objectives", "", "comma-separated score-spectrum prepared-IP TurboQuant top-k objectives as dim:bit=weight, for example fullDim:3=0.5")
+	fs.StringVar(&turboQuantTopKLoss, "turboquant-topk-loss", "", "TurboQuant score-spectrum top-k loss: lambdandcg")
+	fs.IntVar(&turboQuantTopKCutoff, "turboquant-topk-cutoff", 0, "TurboQuant score-spectrum LambdaNDCG cutoff (default 10)")
+	fs.Float64Var(&turboQuantTopKTau, "turboquant-topk-tau", 0, "positive temperature for TurboQuant score-spectrum LambdaNDCG loss (default 0.05)")
+	fs.Float64Var(&turboQuantTopKMargin, "turboquant-topk-margin", 0, "non-negative score margin for TurboQuant score-spectrum LambdaNDCG loss")
+	fs.StringVar(&turboQuantTopKNegativeMask, "turboquant-topk-negative-mask", "", "TurboQuant score-spectrum top-k negative mask: hard (default), all, q3, or bm25")
+	fs.Float64Var(&turboQuantTopKRecallWeight, "turboquant-topk-recall-weight", 0, "opt-in global recall-branch weight for each TurboQuant score-spectrum top-k objective (0 disables)")
+	fs.IntVar(&turboQuantTopKRecallCutoff, "turboquant-topk-recall-cutoff", 0, "TurboQuant score-spectrum recall-branch LambdaNDCG cutoff (default 100 when recall branch is enabled)")
+	fs.Float64Var(&turboQuantTopKRecallTau, "turboquant-topk-recall-tau", 0, "positive temperature for TurboQuant score-spectrum recall-branch LambdaNDCG loss (default 0.05 when recall branch is enabled)")
+	fs.Float64Var(&turboQuantTopKRecallMargin, "turboquant-topk-recall-margin", 0, "non-negative score margin for TurboQuant score-spectrum recall-branch LambdaNDCG loss")
+	fs.StringVar(&turboQuantTopKRecallNegativeMask, "turboquant-topk-recall-negative-mask", "", "TurboQuant score-spectrum recall-branch negative mask: hard (default), all, q3, or bm25")
 	fs.StringVar(&retrievalEvalDir, "retrieval-eval-dir", "", "BEIR-style dataset dir for per-epoch retrieval eval with current weights (nDCG@10, MAP@100, recall@100); enables -select-metric retrieval_ndcg(_at_10), retrieval_map, or retrieval_recall")
 	fs.StringVar(&retrievalEvalSplit, "retrieval-eval-split", "test", "qrels split for retrieval eval (test/dev/train)")
 	fs.IntVar(&retrievalEvalMaxDocs, "retrieval-eval-max-docs", 5000, "cap corpus docs embedded per retrieval eval (0 = all); smaller is faster per-epoch")
@@ -5426,6 +5609,7 @@ func runTrainEmbed(args []string) error {
 	if fs.NArg() < 2 || fs.Arg(0) == "" || fs.Arg(1) == "" {
 		return fmt.Errorf("usage: eos train-embed [flags] <artifact.mll> <train.jsonl> [eval.jsonl]\n       eos train-embed --eval-only [flags] <artifact.mll> <eval.jsonl>")
 	}
+	path := fs.Arg(0)
 	// Retrieval-gated selection default: when --retrieval-eval-dir is set and
 	// the caller did not explicitly pass --select-metric, upgrade the
 	// selection metric to the retrieval nDCG@10 gate instead of the legacy
@@ -5465,6 +5649,30 @@ func runTrainEmbed(args []string) error {
 	if turboQuantRankMargin < 0 || math.IsNaN(turboQuantRankMargin) || math.IsInf(turboQuantRankMargin, 0) {
 		return fmt.Errorf("turboquant-rank-margin must be finite and non-negative")
 	}
+	if turboQuantRankMarginTau < 0 || math.IsNaN(turboQuantRankMarginTau) || math.IsInf(turboQuantRankMarginTau, 0) {
+		return fmt.Errorf("turboquant-rank-margin-tau must be finite and non-negative")
+	}
+	if turboQuantTopKCutoff < 0 {
+		return fmt.Errorf("turboquant-topk-cutoff must be non-negative")
+	}
+	if turboQuantTopKTau < 0 || math.IsNaN(turboQuantTopKTau) || math.IsInf(turboQuantTopKTau, 0) {
+		return fmt.Errorf("turboquant-topk-tau must be finite and non-negative")
+	}
+	if turboQuantTopKMargin < 0 || math.IsNaN(turboQuantTopKMargin) || math.IsInf(turboQuantTopKMargin, 0) {
+		return fmt.Errorf("turboquant-topk-margin must be finite and non-negative")
+	}
+	if turboQuantTopKRecallWeight < 0 || math.IsNaN(turboQuantTopKRecallWeight) || math.IsInf(turboQuantTopKRecallWeight, 0) {
+		return fmt.Errorf("turboquant-topk-recall-weight must be finite and non-negative")
+	}
+	if turboQuantTopKRecallCutoff < 0 {
+		return fmt.Errorf("turboquant-topk-recall-cutoff must be non-negative")
+	}
+	if turboQuantTopKRecallTau < 0 || math.IsNaN(turboQuantTopKRecallTau) || math.IsInf(turboQuantTopKRecallTau, 0) {
+		return fmt.Errorf("turboquant-topk-recall-tau must be finite and non-negative")
+	}
+	if turboQuantTopKRecallMargin < 0 || math.IsNaN(turboQuantTopKRecallMargin) || math.IsInf(turboQuantTopKRecallMargin, 0) {
+		return fmt.Errorf("turboquant-topk-recall-margin must be finite and non-negative")
+	}
 	if vectorDistillRelationalWeight < 0 || math.IsNaN(vectorDistillRelationalWeight) || math.IsInf(vectorDistillRelationalWeight, 0) {
 		return fmt.Errorf("vector-distill-relational-weight must be finite and non-negative")
 	}
@@ -5498,6 +5706,12 @@ func runTrainEmbed(args []string) error {
 	}
 	if scoreSpectrumRecoveryTau < 0 || math.IsNaN(scoreSpectrumRecoveryTau) || math.IsInf(scoreSpectrumRecoveryTau, 0) {
 		return fmt.Errorf("score-spectrum-recovery-tau must be finite and non-negative")
+	}
+	if scoreSpectrumMaxBatchCandidates < 0 {
+		return fmt.Errorf("score-spectrum-max-batch-candidates must be non-negative")
+	}
+	if scoreSpectrumActivationMicrobatchSize < 0 {
+		return fmt.Errorf("score-spectrum-activation-microbatch-size must be non-negative")
 	}
 	trainModeCount := 0
 	for _, enabled := range []bool{pairwiseTrain, hardNegativeTrain, scoreSpectrumTrain, listwiseGeometryTrain, vectorDistillTrain} {
@@ -5554,7 +5768,7 @@ func runTrainEmbed(args []string) error {
 	if len(parsedTurboQuantPrefixObjectives) > 0 && turboQuantPrefixWeight != 0 {
 		return fmt.Errorf("--turboquant-prefix-weight must not be set with --turboquant-prefix-objectives")
 	}
-	parsedTurboQuantCompactObjectives, parseErr := eosruntime.ParseTurboQuantPrefixObjectives(turboQuantCompactObjectives)
+	parsedTurboQuantCompactObjectives, parseErr := parseTrainEmbedTurboQuantObjectives(turboQuantCompactObjectives, path)
 	if parseErr != nil {
 		return fmt.Errorf("turboquant-compact-objectives: %w", parseErr)
 	}
@@ -5562,10 +5776,49 @@ func runTrainEmbed(args []string) error {
 	if parseErr != nil {
 		return fmt.Errorf("turboquant-rank-margin-objectives: %w", parseErr)
 	}
-	if clearTurboQuantPrefix && turboQuantPrefixSeed != 0 && len(parsedTurboQuantCompactObjectives) == 0 && len(parsedTurboQuantRankMarginObjectives) == 0 {
+	parsedTurboQuantTopKObjectives, parseErr := parseTrainEmbedTurboQuantObjectives(turboQuantTopKObjectives, path)
+	if parseErr != nil {
+		return fmt.Errorf("turboquant-topk-objectives: %w", parseErr)
+	}
+	parsedTurboQuantRankMarginLoss := ""
+	if strings.TrimSpace(turboQuantRankMarginLoss) != "" {
+		parsedTurboQuantRankMarginLoss, parseErr = eosruntime.NormalizeTurboQuantRankMarginLossForCLI(turboQuantRankMarginLoss)
+		if parseErr != nil {
+			return fmt.Errorf("turboquant-rank-margin-loss: %w", parseErr)
+		}
+	}
+	parsedTurboQuantRankMarginReduction := ""
+	if strings.TrimSpace(turboQuantRankMarginReduction) != "" {
+		parsedTurboQuantRankMarginReduction, parseErr = eosruntime.NormalizeTurboQuantRankMarginReductionForCLI(turboQuantRankMarginReduction)
+		if parseErr != nil {
+			return fmt.Errorf("turboquant-rank-margin-reduction: %w", parseErr)
+		}
+	}
+	parsedTurboQuantTopKLoss := ""
+	if strings.TrimSpace(turboQuantTopKLoss) != "" {
+		parsedTurboQuantTopKLoss, parseErr = eosruntime.NormalizeTurboQuantTopKLossForCLI(turboQuantTopKLoss)
+		if parseErr != nil {
+			return fmt.Errorf("turboquant-topk-loss: %w", parseErr)
+		}
+	}
+	parsedTurboQuantTopKNegativeMask := ""
+	if strings.TrimSpace(turboQuantTopKNegativeMask) != "" {
+		parsedTurboQuantTopKNegativeMask, parseErr = eosruntime.NormalizeTurboQuantTopKNegativeMaskForCLI(turboQuantTopKNegativeMask)
+		if parseErr != nil {
+			return fmt.Errorf("turboquant-topk-negative-mask: %w", parseErr)
+		}
+	}
+	parsedTurboQuantTopKRecallNegativeMask := ""
+	if strings.TrimSpace(turboQuantTopKRecallNegativeMask) != "" {
+		parsedTurboQuantTopKRecallNegativeMask, parseErr = eosruntime.NormalizeTurboQuantTopKNegativeMaskForCLI(turboQuantTopKRecallNegativeMask)
+		if parseErr != nil {
+			return fmt.Errorf("turboquant-topk-recall-negative-mask: %w", parseErr)
+		}
+	}
+	if clearTurboQuantPrefix && turboQuantPrefixSeed != 0 && len(parsedTurboQuantCompactObjectives) == 0 && len(parsedTurboQuantRankMarginObjectives) == 0 && len(parsedTurboQuantTopKObjectives) == 0 {
 		return fmt.Errorf("--clear-turboquant-prefix is mutually exclusive with --turboquant-prefix-seed")
 	}
-	if clearTurboQuantPrefix && strings.TrimSpace(turboQuantPrefixScoreMode) != "" && len(parsedTurboQuantRankMarginObjectives) == 0 {
+	if clearTurboQuantPrefix && strings.TrimSpace(turboQuantPrefixScoreMode) != "" && len(parsedTurboQuantRankMarginObjectives) == 0 && len(parsedTurboQuantTopKObjectives) == 0 {
 		return fmt.Errorf("--clear-turboquant-prefix is mutually exclusive with --turboquant-prefix-score-mode")
 	}
 	if clearTurboQuantRankMargin && len(parsedTurboQuantRankMarginObjectives) > 0 {
@@ -5573,6 +5826,15 @@ func runTrainEmbed(args []string) error {
 	}
 	if clearTurboQuantRankMargin && turboQuantRankMargin != 0 {
 		return fmt.Errorf("--clear-turboquant-rank-margin is mutually exclusive with --turboquant-rank-margin")
+	}
+	if clearTurboQuantRankMargin && strings.TrimSpace(turboQuantRankMarginLoss) != "" {
+		return fmt.Errorf("--clear-turboquant-rank-margin is mutually exclusive with --turboquant-rank-margin-loss")
+	}
+	if clearTurboQuantRankMargin && strings.TrimSpace(turboQuantRankMarginReduction) != "" {
+		return fmt.Errorf("--clear-turboquant-rank-margin is mutually exclusive with --turboquant-rank-margin-reduction")
+	}
+	if clearTurboQuantRankMargin && turboQuantRankMarginTau != 0 {
+		return fmt.Errorf("--clear-turboquant-rank-margin is mutually exclusive with --turboquant-rank-margin-tau")
 	}
 	parsedTurboQuantPrefixScoreMode := ""
 	if strings.TrimSpace(turboQuantPrefixScoreMode) != "" {
@@ -5597,8 +5859,20 @@ func runTrainEmbed(args []string) error {
 	if len(parsedTurboQuantRankMarginObjectives) > 0 && !hardNegativeTrain && !scoreSpectrumTrain && !listwiseGeometryTrain {
 		return fmt.Errorf("--turboquant-rank-margin-objectives requires --hard-negative-train")
 	}
+	if (parsedTurboQuantRankMarginLoss != "" || parsedTurboQuantRankMarginReduction != "" || turboQuantRankMarginTau != 0) && len(parsedTurboQuantRankMarginObjectives) == 0 {
+		return fmt.Errorf("--turboquant-rank-margin-loss, --turboquant-rank-margin-reduction, and --turboquant-rank-margin-tau require --turboquant-rank-margin-objectives")
+	}
 	if len(parsedTurboQuantCompactObjectives) > 0 && !hardNegativeTrain && !scoreSpectrumTrain && !listwiseGeometryTrain {
-		return fmt.Errorf("--turboquant-compact-objectives requires --hard-negative-train")
+		return fmt.Errorf("--turboquant-compact-objectives requires --hard-negative-train or --listwise-geometry-train")
+	}
+	if len(parsedTurboQuantTopKObjectives) > 0 && !scoreSpectrumTrain {
+		return fmt.Errorf("--turboquant-topk-objectives requires --score-spectrum-train")
+	}
+	if (parsedTurboQuantTopKLoss != "" || turboQuantTopKCutoff != 0 || turboQuantTopKTau != 0 || turboQuantTopKMargin != 0 || parsedTurboQuantTopKNegativeMask != "" || turboQuantTopKRecallWeight != 0 || turboQuantTopKRecallCutoff != 0 || turboQuantTopKRecallTau != 0 || turboQuantTopKRecallMargin != 0 || parsedTurboQuantTopKRecallNegativeMask != "") && len(parsedTurboQuantTopKObjectives) == 0 {
+		return fmt.Errorf("--turboquant-topk-loss, --turboquant-topk-cutoff, --turboquant-topk-tau, --turboquant-topk-margin, --turboquant-topk-negative-mask, and --turboquant-topk-recall-* require --turboquant-topk-objectives")
+	}
+	if turboQuantTopKRecallWeight == 0 && (turboQuantTopKRecallCutoff != 0 || turboQuantTopKRecallTau != 0 || turboQuantTopKRecallMargin != 0 || parsedTurboQuantTopKRecallNegativeMask != "") {
+		return fmt.Errorf("--turboquant-topk-recall-cutoff, --turboquant-topk-recall-tau, --turboquant-topk-recall-margin, and --turboquant-topk-recall-negative-mask require --turboquant-topk-recall-weight")
 	}
 	if allowResearchOnlyScoreSpectrum && !scoreSpectrumTrain {
 		return fmt.Errorf("--allow-research-only-score-spectrum requires --score-spectrum-train")
@@ -5653,6 +5927,9 @@ func runTrainEmbed(args []string) error {
 		if len(parsedTurboQuantRankMarginObjectives) > 0 {
 			return fmt.Errorf("--score-spectrum-train does not support TurboQuant rank-margin objectives")
 		}
+		if len(parsedTurboQuantTopKObjectives) > 0 && parsedTurboQuantTopKLoss != "" && parsedTurboQuantTopKLoss != eosruntime.TurboQuantTopKLossLambdaNDCG {
+			return fmt.Errorf("--score-spectrum-train only supports --turboquant-topk-loss lambdandcg")
+		}
 	}
 	if listwiseGeometryTrain {
 		if !progressEveryProvided && progressEvery == 0 {
@@ -5663,9 +5940,6 @@ func runTrainEmbed(args []string) error {
 		}
 		if len(parsedTurboQuantPrefixBits) > 0 || len(parsedTurboQuantPrefixObjectives) > 0 {
 			return fmt.Errorf("--listwise-geometry-train does not support TurboQuant prefix objectives")
-		}
-		if len(parsedTurboQuantCompactObjectives) > 0 {
-			return fmt.Errorf("--listwise-geometry-train does not support TurboQuant compact objectives")
 		}
 		if len(parsedTurboQuantRankMarginObjectives) > 0 {
 			return fmt.Errorf("--listwise-geometry-train does not support TurboQuant rank-margin objectives")
@@ -5697,7 +5971,6 @@ func runTrainEmbed(args []string) error {
 			return fmt.Errorf("--vector-distill-train requires text tokenization; remove --no-tokenizer or set --tokenizer")
 		}
 	}
-	path := fs.Arg(0)
 	trainPath := fs.Arg(1)
 	evalPath := ""
 	if fs.NArg() > 2 {
@@ -5717,63 +5990,79 @@ func runTrainEmbed(args []string) error {
 		}
 	}
 	runConfig := eosruntime.EmbeddingTrainRunConfig{
-		Epochs:                            epochs,
-		BatchSize:                         batchSize,
-		Shuffle:                           shuffle,
-		Seed:                              seed,
-		EvalEveryEpoch:                    evalEvery,
-		EvalEverySteps:                    evalEverySteps,
-		EarlyStoppingPatience:             patience,
-		SelectMetric:                      selectMetric,
-		MinDelta:                          float32(minDelta),
-		RestoreBest:                       restoreBest,
-		LengthBucketBatches:               lengthBucketBatches,
-		LearningRate:                      float32(learningRate),
-		ContrastiveLoss:                   contrastiveLoss,
-		Temperature:                       float32(temperature),
-		GroupedLossWeight:                 float32(groupedLossWeight),
-		TeacherLossWeight:                 float32(teacherLossWeight),
-		TeacherLossWeightSet:              teacherLossWeightSet,
-		TeacherTemperature:                float32(teacherTemperature),
-		TeacherSourceTemperatures:         parsedTeacherSourceTemperatures,
-		TeacherSourceWeights:              parsedTeacherSourceWeights,
-		TeacherScoreNormalization:         teacherScoreNormalization,
-		MatryoshkaDims:                    parsedMatryoshkaDims,
-		MatryoshkaWeights:                 parsedMatryoshkaWeights,
-		ClearTurboQuantPrefix:             clearTurboQuantPrefix,
-		TurboQuantPrefixBits:              parsedTurboQuantPrefixBits,
-		TurboQuantPrefixObjectives:        parsedTurboQuantPrefixObjectives,
-		TurboQuantPrefixWeight:            float32(turboQuantPrefixWeight),
-		TurboQuantPrefixSeed:              turboQuantPrefixSeed,
-		TurboQuantPrefixScoreMode:         parsedTurboQuantPrefixScoreMode,
-		TurboQuantCompactObjectives:       parsedTurboQuantCompactObjectives,
-		ClearTurboQuantRankMargin:         clearTurboQuantRankMargin,
-		TurboQuantRankMarginObjectives:    parsedTurboQuantRankMarginObjectives,
-		TurboQuantRankMargin:              float32(turboQuantRankMargin),
-		ProgressEverySteps:                progressEvery,
-		EvalOnly:                          evalOnly,
-		PairwiseTrain:                     pairwiseTrain,
-		HardNegativeTrain:                 hardNegativeTrain,
-		ScoreSpectrumTrain:                scoreSpectrumTrain,
-		ListwiseGeometryTrain:             listwiseGeometryTrain,
-		VectorDistillTrain:                vectorDistillTrain,
-		VectorDistillDefaultRole:          parsedVectorDistillDefaultRole,
-		VectorDistillRelationalWeight:     float32(vectorDistillRelationalWeight),
-		VectorDistillOptimizerSync:        parsedVectorDistillOptimizerSync,
-		MovementDiagnostics:               movementDiagnostics,
-		AllowResearchOnlyScoreSpectrum:    allowResearchOnlyScoreSpectrum,
-		AllowResearchOnlyListwiseGeometry: allowResearchOnlyListwiseGeometry,
-		AllowResearchOnlyVectorDistill:    allowResearchOnlyVectorDistill,
-		ScoreSpectrumEvalPath:             scoreSpectrumEvalPath,
-		MaxListwiseGeometryTrainPairs:     maxListwiseTrainPairs,
-		MaxListwiseGeometryEvalPairs:      maxListwiseEvalPairs,
-		ScoreSpectrumLossMode:             parsedScoreSpectrumLossMode,
-		ScoreSpectrumRecoveryWeight:       float32(scoreSpectrumRecoveryWeight),
-		ScoreSpectrumRecoveryMargin:       float32(scoreSpectrumRecoveryMargin),
-		ScoreSpectrumRecoveryTopK:         scoreSpectrumRecoveryTopK,
-		ScoreSpectrumRecoveryTau:          float32(scoreSpectrumRecoveryTau),
-		HardNegativesPerQuery:             hardNegativesPerQuery,
-		HardNegativeSourceWeights:         parsedSourceWeights,
+		Epochs:                                epochs,
+		BatchSize:                             batchSize,
+		Shuffle:                               shuffle,
+		Seed:                                  seed,
+		EvalEveryEpoch:                        evalEvery,
+		EvalEverySteps:                        evalEverySteps,
+		EarlyStoppingPatience:                 patience,
+		SelectMetric:                          selectMetric,
+		MinDelta:                              float32(minDelta),
+		RestoreBest:                           restoreBest,
+		LengthBucketBatches:                   lengthBucketBatches,
+		LearningRate:                          float32(learningRate),
+		ContrastiveLoss:                       contrastiveLoss,
+		Temperature:                           float32(temperature),
+		GroupedLossWeight:                     float32(groupedLossWeight),
+		TeacherLossWeight:                     float32(teacherLossWeight),
+		TeacherLossWeightSet:                  teacherLossWeightSet,
+		TeacherTemperature:                    float32(teacherTemperature),
+		TeacherSourceTemperatures:             parsedTeacherSourceTemperatures,
+		TeacherSourceWeights:                  parsedTeacherSourceWeights,
+		TeacherScoreNormalization:             teacherScoreNormalization,
+		MatryoshkaDims:                        parsedMatryoshkaDims,
+		MatryoshkaWeights:                     parsedMatryoshkaWeights,
+		ClearTurboQuantPrefix:                 clearTurboQuantPrefix,
+		TurboQuantPrefixBits:                  parsedTurboQuantPrefixBits,
+		TurboQuantPrefixObjectives:            parsedTurboQuantPrefixObjectives,
+		TurboQuantPrefixWeight:                float32(turboQuantPrefixWeight),
+		TurboQuantPrefixSeed:                  turboQuantPrefixSeed,
+		TurboQuantPrefixScoreMode:             parsedTurboQuantPrefixScoreMode,
+		TurboQuantCompactObjectives:           parsedTurboQuantCompactObjectives,
+		ClearTurboQuantRankMargin:             clearTurboQuantRankMargin,
+		TurboQuantRankMarginObjectives:        parsedTurboQuantRankMarginObjectives,
+		TurboQuantRankMargin:                  float32(turboQuantRankMargin),
+		TurboQuantRankMarginLoss:              parsedTurboQuantRankMarginLoss,
+		TurboQuantRankMarginReduction:         parsedTurboQuantRankMarginReduction,
+		TurboQuantRankMarginTau:               float32(turboQuantRankMarginTau),
+		TurboQuantTopKObjectives:              parsedTurboQuantTopKObjectives,
+		TurboQuantTopKLoss:                    parsedTurboQuantTopKLoss,
+		TurboQuantTopKCutoff:                  turboQuantTopKCutoff,
+		TurboQuantTopKTau:                     float32(turboQuantTopKTau),
+		TurboQuantTopKMargin:                  float32(turboQuantTopKMargin),
+		TurboQuantTopKNegativeMask:            parsedTurboQuantTopKNegativeMask,
+		TurboQuantTopKRecallWeight:            float32(turboQuantTopKRecallWeight),
+		TurboQuantTopKRecallCutoff:            turboQuantTopKRecallCutoff,
+		TurboQuantTopKRecallTau:               float32(turboQuantTopKRecallTau),
+		TurboQuantTopKRecallMargin:            float32(turboQuantTopKRecallMargin),
+		TurboQuantTopKRecallNegativeMask:      parsedTurboQuantTopKRecallNegativeMask,
+		ProgressEverySteps:                    progressEvery,
+		EvalOnly:                              evalOnly,
+		PairwiseTrain:                         pairwiseTrain,
+		HardNegativeTrain:                     hardNegativeTrain,
+		ScoreSpectrumTrain:                    scoreSpectrumTrain,
+		ListwiseGeometryTrain:                 listwiseGeometryTrain,
+		VectorDistillTrain:                    vectorDistillTrain,
+		VectorDistillDefaultRole:              parsedVectorDistillDefaultRole,
+		VectorDistillRelationalWeight:         float32(vectorDistillRelationalWeight),
+		VectorDistillOptimizerSync:            parsedVectorDistillOptimizerSync,
+		MovementDiagnostics:                   movementDiagnostics,
+		AllowResearchOnlyScoreSpectrum:        allowResearchOnlyScoreSpectrum,
+		AllowResearchOnlyListwiseGeometry:     allowResearchOnlyListwiseGeometry,
+		AllowResearchOnlyVectorDistill:        allowResearchOnlyVectorDistill,
+		ScoreSpectrumEvalPath:                 scoreSpectrumEvalPath,
+		MaxListwiseGeometryTrainPairs:         maxListwiseTrainPairs,
+		MaxListwiseGeometryEvalPairs:          maxListwiseEvalPairs,
+		ScoreSpectrumLossMode:                 parsedScoreSpectrumLossMode,
+		ScoreSpectrumRecoveryWeight:           float32(scoreSpectrumRecoveryWeight),
+		ScoreSpectrumRecoveryMargin:           float32(scoreSpectrumRecoveryMargin),
+		ScoreSpectrumRecoveryTopK:             scoreSpectrumRecoveryTopK,
+		ScoreSpectrumRecoveryTau:              float32(scoreSpectrumRecoveryTau),
+		ScoreSpectrumMaxBatchCandidates:       scoreSpectrumMaxBatchCandidates,
+		ScoreSpectrumActivationMicrobatchSize: scoreSpectrumActivationMicrobatchSize,
+		HardNegativesPerQuery:                 hardNegativesPerQuery,
+		HardNegativeSourceWeights:             parsedSourceWeights,
 	}
 	if progressEvery > 0 {
 		runConfig.Progress = printTrainProgress
@@ -5809,9 +6098,9 @@ func runTrainEmbed(args []string) error {
 			RoleMode:    parsedRetrievalEvalRoleMode,
 		}
 	}
-	workload, workloadErr := estimateTrainEmbedWorkload(tokenizerPath, trainPath, evalPath, runConfig)
+	workload, workloadErr := estimateTrainEmbedWorkload(path, tokenizerPath, trainPath, evalPath, runConfig)
 	if workloadErr == nil {
-		fmt.Printf("planned workload: %s\n", formatTrainWorkload(workload))
+		fmt.Printf("planned workload: %s\n", formatTrainWorkloadWithScoreSpectrumConfig(workload, runConfig))
 		if err := validateTrainEmbedListwiseGeometryWorkload(workload, runConfig); err != nil {
 			return err
 		}
@@ -5859,7 +6148,7 @@ func runTrainEmbed(args []string) error {
 	if summary.FinalScoreSpectrumEval != nil {
 		fmt.Printf("final score-spectrum eval: loss=%.6f any_positive_top1=%.6f original_positive_top1=%.6f alternate_recovery=%.6f best_positive_hardest_negative_margin=%.6f rows=%d candidates=%d\n", summary.FinalScoreSpectrumEval.Loss, summary.FinalScoreSpectrumEval.AnyPositiveTop1, summary.FinalScoreSpectrumEval.OriginalPositiveTop1, summary.FinalScoreSpectrumEval.AlternateRelevantRecovery, summary.FinalScoreSpectrumEval.BestPositiveHardestNegativeMargin, summary.FinalScoreSpectrumEval.RowCount, summary.FinalScoreSpectrumEval.CandidateCount)
 	}
-	fmt.Printf("workload: %s\n", formatTrainWorkload(summary.Workload))
+	fmt.Printf("workload: %s\n", formatTrainWorkloadWithScoreSpectrumConfig(summary.Workload, summary.Config))
 	fmt.Printf("throughput: %s\n", formatTrainThroughput(summary))
 	fmt.Printf("accelerators: forward=%s optimizer=%s activation=%s contrastive=%s\n",
 		displayTrainBackend(summary.EndProfile.ForwardBackend),
@@ -6011,6 +6300,33 @@ func validateTurboQuantPrefixBitsFlag(bits []int) error {
 	return nil
 }
 
+func parseTrainEmbedTurboQuantObjectives(raw, artifactPath string) ([]eosruntime.TurboQuantPrefixObjective, error) {
+	if !strings.Contains(strings.ToLower(raw), "fulldim") {
+		return eosruntime.ParseTurboQuantPrefixObjectives(raw)
+	}
+	manifest, err := eosruntime.ReadEmbeddingManifestFile(eosruntime.DefaultEmbeddingManifestPath(artifactPath))
+	if err != nil {
+		return nil, fmt.Errorf("resolve fullDim: %w", err)
+	}
+	fullDim := manifest.OutputDim
+	if fullDim <= 0 {
+		checkpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(eosruntime.DefaultEmbeddingCheckpointPath(artifactPath))
+		if err != nil {
+			return nil, fmt.Errorf("resolve fullDim: embedding manifest output_dim is unset and checkpoint fallback failed: %w", err)
+		}
+		if checkpoint.Projection == nil || len(checkpoint.Projection.Shape) != 2 || checkpoint.Projection.Shape[1] <= 0 {
+			return nil, fmt.Errorf("resolve fullDim: embedding manifest output_dim is unset and checkpoint projection shape is invalid")
+		}
+		fullDim = checkpoint.Projection.Shape[1]
+	}
+	fullDimText := strconv.Itoa(fullDim)
+	resolved := strings.ReplaceAll(raw, "fullDim", fullDimText)
+	resolved = strings.ReplaceAll(resolved, "FullDim", fullDimText)
+	resolved = strings.ReplaceAll(resolved, "fulldim", fullDimText)
+	resolved = strings.ReplaceAll(resolved, "FULLDIM", fullDimText)
+	return eosruntime.ParseTurboQuantPrefixObjectives(resolved)
+}
+
 func flagWasProvided(fs *flag.FlagSet, name string) bool {
 	provided := false
 	fs.Visit(func(f *flag.Flag) {
@@ -6135,7 +6451,40 @@ func parseNonNegativeFloatMap(raw string) (map[string]float32, error) {
 	return out, nil
 }
 
-func estimateTrainEmbedWorkload(tokenizerPath, trainPath, evalPath string, cfg eosruntime.EmbeddingTrainRunConfig) (eosruntime.EmbeddingTrainWorkload, error) {
+// openScoreSpectrumPlanSource indexes a score-spectrum JSONL file and keeps
+// only compact row metadata in memory. Text rows use a tokenizer solely to
+// construct the source; planning never decodes or retains tokenized payloads.
+func openScoreSpectrumPlanSource(tokenizerPath, path string, allowResearchOnly bool) (eosruntime.EmbeddingScoreSpectrumExampleSource, error) {
+	opts := eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: allowResearchOnly}
+	if strings.TrimSpace(tokenizerPath) == "" {
+		return eosruntime.OpenEmbeddingScoreSpectrumSource(path, opts)
+	}
+	tokenizerFile, err := eosruntime.ReadTokenizerFile(tokenizerPath)
+	if err != nil {
+		return nil, fmt.Errorf("read tokenizer for score-spectrum plan: %w", err)
+	}
+	// No embedding manifest is needed for planning: the source index validates
+	// row structure and candidate counts without encoding any text.
+	tokenizer, err := eosruntime.NewBPETokenizer(tokenizerFile, eosruntime.TokenizerManifest{})
+	if err != nil {
+		return nil, fmt.Errorf("build tokenizer for score-spectrum plan: %w", err)
+	}
+	return eosruntime.OpenEmbeddingTextScoreSpectrumSource(path, tokenizer, opts)
+}
+
+func scoreSpectrumSourceCandidateCount(source eosruntime.EmbeddingScoreSpectrumExampleSource) int {
+	if source == nil {
+		return 0
+	}
+	total := 0
+	for i := 0; i < source.Len(); i++ {
+		total += source.CandidateCount(i)
+	}
+	return total
+}
+
+func estimateTrainEmbedWorkload(artifactPath, tokenizerPath, trainPath, evalPath string, cfg eosruntime.EmbeddingTrainRunConfig) (eosruntime.EmbeddingTrainWorkload, error) {
+	cfg = normalizeTrainEmbedWorkloadConfigForArtifact(artifactPath, cfg)
 	if cfg.EvalOnly && evalPath == "" && cfg.ScoreSpectrumEvalPath == "" && !cfg.ListwiseGeometryTrain && !cfg.VectorDistillTrain {
 		evalPath = trainPath
 		trainPath = ""
@@ -6148,41 +6497,34 @@ func estimateTrainEmbedWorkload(tokenizerPath, trainPath, evalPath string, cfg e
 	}
 	if cfg.EvalOnly && cfg.ScoreSpectrumTrain {
 		evalCount := 0
+		pairwiseEvalCount := 0
 		if evalPath != "" {
 			if tokenizerPath != "" {
 				evalPairs, err := eosruntime.ReadEmbeddingTextPairExamplesFile(evalPath)
 				if err != nil {
 					return eosruntime.EmbeddingTrainWorkload{}, err
 				}
-				evalCount += len(evalPairs)
+				pairwiseEvalCount += len(evalPairs)
 			} else {
 				evalPairs, err := eosruntime.ReadEmbeddingPairExamplesFile(evalPath)
 				if err != nil {
 					return eosruntime.EmbeddingTrainWorkload{}, err
 				}
-				evalCount += len(evalPairs)
+				pairwiseEvalCount += len(evalPairs)
 			}
 		}
 		if cfg.ScoreSpectrumEvalPath != "" {
-			if tokenizerPath != "" {
-				scoreEval, err := eosruntime.ReadEmbeddingTextScoreSpectrumExamplesFile(cfg.ScoreSpectrumEvalPath, eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
-				if err != nil {
-					return eosruntime.EmbeddingTrainWorkload{}, err
-				}
-				for _, example := range scoreEval {
-					evalCount += len(example.Candidates)
-				}
-			} else {
-				scoreEval, err := eosruntime.ReadEmbeddingScoreSpectrumExamplesFile(cfg.ScoreSpectrumEvalPath, eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
-				if err != nil {
-					return eosruntime.EmbeddingTrainWorkload{}, err
-				}
-				for _, example := range scoreEval {
-					evalCount += len(example.CandidateTokens)
-				}
+			scoreSource, err := openScoreSpectrumPlanSource(tokenizerPath, cfg.ScoreSpectrumEvalPath, cfg.AllowResearchOnlyScoreSpectrum)
+			if err != nil {
+				return eosruntime.EmbeddingTrainWorkload{}, err
+			}
+			evalCount += scoreSpectrumSourceCandidateCount(scoreSource)
+			if err := scoreSource.Close(); err != nil {
+				return eosruntime.EmbeddingTrainWorkload{}, err
 			}
 		}
-		return eosruntime.EstimateScoreSpectrumTrainWorkload(nil, evalCount, cfg), nil
+		evalCount += pairwiseEvalCount
+		return eosruntime.EstimateScoreSpectrumSourceTrainWorkload(nil, pairwiseEvalCount, evalCount-pairwiseEvalCount, evalCount, cfg), nil
 	}
 	if cfg.EvalOnly && cfg.ListwiseGeometryTrain {
 		if tokenizerPath == "" {
@@ -6239,39 +6581,32 @@ func estimateTrainEmbedWorkload(tokenizerPath, trainPath, evalPath string, cfg e
 			return eosruntime.EstimatePairwiseTrainWorkload(len(trainPairs), evalCount, cfg), nil
 		}
 		if cfg.ScoreSpectrumTrain {
-			trainSet, err := eosruntime.ReadEmbeddingTextScoreSpectrumExamplesFile(trainPath, eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
+			trainSource, err := openScoreSpectrumPlanSource(tokenizerPath, trainPath, cfg.AllowResearchOnlyScoreSpectrum)
 			if err != nil {
 				return eosruntime.EmbeddingTrainWorkload{}, err
 			}
-			evalCount := 0
+			defer trainSource.Close()
+			pairwiseEvalCount := 0
+			scoreSpectrumEvalCount := 0
 			if evalPath != "" {
 				evalPairs, err := eosruntime.ReadEmbeddingTextPairExamplesFile(evalPath)
 				if err != nil {
 					return eosruntime.EmbeddingTrainWorkload{}, err
 				}
-				evalCount = len(evalPairs)
+				pairwiseEvalCount = len(evalPairs)
 			}
 			if cfg.ScoreSpectrumEvalPath != "" {
-				scoreEval, err := eosruntime.ReadEmbeddingTextScoreSpectrumExamplesFile(cfg.ScoreSpectrumEvalPath, eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
+				scoreSource, err := openScoreSpectrumPlanSource(tokenizerPath, cfg.ScoreSpectrumEvalPath, cfg.AllowResearchOnlyScoreSpectrum)
 				if err != nil {
 					return eosruntime.EmbeddingTrainWorkload{}, err
 				}
-				for _, example := range scoreEval {
-					evalCount += len(example.Candidates)
+				scoreSpectrumEvalCount = scoreSpectrumSourceCandidateCount(scoreSource)
+				if err := scoreSource.Close(); err != nil {
+					return eosruntime.EmbeddingTrainWorkload{}, err
 				}
 			}
-			tokenized := make([]eosruntime.EmbeddingScoreSpectrumExample, 0, len(trainSet))
-			for _, example := range trainSet {
-				tokenized = append(tokenized, eosruntime.EmbeddingScoreSpectrumExample{
-					CandidateTokens: make([][]int32, len(example.Candidates)),
-				})
-			}
-			for i, example := range trainSet {
-				for j := range example.Candidates {
-					tokenized[i].CandidateTokens[j] = []int32{1}
-				}
-			}
-			return eosruntime.EstimateScoreSpectrumTrainWorkload(tokenized, evalCount, cfg), nil
+			evalCount := pairwiseEvalCount + scoreSpectrumEvalCount
+			return eosruntime.EstimateScoreSpectrumSourceTrainWorkload(trainSource, pairwiseEvalCount, scoreSpectrumEvalCount, evalCount, cfg), nil
 		}
 		if cfg.ListwiseGeometryTrain {
 			trainSet, err := eosruntime.ReadEmbeddingListwiseGeometryBatchesFile(trainPath)
@@ -6372,28 +6707,32 @@ func estimateTrainEmbedWorkload(tokenizerPath, trainPath, evalPath string, cfg e
 		return eosruntime.EstimatePairwiseTrainWorkload(len(trainPairs), evalCount, cfg), nil
 	}
 	if cfg.ScoreSpectrumTrain {
-		trainSet, err := eosruntime.ReadEmbeddingScoreSpectrumExamplesFile(trainPath, eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
+		trainSource, err := openScoreSpectrumPlanSource(tokenizerPath, trainPath, cfg.AllowResearchOnlyScoreSpectrum)
 		if err != nil {
 			return eosruntime.EmbeddingTrainWorkload{}, err
 		}
-		evalCount := 0
+		defer trainSource.Close()
+		pairwiseEvalCount := 0
+		scoreSpectrumEvalCount := 0
 		if evalPath != "" {
 			evalPairs, err := eosruntime.ReadEmbeddingPairExamplesFile(evalPath)
 			if err != nil {
 				return eosruntime.EmbeddingTrainWorkload{}, err
 			}
-			evalCount = len(evalPairs)
+			pairwiseEvalCount = len(evalPairs)
 		}
 		if cfg.ScoreSpectrumEvalPath != "" {
-			scoreEval, err := eosruntime.ReadEmbeddingScoreSpectrumExamplesFile(cfg.ScoreSpectrumEvalPath, eosruntime.EmbeddingScoreSpectrumReadOptions{AllowResearchOnly: cfg.AllowResearchOnlyScoreSpectrum})
+			scoreSource, err := openScoreSpectrumPlanSource(tokenizerPath, cfg.ScoreSpectrumEvalPath, cfg.AllowResearchOnlyScoreSpectrum)
 			if err != nil {
 				return eosruntime.EmbeddingTrainWorkload{}, err
 			}
-			for _, example := range scoreEval {
-				evalCount += len(example.CandidateTokens)
+			scoreSpectrumEvalCount = scoreSpectrumSourceCandidateCount(scoreSource)
+			if err := scoreSource.Close(); err != nil {
+				return eosruntime.EmbeddingTrainWorkload{}, err
 			}
 		}
-		return eosruntime.EstimateScoreSpectrumTrainWorkload(trainSet, evalCount, cfg), nil
+		evalCount := pairwiseEvalCount + scoreSpectrumEvalCount
+		return eosruntime.EstimateScoreSpectrumSourceTrainWorkload(trainSource, pairwiseEvalCount, scoreSpectrumEvalCount, evalCount, cfg), nil
 	}
 	if cfg.ListwiseGeometryTrain {
 		return eosruntime.EmbeddingTrainWorkload{}, fmt.Errorf("listwise geometry training requires text tokenization; remove --no-tokenizer or set --tokenizer")
@@ -6449,6 +6788,24 @@ func estimateTrainEmbedWorkload(tokenizerPath, trainPath, evalPath string, cfg e
 	return eosruntime.EstimateContrastiveTrainWorkload(len(trainSet), evalCount, cfg), nil
 }
 
+func normalizeTrainEmbedWorkloadConfigForArtifact(artifactPath string, cfg eosruntime.EmbeddingTrainRunConfig) eosruntime.EmbeddingTrainRunConfig {
+	embeddingDim := 0
+	if strings.TrimSpace(artifactPath) != "" {
+		if manifest, err := eosruntime.ReadEmbeddingManifestFile(eosruntime.DefaultEmbeddingManifestPath(artifactPath)); err == nil {
+			embeddingDim = manifest.OutputDim
+			if embeddingDim <= 0 {
+				embeddingDim = manifest.ModelDim
+			}
+		}
+		if embeddingDim <= 0 {
+			if checkpoint, err := eosruntime.ReadEmbeddingTrainCheckpointFile(eosruntime.DefaultEmbeddingCheckpointPath(artifactPath)); err == nil && checkpoint.Projection != nil && len(checkpoint.Projection.Shape) == 2 {
+				embeddingDim = checkpoint.Projection.Shape[1]
+			}
+		}
+	}
+	return eosruntime.NormalizeEmbeddingTrainRunConfigForEmbeddingDim(cfg, embeddingDim)
+}
+
 func tokenizedListwiseGeometryWorkloadShape(batches []eosruntime.EmbeddingListwiseGeometryBatch) []eosruntime.EmbeddingTokenizedListwiseGeometryBatch {
 	tokenized := make([]eosruntime.EmbeddingTokenizedListwiseGeometryBatch, 0, len(batches))
 	for _, batch := range batches {
@@ -6486,6 +6843,32 @@ func formatTrainWorkload(workload eosruntime.EmbeddingTrainWorkload) string {
 	parts = append(parts,
 		fmt.Sprintf("pairs(planned=%d actual=%d)", workload.PlannedTotalPairs, workload.ActualTotalPairs),
 	)
+	return strings.Join(parts, " ")
+}
+
+func formatTrainWorkloadWithScoreSpectrumConfig(workload eosruntime.EmbeddingTrainWorkload, cfg eosruntime.EmbeddingTrainRunConfig) string {
+	parts := []string{
+		formatTrainWorkload(workload),
+		fmt.Sprintf("score_spectrum_activation_microbatch=%d", cfg.ScoreSpectrumActivationMicrobatchSize),
+	}
+	if workload.ScoreSpectrumAuxOnlyRows > 0 {
+		parts = append(parts, fmt.Sprintf("score_spectrum_aux_only_rows=%d", workload.ScoreSpectrumAuxOnlyRows))
+	}
+	if cfg.TurboQuantTopKRecallWeight > 0 {
+		recallCutoff := cfg.TurboQuantTopKRecallCutoff
+		if recallCutoff == 0 {
+			recallCutoff = 100
+		}
+		recallTau := cfg.TurboQuantTopKRecallTau
+		if recallTau == 0 {
+			recallTau = 0.05
+		}
+		recallMask := cfg.TurboQuantTopKRecallNegativeMask
+		if strings.TrimSpace(recallMask) == "" {
+			recallMask = eosruntime.TurboQuantTopKNegativeMaskHard
+		}
+		parts = append(parts, fmt.Sprintf("turboquant_topk_recall=weight:%g cutoff:%d tau:%g margin:%g mask:%s", cfg.TurboQuantTopKRecallWeight, recallCutoff, recallTau, cfg.TurboQuantTopKRecallMargin, recallMask))
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -6542,6 +6925,26 @@ func printTrainProgress(progress eosruntime.EmbeddingTrainProgress) {
 			progress.EvalPass,
 			progress.EvalExamples,
 			progress.EvalPairs,
+			progress.Elapsed.Round(time.Millisecond),
+		)
+		return
+	}
+	if phase == "train_start" && progress.Route != "" {
+		fmt.Printf(
+			"progress: phase=train_start epoch=%d batch=%d/%d step=%d architecture=%s route=%s branch=%s compact_backend=%s resident_requested=%t candidate_cap=%d activation_microbatch=%d first_span_rows=%d first_span_candidates=%d elapsed=%s\n",
+			progress.Epoch,
+			progress.Batch,
+			progress.Batches,
+			progress.Step,
+			progress.Architecture,
+			progress.Route,
+			progress.Branch,
+			progress.CompactBackend,
+			progress.ResidentRequested,
+			progress.CandidateCap,
+			progress.ActivationMicrobatchSize,
+			progress.FirstSpanRows,
+			progress.FirstSpanCandidates,
 			progress.Elapsed.Round(time.Millisecond),
 		)
 		return
@@ -6898,59 +7301,76 @@ type trainEvalSummaryJSON struct {
 }
 
 type trainRunConfigJSON struct {
-	Epochs                            int                                    `json:"epochs"`
-	BatchSize                         int                                    `json:"batch_size"`
-	Shuffle                           bool                                   `json:"shuffle"`
-	Seed                              int64                                  `json:"seed"`
-	EvalEveryEpoch                    int                                    `json:"eval_every_epoch"`
-	EvalEverySteps                    int                                    `json:"eval_every_steps"`
-	Patience                          int                                    `json:"patience"`
-	SelectMetric                      string                                 `json:"select_metric"`
-	MinDelta                          float32                                `json:"min_delta"`
-	RestoreBest                       bool                                   `json:"restore_best"`
-	LengthBucketBatches               bool                                   `json:"length_bucket_batches"`
-	LearningRate                      float32                                `json:"learning_rate"`
-	EffectiveLearningRate             float32                                `json:"effective_learning_rate"`
-	ContrastiveLoss                   string                                 `json:"contrastive_loss,omitempty"`
-	Temperature                       float32                                `json:"temperature"`
-	GroupedLossWeight                 float32                                `json:"grouped_loss_weight,omitempty"`
-	TeacherLossWeight                 float32                                `json:"teacher_loss_weight,omitempty"`
-	TeacherTemperature                float32                                `json:"teacher_temperature,omitempty"`
-	TeacherSourceTemperatures         map[string]float32                     `json:"teacher_source_temperatures,omitempty"`
-	TeacherSourceWeights              map[string]float32                     `json:"teacher_source_weights,omitempty"`
-	TeacherScoreNormalization         string                                 `json:"teacher_score_normalization,omitempty"`
-	MatryoshkaDims                    []int                                  `json:"matryoshka_dims,omitempty"`
-	MatryoshkaWeights                 []float32                              `json:"matryoshka_weights,omitempty"`
-	TurboQuantPrefixBits              []int                                  `json:"turboquant_prefix_bits,omitempty"`
-	TurboQuantPrefixObjectives        []eosruntime.TurboQuantPrefixObjective `json:"turboquant_prefix_objectives,omitempty"`
-	TurboQuantPrefixWeight            float32                                `json:"turboquant_prefix_weight,omitempty"`
-	TurboQuantPrefixSeed              int64                                  `json:"turboquant_prefix_seed,omitempty"`
-	TurboQuantPrefixScoreMode         string                                 `json:"turboquant_prefix_score_mode,omitempty"`
-	TurboQuantCompactObjectives       []eosruntime.TurboQuantPrefixObjective `json:"turboquant_compact_objectives,omitempty"`
-	ClearTurboQuantRankMargin         bool                                   `json:"clear_turboquant_rank_margin,omitempty"`
-	TurboQuantRankMarginObjectives    []eosruntime.TurboQuantPrefixObjective `json:"turboquant_rank_margin_objectives,omitempty"`
-	TurboQuantRankMargin              float32                                `json:"turboquant_rank_margin,omitempty"`
-	ProgressEverySteps                int                                    `json:"progress_every_steps"`
-	EvalOnly                          bool                                   `json:"eval_only"`
-	PairwiseTrain                     bool                                   `json:"pairwise_train"`
-	HardNegativeTrain                 bool                                   `json:"hard_negative_train"`
-	ScoreSpectrumTrain                bool                                   `json:"score_spectrum_train"`
-	ListwiseGeometryTrain             bool                                   `json:"listwise_geometry_train"`
-	VectorDistillTrain                bool                                   `json:"vector_distill_train,omitempty"`
-	VectorDistillOptimizerSync        string                                 `json:"vector_distill_optimizer_sync,omitempty"`
-	MovementDiagnostics               bool                                   `json:"movement_diagnostics"`
-	AllowResearchOnlyListwiseGeometry bool                                   `json:"allow_research_only_listwise_geometry,omitempty"`
-	AllowResearchOnlyVectorDistill    bool                                   `json:"allow_research_only_vector_distill,omitempty"`
-	MaxListwiseGeometryTrainPairs     int64                                  `json:"max_listwise_geometry_train_pairs,omitempty"`
-	MaxListwiseGeometryEvalPairs      int64                                  `json:"max_listwise_geometry_eval_pairs,omitempty"`
-	ScoreSpectrumEvalPath             string                                 `json:"score_spectrum_eval_path,omitempty"`
-	ScoreSpectrumLossMode             string                                 `json:"score_spectrum_loss_mode,omitempty"`
-	ScoreSpectrumRecoveryWeight       float32                                `json:"score_spectrum_recovery_weight,omitempty"`
-	ScoreSpectrumRecoveryMargin       float32                                `json:"score_spectrum_recovery_margin,omitempty"`
-	ScoreSpectrumRecoveryTopK         int                                    `json:"score_spectrum_recovery_top_k,omitempty"`
-	ScoreSpectrumRecoveryTau          float32                                `json:"score_spectrum_recovery_tau,omitempty"`
-	HardNegativesPerQuery             int                                    `json:"hard_negatives_per_query"`
-	HardNegativeSourceWeights         map[string]int                         `json:"hard_negative_source_weights,omitempty"`
+	Epochs                                int                                    `json:"epochs"`
+	BatchSize                             int                                    `json:"batch_size"`
+	Shuffle                               bool                                   `json:"shuffle"`
+	Seed                                  int64                                  `json:"seed"`
+	EvalEveryEpoch                        int                                    `json:"eval_every_epoch"`
+	EvalEverySteps                        int                                    `json:"eval_every_steps"`
+	Patience                              int                                    `json:"patience"`
+	SelectMetric                          string                                 `json:"select_metric"`
+	MinDelta                              float32                                `json:"min_delta"`
+	RestoreBest                           bool                                   `json:"restore_best"`
+	LengthBucketBatches                   bool                                   `json:"length_bucket_batches"`
+	LearningRate                          float32                                `json:"learning_rate"`
+	EffectiveLearningRate                 float32                                `json:"effective_learning_rate"`
+	ContrastiveLoss                       string                                 `json:"contrastive_loss,omitempty"`
+	Temperature                           float32                                `json:"temperature"`
+	GroupedLossWeight                     float32                                `json:"grouped_loss_weight,omitempty"`
+	TeacherLossWeight                     float32                                `json:"teacher_loss_weight,omitempty"`
+	TeacherTemperature                    float32                                `json:"teacher_temperature,omitempty"`
+	TeacherSourceTemperatures             map[string]float32                     `json:"teacher_source_temperatures,omitempty"`
+	TeacherSourceWeights                  map[string]float32                     `json:"teacher_source_weights,omitempty"`
+	TeacherScoreNormalization             string                                 `json:"teacher_score_normalization,omitempty"`
+	MatryoshkaDims                        []int                                  `json:"matryoshka_dims,omitempty"`
+	MatryoshkaWeights                     []float32                              `json:"matryoshka_weights,omitempty"`
+	TurboQuantPrefixBits                  []int                                  `json:"turboquant_prefix_bits,omitempty"`
+	TurboQuantPrefixObjectives            []eosruntime.TurboQuantPrefixObjective `json:"turboquant_prefix_objectives,omitempty"`
+	TurboQuantPrefixWeight                float32                                `json:"turboquant_prefix_weight,omitempty"`
+	TurboQuantPrefixSeed                  int64                                  `json:"turboquant_prefix_seed,omitempty"`
+	TurboQuantPrefixScoreMode             string                                 `json:"turboquant_prefix_score_mode,omitempty"`
+	TurboQuantCompactObjectives           []eosruntime.TurboQuantPrefixObjective `json:"turboquant_compact_objectives,omitempty"`
+	ClearTurboQuantRankMargin             bool                                   `json:"clear_turboquant_rank_margin,omitempty"`
+	TurboQuantRankMarginObjectives        []eosruntime.TurboQuantPrefixObjective `json:"turboquant_rank_margin_objectives,omitempty"`
+	TurboQuantRankMargin                  float32                                `json:"turboquant_rank_margin,omitempty"`
+	TurboQuantRankMarginLoss              string                                 `json:"turboquant_rank_margin_loss,omitempty"`
+	TurboQuantRankMarginReduction         string                                 `json:"turboquant_rank_margin_reduction,omitempty"`
+	TurboQuantRankMarginTau               float32                                `json:"turboquant_rank_margin_tau,omitempty"`
+	TurboQuantTopKObjectives              []eosruntime.TurboQuantPrefixObjective `json:"turboquant_topk_objectives,omitempty"`
+	TurboQuantTopKLoss                    string                                 `json:"turboquant_topk_loss,omitempty"`
+	TurboQuantTopKCutoff                  int                                    `json:"turboquant_topk_cutoff,omitempty"`
+	TurboQuantTopKTau                     float32                                `json:"turboquant_topk_tau,omitempty"`
+	TurboQuantTopKMargin                  float32                                `json:"turboquant_topk_margin,omitempty"`
+	TurboQuantTopKNegativeMask            string                                 `json:"turboquant_topk_negative_mask,omitempty"`
+	TurboQuantTopKRecallWeight            float32                                `json:"turboquant_topk_recall_weight,omitempty"`
+	TurboQuantTopKRecallCutoff            int                                    `json:"turboquant_topk_recall_cutoff,omitempty"`
+	TurboQuantTopKRecallTau               float32                                `json:"turboquant_topk_recall_tau,omitempty"`
+	TurboQuantTopKRecallMargin            float32                                `json:"turboquant_topk_recall_margin,omitempty"`
+	TurboQuantTopKRecallNegativeMask      string                                 `json:"turboquant_topk_recall_negative_mask,omitempty"`
+	ProgressEverySteps                    int                                    `json:"progress_every_steps"`
+	EvalOnly                              bool                                   `json:"eval_only"`
+	PairwiseTrain                         bool                                   `json:"pairwise_train"`
+	HardNegativeTrain                     bool                                   `json:"hard_negative_train"`
+	ScoreSpectrumTrain                    bool                                   `json:"score_spectrum_train"`
+	ListwiseGeometryTrain                 bool                                   `json:"listwise_geometry_train"`
+	VectorDistillTrain                    bool                                   `json:"vector_distill_train,omitempty"`
+	VectorDistillOptimizerSync            string                                 `json:"vector_distill_optimizer_sync,omitempty"`
+	MovementDiagnostics                   bool                                   `json:"movement_diagnostics"`
+	AllowResearchOnlyScoreSpectrum        bool                                   `json:"allow_research_only_score_spectrum,omitempty"`
+	AllowResearchOnlyListwiseGeometry     bool                                   `json:"allow_research_only_listwise_geometry,omitempty"`
+	AllowResearchOnlyVectorDistill        bool                                   `json:"allow_research_only_vector_distill,omitempty"`
+	MaxListwiseGeometryTrainPairs         int64                                  `json:"max_listwise_geometry_train_pairs,omitempty"`
+	MaxListwiseGeometryEvalPairs          int64                                  `json:"max_listwise_geometry_eval_pairs,omitempty"`
+	ScoreSpectrumEvalPath                 string                                 `json:"score_spectrum_eval_path,omitempty"`
+	ScoreSpectrumLossMode                 string                                 `json:"score_spectrum_loss_mode,omitempty"`
+	ScoreSpectrumRecoveryWeight           float32                                `json:"score_spectrum_recovery_weight,omitempty"`
+	ScoreSpectrumRecoveryMargin           float32                                `json:"score_spectrum_recovery_margin,omitempty"`
+	ScoreSpectrumRecoveryTopK             int                                    `json:"score_spectrum_recovery_top_k,omitempty"`
+	ScoreSpectrumRecoveryTau              float32                                `json:"score_spectrum_recovery_tau,omitempty"`
+	ScoreSpectrumMaxBatchCandidates       int                                    `json:"score_spectrum_max_batch_candidates"`
+	ScoreSpectrumActivationMicrobatchSize int                                    `json:"score_spectrum_activation_microbatch_size"`
+	HardNegativesPerQuery                 int                                    `json:"hard_negatives_per_query"`
+	HardNegativeSourceWeights             map[string]int                         `json:"hard_negative_source_weights,omitempty"`
 }
 
 type trainBatchMetricsJSON struct {
@@ -7142,8 +7562,60 @@ func writeTrainMetricsJSON(outputPath, command, mode, artifactPath, tokenizerPat
 		return fmt.Errorf("encode metrics JSON: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(outputPath, data, 0o644); err != nil {
+	if err := writeTrainMetricsFileAtomic(outputPath, data, 0o644); err != nil {
 		return fmt.Errorf("write metrics JSON %q: %w", outputPath, err)
+	}
+	return nil
+}
+
+var renameTrainMetricsFile = os.Rename
+
+func writeTrainMetricsFileAtomic(outputPath string, data []byte, perm os.FileMode) error {
+	parent := filepath.Dir(outputPath)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return fmt.Errorf("create metrics parent directory %q: %w", parent, err)
+	}
+	info, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("stat metrics parent directory %q: %w", parent, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("metrics parent path %q is not a directory", parent)
+	}
+	base := filepath.Base(outputPath)
+	tmp, err := os.CreateTemp(parent, "."+base+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temporary metrics file in %q: %w", parent, err)
+	}
+	tmpPath := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary metrics file %q: %w", tmpPath, err)
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod temporary metrics file %q: %w", tmpPath, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary metrics file %q: %w", tmpPath, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary metrics file %q: %w", tmpPath, err)
+	}
+	if err := renameTrainMetricsFile(tmpPath, outputPath); err != nil {
+		return fmt.Errorf("rename temporary metrics file %q to %q: %w", tmpPath, outputPath, err)
+	}
+	cleanup = false
+	if dir, err := os.Open(parent); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
 	}
 	return nil
 }
@@ -7211,58 +7683,75 @@ func trainEvalHistoryPayload(history []eosruntime.EmbeddingTrainEvalSummary) []t
 
 func trainRunConfigPayload(cfg eosruntime.EmbeddingTrainRunConfig, effectiveLearningRate float32) trainRunConfigJSON {
 	return trainRunConfigJSON{
-		Epochs:                            cfg.Epochs,
-		BatchSize:                         cfg.BatchSize,
-		Shuffle:                           cfg.Shuffle,
-		Seed:                              cfg.Seed,
-		EvalEveryEpoch:                    cfg.EvalEveryEpoch,
-		EvalEverySteps:                    cfg.EvalEverySteps,
-		Patience:                          cfg.EarlyStoppingPatience,
-		SelectMetric:                      cfg.SelectMetric,
-		MinDelta:                          cfg.MinDelta,
-		RestoreBest:                       cfg.RestoreBest,
-		LengthBucketBatches:               cfg.LengthBucketBatches,
-		LearningRate:                      cfg.LearningRate,
-		EffectiveLearningRate:             effectiveLearningRate,
-		ContrastiveLoss:                   cfg.ContrastiveLoss,
-		Temperature:                       cfg.Temperature,
-		GroupedLossWeight:                 cfg.GroupedLossWeight,
-		TeacherLossWeight:                 cfg.TeacherLossWeight,
-		TeacherTemperature:                cfg.TeacherTemperature,
-		TeacherSourceTemperatures:         cfg.TeacherSourceTemperatures,
-		TeacherSourceWeights:              cfg.TeacherSourceWeights,
-		TeacherScoreNormalization:         cfg.TeacherScoreNormalization,
-		MatryoshkaDims:                    cfg.MatryoshkaDims,
-		MatryoshkaWeights:                 cfg.MatryoshkaWeights,
-		TurboQuantPrefixBits:              cfg.TurboQuantPrefixBits,
-		TurboQuantPrefixObjectives:        cfg.TurboQuantPrefixObjectives,
-		TurboQuantPrefixWeight:            cfg.TurboQuantPrefixWeight,
-		TurboQuantPrefixSeed:              cfg.TurboQuantPrefixSeed,
-		TurboQuantPrefixScoreMode:         cfg.TurboQuantPrefixScoreMode,
-		TurboQuantCompactObjectives:       cfg.TurboQuantCompactObjectives,
-		ClearTurboQuantRankMargin:         cfg.ClearTurboQuantRankMargin,
-		TurboQuantRankMarginObjectives:    cfg.TurboQuantRankMarginObjectives,
-		TurboQuantRankMargin:              cfg.TurboQuantRankMargin,
-		ProgressEverySteps:                cfg.ProgressEverySteps,
-		EvalOnly:                          cfg.EvalOnly,
-		PairwiseTrain:                     cfg.PairwiseTrain,
-		HardNegativeTrain:                 cfg.HardNegativeTrain,
-		ScoreSpectrumTrain:                cfg.ScoreSpectrumTrain,
-		ListwiseGeometryTrain:             cfg.ListwiseGeometryTrain,
-		VectorDistillTrain:                cfg.VectorDistillTrain,
-		VectorDistillOptimizerSync:        cfg.VectorDistillOptimizerSync,
-		MovementDiagnostics:               cfg.MovementDiagnostics,
-		AllowResearchOnlyListwiseGeometry: cfg.AllowResearchOnlyListwiseGeometry,
-		MaxListwiseGeometryTrainPairs:     cfg.MaxListwiseGeometryTrainPairs,
-		MaxListwiseGeometryEvalPairs:      cfg.MaxListwiseGeometryEvalPairs,
-		ScoreSpectrumEvalPath:             cfg.ScoreSpectrumEvalPath,
-		ScoreSpectrumLossMode:             cfg.ScoreSpectrumLossMode,
-		ScoreSpectrumRecoveryWeight:       cfg.ScoreSpectrumRecoveryWeight,
-		ScoreSpectrumRecoveryMargin:       cfg.ScoreSpectrumRecoveryMargin,
-		ScoreSpectrumRecoveryTopK:         cfg.ScoreSpectrumRecoveryTopK,
-		ScoreSpectrumRecoveryTau:          cfg.ScoreSpectrumRecoveryTau,
-		HardNegativesPerQuery:             cfg.HardNegativesPerQuery,
-		HardNegativeSourceWeights:         cfg.HardNegativeSourceWeights,
+		Epochs:                                cfg.Epochs,
+		BatchSize:                             cfg.BatchSize,
+		Shuffle:                               cfg.Shuffle,
+		Seed:                                  cfg.Seed,
+		EvalEveryEpoch:                        cfg.EvalEveryEpoch,
+		EvalEverySteps:                        cfg.EvalEverySteps,
+		Patience:                              cfg.EarlyStoppingPatience,
+		SelectMetric:                          cfg.SelectMetric,
+		MinDelta:                              cfg.MinDelta,
+		RestoreBest:                           cfg.RestoreBest,
+		LengthBucketBatches:                   cfg.LengthBucketBatches,
+		LearningRate:                          cfg.LearningRate,
+		EffectiveLearningRate:                 effectiveLearningRate,
+		ContrastiveLoss:                       cfg.ContrastiveLoss,
+		Temperature:                           cfg.Temperature,
+		GroupedLossWeight:                     cfg.GroupedLossWeight,
+		TeacherLossWeight:                     cfg.TeacherLossWeight,
+		TeacherTemperature:                    cfg.TeacherTemperature,
+		TeacherSourceTemperatures:             cfg.TeacherSourceTemperatures,
+		TeacherSourceWeights:                  cfg.TeacherSourceWeights,
+		TeacherScoreNormalization:             cfg.TeacherScoreNormalization,
+		MatryoshkaDims:                        cfg.MatryoshkaDims,
+		MatryoshkaWeights:                     cfg.MatryoshkaWeights,
+		TurboQuantPrefixBits:                  cfg.TurboQuantPrefixBits,
+		TurboQuantPrefixObjectives:            cfg.TurboQuantPrefixObjectives,
+		TurboQuantPrefixWeight:                cfg.TurboQuantPrefixWeight,
+		TurboQuantPrefixSeed:                  cfg.TurboQuantPrefixSeed,
+		TurboQuantPrefixScoreMode:             cfg.TurboQuantPrefixScoreMode,
+		TurboQuantCompactObjectives:           cfg.TurboQuantCompactObjectives,
+		ClearTurboQuantRankMargin:             cfg.ClearTurboQuantRankMargin,
+		TurboQuantRankMarginObjectives:        cfg.TurboQuantRankMarginObjectives,
+		TurboQuantRankMargin:                  cfg.TurboQuantRankMargin,
+		TurboQuantRankMarginLoss:              cfg.TurboQuantRankMarginLoss,
+		TurboQuantRankMarginReduction:         cfg.TurboQuantRankMarginReduction,
+		TurboQuantRankMarginTau:               cfg.TurboQuantRankMarginTau,
+		TurboQuantTopKObjectives:              cfg.TurboQuantTopKObjectives,
+		TurboQuantTopKLoss:                    cfg.TurboQuantTopKLoss,
+		TurboQuantTopKCutoff:                  cfg.TurboQuantTopKCutoff,
+		TurboQuantTopKTau:                     cfg.TurboQuantTopKTau,
+		TurboQuantTopKMargin:                  cfg.TurboQuantTopKMargin,
+		TurboQuantTopKNegativeMask:            cfg.TurboQuantTopKNegativeMask,
+		TurboQuantTopKRecallWeight:            cfg.TurboQuantTopKRecallWeight,
+		TurboQuantTopKRecallCutoff:            cfg.TurboQuantTopKRecallCutoff,
+		TurboQuantTopKRecallTau:               cfg.TurboQuantTopKRecallTau,
+		TurboQuantTopKRecallMargin:            cfg.TurboQuantTopKRecallMargin,
+		TurboQuantTopKRecallNegativeMask:      cfg.TurboQuantTopKRecallNegativeMask,
+		ProgressEverySteps:                    cfg.ProgressEverySteps,
+		EvalOnly:                              cfg.EvalOnly,
+		PairwiseTrain:                         cfg.PairwiseTrain,
+		HardNegativeTrain:                     cfg.HardNegativeTrain,
+		ScoreSpectrumTrain:                    cfg.ScoreSpectrumTrain,
+		ListwiseGeometryTrain:                 cfg.ListwiseGeometryTrain,
+		VectorDistillTrain:                    cfg.VectorDistillTrain,
+		VectorDistillOptimizerSync:            cfg.VectorDistillOptimizerSync,
+		MovementDiagnostics:                   cfg.MovementDiagnostics,
+		AllowResearchOnlyScoreSpectrum:        cfg.AllowResearchOnlyScoreSpectrum,
+		AllowResearchOnlyListwiseGeometry:     cfg.AllowResearchOnlyListwiseGeometry,
+		MaxListwiseGeometryTrainPairs:         cfg.MaxListwiseGeometryTrainPairs,
+		MaxListwiseGeometryEvalPairs:          cfg.MaxListwiseGeometryEvalPairs,
+		ScoreSpectrumEvalPath:                 cfg.ScoreSpectrumEvalPath,
+		ScoreSpectrumLossMode:                 cfg.ScoreSpectrumLossMode,
+		ScoreSpectrumRecoveryWeight:           cfg.ScoreSpectrumRecoveryWeight,
+		ScoreSpectrumRecoveryMargin:           cfg.ScoreSpectrumRecoveryMargin,
+		ScoreSpectrumRecoveryTopK:             cfg.ScoreSpectrumRecoveryTopK,
+		ScoreSpectrumRecoveryTau:              cfg.ScoreSpectrumRecoveryTau,
+		ScoreSpectrumMaxBatchCandidates:       cfg.ScoreSpectrumMaxBatchCandidates,
+		ScoreSpectrumActivationMicrobatchSize: cfg.ScoreSpectrumActivationMicrobatchSize,
+		HardNegativesPerQuery:                 cfg.HardNegativesPerQuery,
+		HardNegativeSourceWeights:             cfg.HardNegativeSourceWeights,
 	}
 }
 
@@ -8855,6 +9344,10 @@ func printUsage() {
 	fmt.Println("  eos smoke-sparse-embedding-encoder [flags]")
 	fmt.Println("  eos materialize-aoqt-sidecar [flags]")
 	fmt.Println("  eos train-aoqt-sidecar [flags]")
+	fmt.Println("  eos screen-aoqt-v7-r6 [flags]")
+	fmt.Println("  eos screen-aoqt-v8-constrained-basis [flags]")
+	fmt.Println("  eos screen-aoqt-v9-active-set-nullspace [flags]")
+	fmt.Println("  eos screen-aoqt-v10-residual-lowrank [flags]")
 	fmt.Println("  eos plan-multivector-storage [flags]")
 	fmt.Println("  eos init-model [flags] <artifact.mll>")
 	fmt.Println("  eos init-mirage [flags] <artifact.mll>")
@@ -8921,7 +9414,11 @@ func printUsage() {
 	fmt.Println("calibrate-sparse-routing sweeps sparse routing policy budgets, including optional calibration-only oracle policies, on synthetic tensors and writes router recall, output delta, and score-work artifacts.")
 	fmt.Println("smoke-sparse-embedding-encoder runs a deterministic routed TurboQuant sparse-attention encoder-shaped smoke and writes manifest.json, summary.tsv, scorecard.json, and scorecard.tsv.")
 	fmt.Println("materialize-aoqt-sidecar builds fixture-only AOQT calibration rows, manifest, and preflight JSON from Stage3 train-only plans, bound vectors, top120 evidence, and qrels; quality_claim=false.")
-	fmt.Println("train-aoqt-sidecar validates strict AOQT calibration/preflight inputs, supports digest-bound file input for large source-artifact hash lists, writes metrics in plan-only mode, and only writes a research-only candidate package after guarded non-plan eligibility.")
+	fmt.Println("train-aoqt-sidecar validates strict AOQT calibration/preflight inputs, supports digest-bound file input for large source-artifact hash lists, keeps empty optimizer-mode as the production-safe default, writes metrics in plan-only mode, writes a research-only candidate package only after guarded non-plan eligibility, and exposes AOQT V7 trust-region as explicit dev-only evidence without package output.")
+	fmt.Println("screen-aoqt-v7-r6 runs the required train-only, probe-only progressive S512/S1024 prepared-IP screen against the canonical V7-r4 endpoint set; it writes only a bound screen receipt and keeps all quality, release, official, heldout, and commercial claims false.")
+	fmt.Println("screen-aoqt-v8-constrained-basis runs the research-only, probe-only D384 constrained-basis AOQT screen bound to terminal V7-r6 evidence; it writes only a bound screen receipt and keeps quality, release, official, heldout, commercial, and free/open-use claims false.")
+	fmt.Println("screen-aoqt-v9-active-set-nullspace runs the research-only, probe-only D384 active-set/nullspace AOQT screen bound to terminal V8 evidence; it writes only a bound screen receipt and keeps quality, release, official, heldout, commercial, and free/open-use claims false.")
+	fmt.Println("screen-aoqt-v10-residual-lowrank writes a research-only, probe-only, dry-run D384 residual low-rank screen receipt for the canonical 24 endpoint schedule; real evaluator integration and all quality/release claims remain fail-closed.")
 	fmt.Println("plan-multivector-storage estimates how many TurboQuant child vectors per parent fit in one dense fp32 baseline-vector budget; use --baseline-dim to compare compact children against a larger dense baseline, and --series-lengths with --window-size/--window-stride to derive vectors per object from time-series windows.")
 	fmt.Println("init-model creates the Eos-owned default quantized embedding training package.")
 	fmt.Println("init-mirage creates the Eos-owned Mirage Image v1 host-reference artifact.")

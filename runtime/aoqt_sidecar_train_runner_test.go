@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -32,8 +34,561 @@ func TestAOQTSidecarTrainRunnerAcceptsCanonicalMaterializerManifestDigest(t *tes
 	if result.Metrics.Inputs.DatasetManifestSHA256 != preflight.CalibrationManifestSHA256 {
 		t.Fatalf("metrics dataset manifest SHA = %s, want canonical SHA %s", result.Metrics.Inputs.DatasetManifestSHA256, preflight.CalibrationManifestSHA256)
 	}
+	if result.Metrics.Plan.OptimizerMode != "" || result.Metrics.Summary.OptimizerMode != "" || result.DevEvidence != nil || result.PackageResult != nil {
+		t.Fatalf("default plan-only runner was not production-compatible: metrics=%+v dev=%+v package=%+v", result.Metrics, result.DevEvidence, result.PackageResult)
+	}
 	if _, err := os.Lstat(AOQTFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath)); !os.IsNotExist(err) {
 		t.Fatalf("successful plan-only run fail-closed diagnostics state = %v, want absent", err)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerRejectsUnauthorizedV7DevMode(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+	trainCfg.DevOutputDir = t.TempDir()
+	called := false
+	_, err := runAOQTSidecarTraining(trainCfg, func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		called = true
+		return nil, fmt.Errorf("objective factory must not run without dev authorization")
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires explicit dev-only authorization") {
+		t.Fatalf("unauthorized dev optimizer error = %v, want dev authorization rejection", err)
+	}
+	if called {
+		t.Fatalf("objective factory ran despite missing dev authorization")
+	}
+	if _, err := os.Lstat(trainCfg.MetricsJSONPath); !os.IsNotExist(err) {
+		t.Fatalf("metrics output state = %v, want absent", err)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerWritesV7DevEvidenceWithoutPackage(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", nil)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+
+	result, err := runAOQTSidecarTraining(trainCfg, aoqtRunnerObjectiveFromContract)
+	if err != nil {
+		t.Fatalf("run V7 dev AOQT sidecar training: %v", err)
+	}
+	if result.PackageResult != nil {
+		t.Fatalf("dev-only runner returned candidate package result: %+v", result.PackageResult)
+	}
+	if result.DevEvidence == nil {
+		t.Fatalf("dev-only runner did not return dev evidence")
+	}
+	if result.Metrics.Plan.OptimizerMode != AOQTSidecarOptimizerModeV7DevTrustRegion || result.Metrics.Summary.OptimizerMode != AOQTSidecarOptimizerModeV7DevTrustRegion {
+		t.Fatalf("dev optimizer mode not recorded in metrics: plan=%q summary=%q", result.Metrics.Plan.OptimizerMode, result.Metrics.Summary.OptimizerMode)
+	}
+	if result.Metrics.Summary.OptimizerDiagnostics == nil || !result.Metrics.Summary.OptimizerDiagnostics.DevOnly {
+		t.Fatalf("dev-only optimizer diagnostics not recorded: %+v", result.Metrics.Summary.OptimizerDiagnostics)
+	}
+	if err := result.DevEvidence.Validate(); err != nil {
+		t.Fatalf("dev evidence invalid: %v", err)
+	}
+	if result.DevEvidence.SplitBinding == nil || result.DevEvidence.SplitBinding.SplitManifestSHA256 != trainCfg.ExpectedSplitManifestSHA256 || result.DevEvidence.SplitBinding.FoldID != trainCfg.FoldID {
+		t.Fatalf("dev split binding not recorded: %+v", result.DevEvidence.SplitBinding)
+	}
+	if result.Metrics.SplitBinding == nil || !reflect.DeepEqual(*result.Metrics.SplitBinding, *result.DevEvidence.SplitBinding) {
+		t.Fatalf("metrics/dev evidence split binding mismatch: metrics=%+v dev=%+v", result.Metrics.SplitBinding, result.DevEvidence.SplitBinding)
+	}
+	if result.Metrics.SplitBinding.TrainRowCount != result.Metrics.Plan.RowCount || result.Metrics.SplitBinding.MaterializedRowCount != result.Metrics.Plan.RowCount {
+		t.Fatalf("split binding row counts = train %d materialized %d plan %d", result.Metrics.SplitBinding.TrainRowCount, result.Metrics.SplitBinding.MaterializedRowCount, result.Metrics.Plan.RowCount)
+	}
+	if result.Metrics.SplitBinding.MaterializedRowsSHA256 != trainCfg.ExpectedRowsSHA256 || result.Metrics.SplitBinding.MaterializedPreflightSHA256 != trainCfg.ExpectedPreflightSHA256 {
+		t.Fatalf("split binding materialized hashes not recorded: %+v", result.Metrics.SplitBinding)
+	}
+	for _, path := range []string{trainCfg.MetricsJSONPath, result.DevEvidence.TransformPath, filepath.Join(trainCfg.DevOutputDir, "aoqt-sidecar-dev-evidence.json")} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Fatalf("expected dev artifact %q: %v", path, err)
+		}
+	}
+	var transform AOQTGivensTransform
+	transformData, err := os.ReadFile(result.DevEvidence.TransformPath)
+	if err != nil {
+		t.Fatalf("read dev transform: %v", err)
+	}
+	if err := strictUnmarshalAOQT(transformData, &transform); err != nil {
+		t.Fatalf("decode dev transform: %v", err)
+	}
+	if got, err := transform.AnglesSHA256(); err != nil || got != result.Metrics.Summary.AnglesSHA256 {
+		t.Fatalf("dev transform angles sha = %q, %v; want metrics %q", got, err, result.Metrics.Summary.AnglesSHA256)
+	}
+	for role, candidate := range aoqtCandidatePathMap(aoqtCandidateOutputPaths(filepath.Join(trainCfg.DevOutputDir, "candidate.mll"), true)) {
+		if _, err := os.Lstat(candidate); err == nil {
+			t.Fatalf("dev-only runner wrote candidate %s output %q", role, candidate)
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat candidate %s output: %v", role, err)
+		}
+	}
+}
+
+func TestAOQTSidecarTrainRunnerWritesDevFailureDiagnosticsWithoutPackage(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", nil)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+	objectiveFactory := func(contract AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		objective, err := objectiveFromAOQTContract(contract)
+		if err != nil {
+			return nil, err
+		}
+		stateful := &statefulRejectingAOQTObjective{config: objective.AOQTPreparedIPObjectiveConfig()}
+		objective.workspace.evaluateOverride = stateful.EvaluateAOQT
+		return objective, nil
+	}
+	result, err := runAOQTSidecarTraining(trainCfg, objectiveFactory)
+	if err == nil {
+		t.Fatal("dev failure fixture unexpectedly succeeded")
+	}
+	if result.DevFailureDiagnostics == nil {
+		t.Fatalf("dev failure diagnostics missing: %v", err)
+	}
+	diagnostics := result.DevFailureDiagnostics
+	if diagnostics.QualityClaim || diagnostics.ReleaseClaim || diagnostics.OfficialClaim || diagnostics.OfficialHeldoutGate || diagnostics.CommercialClaim {
+		t.Fatalf("dev failure claims are not fail-closed: %+v", diagnostics)
+	}
+	if err := diagnostics.Validate(); err != nil {
+		t.Fatalf("dev failure diagnostics invalid: %v", err)
+	}
+	optimizer := diagnostics.Summary.OptimizerDiagnostics
+	if optimizer == nil || optimizer.ProposalReceipts == nil || len(*optimizer.ProposalReceipts) != optimizer.ProposalAttempts {
+		t.Fatalf("dev failure proposal receipts = %+v, want every attempt", optimizer)
+	}
+	for i, receipt := range *optimizer.ProposalReceipts {
+		if !receipt.TotalDeltaFinite || !receipt.ComponentDeltasFinite {
+			t.Fatalf("receipt[%d] omitted finite deltas: %+v", i, receipt)
+		}
+	}
+	path := AOQTDevFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read dev failure diagnostics: %v", err)
+	}
+	var decoded AOQTSidecarDevFailClosedDiagnostics
+	if err := strictUnmarshalAOQT(data, &decoded); err != nil {
+		t.Fatalf("decode dev failure diagnostics: %v", err)
+	}
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("decoded dev failure diagnostics invalid: %v", err)
+	}
+	if decoded.IOReport != result.IOReport || !reflect.DeepEqual(decoded.Preflight, result.Preflight) || decoded.SplitBinding == nil {
+		t.Fatalf("dev failure diagnostics lost exact input/split binding")
+	}
+	if _, err := os.Lstat(trainCfg.MetricsJSONPath); !os.IsNotExist(err) {
+		t.Fatalf("metrics output state = %v, want absent on failure", err)
+	}
+	if _, err := os.Lstat(trainCfg.OutputArtifactPath); !os.IsNotExist(err) {
+		t.Fatalf("candidate package output state = %v, want absent", err)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerV7R2ProbePreconditionFailsClosed(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", nil)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.LearningRate = 0.01
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7R2DevTrustRegion
+	trainCfg.RequireForwardConsistencyProbe = true
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+	result, err := runAOQTSidecarTraining(trainCfg, aoqtRunnerObjectiveFromContract)
+	if err == nil || result.DevFailureDiagnostics == nil {
+		t.Fatalf("V7-r2 precondition result=%+v err=%v, want fail-closed diagnostics", result, err)
+	}
+	if result.DevFailureDiagnostics.ForwardConsistencyProbe == nil || result.DevFailureDiagnostics.ForwardConsistencyProbe.Passed {
+		t.Fatalf("V7-r2 precondition probe receipt = %+v, want failed receipt", result.DevFailureDiagnostics.ForwardConsistencyProbe)
+	}
+	if strings.TrimSpace(result.DevFailureDiagnostics.ForwardConsistencyProbe.FailureReason) == "" {
+		t.Fatalf("V7-r2 probe failure reason is empty")
+	}
+	if err := result.DevFailureDiagnostics.Validate(); err != nil {
+		t.Fatalf("V7-r2 precondition diagnostics invalid: %v", err)
+	}
+	if _, err := os.Stat(AOQTDevFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath)); err != nil {
+		t.Fatalf("V7-r2 dev fail-closed diagnostics missing: %v", err)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerV7R2PassedProbeOptimizerFailureIsDevTrainingFailed(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", nil)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.LearningRate = 0.01
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7R2DevTrustRegion
+	trainCfg.RequireForwardConsistencyProbe = true
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+
+	manifest := readAOQTManifestForTrainRunnerTest(t, trainCfg.ManifestPath)
+	topology, err := expectedAOQTSidecarTrainTopology()
+	if err != nil {
+		t.Fatalf("expected AOQT topology: %v", err)
+	}
+	set, _, err := LoadAOQTSidecarCalibrationSet(AOQTSidecarCalibrationIOConfig{
+		ManifestPath:                        trainCfg.ManifestPath,
+		RowsJSONLPath:                       trainCfg.RowsJSONLPath,
+		ExpectedManifestSHA256:              trainCfg.ExpectedManifestSHA256,
+		ExpectedRowsSHA256:                  trainCfg.ExpectedRowsSHA256,
+		ExpectedAnchorArtifactSHA256:        trainCfg.ExpectedAnchorArtifactSHA256,
+		ExpectedAnchorPackageManifestSHA256: trainCfg.ExpectedAnchorPackageManifestSHA256,
+		ExpectedAnchorEmbeddingSpaceID:      trainCfg.ExpectedAnchorEmbeddingSpaceID,
+		ExpectedCompatibilityDigest:         trainCfg.ExpectedCompatibilityDigest,
+		ExpectedTurboQuantSeed:              AOQTSidecarMaterializerQuantSeed,
+		ExpectedTopology:                    topology,
+		ExpectedSourceArtifactHashes:        manifest.SourceArtifactHashes,
+		ExpectedVectorCacheHashes:           manifest.VectorCacheHashes,
+	})
+	if err != nil {
+		t.Fatalf("load AOQT fixture: %v", err)
+	}
+
+	// Count the exact objective calls consumed by the probe. The runner uses
+	// the same deterministic trainer inputs, so the next objective call is
+	// unambiguously an optimizer failure rather than a probe failure.
+	newProbeObjective := func() AOQTSidecarPreparedIPObjective {
+		objective, err := objectiveFromAOQTContract(set.Manifest.ObjectiveContract)
+		if err != nil {
+			t.Fatalf("new probe objective: %v", err)
+		}
+		objective.workspace.evaluateOverride = func(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+			const slope = float32(10)
+			value := float32(100)
+			for _, coordinate := range input.Query {
+				value += slope * coordinate
+			}
+			weightSum := input.Row.Weights.Q3Gain + input.Row.Weights.Q3OrderGuard + input.Row.Weights.Q3ScoreDistill + input.Row.Weights.Q5OrderGuard + input.Row.Weights.Q5ScoreDistill + input.Row.Weights.NFBoundaryGuard
+			result := AOQTSidecarObjectiveResult{
+				QueryGrad:  make([]float32, len(input.Query)),
+				Components: AOQTSidecarObjectiveComponents{},
+				Activation: aoqtActiveObjectiveForWeights(input.Row.Weights, len(input.Candidates)),
+			}
+			for i := range result.QueryGrad {
+				result.QueryGrad[i] = slope * weightSum
+			}
+			for i := range input.Candidates {
+				result.CandidateGrads = append(result.CandidateGrads, make([]float32, len(input.Candidates[i])))
+			}
+			for _, item := range []struct {
+				weight float32
+				set    func(*AOQTSidecarObjectiveComponents, float32)
+			}{
+				{input.Row.Weights.Q3Gain, func(c *AOQTSidecarObjectiveComponents, v float32) { c.Q3Gain += v }},
+				{input.Row.Weights.Q3OrderGuard, func(c *AOQTSidecarObjectiveComponents, v float32) { c.Q3OrderGuard += v }},
+				{input.Row.Weights.Q3ScoreDistill, func(c *AOQTSidecarObjectiveComponents, v float32) { c.Q3ScoreDistill += v }},
+				{input.Row.Weights.Q5OrderGuard, func(c *AOQTSidecarObjectiveComponents, v float32) { c.Q5OrderGuard += v }},
+				{input.Row.Weights.Q5ScoreDistill, func(c *AOQTSidecarObjectiveComponents, v float32) { c.Q5ScoreDistill += v }},
+				{input.Row.Weights.NFBoundaryGuard, func(c *AOQTSidecarObjectiveComponents, v float32) { c.NFBoundaryGuard += v }},
+			} {
+				component := item.weight * value
+				item.set(&result.Components, component)
+				result.Loss += component
+			}
+			return result, nil
+		}
+		return objective
+	}
+	probeObjective := newProbeObjective()
+	probeCalls := 0
+	probeEvaluate := probeObjective.workspace.evaluateOverride
+	probeObjective.workspace.evaluateOverride = func(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+		probeCalls++
+		return probeEvaluate(input)
+	}
+	probeTrainer, err := NewAOQTSidecarTrainer(AOQTSidecarTrainConfig{
+		PairingSeed:                                AOQTSidecarMaterializerTopologySeed,
+		WorkplanSeed:                               AOQTSidecarMaterializerQuantSeed,
+		OptimizerMode:                              AOQTSidecarOptimizerModeV7R2DevTrustRegion,
+		ForwardConsistencyProbeRequired:            true,
+		ForwardConsistencyProbeFoldID:              trainCfg.FoldID,
+		ForwardConsistencyProbeSplitManifestSHA256: trainCfg.ExpectedSplitManifestSHA256,
+		MaxSteps:                   1,
+		LearningRate:               0.01,
+		TrainingContract:           set.Manifest.TrainingContract,
+		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
+	})
+	if err != nil {
+		t.Fatalf("new probe trainer: %v", err)
+	}
+	probeReceipt, err := probeTrainer.runForwardConsistencyProbe(set, probeObjective)
+	if err != nil || !probeReceipt.Passed || probeCalls == 0 {
+		t.Fatalf("synthetic probe setup receipt=%+v calls=%d err=%v", probeReceipt, probeCalls, err)
+	}
+
+	result, err := runAOQTSidecarTraining(trainCfg, func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		objective := newProbeObjective()
+		calls := 0
+		evaluate := objective.workspace.evaluateOverride
+		objective.workspace.evaluateOverride = func(input AOQTSidecarObjectiveInput) (AOQTSidecarObjectiveResult, error) {
+			calls++
+			if calls > probeCalls {
+				return AOQTSidecarObjectiveResult{}, fmt.Errorf("forced optimizer failure after passed probe")
+			}
+			return evaluate(input)
+		}
+		return objective, nil
+	})
+	if err == nil {
+		t.Fatal("passed-probe optimizer failure unexpectedly succeeded")
+	}
+	if result.DevFailureDiagnostics == nil || result.DevFailureDiagnostics.ForwardConsistencyProbe == nil {
+		t.Fatalf("passed-probe optimizer failure diagnostics = %+v, want bound probe diagnostics", result.DevFailureDiagnostics)
+	}
+	diagnostics := result.DevFailureDiagnostics
+	if !diagnostics.ForwardConsistencyProbe.Passed {
+		t.Fatalf("optimizer failure was classified with a failed probe: %+v", diagnostics.ForwardConsistencyProbe)
+	}
+	if diagnostics.FailureKind != "dev_training_failed" {
+		t.Fatalf("failure kind = %q, want dev_training_failed", diagnostics.FailureKind)
+	}
+	if err := diagnostics.Validate(); err != nil {
+		t.Fatalf("passed-probe optimizer failure diagnostics invalid: %v", err)
+	}
+	data, err := os.ReadFile(AOQTDevFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath))
+	if err != nil {
+		t.Fatalf("read passed-probe optimizer failure diagnostics: %v", err)
+	}
+	var decoded AOQTSidecarDevFailClosedDiagnostics
+	if err := strictUnmarshalAOQT(data, &decoded); err != nil {
+		t.Fatalf("decode passed-probe optimizer failure diagnostics: %v", err)
+	}
+	if decoded.FailureKind != "dev_training_failed" || !decoded.ForwardConsistencyProbe.Passed {
+		t.Fatalf("written failure diagnostics = %+v, want dev_training_failed with passed probe", decoded)
+	}
+}
+
+func TestAOQTSidecarTrainRunnerV7R2ProbeOnlyWritesOnlyBoundReceipt(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", nil)
+	receiptPath := filepath.Join(t.TempDir(), "v7-r2-probe.receipt.json")
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 99 // ignored by probe-only mode; no optimizer step is legal.
+	trainCfg.LearningRate = 0.01
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7R2DevTrustRegion
+	trainCfg.RequireForwardConsistencyProbe = true
+	trainCfg.ForwardConsistencyProbeOnly = true
+	trainCfg.ForwardConsistencyProbeReceiptJSONPath = receiptPath
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = ""
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+
+	result, err := runAOQTSidecarTraining(trainCfg, aoqtRunnerObjectiveFromContract)
+	if err == nil || result.ForwardConsistencyProbe == nil || result.ForwardConsistencyProbe.Passed {
+		t.Fatalf("probe-only precondition result=%+v err=%v, want failed receipt", result, err)
+	}
+	if result.ForwardConsistencyProbeReceiptJSONPath != receiptPath {
+		t.Fatalf("probe-only receipt path = %q, want %q", result.ForwardConsistencyProbeReceiptJSONPath, receiptPath)
+	}
+	data, readErr := os.ReadFile(receiptPath)
+	if readErr != nil {
+		t.Fatalf("read probe-only receipt: %v", readErr)
+	}
+	var receipt AOQTSidecarForwardConsistencyProbeReceipt
+	if err := strictUnmarshalAOQT(data, &receipt); err != nil {
+		t.Fatalf("decode probe-only receipt: %v", err)
+	}
+	if err := receipt.ValidateBound(); err != nil {
+		t.Fatalf("probe-only receipt validation: %v", err)
+	}
+	if receipt.Passed || strings.TrimSpace(receipt.FailureReason) == "" {
+		t.Fatalf("probe-only receipt = %+v, want failed receipt", receipt)
+	}
+	t.Run("bound-selection-and-contract-tamper", func(t *testing.T) {
+		mutate := func(name string, fn func(*AOQTSidecarForwardConsistencyProbeReceipt)) {
+			t.Helper()
+			tampered := receipt
+			tampered.SubsetRowIDs = append([]string(nil), receipt.SubsetRowIDs...)
+			tampered.ProtectedComponents = append([]string(nil), receipt.ProtectedComponents...)
+			fn(&tampered)
+			if err := tampered.ValidateBound(); err == nil {
+				t.Fatalf("tampered %s receipt unexpectedly validated", name)
+			}
+		}
+		mutate("selected-row-membership", func(r *AOQTSidecarForwardConsistencyProbeReceipt) {
+			r.SubsetRowIDs[0] = "forged-row-id"
+			r.SubsetRowIDSHA256 = aoqtRowIDSHA256(r.SubsetRowIDs)
+		})
+		mutate("selection-seed", func(r *AOQTSidecarForwardConsistencyProbeReceipt) {
+			r.SelectionSeedSHA256 = strings.Repeat("a", 64)
+		})
+		mutate("bound-io-seed", func(r *AOQTSidecarForwardConsistencyProbeReceipt) {
+			r.Binding.IOReport.TurboQuantSeed++
+			r.SelectionSeedSHA256 = sha256AOQTForwardConsistencySelectionSeed(
+				r.Binding.IOReport.TurboQuantSeed,
+				r.Binding.SplitBinding.FoldID,
+				r.Binding.SplitBinding.SplitManifestSHA256,
+				r.Binding.Inputs.DatasetManifestSHA256,
+				r.Binding.SplitBinding.MaterializedRowIDSHA256,
+			)
+		})
+		mutate("protected-components", func(r *AOQTSidecarForwardConsistencyProbeReceipt) {
+			r.ProtectedComponents = []string{"q3_order_guard"}
+		})
+	})
+	if result.Metrics.Schema != "" || result.DevEvidence != nil || result.DevFailureDiagnostics != nil || result.PackageResult != nil {
+		t.Fatalf("probe-only returned non-receipt artifacts: metrics=%+v dev=%+v failure=%+v package=%+v", result.Metrics, result.DevEvidence, result.DevFailureDiagnostics, result.PackageResult)
+	}
+	for _, path := range []string{
+		trainCfg.MetricsJSONPath,
+		AOQTDevFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath),
+		AOQTFailClosedDiagnosticsPath(trainCfg.MetricsJSONPath),
+		filepath.Join(trainCfg.DevOutputDir, "aoqt-sidecar-dev-evidence.json"),
+	} {
+		if path == "" || path == ".dev.failclosed.json" || path == ".failclosed.json" {
+			continue
+		}
+		if _, statErr := os.Lstat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("probe-only wrote forbidden artifact %q: %v", path, statErr)
+		}
+	}
+}
+
+func TestAOQTSidecarTrainRunnerRejectsForgedV7DevSplitManifestPayload(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", func(manifest map[string]any) {
+		manifest["seed"] = "forged-after-payload-hash"
+	})
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+	called := false
+	_, err := runAOQTSidecarTraining(trainCfg, func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		called = true
+		return nil, fmt.Errorf("objective factory must not run after split manifest forgery")
+	})
+	if err == nil || !strings.Contains(err.Error(), "provenance.manifest_sha256 does not bind split payload") {
+		t.Fatalf("forged split manifest error = %v, want payload binding rejection", err)
+	}
+	if called {
+		t.Fatalf("objective factory ran after forged split manifest")
+	}
+}
+
+func TestAOQTSidecarTrainRunnerRejectsUnknownV7DevSplitFold(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", nil)
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-1"
+	called := false
+	_, err := runAOQTSidecarTraining(trainCfg, func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		called = true
+		return nil, fmt.Errorf("objective factory must not run after wrong fold")
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not contain fold") {
+		t.Fatalf("wrong fold error = %v, want fold rejection", err)
+	}
+	if called {
+		t.Fatalf("objective factory ran after wrong fold")
+	}
+}
+
+func TestAOQTSidecarTrainRunnerRejectsWrongV7DevTrainRows(t *testing.T) {
+	materializerCfg := writeTinyAOQTMaterializerFixture(t)
+	if _, err := MaterializeAOQTSidecarCalibration(materializerCfg); err != nil {
+		t.Fatalf("materialize AOQT sidecar calibration: %v", err)
+	}
+	trainCfg := aoqtTrainRunnerConfigFromMaterializerFixture(t, materializerCfg)
+	splitManifestPath := writeV7DevSplitManifestForTrainRunnerTest(t, trainCfg, "fold-0", func(manifest map[string]any) {
+		fold := manifest["folds"].([]any)[0].(map[string]any)
+		train := fold["train"].(map[string]any)
+		rows := append([]string(nil), train["row_ids"].([]string)...)
+		rows[len(rows)-1] += ".forged"
+		train["row_ids"] = rows
+		train["row_ids_sha256"] = mustSHA256JSONAOQT(rows)
+		provenance := manifest["provenance"].(map[string]any)
+		delete(provenance, "manifest_sha256")
+		payloadSHA, err := aoqtV7SplitPayloadSHA256(manifest)
+		if err != nil {
+			t.Fatalf("rehash tampered split manifest: %v", err)
+		}
+		provenance["manifest_sha256"] = payloadSHA
+	})
+	trainCfg.PlanOnly = false
+	trainCfg.MaxSteps = 1
+	trainCfg.OptimizerMode = AOQTSidecarOptimizerModeV7DevTrustRegion
+	trainCfg.AllowDevOnly = true
+	trainCfg.DevOutputDir = t.TempDir()
+	trainCfg.SplitManifestPath = splitManifestPath
+	trainCfg.ExpectedSplitManifestSHA256 = mustSHA256FileAOQTTest(t, splitManifestPath)
+	trainCfg.FoldID = "fold-0"
+	called := false
+	_, err := runAOQTSidecarTraining(trainCfg, func(AOQTSidecarObjectiveContract) (AOQTSidecarVectorObjective, error) {
+		called = true
+		return nil, fmt.Errorf("objective factory must not run after wrong train rows")
+	})
+	if err == nil || !strings.Contains(err.Error(), "train row_ids do not exactly match materialized calibration rows") {
+		t.Fatalf("wrong train rows error = %v, want row binding rejection", err)
+	}
+	if called {
+		t.Fatalf("objective factory ran after wrong train rows")
 	}
 }
 
@@ -624,6 +1179,97 @@ func aoqtTrainRunnerConfigFromMaterializerFixture(t *testing.T, materializerCfg 
 		PlanOnly:                            true,
 		AllowResearchOnly:                   true,
 	}
+}
+
+func writeV7DevSplitManifestForTrainRunnerTest(t *testing.T, trainCfg AOQTSidecarTrainRunnerConfig, foldID string, mutate func(map[string]any)) string {
+	t.Helper()
+	rowsData, err := os.ReadFile(trainCfg.RowsJSONLPath)
+	if err != nil {
+		t.Fatalf("read rows JSONL: %v", err)
+	}
+	rows, err := parseAOQTCalibrationRowsJSONL(rowsData, trainCfg.RowsJSONLPath)
+	if err != nil {
+		t.Fatalf("parse rows JSONL: %v", err)
+	}
+	rowIDs := make([]string, 0, len(rows))
+	qidsByDataset := map[string][]string{}
+	seenQIDs := map[string]map[string]bool{}
+	for _, row := range rows {
+		rowIDs = append(rowIDs, row.RowID)
+		if seenQIDs[row.Dataset] == nil {
+			seenQIDs[row.Dataset] = map[string]bool{}
+		}
+		if !seenQIDs[row.Dataset][row.QueryID] {
+			seenQIDs[row.Dataset][row.QueryID] = true
+			qidsByDataset[row.Dataset] = append(qidsByDataset[row.Dataset], row.QueryID)
+		}
+	}
+	sort.Strings(rowIDs)
+	for dataset := range qidsByDataset {
+		sort.Strings(qidsByDataset[dataset])
+	}
+	qidCounts := map[string]int{}
+	for dataset, qids := range qidsByDataset {
+		qidCounts[dataset] = len(qids)
+	}
+	train := map[string]any{
+		"row_count":              len(rowIDs),
+		"row_ids":                rowIDs,
+		"row_ids_sha256":         mustSHA256JSONAOQT(rowIDs),
+		"qid_count_by_dataset":   qidCounts,
+		"qids_by_dataset":        qidsByDataset,
+		"qids_by_dataset_sha256": mustSHA256JSONAOQT(qidsByDataset),
+	}
+	devQIDs := map[string][]string{}
+	dev := map[string]any{
+		"row_count":              0,
+		"row_ids":                []string{},
+		"row_ids_sha256":         mustSHA256JSONAOQT([]string{}),
+		"qid_count_by_dataset":   map[string]int{},
+		"qids_by_dataset":        devQIDs,
+		"qids_by_dataset_sha256": mustSHA256JSONAOQT(devQIDs),
+	}
+	manifest := map[string]any{
+		"schema":                        AOQTV7DevSplitManifestSchema,
+		"mode":                          "plan_only_split_manifest",
+		"actual_training_ran":           false,
+		"actual_eval_ran":               false,
+		"actual_official_data_eval_ran": false,
+		"seed":                          "go-runner-test",
+		"fold_count":                    1,
+		"reserve_fraction":              json.Number("0.0"),
+		"source_plan": map[string]any{
+			"sha256":         strings.Repeat("a", 64),
+			"rows_sha256":    strings.Repeat("b", 64),
+			"row_ids_sha256": strings.Repeat("c", 64),
+		},
+		"official_qid_registry": map[string]any{
+			"manifest_sha256": strings.Repeat("d", 64),
+			"source_sha256":   strings.Repeat("e", 64),
+		},
+		"folds": []any{
+			map[string]any{
+				"name":  foldID,
+				"train": train,
+				"dev":   dev,
+			},
+		},
+		"provenance": map[string]any{},
+	}
+	provenance := manifest["provenance"].(map[string]any)
+	payloadSHA, err := aoqtV7SplitPayloadSHA256(manifest)
+	if err != nil {
+		t.Fatalf("hash split manifest payload: %v", err)
+	}
+	provenance["manifest_sha256"] = payloadSHA
+	if mutate != nil {
+		mutate(manifest)
+	}
+	path := filepath.Join(t.TempDir(), "split.json")
+	if err := writeJSONFileAOQT(path, manifest); err != nil {
+		t.Fatalf("write split manifest: %v", err)
+	}
+	return path
 }
 
 func readAOQTManifestForTrainRunnerTest(t *testing.T, path string) AOQTSidecarCalibrationManifest {

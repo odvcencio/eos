@@ -338,6 +338,89 @@ func TestEmbeddingTrainerFitListwiseGeometryIsolatesInheritedCompactPackageObjec
 	}
 }
 
+func TestEmbeddingTrainerFitListwiseGeometryExplicitFullDimCompactOverridesInheritedPackageConfig(t *testing.T) {
+	seed := int64(17)
+	path := filepath.Join(t.TempDir(), "inherited-listwise-compact.mll")
+	source := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
+	source.config.MatryoshkaDims = []int{2}
+	source.config.MatryoshkaWeights = []float32{1}
+	source.config.TurboQuantPrefixBits = []int{2}
+	source.config.TurboQuantPrefixWeight = 0.25
+	source.config.TurboQuantRankMarginObjectives = []TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.5}}
+	source.config.TurboQuantRankMargin = 0.02
+	source.config.TurboQuantCompactObjectives = []TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.25}}
+	source.config.TurboQuantPrefixSeed = 11
+	if _, err := source.WriteTrainingPackage(path); err != nil {
+		t.Fatalf("write inherited package: %v", err)
+	}
+
+	limited, err := LoadEmbeddingTrainerPackage(path)
+	if err != nil {
+		t.Fatalf("load inherited package for cap check: %v", err)
+	}
+	_, err = limited.FitListwiseGeometry(tinyTokenizedListwiseGeometryBatches(false), nil, EmbeddingTrainRunConfig{
+		Epochs:                        1,
+		BatchSize:                     1,
+		EvalEveryEpoch:                1,
+		Temperature:                   0.05,
+		TurboQuantCompactObjectives:   []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 3, Weight: 0.5}},
+		TurboQuantPrefixSeed:          seed,
+		MaxListwiseGeometryTrainPairs: 7,
+	})
+	if err == nil || !strings.Contains(err.Error(), "max_listwise_geometry_train_pairs 7") {
+		t.Fatalf("cap error = %v, want dense+compact train pair cap rejection", err)
+	}
+
+	denseSummary, err := newTinyTrainable3DEmbeddingTrainer(t, 0.05).FitListwiseGeometry(tinyTokenizedListwiseGeometryBatches(false), nil, EmbeddingTrainRunConfig{
+		Epochs:         1,
+		BatchSize:      1,
+		EvalEveryEpoch: 1,
+		Temperature:    0.05,
+	})
+	if err != nil {
+		t.Fatalf("fit dense listwise geometry: %v", err)
+	}
+	trainer, err := LoadEmbeddingTrainerPackage(path)
+	if err != nil {
+		t.Fatalf("load inherited package: %v", err)
+	}
+	summary, err := trainer.FitListwiseGeometry(tinyTokenizedListwiseGeometryBatches(false), nil, EmbeddingTrainRunConfig{
+		Epochs:                        1,
+		BatchSize:                     1,
+		EvalEveryEpoch:                1,
+		Temperature:                   0.05,
+		TurboQuantCompactObjectives:   []TurboQuantPrefixObjective{{Dim: 3, BitWidth: 3, Weight: 0.5}},
+		TurboQuantPrefixSeed:          seed,
+		MaxListwiseGeometryTrainPairs: 8,
+	})
+	if err != nil {
+		t.Fatalf("fit explicit full-dim compact listwise geometry: %v", err)
+	}
+	if math.IsNaN(float64(summary.FinalTrain.Loss)) || math.IsInf(float64(summary.FinalTrain.Loss), 0) || summary.FinalTrain.Loss <= 0 {
+		t.Fatalf("compact final train loss = %f, want finite positive", summary.FinalTrain.Loss)
+	}
+	if math.Abs(float64(summary.FinalTrain.Loss-denseSummary.FinalTrain.Loss)) < 1e-7 {
+		t.Fatalf("compact loss = %f, dense loss = %f, want distinct objective result", summary.FinalTrain.Loss, denseSummary.FinalTrain.Loss)
+	}
+	if summary.FinalTrain.BatchSize != 8 || summary.Workload.TrainPairsPerEpoch != 8 || summary.Workload.PlannedTrainPairs != 8 || summary.Workload.ActualTrainPairs != 8 || summary.Workload.PlannedTotalPairs != 8 || summary.Workload.ActualTotalPairs != 8 {
+		t.Fatalf("workload/final train = %+v final=%+v, want exactly dense+one compact objective (8 pairs)", summary.Workload, summary.FinalTrain)
+	}
+	if got := summary.Config.TurboQuantCompactObjectives; len(got) != 1 || got[0].Dim != 3 || got[0].BitWidth != 3 || got[0].Weight != 0.5 {
+		t.Fatalf("summary compact objectives = %+v, want explicit full-dim q3", got)
+	}
+	if got := trainer.config.TurboQuantCompactObjectives; len(got) != 1 || got[0].Dim != 3 || got[0].BitWidth != 3 || got[0].Weight != 0.5 {
+		t.Fatalf("trainer compact objectives = %+v, want explicit full-dim q3", got)
+	}
+	if len(trainer.config.MatryoshkaDims) != 0 || len(trainer.config.TurboQuantPrefixBits) != 0 || len(trainer.config.TurboQuantRankMarginObjectives) != 0 {
+		t.Fatalf("inherited incompatible trainer objectives not cleared: %+v", trainer.config)
+	}
+	for _, want := range []string{"matryoshka", "turboquant_prefix_bits", "turboquant_rank_margin_objectives", "turboquant_compact_objectives", "turboquant_prefix_seed"} {
+		if !hasScoreSpectrumObjectiveName(trainer.listwiseGeometryLineage.IsolatedInheritedObjectives, want) {
+			t.Fatalf("isolated inherited objectives = %v, missing %q", trainer.listwiseGeometryLineage.IsolatedInheritedObjectives, want)
+		}
+	}
+}
+
 func TestEmbeddingTrainerFitListwiseGeometryRejectsExplicitIncompatibleObjectivesBeforeIsolation(t *testing.T) {
 	trainer := newTinyTrainable3DEmbeddingTrainer(t, 0.05)
 	trainer.config.TurboQuantCompactObjectives = []TurboQuantPrefixObjective{{Dim: 2, BitWidth: 2, Weight: 0.25}}
@@ -490,7 +573,7 @@ func TestListwiseGeometryGradientScaleIsQueryRowAveragedAcrossPackedRows(t *test
 	}}
 	combinedQueryGrads := [][]float32{{0, 0}, {0, 0}}
 	combinedDocGrads := [][]float32{{0, 0}, {0, 0}}
-	combinedLoss, _, _, combinedQueries, err := accumulateListwiseGeometryGrads(queries, combinedDocs, []embeddingCandidateSpan{{Start: 0, End: 2}}, combinedBatch, 0.5, combinedQueryGrads, combinedDocGrads)
+	combinedLoss, _, _, combinedQueries, err := accumulateListwiseGeometryGrads(queries, combinedDocs, []embeddingCandidateSpan{{Start: 0, End: 2}}, combinedBatch, EmbeddingTrainConfig{Temperature: 0.5}, combinedQueryGrads, combinedDocGrads)
 	if err != nil {
 		t.Fatalf("combined grads: %v", err)
 	}
@@ -507,7 +590,7 @@ func TestListwiseGeometryGradientScaleIsQueryRowAveragedAcrossPackedRows(t *test
 	}
 	splitQueryGrads := [][]float32{{0, 0}, {0, 0}}
 	splitDocGrads := [][]float32{{0, 0}, {0, 0}, {0, 0}, {0, 0}}
-	splitLoss, _, _, splitQueries, err := accumulateListwiseGeometryGrads(queries, splitDocs, []embeddingCandidateSpan{{Start: 0, End: 2}, {Start: 2, End: 4}}, splitBatch, 0.5, splitQueryGrads, splitDocGrads)
+	splitLoss, _, _, splitQueries, err := accumulateListwiseGeometryGrads(queries, splitDocs, []embeddingCandidateSpan{{Start: 0, End: 2}, {Start: 2, End: 4}}, splitBatch, EmbeddingTrainConfig{Temperature: 0.5}, splitQueryGrads, splitDocGrads)
 	if err != nil {
 		t.Fatalf("split grads: %v", err)
 	}

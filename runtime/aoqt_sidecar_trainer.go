@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -15,10 +16,45 @@ import (
 )
 
 type AOQTSidecarTrainConfig struct {
-	Dim                        int
-	Stages                     int
-	PairingSeed                int64
-	WorkplanSeed               int64
+	Dim                             int
+	Stages                          int
+	PairingSeed                     int64
+	WorkplanSeed                    int64
+	OptimizerMode                   string
+	ForwardConsistencyProbeRequired bool
+	// ForwardConsistencyProbeOnly runs the required V7-r2 probe and returns
+	// before any optimizer step. It is separate from
+	// ForwardConsistencyProbeRequired so a probe-only run cannot fall through
+	// into optimizer telemetry or package production.
+	ForwardConsistencyProbeOnly                bool
+	ForwardConsistencyProbeFoldID              string
+	ForwardConsistencyProbeSplitManifestSHA256 string
+	// ActualDirectionProbeRequired enables the V7-r3 deterministic actual
+	// endpoint sweep. It is separate from the V7-r2 sign-consistency probe so
+	// the older sign-authority contract cannot be silently relabeled.
+	ActualDirectionProbeRequired            bool
+	ActualDirectionProbeOnly                bool
+	ActualDirectionProbeFoldID              string
+	ActualDirectionProbeSplitManifestSHA256 string
+	// ActualCoordinateProbeRequired enables the preregistered V7-r4 scalar
+	// endpoint probe.  It is intentionally separate from the V7-r3 actual
+	// direction search so the r3 contract cannot be silently relabeled.
+	ActualCoordinateProbeRequired            bool
+	ActualCoordinateProbeOnly                bool
+	ActualCoordinateProbeFoldID              string
+	ActualCoordinateProbeSplitManifestSHA256 string
+	// ActualCoordinateTrainRequired enables the V7-r5 full trainer.  The
+	// canonical V7-r4 receipt is an authorization/input pin; r5 never falls
+	// back to Adam or the legacy STE proposal path.
+	ActualCoordinateTrainRequired        bool
+	ActualCoordinateTrainR4Receipt       *AOQTSidecarActualCoordinateProbeReceipt
+	ActualCoordinateTrainR4ReceiptPath   string
+	ActualCoordinateTrainR4ReceiptSHA256 string
+	// CanonicalR4Receipt* are source-compatible aliases for callers that use
+	// the shorter design terminology.
+	CanonicalR4Receipt         *AOQTSidecarActualCoordinateProbeReceipt
+	CanonicalR4ReceiptPath     string
+	CanonicalR4ReceiptSHA256   string
 	PlanOnly                   bool
 	MaxSteps                   int
 	LearningRate               float32
@@ -33,69 +69,106 @@ type AOQTSidecarTrainConfig struct {
 }
 
 type AOQTSidecarWorkPlan struct {
-	Dim            int     `json:"dim"`
-	Stages         int     `json:"stages"`
-	PairsPerStage  int     `json:"pairs_per_stage"`
-	AngleCount     int     `json:"angle_count"`
-	RowCount       int     `json:"row_count"`
-	PairCount      int     `json:"pair_count"`
-	StepCount      int     `json:"step_count"`
-	PairingSeed    int64   `json:"pairing_seed"`
-	WorkplanSeed   int64   `json:"workplan_seed"`
-	LearningRate   float32 `json:"learning_rate"`
-	PairingsSHA256 string  `json:"pairings_sha256"`
-	PlanOnly       bool    `json:"plan_only"`
+	Dim                               int     `json:"dim"`
+	Stages                            int     `json:"stages"`
+	PairsPerStage                     int     `json:"pairs_per_stage"`
+	AngleCount                        int     `json:"angle_count"`
+	RowCount                          int     `json:"row_count"`
+	PairCount                         int     `json:"pair_count"`
+	StepCount                         int     `json:"step_count"`
+	PairingSeed                       int64   `json:"pairing_seed"`
+	WorkplanSeed                      int64   `json:"workplan_seed"`
+	LearningRate                      float32 `json:"learning_rate"`
+	OptimizerMode                     string  `json:"optimizer_mode,omitempty"`
+	ForwardConsistencyProbeRequired   bool    `json:"forward_consistency_probe_required,omitempty"`
+	ForwardConsistencyProbeOnly       bool    `json:"forward_consistency_probe_only,omitempty"`
+	ActualDirectionProbeRequired      bool    `json:"actual_direction_probe_required,omitempty"`
+	ActualDirectionProbeOnly          bool    `json:"actual_direction_probe_only,omitempty"`
+	ActualCoordinateProbeRequired     bool    `json:"actual_coordinate_probe_required,omitempty"`
+	ActualCoordinateProbeOnly         bool    `json:"actual_coordinate_probe_only,omitempty"`
+	ActualCoordinateTrainRequired     bool    `json:"actual_coordinate_train_required,omitempty"`
+	ActualCoordinateFullTrainRequired bool    `json:"actual_coordinate_full_train_required,omitempty"`
+	PairingsSHA256                    string  `json:"pairings_sha256"`
+	PlanOnly                          bool    `json:"plan_only"`
 }
 
 type AOQTSidecarTrainSummary struct {
-	Plan                       AOQTSidecarWorkPlan                    `json:"plan"`
-	ObjectiveContract          AOQTSidecarObjectiveContract           `json:"objective_contract"`
-	Steps                      int                                    `json:"steps"`
-	InitialLoss                float32                                `json:"initial_loss"`
-	FinalLoss                  float32                                `json:"final_loss"`
-	InitialObjectiveComponents AOQTSidecarObjectiveComponents         `json:"initial_objective_components"`
-	FinalObjectiveComponents   AOQTSidecarObjectiveComponents         `json:"final_objective_components"`
-	InitialObjectiveActivation AOQTSidecarObjectiveActivation         `json:"initial_objective_activation"`
-	FinalObjectiveActivation   AOQTSidecarObjectiveActivation         `json:"final_objective_activation"`
-	AngleL2                    float32                                `json:"angle_l2"`
-	AngleMaxAbs                float32                                `json:"angle_max_abs"`
-	AnglesSHA256               string                                 `json:"angles_sha256"`
-	DenseMaxAbsDelta           float64                                `json:"dense_max_abs_delta"`
-	OptimizerDiagnostics       *AOQTSidecarOptimizerDiagnostics       `json:"optimizer_diagnostics,omitempty"`
-	OptimizerDiagnosticsSHA256 string                                 `json:"optimizer_diagnostics_sha256,omitempty"`
-	QualityClaim               bool                                   `json:"quality_claim"`
-	TrainingContract           string                                 `json:"training_contract,omitempty"`
-	CandidateEligibilityPolicy *AOQTSidecarCandidateEligibilityPolicy `json:"candidate_eligibility_policy,omitempty"`
+	Plan                              AOQTSidecarWorkPlan                        `json:"plan"`
+	ObjectiveContract                 AOQTSidecarObjectiveContract               `json:"objective_contract"`
+	Steps                             int                                        `json:"steps"`
+	InitialLoss                       float32                                    `json:"initial_loss"`
+	FinalLoss                         float32                                    `json:"final_loss"`
+	InitialObjectiveComponents        AOQTSidecarObjectiveComponents             `json:"initial_objective_components"`
+	FinalObjectiveComponents          AOQTSidecarObjectiveComponents             `json:"final_objective_components"`
+	InitialObjectiveActivation        AOQTSidecarObjectiveActivation             `json:"initial_objective_activation"`
+	FinalObjectiveActivation          AOQTSidecarObjectiveActivation             `json:"final_objective_activation"`
+	AngleL2                           float32                                    `json:"angle_l2"`
+	AngleMaxAbs                       float32                                    `json:"angle_max_abs"`
+	AnglesSHA256                      string                                     `json:"angles_sha256"`
+	DenseMaxAbsDelta                  float64                                    `json:"dense_max_abs_delta"`
+	OptimizerDiagnostics              *AOQTSidecarOptimizerDiagnostics           `json:"optimizer_diagnostics,omitempty"`
+	OptimizerDiagnosticsSHA256        string                                     `json:"optimizer_diagnostics_sha256,omitempty"`
+	QualityClaim                      bool                                       `json:"quality_claim"`
+	TrainingContract                  string                                     `json:"training_contract,omitempty"`
+	CandidateEligibilityPolicy        *AOQTSidecarCandidateEligibilityPolicy     `json:"candidate_eligibility_policy,omitempty"`
+	OptimizerMode                     string                                     `json:"optimizer_mode,omitempty"`
+	ForwardConsistencyProbeRequired   bool                                       `json:"forward_consistency_probe_required,omitempty"`
+	ForwardConsistencyProbeOnly       bool                                       `json:"forward_consistency_probe_only,omitempty"`
+	ActualDirectionProbeRequired      bool                                       `json:"actual_direction_probe_required,omitempty"`
+	ActualDirectionProbeOnly          bool                                       `json:"actual_direction_probe_only,omitempty"`
+	ActualCoordinateProbeRequired     bool                                       `json:"actual_coordinate_probe_required,omitempty"`
+	ActualCoordinateProbeOnly         bool                                       `json:"actual_coordinate_probe_only,omitempty"`
+	ActualCoordinateTrainRequired     bool                                       `json:"actual_coordinate_train_required,omitempty"`
+	ActualCoordinateFullTrainRequired bool                                       `json:"actual_coordinate_full_train_required,omitempty"`
+	ForwardConsistencyProbe           *AOQTSidecarForwardConsistencyProbeReceipt `json:"forward_consistency_probe,omitempty"`
+	ForwardConsistencyProbeSHA256     string                                     `json:"forward_consistency_probe_sha256,omitempty"`
+	ActualDirectionProbe              *AOQTSidecarActualDirectionProbeReceipt    `json:"actual_direction_probe,omitempty"`
+	ActualDirectionProbeSHA256        string                                     `json:"actual_direction_probe_sha256,omitempty"`
+	ActualCoordinateProbe             *AOQTSidecarActualCoordinateProbeReceipt   `json:"actual_coordinate_probe,omitempty"`
+	ActualCoordinateProbeSHA256       string                                     `json:"actual_coordinate_probe_sha256,omitempty"`
+	ActualCoordinateTrain             *AOQTSidecarActualCoordinateTrainReceipt   `json:"actual_coordinate_train,omitempty"`
+	ActualCoordinateTrainSHA256       string                                     `json:"actual_coordinate_train_sha256,omitempty"`
 }
 
 type AOQTSidecarOptimizerDiagnostics struct {
-	PlannedSteps                 int                                      `json:"planned_steps"`
-	AttemptedSteps               int                                      `json:"attempted_steps"`
-	AcceptedSteps                int                                      `json:"accepted_steps"`
-	ProposalAttempts             int                                      `json:"proposal_attempts"`
-	AcceptedProposals            int                                      `json:"accepted_proposals"`
-	RejectedProposals            int                                      `json:"rejected_proposals"`
-	Backtracks                   int                                      `json:"backtracks"`
-	MaxAttemptsPerStep           int                                      `json:"max_attempts_per_step"`
-	ExhaustedSteps               int                                      `json:"exhausted_steps"`
-	AdamProposalAttempts         int                                      `json:"adam_proposal_attempts,omitempty"`
-	AdamAcceptedProposals        int                                      `json:"adam_accepted_proposals,omitempty"`
-	AdamRejectedProposals        int                                      `json:"adam_rejected_proposals,omitempty"`
-	CoordinateProposalAttempts   int                                      `json:"coordinate_proposal_attempts,omitempty"`
-	CoordinateAcceptedProposals  int                                      `json:"coordinate_accepted_proposals,omitempty"`
-	CoordinateRejectedProposals  int                                      `json:"coordinate_rejected_proposals,omitempty"`
-	CoordinateSearchPlanCount    int                                      `json:"coordinate_search_plan_count,omitempty"`
-	CoordinateTopAngles          int                                      `json:"coordinate_top_angles,omitempty"`
-	CoordinateMagnitudeCount     int                                      `json:"coordinate_magnitude_count,omitempty"`
-	CoordinateBlockCount         int                                      `json:"coordinate_block_count,omitempty"`
-	CoordinateSearchStrategy     string                                   `json:"coordinate_search_strategy,omitempty"`
-	CoordinateSearchOrderingHash string                                   `json:"coordinate_search_ordering_sha256,omitempty"`
-	CoordinateSearchLearningRate float32                                  `json:"coordinate_search_learning_rate,omitempty"`
-	CoordinateSearchAudit        string                                   `json:"coordinate_search_audit,omitempty"`
-	CoordinateSearchAuditChain   string                                   `json:"coordinate_search_audit_chain,omitempty"`
-	CoordinateSearchHashChain    string                                   `json:"coordinate_search_hash_chain,omitempty"`
-	RejectionDiagnostics         AOQTSidecarOptimizerRejectionDiagnostics `json:"rejection_diagnostics,omitempty"`
-	ProposalReceipts             *AOQTSidecarOptimizerProposalReceipts    `json:"proposal_receipts,omitempty"`
+	OptimizerMode                 string                                   `json:"optimizer_mode,omitempty"`
+	DevOnly                       bool                                     `json:"dev_only,omitempty"`
+	PlannedSteps                  int                                      `json:"planned_steps"`
+	AttemptedSteps                int                                      `json:"attempted_steps"`
+	AcceptedSteps                 int                                      `json:"accepted_steps"`
+	ProposalAttempts              int                                      `json:"proposal_attempts"`
+	AcceptedProposals             int                                      `json:"accepted_proposals"`
+	RejectedProposals             int                                      `json:"rejected_proposals"`
+	Backtracks                    int                                      `json:"backtracks"`
+	MaxAttemptsPerStep            int                                      `json:"max_attempts_per_step"`
+	ExhaustedSteps                int                                      `json:"exhausted_steps"`
+	AdamProposalAttempts          int                                      `json:"adam_proposal_attempts,omitempty"`
+	AdamAcceptedProposals         int                                      `json:"adam_accepted_proposals,omitempty"`
+	AdamRejectedProposals         int                                      `json:"adam_rejected_proposals,omitempty"`
+	CoordinateProposalAttempts    int                                      `json:"coordinate_proposal_attempts,omitempty"`
+	CoordinateAcceptedProposals   int                                      `json:"coordinate_accepted_proposals,omitempty"`
+	CoordinateRejectedProposals   int                                      `json:"coordinate_rejected_proposals,omitempty"`
+	CoordinateSearchPlanCount     int                                      `json:"coordinate_search_plan_count,omitempty"`
+	CoordinateTopAngles           int                                      `json:"coordinate_top_angles,omitempty"`
+	CoordinateMagnitudeCount      int                                      `json:"coordinate_magnitude_count,omitempty"`
+	CoordinateBlockCount          int                                      `json:"coordinate_block_count,omitempty"`
+	CoordinateSearchStrategy      string                                   `json:"coordinate_search_strategy,omitempty"`
+	CoordinateSearchOrderingHash  string                                   `json:"coordinate_search_ordering_sha256,omitempty"`
+	CoordinateSearchLearningRate  float32                                  `json:"coordinate_search_learning_rate,omitempty"`
+	CoordinateSearchAudit         string                                   `json:"coordinate_search_audit,omitempty"`
+	CoordinateSearchAuditChain    string                                   `json:"coordinate_search_audit_chain,omitempty"`
+	CoordinateSearchHashChain     string                                   `json:"coordinate_search_hash_chain,omitempty"`
+	TrustRegionRadius             float32                                  `json:"trust_region_radius,omitempty"`
+	TrustRegionProposalAttempts   int                                      `json:"trust_region_proposal_attempts,omitempty"`
+	TrustRegionAcceptedBlocks     int                                      `json:"trust_region_accepted_blocks,omitempty"`
+	TrustRegionAcceptedSingles    int                                      `json:"trust_region_accepted_singles,omitempty"`
+	TrustRegionMaxMovedAngles     int                                      `json:"trust_region_max_moved_angles,omitempty"`
+	TrustRegionMaxMagnitude       float32                                  `json:"trust_region_max_magnitude,omitempty"`
+	TrustRegionAcceptedMagnitude  float32                                  `json:"trust_region_accepted_magnitude,omitempty"`
+	TrustRegionMovedAngleIndices  *[]int                                   `json:"trust_region_moved_angle_indices,omitempty"`
+	TrustRegionAcceptedSingleRule string                                   `json:"trust_region_accepted_single_coordinate_rule,omitempty"`
+	RejectionDiagnostics          AOQTSidecarOptimizerRejectionDiagnostics `json:"rejection_diagnostics,omitempty"`
+	ProposalReceipts              *AOQTSidecarOptimizerProposalReceipts    `json:"proposal_receipts,omitempty"`
 }
 
 type AOQTSidecarOptimizerProposalReceipts []AOQTSidecarOptimizerProposalReceipt
@@ -121,6 +194,24 @@ type AOQTSidecarOptimizerProposalReceipt struct {
 	CandidateComponents       AOQTSidecarObjectiveComponents `json:"candidate_components"`
 	CandidateComponentsFinite bool                           `json:"candidate_components_finite"`
 	CandidateActivation       AOQTSidecarObjectiveActivation `json:"candidate_activation"`
+	TotalDelta                float32                        `json:"total_delta"`
+	TotalDeltaFinite          bool                           `json:"total_delta_finite"`
+	ComponentDeltas           AOQTSidecarObjectiveComponents `json:"component_deltas"`
+	ComponentDeltasFinite     bool                           `json:"component_deltas_finite"`
+	ProposalMagnitude         float32                        `json:"proposal_magnitude,omitempty"`
+	ProposalBlockSize         int                            `json:"proposal_block_size,omitempty"`
+	CoordinateSearchStrategy  string                         `json:"coordinate_search_strategy,omitempty"`
+	MovedAngleCount           int                            `json:"moved_angle_count,omitempty"`
+	MovedAngleIndices         []int                          `json:"moved_angle_indices,omitempty"`
+	DirectionSource           string                         `json:"direction_source,omitempty"`
+	EndpointOrdinal           int                            `json:"endpoint_ordinal,omitempty"`
+	// V7-r3 coordinate receipts carry the exact probe evidence that authorized
+	// the full proposal. These fields remain absent for Adam and non-r3
+	// receipts; metrics validation binds them back to the selected endpoint.
+	EndpointHashSHA256         string `json:"endpoint_hash_sha256,omitempty"`
+	RequestedDirectionSHA256   string `json:"requested_direction_sha256,omitempty"`
+	ActualDirectionSHA256      string `json:"actual_direction_sha256,omitempty"`
+	ActualDirectionProbeSHA256 string `json:"actual_direction_probe_sha256,omitempty"`
 }
 
 type AOQTSidecarOptimizerRejectionDiagnostics struct {
@@ -206,10 +297,12 @@ func (c AOQTSidecarObjectiveComponents) Sum() float32 {
 }
 
 type AOQTSidecarObjectiveActivation struct {
-	Q3GainEligiblePairs         int `json:"q3_gain_eligible_pairs"`
-	Q3GainContributingPairs     int `json:"q3_gain_contributing_pairs"`
-	Q3OrderGuardPairs           int `json:"q3_order_guard_pairs"`
-	Q3OrderGuardContributing    int `json:"q3_order_guard_contributing_pairs"`
+	Q3GainEligiblePairs      int `json:"q3_gain_eligible_pairs"`
+	Q3GainContributingPairs  int `json:"q3_gain_contributing_pairs"`
+	Q3OrderGuardPairs        int `json:"q3_order_guard_pairs"`
+	Q3OrderGuardContributing int `json:"q3_order_guard_contributing_pairs"`
+	// Score-distill counts are structural prepared-candidate coverage counts;
+	// they do not assert that the corresponding numeric loss is non-zero.
 	Q3ScoreDistillCount         int `json:"q3_score_distill_count"`
 	Q5OrderGuardPairs           int `json:"q5_order_guard_pairs"`
 	Q5OrderGuardContributing    int `json:"q5_order_guard_contributing_pairs"`
@@ -562,22 +655,31 @@ func (t *AOQTSidecarTrainer) Plan(set AOQTSidecarCalibrationSet) (AOQTSidecarWor
 		pairCount += countEligibleAOQTPairs(row)
 	}
 	steps := t.config.MaxSteps
-	if t.config.PlanOnly {
+	if t.config.PlanOnly || t.config.ForwardConsistencyProbeOnly || t.config.ActualDirectionProbeOnly || t.config.ActualCoordinateProbeOnly {
 		steps = 0
 	}
 	return AOQTSidecarWorkPlan{
-		Dim:            t.config.Dim,
-		Stages:         t.config.Stages,
-		PairsPerStage:  AOQTSidecarPairsPerStage,
-		AngleCount:     len(t.angles),
-		RowCount:       len(set.Rows),
-		PairCount:      pairCount,
-		StepCount:      steps,
-		PairingSeed:    t.config.PairingSeed,
-		WorkplanSeed:   t.config.WorkplanSeed,
-		LearningRate:   t.config.LearningRate,
-		PairingsSHA256: pairings,
-		PlanOnly:       t.config.PlanOnly,
+		Dim:                               t.config.Dim,
+		Stages:                            t.config.Stages,
+		PairsPerStage:                     AOQTSidecarPairsPerStage,
+		AngleCount:                        len(t.angles),
+		RowCount:                          len(set.Rows),
+		PairCount:                         pairCount,
+		StepCount:                         steps,
+		PairingSeed:                       t.config.PairingSeed,
+		WorkplanSeed:                      t.config.WorkplanSeed,
+		LearningRate:                      t.config.LearningRate,
+		OptimizerMode:                     t.config.OptimizerMode,
+		ForwardConsistencyProbeRequired:   t.config.ForwardConsistencyProbeRequired,
+		ForwardConsistencyProbeOnly:       t.config.ForwardConsistencyProbeOnly,
+		ActualDirectionProbeRequired:      t.config.ActualDirectionProbeRequired,
+		ActualDirectionProbeOnly:          t.config.ActualDirectionProbeOnly,
+		ActualCoordinateProbeRequired:     t.config.ActualCoordinateProbeRequired,
+		ActualCoordinateProbeOnly:         t.config.ActualCoordinateProbeOnly,
+		ActualCoordinateTrainRequired:     t.config.ActualCoordinateTrainRequired || isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode),
+		ActualCoordinateFullTrainRequired: t.config.ActualCoordinateTrainRequired || isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode),
+		PairingsSHA256:                    pairings,
+		PlanOnly:                          t.config.PlanOnly,
 	}, nil
 }
 
@@ -589,19 +691,46 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	if err != nil {
 		return AOQTSidecarTrainSummary{}, err
 	}
+	summary := AOQTSidecarTrainSummary{
+		Plan:                              plan,
+		ObjectiveContract:                 set.Manifest.ObjectiveContract,
+		QualityClaim:                      false,
+		TrainingContract:                  set.Manifest.TrainingContract,
+		CandidateEligibilityPolicy:        cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
+		OptimizerMode:                     t.config.OptimizerMode,
+		ForwardConsistencyProbeRequired:   t.config.ForwardConsistencyProbeRequired,
+		ForwardConsistencyProbeOnly:       t.config.ForwardConsistencyProbeOnly,
+		ActualDirectionProbeRequired:      t.config.ActualDirectionProbeRequired,
+		ActualDirectionProbeOnly:          t.config.ActualDirectionProbeOnly,
+		ActualCoordinateProbeRequired:     t.config.ActualCoordinateProbeRequired,
+		ActualCoordinateProbeOnly:         t.config.ActualCoordinateProbeOnly,
+		ActualCoordinateTrainRequired:     t.config.ActualCoordinateTrainRequired || isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode),
+		ActualCoordinateFullTrainRequired: t.config.ActualCoordinateTrainRequired || isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode),
+	}
 	manifestPolicy, err := AOQTSidecarTrainingContractPolicy(set.Manifest.TrainingContract, set.Manifest.CandidateEligibilityPolicy)
 	if err != nil {
+		if isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode) {
+			if diagnostics, receipt, initErr := t.initializeV7R5FailureArtifacts(); initErr == nil {
+				return t.finishV7R5Failure(summary, diagnostics, receipt, err)
+			}
+		}
 		return AOQTSidecarTrainSummary{}, err
 	}
 	if !aoqtCandidateEligibilityPoliciesEqual(manifestPolicy, t.eligibilityPolicy) {
-		return AOQTSidecarTrainSummary{}, fmt.Errorf("AOQT trainer eligibility policy does not match calibration manifest training contract")
+		failure := fmt.Errorf("AOQT trainer eligibility policy does not match calibration manifest training contract")
+		if isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode) {
+			if diagnostics, receipt, initErr := t.initializeV7R5FailureArtifacts(); initErr == nil {
+				return t.finishV7R5Failure(summary, diagnostics, receipt, failure)
+			}
+		}
+		return summary, failure
 	}
-	summary := AOQTSidecarTrainSummary{
-		Plan:                       plan,
-		ObjectiveContract:          set.Manifest.ObjectiveContract,
-		QualityClaim:               false,
-		TrainingContract:           set.Manifest.TrainingContract,
-		CandidateEligibilityPolicy: cloneAOQTSidecarCandidateEligibilityPolicy(set.Manifest.CandidateEligibilityPolicy),
+	// Route r5 through its fail-closed initializer before inspecting the
+	// objective.  Objective factories are allowed to fail (including a nil
+	// factory), but those failures still need a bound failed r5 receipt and
+	// diagnostics witness from the runner.
+	if isAOQTV7R5ActualCoordinateMode(t.config.OptimizerMode) {
+		return t.fitV7R5ActualCoordinate(set, objective, summary)
 	}
 	if t.config.PlanOnly {
 		angles, err := t.Transform().AnglesSHA256()
@@ -627,24 +756,126 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	diagnostics := AOQTSidecarOptimizerDiagnostics{
 		PlannedSteps:       t.config.MaxSteps,
 		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+		OptimizerMode:      t.config.OptimizerMode,
+		DevOnly:            isAOQTV7DevOptimizerMode(t.config.OptimizerMode),
 	}
 	if t.config.CaptureProposalReceipts {
 		receipts := make(AOQTSidecarOptimizerProposalReceipts, 0)
 		diagnostics.ProposalReceipts = &receipts
+	}
+	refreshOptimizerDiagnostics := func() {
+		summary.OptimizerDiagnostics = &diagnostics
+		if hash, hashErr := diagnostics.SHA256(); hashErr == nil {
+			summary.OptimizerDiagnosticsSHA256 = hash
+		}
+	}
+	// The diagnostics pointer is installed before the optional r2 probe so a
+	// normal dev probe failure can be serialized as a complete, fail-closed
+	// artifact. Probe-only mode intentionally carries no optimizer diagnostics.
+	if !t.config.ForwardConsistencyProbeOnly && !t.config.ActualDirectionProbeOnly && !t.config.ActualCoordinateProbeOnly {
+		refreshOptimizerDiagnostics()
+	}
+	if t.config.ForwardConsistencyProbeRequired {
+		receipt, probeErr := t.runForwardConsistencyProbe(set, objective)
+		if probeErr != nil && receipt.FailureReason == "" {
+			prefix := "probe_error: "
+			if receipt.SelectionSeedSHA256 == "" {
+				prefix = "precondition: "
+			}
+			receipt.FailureReason = prefix + probeErr.Error()
+		}
+		summary.ForwardConsistencyProbe = &receipt
+		if probeErr != nil {
+			if !t.config.ForwardConsistencyProbeOnly {
+				refreshOptimizerDiagnostics()
+			}
+			return summary, probeErr
+		}
+		probeSHA, hashErr := receipt.SHA256()
+		if hashErr != nil {
+			if !t.config.ForwardConsistencyProbeOnly {
+				refreshOptimizerDiagnostics()
+			}
+			return summary, hashErr
+		}
+		summary.ForwardConsistencyProbeSHA256 = probeSHA
+		if t.config.ForwardConsistencyProbeOnly {
+			// There is deliberately no optimizer path in probe-only mode. The
+			// runner consumes the bound receipt and does not serialize this
+			// in-memory summary as metrics or dev evidence.
+			return summary, nil
+		}
+	}
+	if t.config.ActualDirectionProbeRequired {
+		receipt, probeErr := t.runActualDirectionProbe(set, objective)
+		if probeErr != nil && receipt.FailureReason == "" {
+			prefix := "probe_error: "
+			if receipt.SelectionSeedSHA256 == "" {
+				prefix = "precondition: "
+			}
+			receipt.FailureReason = prefix + probeErr.Error()
+		}
+		summary.ActualDirectionProbe = &receipt
+		if probeErr != nil {
+			if !t.config.ActualDirectionProbeOnly {
+				refreshOptimizerDiagnostics()
+			}
+			return summary, probeErr
+		}
+		probeSHA, hashErr := receipt.SHA256()
+		if hashErr != nil {
+			if !t.config.ActualDirectionProbeOnly {
+				refreshOptimizerDiagnostics()
+			}
+			return summary, hashErr
+		}
+		summary.ActualDirectionProbeSHA256 = probeSHA
+		if t.config.ActualDirectionProbeOnly {
+			// The runner serializes only the bound receipt. No metrics, transform,
+			// proposal, or package artifact is produced in this mode.
+			return summary, nil
+		}
+	}
+	if t.config.ActualCoordinateProbeRequired {
+		receipt, probeErr := t.runActualCoordinateProbe(set, objective)
+		if probeErr != nil && receipt.FailureReason == "" {
+			prefix := "probe_error: "
+			if receipt.SelectionSeedSHA256 == "" {
+				prefix = "precondition: "
+			}
+			receipt.FailureReason = prefix + probeErr.Error()
+		}
+		summary.ActualCoordinateProbe = &receipt
+		if probeErr != nil {
+			return summary, probeErr
+		}
+		probeSHA, hashErr := receipt.SHA256()
+		if hashErr != nil {
+			return summary, hashErr
+		}
+		summary.ActualCoordinateProbeSHA256 = probeSHA
+		if t.config.ActualCoordinateProbeOnly {
+			// Probe-only mode deliberately stops before optimizer telemetry,
+			// metrics, transform, dev evidence, or package publication.
+			return summary, nil
+		}
 	}
 	var initialSet bool
 	for step := 0; step < t.config.MaxSteps; step++ {
 		rows := deterministicAOQTRowOrder(set.Rows, t.config.WorkplanSeed, step)
 		loss, grad, activation, components, err := t.lossAndAngleGrad(rows, objective)
 		if err != nil {
+			refreshOptimizerDiagnostics()
 			return summary, err
 		}
 		q3GainGrad, err := t.q3GainOnlyAngleGrad(rows, objective)
 		if err != nil {
+			refreshOptimizerDiagnostics()
 			return summary, err
 		}
 		protectedGradients, err := t.protectedComponentAngleGrads(rows, objective, set.Manifest.ObjectiveContract.WeightSums)
 		if err != nil {
+			refreshOptimizerDiagnostics()
 			return summary, err
 		}
 		if !initialSet {
@@ -653,25 +884,30 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 			summary.InitialObjectiveComponents = components
 			initialSet = true
 		}
-		accepted, err := t.acceptTransactionalAdamStep(grad, q3GainGrad, aoqtStepEvaluation{
+		baseline := aoqtStepEvaluation{
 			loss:       loss,
 			activation: activation,
 			components: components,
-		}, func() (aoqtStepEvaluation, error) {
+		}
+		evaluate := func() (aoqtStepEvaluation, error) {
 			loss, _, activation, components, err := t.lossAndAngleGrad(rows, objective)
 			return aoqtStepEvaluation{loss: loss, activation: activation, components: components}, err
-		}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protectedGradients)
+		}
+		var accepted bool
+		if t.config.OptimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+			accepted, err = t.acceptTransactionalActualDirectionStep(set, objective, grad, q3GainGrad, baseline, evaluate, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protectedGradients)
+		} else {
+			accepted, err = t.acceptTransactionalAdamStep(grad, q3GainGrad, baseline, evaluate, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protectedGradients)
+		}
 		if err != nil {
+			refreshOptimizerDiagnostics()
 			return summary, err
 		}
 		diagnostics.AttemptedSteps++
 		if !accepted {
 			diagnostics.ExhaustedSteps++
 			if diagnostics.AcceptedSteps == 0 {
-				summary.OptimizerDiagnostics = &diagnostics
-				if sum, err := diagnostics.SHA256(); err == nil {
-					summary.OptimizerDiagnosticsSHA256 = sum
-				}
+				refreshOptimizerDiagnostics()
 				return summary, fmt.Errorf("AOQT transactional optimizer accepted zero safe steps after %d proposal attempts; %s", diagnostics.ProposalAttempts, diagnostics.RejectionSummary())
 			}
 			break
@@ -682,6 +918,7 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	summary.OptimizerDiagnostics = &diagnostics
 	diagnosticsSHA, err := diagnostics.SHA256()
 	if err != nil {
+		refreshOptimizerDiagnostics()
 		return summary, err
 	}
 	summary.OptimizerDiagnosticsSHA256 = diagnosticsSHA
@@ -690,6 +927,7 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	finalRows := deterministicAOQTRowOrder(set.Rows, t.config.WorkplanSeed, 0)
 	finalLoss, _, finalActivation, finalComponents, err := t.lossAndAngleGrad(finalRows, objective)
 	if err != nil {
+		refreshOptimizerDiagnostics()
 		return summary, err
 	}
 	summary.FinalLoss = finalLoss
@@ -698,12 +936,14 @@ func (t *AOQTSidecarTrainer) Fit(set AOQTSidecarCalibrationSet, objective AOQTSi
 	finalTransform := t.Transform()
 	angles, err := finalTransform.AnglesSHA256()
 	if err != nil {
+		refreshOptimizerDiagnostics()
 		return summary, err
 	}
 	summary.AnglesSHA256 = angles
 	summary.AngleL2, summary.AngleMaxAbs = aoqtAngleStats(t.angles)
 	dense, err := DenseInvariantMaxAbsDelta(finalTransform, set.Rows)
 	if err != nil {
+		refreshOptimizerDiagnostics()
 		return summary, err
 	}
 	summary.DenseMaxAbsDelta = dense
@@ -742,9 +982,59 @@ const (
 	aoqtTransactionalCoordinateMicroTailMagnitudeCount = 3
 	aoqtCoordinateSearchStrategyLegacyQ3GainPrimary    = "q3_gain_primary_fine_tail_v1"
 	aoqtCoordinateSearchStrategyProtectedConeMicroTail = "q3_gain_protected_cone_micro_tail_v2"
-	aoqtTransactionalLossEpsilon                       = float32(1e-7)
-	aoqtTransactionalQ3ImprovementMinMagnitude         = float32(0)
+	aoqtCoordinateSearchStrategyV7R3ActualDirection    = "actual_direction_probe_v1"
+	aoqtCoordinateSearchStrategyV7R4ActualCoordinate   = "actual_coordinate_probe_v1"
+	AOQTSidecarOptimizerModeV7DevTrustRegion           = "aoqt-v7-dev-trust-region-v1"
+	AOQTSidecarOptimizerModeV7R2DevTrustRegion         = "aoqt-v7-r2-dev-trust-region-v1"
+	AOQTSidecarOptimizerModeV7R3DevActualDirection     = "aoqt-v7-r3-dev-actual-direction-v1"
+	AOQTSidecarOptimizerModeV7R4DevActualCoordinate    = "aoqt-v7-r4-dev-actual-coordinate-v1"
+	// V7-r5 is the explicitly authorized full-training mode. Keep the two
+	// earlier draft spellings as aliases so old callers fail closed through the
+	// same dev-only path while newly emitted plans use the preregistered name.
+	AOQTSidecarOptimizerModeV7R5DevActualCoordinateTrain  = "aoqt-v7-r5-dev-actual-coordinate-train-v1"
+	AOQTSidecarOptimizerModeV7R5DevActualCoordinate       = AOQTSidecarOptimizerModeV7R5DevActualCoordinateTrain
+	AOQTSidecarOptimizerModeV7R5DevActualCoordinateFull   = "aoqt-v7-r5-dev-actual-coordinate-full-v1"
+	AOQTSidecarOptimizerModeV7R5DevActualCoordinateLegacy = "aoqt-v7-r5-dev-actual-coordinate-v1"
+	AOQTSidecarV7AcceptedSingleCoordinateRule             = "aoqt-v7-dev-preregistered-accepted-single-coordinate-v1"
+	aoqtCoordinateSearchStrategyV7DevTrustRegion          = "q3_gain_protected_cone_trust_region_dev_v1"
+	aoqtTransactionalLossEpsilon                          = float32(1e-7)
+	aoqtTransactionalQ3ImprovementMinMagnitude            = float32(0)
 )
+
+const (
+	AOQTV7R2ForwardConsistencyProbeMagnitude       = float32(0.0003125)
+	AOQTV7R2ForwardConsistencyProbeRowCount        = 8
+	AOQTV7R2ForwardConsistencyProbeTopAngles       = 8
+	AOQTV7R2ForwardConsistencyProbeCoordinateCount = AOQTSidecarDim * AOQTSidecarStages / 2
+	// V7-r2 uses an exact sign comparison. Zero is the only neutral value;
+	// there is no implicit numerical tolerance around zero.
+	AOQTV7R2ForwardConsistencyProbeSignPolicy          = "exact-sign-zero-neutral-v1"
+	AOQTV7R2ForwardConsistencyProbeSignNearZeroEpsilon = float32(0)
+	AOQTV7R3ActualDirectionProbeRowCount               = 8
+	AOQTV7R3ActualDirectionProbeTopAngles              = 8
+	AOQTV7R3ActualDirectionProbeMagnitudeCount         = 6
+	AOQTV7R3ActualDirectionProbeMaxFullCandidates      = 2
+	AOQTV7R3ActualDirectionProbeEndpointCount          = 132
+	AOQTV7R3ActualDirectionProbeLearningRate           = float32(0.01)
+	AOQTV7R3ActualDirectionProbeDirectionSource        = "actual_probe"
+	AOQTV7R4ActualCoordinateProbeRowCount              = 12
+	AOQTV7R4ActualCoordinateProbeTopAngles             = 32
+	AOQTV7R4ActualCoordinateProbeMagnitudeCount        = 6
+	AOQTV7R4ActualCoordinateProbeEndpointCount         = 384
+	AOQTV7R4ActualCoordinateProbeLearningRate          = float32(0.01)
+	AOQTV7R4ActualCoordinateProbeDirectionSource       = "actual_coordinate_probe"
+)
+
+func isAOQTV7DevOptimizerMode(mode string) bool {
+	return mode == AOQTSidecarOptimizerModeV7DevTrustRegion || mode == AOQTSidecarOptimizerModeV7R2DevTrustRegion || mode == AOQTSidecarOptimizerModeV7R3DevActualDirection || mode == AOQTSidecarOptimizerModeV7R4DevActualCoordinate || isAOQTV7R5ActualCoordinateMode(mode)
+}
+
+func isAOQTV7R5ActualCoordinateMode(mode string) bool {
+	// V7-r5 is a preregistered authorization surface.  Do not silently
+	// broaden it with draft/legacy spellings: the runner, receipts, and
+	// fail-closed artifacts must all name the exact contract mode.
+	return mode == AOQTSidecarOptimizerModeV7R5DevActualCoordinateTrain
+}
 
 var aoqtTransactionalCoordinateBlockSizes = []int{2, 4, 8}
 
@@ -794,30 +1084,62 @@ const (
 	aoqtProposalAcceptedReason = "accepted"
 )
 
+type aoqtProposalEvidence struct {
+	magnitude                  float32
+	blockSize                  int
+	movedAngleIndices          []int
+	directionSource            string
+	endpointOrdinal            int
+	endpointHashSHA256         string
+	requestedDirectionSHA256   string
+	actualDirectionSHA256      string
+	actualDirectionProbeSHA256 string
+}
+
 // RecordProposal appends one bounded receipt for an actually evaluated
 // proposal and preserves the existing aggregate rejection diagnostics.
-func (d *AOQTSidecarOptimizerDiagnostics) RecordProposal(ordinal int, kind string, decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) {
+func (d *AOQTSidecarOptimizerDiagnostics) RecordProposal(ordinal int, kind string, decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation, evidence ...aoqtProposalEvidence) {
 	if d == nil {
 		return
 	}
+	var proposalEvidence aoqtProposalEvidence
+	if len(evidence) > 0 {
+		proposalEvidence = evidence[0]
+	}
 	if d.ProposalReceipts != nil {
-		*d.ProposalReceipts = append(*d.ProposalReceipts, newAOQTProposalReceipt(ordinal, kind, decision, baseline, candidate))
+		*d.ProposalReceipts = append(*d.ProposalReceipts, newAOQTProposalReceipt(ordinal, kind, decision, baseline, candidate, proposalEvidence, d.CoordinateSearchStrategy))
+	}
+	if kind == aoqtProposalKindCoordinate && isAOQTV7DevOptimizerMode(d.OptimizerMode) && !isAOQTV7R5ActualCoordinateMode(d.OptimizerMode) {
+		d.recordTrustRegionProposal(proposalEvidence, decision.accepted)
 	}
 	if !decision.accepted {
 		d.RejectionDiagnostics.record(decision, baseline, candidate)
 	}
 }
 
-func newAOQTProposalReceipt(ordinal int, kind string, decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation) AOQTSidecarOptimizerProposalReceipt {
+func newAOQTProposalReceipt(ordinal int, kind string, decision aoqtTransactionalProposalDecision, baseline, candidate aoqtStepEvaluation, evidence aoqtProposalEvidence, coordinateSearchStrategy string) AOQTSidecarOptimizerProposalReceipt {
 	receipt := AOQTSidecarOptimizerProposalReceipt{
-		Ordinal:              ordinal,
-		Kind:                 kind,
-		Accepted:             decision.accepted,
-		Reason:               string(decision.reason),
-		AngleMoved:           decision.angleMoved,
-		ActivationChecked:    decision.activationChecked,
-		ActivationSufficient: decision.activationSufficient,
-		CandidateActivation:  candidate.activation,
+		Ordinal:                    ordinal,
+		Kind:                       kind,
+		Accepted:                   decision.accepted,
+		Reason:                     string(decision.reason),
+		AngleMoved:                 decision.angleMoved,
+		ActivationChecked:          decision.activationChecked,
+		ActivationSufficient:       decision.activationSufficient,
+		CandidateActivation:        candidate.activation,
+		ProposalMagnitude:          evidence.magnitude,
+		ProposalBlockSize:          evidence.blockSize,
+		MovedAngleCount:            len(evidence.movedAngleIndices),
+		MovedAngleIndices:          append([]int(nil), evidence.movedAngleIndices...),
+		DirectionSource:            evidence.directionSource,
+		EndpointOrdinal:            evidence.endpointOrdinal,
+		EndpointHashSHA256:         evidence.endpointHashSHA256,
+		RequestedDirectionSHA256:   evidence.requestedDirectionSHA256,
+		ActualDirectionSHA256:      evidence.actualDirectionSHA256,
+		ActualDirectionProbeSHA256: evidence.actualDirectionProbeSHA256,
+	}
+	if kind == aoqtProposalKindCoordinate {
+		receipt.CoordinateSearchStrategy = coordinateSearchStrategy
 	}
 	if receipt.Accepted {
 		receipt.Reason = aoqtProposalAcceptedReason
@@ -826,7 +1148,75 @@ func newAOQTProposalReceipt(ordinal int, kind string, decision aoqtTransactional
 	receipt.CandidateLoss, receipt.CandidateLossFinite = aoqtFiniteReceiptFloat(candidate.loss)
 	receipt.BaselineComponents, receipt.BaselineComponentsFinite = aoqtFiniteReceiptComponents(baseline.components)
 	receipt.CandidateComponents, receipt.CandidateComponentsFinite = aoqtFiniteReceiptComponents(candidate.components)
+	if receipt.BaselineLossFinite && receipt.CandidateLossFinite {
+		receipt.TotalDelta = candidate.loss - baseline.loss
+		receipt.TotalDeltaFinite = isFinite32(receipt.TotalDelta)
+		if !receipt.TotalDeltaFinite {
+			receipt.TotalDelta = 0
+		}
+	}
+	if receipt.BaselineComponentsFinite && receipt.CandidateComponentsFinite {
+		receipt.ComponentDeltas = aoqtObjectiveComponentDelta(baseline.components, candidate.components)
+		receipt.ComponentDeltasFinite = aoqtFiniteReceiptComponentsValue(receipt.ComponentDeltas)
+		if !receipt.ComponentDeltasFinite {
+			receipt.ComponentDeltas = AOQTSidecarObjectiveComponents{}
+		}
+	}
 	return receipt
+}
+
+func aoqtObjectiveComponentDelta(baseline, candidate AOQTSidecarObjectiveComponents) AOQTSidecarObjectiveComponents {
+	return AOQTSidecarObjectiveComponents{
+		Q3Gain:          candidate.Q3Gain - baseline.Q3Gain,
+		Q3OrderGuard:    candidate.Q3OrderGuard - baseline.Q3OrderGuard,
+		Q3ScoreDistill:  candidate.Q3ScoreDistill - baseline.Q3ScoreDistill,
+		Q5OrderGuard:    candidate.Q5OrderGuard - baseline.Q5OrderGuard,
+		Q5ScoreDistill:  candidate.Q5ScoreDistill - baseline.Q5ScoreDistill,
+		NFBoundaryGuard: candidate.NFBoundaryGuard - baseline.NFBoundaryGuard,
+	}
+}
+
+func (d *AOQTSidecarOptimizerDiagnostics) recordTrustRegionProposal(evidence aoqtProposalEvidence, accepted bool) {
+	if d == nil {
+		return
+	}
+	d.TrustRegionProposalAttempts++
+	if evidence.magnitude > d.TrustRegionMaxMagnitude {
+		d.TrustRegionMaxMagnitude = evidence.magnitude
+	}
+	if !accepted {
+		return
+	}
+	moved := len(evidence.movedAngleIndices)
+	if moved > d.TrustRegionMaxMovedAngles {
+		d.TrustRegionMaxMovedAngles = moved
+	}
+	if moved > 1 {
+		d.TrustRegionAcceptedBlocks++
+	} else {
+		d.TrustRegionAcceptedSingles++
+	}
+	if evidence.magnitude > d.TrustRegionAcceptedMagnitude {
+		d.TrustRegionAcceptedMagnitude = evidence.magnitude
+	}
+	for _, index := range evidence.movedAngleIndices {
+		if index < 0 {
+			continue
+		}
+		if d.TrustRegionMovedAngleIndices == nil {
+			indices := make([]int, 0, len(evidence.movedAngleIndices))
+			d.TrustRegionMovedAngleIndices = &indices
+		}
+		indices := *d.TrustRegionMovedAngleIndices
+		insert := sort.SearchInts(indices, index)
+		if insert < len(indices) && indices[insert] == index {
+			continue
+		}
+		indices = append(indices, 0)
+		copy(indices[insert+1:], indices[insert:])
+		indices[insert] = index
+		d.TrustRegionMovedAngleIndices = &indices
+	}
 }
 
 func aoqtFiniteReceiptFloat(value float32) (float32, bool) {
@@ -1224,6 +1614,10 @@ func validateAOQTOptimizerProposalReceipts(diagnostics AOQTSidecarOptimizerDiagn
 		adamAttempts, coordinateAttempts int
 		adamAccepted, coordinateAccepted int
 		accepted, rejected               int
+		trustRegionAcceptedBlocks        int
+		trustRegionAcceptedSingles       int
+		trustRegionMaxMovedAngles        int
+		trustRegionMovedAngleSet         []int
 		reasonCounts                     AOQTSidecarOptimizerRejectionReasonCounts
 	)
 	for i, receipt := range receipts {
@@ -1237,6 +1631,46 @@ func validateAOQTOptimizerProposalReceipts(diagnostics AOQTSidecarOptimizerDiagn
 			coordinateAttempts++
 		default:
 			return fmt.Errorf("%s proposal_receipts[%d].kind %q is unsupported", label, i, receipt.Kind)
+		}
+		if diagnostics.OptimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+			if receipt.Kind == aoqtProposalKindCoordinate {
+				if receipt.DirectionSource != AOQTV7R3ActualDirectionProbeDirectionSource || receipt.EndpointOrdinal <= 0 || receipt.EndpointOrdinal > AOQTV7R3ActualDirectionProbeEndpointCount {
+					return fmt.Errorf("%s proposal_receipts[%d] V7-r3 coordinate proposal must bind actual_probe direction_source and endpoint ordinal", label, i)
+				}
+				provenanceCount := 0
+				for _, value := range []string{receipt.EndpointHashSHA256, receipt.RequestedDirectionSHA256, receipt.ActualDirectionSHA256, receipt.ActualDirectionProbeSHA256} {
+					if value != "" {
+						provenanceCount++
+					}
+				}
+				if receipt.Accepted && provenanceCount != 4 {
+					return fmt.Errorf("%s proposal_receipts[%d] accepted V7-r3 coordinate proposal must carry complete endpoint provenance", label, i)
+				}
+				if provenanceCount != 0 && provenanceCount != 4 {
+					return fmt.Errorf("%s proposal_receipts[%d] V7-r3 coordinate endpoint provenance is incomplete", label, i)
+				}
+				if provenanceCount == 4 {
+					for name, value := range map[string]string{
+						"endpoint_hash_sha256":          receipt.EndpointHashSHA256,
+						"requested_direction_sha256":    receipt.RequestedDirectionSHA256,
+						"actual_direction_sha256":       receipt.ActualDirectionSHA256,
+						"actual_direction_probe_sha256": receipt.ActualDirectionProbeSHA256,
+					} {
+						if err := validateAOQTSHA256(value, fmt.Sprintf("%s proposal_receipts[%d] %s", label, i, name)); err != nil {
+							return err
+						}
+					}
+				}
+			} else if receipt.DirectionSource != "" || receipt.EndpointOrdinal != 0 {
+				return fmt.Errorf("%s proposal_receipts[%d] V7-r3 Adam proposal must not carry actual-probe direction metadata", label, i)
+			}
+			if receipt.Kind == aoqtProposalKindAdam && (receipt.EndpointHashSHA256 != "" || receipt.RequestedDirectionSHA256 != "" || receipt.ActualDirectionSHA256 != "" || receipt.ActualDirectionProbeSHA256 != "") {
+				return fmt.Errorf("%s proposal_receipts[%d] V7-r3 Adam proposal must not carry endpoint provenance", label, i)
+			}
+		} else if receipt.DirectionSource != "" || receipt.EndpointOrdinal != 0 {
+			return fmt.Errorf("%s proposal_receipts[%d] non-r3 proposal must not carry actual-probe direction metadata", label, i)
+		} else if receipt.EndpointHashSHA256 != "" || receipt.RequestedDirectionSHA256 != "" || receipt.ActualDirectionSHA256 != "" || receipt.ActualDirectionProbeSHA256 != "" {
+			return fmt.Errorf("%s proposal_receipts[%d] non-r3 proposal must not carry endpoint provenance", label, i)
 		}
 		switch receipt.Reason {
 		case aoqtProposalAcceptedReason:
@@ -1257,6 +1691,28 @@ func validateAOQTOptimizerProposalReceipts(diagnostics AOQTSidecarOptimizerDiagn
 				adamAccepted++
 			} else {
 				coordinateAccepted++
+				if isAOQTV7DevOptimizerMode(diagnostics.OptimizerMode) && !isAOQTV7R5ActualCoordinateMode(diagnostics.OptimizerMode) {
+					if receipt.MovedAngleCount <= 0 {
+						return fmt.Errorf("%s proposal_receipts[%d] accepted V7 trust-region coordinate proposal must record moved angles", label, i)
+					}
+					if receipt.MovedAngleCount > trustRegionMaxMovedAngles {
+						trustRegionMaxMovedAngles = receipt.MovedAngleCount
+					}
+					if receipt.MovedAngleCount > 1 {
+						trustRegionAcceptedBlocks++
+					} else {
+						trustRegionAcceptedSingles++
+					}
+					for _, index := range receipt.MovedAngleIndices {
+						insert := sort.SearchInts(trustRegionMovedAngleSet, index)
+						if insert < len(trustRegionMovedAngleSet) && trustRegionMovedAngleSet[insert] == index {
+							continue
+						}
+						trustRegionMovedAngleSet = append(trustRegionMovedAngleSet, 0)
+						copy(trustRegionMovedAngleSet[insert+1:], trustRegionMovedAngleSet[insert:])
+						trustRegionMovedAngleSet[insert] = index
+					}
+				}
 			}
 		} else {
 			rejected++
@@ -1283,8 +1739,39 @@ func validateAOQTOptimizerProposalReceipts(diagnostics AOQTSidecarOptimizerDiagn
 		} else if !aoqtReceiptComponentsZero(receipt.CandidateComponents) {
 			return fmt.Errorf("%s proposal_receipts[%d] unavailable candidate component evidence must be zero", label, i)
 		}
+		if receipt.TotalDeltaFinite {
+			if !isFinite32(receipt.TotalDelta) || !receipt.BaselineLossFinite || !receipt.CandidateLossFinite || receipt.TotalDelta != receipt.CandidateLoss-receipt.BaselineLoss {
+				return fmt.Errorf("%s proposal_receipts[%d] total_delta is inconsistent with loss evidence", label, i)
+			}
+		} else if receipt.TotalDelta != 0 {
+			return fmt.Errorf("%s proposal_receipts[%d] unavailable total_delta must be zero", label, i)
+		}
+		if receipt.ComponentDeltasFinite {
+			if !aoqtFiniteReceiptComponentsValue(receipt.ComponentDeltas) || !receipt.BaselineComponentsFinite || !receipt.CandidateComponentsFinite || receipt.ComponentDeltas != aoqtObjectiveComponentDelta(receipt.BaselineComponents, receipt.CandidateComponents) {
+				return fmt.Errorf("%s proposal_receipts[%d] component_deltas are inconsistent with component evidence", label, i)
+			}
+		} else if !aoqtReceiptComponentsZero(receipt.ComponentDeltas) {
+			return fmt.Errorf("%s proposal_receipts[%d] unavailable component_deltas must be zero", label, i)
+		}
 		if err := validateAOQTObjectiveActivation(receipt.CandidateActivation, fmt.Sprintf("%s proposal_receipts[%d].candidate_activation", label, i)); err != nil {
 			return err
+		}
+		if receipt.ProposalMagnitude < 0 || !isFinite32(receipt.ProposalMagnitude) {
+			return fmt.Errorf("%s proposal_receipts[%d].proposal_magnitude must be finite and non-negative", label, i)
+		}
+		if receipt.ProposalBlockSize < 0 {
+			return fmt.Errorf("%s proposal_receipts[%d].proposal_block_size must be non-negative", label, i)
+		}
+		if receipt.MovedAngleCount != len(receipt.MovedAngleIndices) {
+			return fmt.Errorf("%s proposal_receipts[%d].moved_angle_count = %d, want moved_angle_indices length %d", label, i, receipt.MovedAngleCount, len(receipt.MovedAngleIndices))
+		}
+		for j, index := range receipt.MovedAngleIndices {
+			if index < 0 {
+				return fmt.Errorf("%s proposal_receipts[%d].moved_angle_indices[%d] must be non-negative", label, i, j)
+			}
+			if j > 0 && index <= receipt.MovedAngleIndices[j-1] {
+				return fmt.Errorf("%s proposal_receipts[%d].moved_angle_indices must be strictly increasing", label, i)
+			}
 		}
 		if receipt.ActivationSufficient && !receipt.ActivationChecked {
 			return fmt.Errorf("%s proposal_receipts[%d] activation_sufficient requires activation_checked", label, i)
@@ -1316,6 +1803,21 @@ func validateAOQTOptimizerProposalReceipts(diagnostics AOQTSidecarOptimizerDiagn
 	}
 	if accepted != diagnostics.AcceptedProposals || rejected != diagnostics.RejectedProposals {
 		return fmt.Errorf("%s proposal_receipts accepted/rejected accounting mismatch", label)
+	}
+	if isAOQTV7DevOptimizerMode(diagnostics.OptimizerMode) && !isAOQTV7R5ActualCoordinateMode(diagnostics.OptimizerMode) {
+		if trustRegionAcceptedBlocks != diagnostics.TrustRegionAcceptedBlocks || trustRegionAcceptedSingles != diagnostics.TrustRegionAcceptedSingles {
+			return fmt.Errorf("%s proposal_receipts trust-region accepted block/single accounting mismatch", label)
+		}
+		if trustRegionMaxMovedAngles != diagnostics.TrustRegionMaxMovedAngles {
+			return fmt.Errorf("%s proposal_receipts trust_region_max_moved_angles mismatch", label)
+		}
+		if diagnostics.TrustRegionMovedAngleIndices == nil {
+			if len(trustRegionMovedAngleSet) != 0 {
+				return fmt.Errorf("%s proposal_receipts trust_region_moved_angle_indices missing accepted moved angles", label)
+			}
+		} else if !slices.Equal(*diagnostics.TrustRegionMovedAngleIndices, trustRegionMovedAngleSet) {
+			return fmt.Errorf("%s proposal_receipts trust_region_moved_angle_indices mismatch", label)
+		}
 	}
 	if reasonCounts != diagnostics.RejectionDiagnostics.ReasonCounts {
 		return fmt.Errorf("%s proposal_receipts reason accounting mismatch", label)
@@ -1359,9 +1861,41 @@ func validateAOQTOptimizerPathDiagnostics(diagnostics AOQTSidecarOptimizerDiagno
 		{"coordinate_top_angles", diagnostics.CoordinateTopAngles},
 		{"coordinate_magnitude_count", diagnostics.CoordinateMagnitudeCount},
 		{"coordinate_block_count", diagnostics.CoordinateBlockCount},
+		{"trust_region_proposal_attempts", diagnostics.TrustRegionProposalAttempts},
+		{"trust_region_accepted_blocks", diagnostics.TrustRegionAcceptedBlocks},
+		{"trust_region_accepted_singles", diagnostics.TrustRegionAcceptedSingles},
+		{"trust_region_max_moved_angles", diagnostics.TrustRegionMaxMovedAngles},
 	} {
 		if item.value < 0 {
 			return fmt.Errorf("%s %s must be non-negative", label, item.name)
+		}
+	}
+	switch diagnostics.OptimizerMode {
+	case "":
+		if diagnostics.DevOnly || diagnostics.TrustRegionRadius != 0 || diagnostics.TrustRegionProposalAttempts != 0 || diagnostics.TrustRegionAcceptedBlocks != 0 || diagnostics.TrustRegionAcceptedSingles != 0 || diagnostics.TrustRegionMaxMovedAngles != 0 || diagnostics.TrustRegionMaxMagnitude != 0 || diagnostics.TrustRegionAcceptedMagnitude != 0 || diagnostics.TrustRegionMovedAngleIndices != nil || diagnostics.TrustRegionAcceptedSingleRule != "" {
+			return fmt.Errorf("%s dev trust-region fields require explicit dev optimizer mode", label)
+		}
+	case AOQTSidecarOptimizerModeV7DevTrustRegion, AOQTSidecarOptimizerModeV7R2DevTrustRegion, AOQTSidecarOptimizerModeV7R3DevActualDirection:
+		if !diagnostics.DevOnly {
+			return fmt.Errorf("%s dev_only is required for V7 dev trust-region mode", label)
+		}
+		if diagnostics.TrustRegionAcceptedSingleRule != "" && diagnostics.TrustRegionAcceptedSingleRule != AOQTSidecarV7AcceptedSingleCoordinateRule {
+			return fmt.Errorf("%s trust_region_accepted_single_coordinate_rule is unsupported", label)
+		}
+		if diagnostics.TrustRegionRadius < 0 || diagnostics.TrustRegionMaxMagnitude < 0 || diagnostics.TrustRegionAcceptedMagnitude < 0 || !isFinite32(diagnostics.TrustRegionRadius) || !isFinite32(diagnostics.TrustRegionMaxMagnitude) || !isFinite32(diagnostics.TrustRegionAcceptedMagnitude) {
+			return fmt.Errorf("%s trust-region magnitudes must be finite and non-negative", label)
+		}
+	default:
+		return fmt.Errorf("%s optimizer_mode %q is unsupported", label, diagnostics.OptimizerMode)
+	}
+	if diagnostics.TrustRegionMovedAngleIndices != nil {
+		for i, index := range *diagnostics.TrustRegionMovedAngleIndices {
+			if index < 0 {
+				return fmt.Errorf("%s trust_region_moved_angle_indices[%d] must be non-negative", label, i)
+			}
+			if i > 0 && index <= (*diagnostics.TrustRegionMovedAngleIndices)[i-1] {
+				return fmt.Errorf("%s trust_region_moved_angle_indices must be strictly increasing", label)
+			}
 		}
 	}
 	hasPathDiagnostics := diagnostics.AdamProposalAttempts != 0 ||
@@ -1459,7 +1993,17 @@ func (t *AOQTSidecarTrainer) acceptTransactionalAdamStep(grad, q3GainGrad []floa
 			return false, err
 		}
 		decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights)
-		diagnostics.RecordProposal(diagnostics.ProposalAttempts, aoqtProposalKindAdam, decision, baseline, candidate)
+		var evidence aoqtProposalEvidence
+		if isAOQTV7DevOptimizerMode(diagnostics.OptimizerMode) {
+			direction := make([]float32, len(t.angles))
+			for i := range direction {
+				direction[i] = t.angles[i] - state.angles[i]
+			}
+			evidence.magnitude = aoqtMaxAbsFloat32(direction)
+			evidence.movedAngleIndices = aoqtMovedAngleIndices(direction)
+			evidence.blockSize = len(evidence.movedAngleIndices)
+		}
+		diagnostics.RecordProposal(diagnostics.ProposalAttempts, aoqtProposalKindAdam, decision, baseline, candidate, evidence)
 		if decision.accepted {
 			diagnostics.AdamAcceptedProposals++
 			diagnostics.AcceptedProposals++
@@ -1490,7 +2034,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 			return false, err
 		}
 	}
-	plan, err := newAOQTCoordinateSearchPlan(q3GainGrad, grad, t.config.LearningRate, protectedGradients)
+	plan, err := newAOQTCoordinateSearchPlanForMode(q3GainGrad, grad, t.config.LearningRate, t.config.AngleCap, t.config.OptimizerMode, protectedGradients)
 	if err != nil {
 		t.restoreOptimizerState(state)
 		return false, err
@@ -1505,6 +2049,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 	diagnostics.CoordinateBlockCount = len(plan.BlockSizes)
 	diagnostics.CoordinateSearchStrategy = plan.Strategy
 	diagnostics.CoordinateSearchLearningRate = plan.LearningRate
+	diagnostics.TrustRegionRadius = plan.TrustRegionRadius
 	audit, err := plan.coordinateSearchAuditJSON()
 	if err != nil {
 		t.restoreOptimizerState(state)
@@ -1532,7 +2077,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 	diagnostics.CoordinateSearchOrderingHash = linkedHashes[len(linkedHashes)-1]
 	diagnostics.CoordinateSearchAuditChain = auditChain
 	diagnostics.CoordinateSearchHashChain = hashChain
-	tryProposal := func(apply func()) (bool, error) {
+	tryProposal := func(evidence aoqtProposalEvidence, apply func()) (bool, error) {
 		if attemptsThisStep >= aoqtTransactionalMaxAttemptsPerStep {
 			return false, nil
 		}
@@ -1542,11 +2087,12 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 			t.restoreOptimizerState(state)
 			return false, err
 		}
+		direction := make([]float32, len(t.angles))
+		for i := range direction {
+			direction[i] = t.angles[i] - state.angles[i]
+		}
+		evidence.movedAngleIndices = aoqtMovedAngleIndices(direction)
 		if len(plan.ProtectedComponents) > 0 {
-			direction := make([]float32, len(t.angles))
-			for i := range direction {
-				direction[i] = t.angles[i] - state.angles[i]
-			}
 			if !aoqtActualDirectionInProtectedCone(direction, q3GainGrad, protectedGradients) {
 				t.restoreOptimizerState(state)
 				return false, nil
@@ -1561,7 +2107,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 			return false, err
 		}
 		decision := t.evaluateTransactionalProposal(state, baseline, candidate, weights)
-		diagnostics.RecordProposal(diagnostics.ProposalAttempts, aoqtProposalKindCoordinate, decision, baseline, candidate)
+		diagnostics.RecordProposal(diagnostics.ProposalAttempts, aoqtProposalKindCoordinate, decision, baseline, candidate, evidence)
 		if decision.accepted {
 			diagnostics.CoordinateAcceptedProposals++
 			diagnostics.AcceptedProposals++
@@ -1577,7 +2123,8 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 			if len(plan.ProtectedComponents) > 0 && !aoqtCoordinateBlockDirectionInCone(plan.Order[:blockSize], q3GainGrad, protectedGradients) {
 				continue
 			}
-			accepted, err := tryProposal(func() {
+			indices := aoqtCoordinateRankIndices(plan.Order[:blockSize])
+			accepted, err := tryProposal(aoqtProposalEvidence{magnitude: magnitude, blockSize: blockSize, movedAngleIndices: indices}, func() {
 				for _, ranked := range plan.Order[:blockSize] {
 					t.angles[ranked.index] += ranked.primaryDirection * magnitude
 				}
@@ -1593,7 +2140,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 		}
 		direction := ranked.primaryDirection
 		for _, magnitude := range plan.Magnitudes {
-			accepted, err := tryProposal(func() {
+			accepted, err := tryProposal(aoqtProposalEvidence{magnitude: magnitude, blockSize: 1, movedAngleIndices: []int{ranked.index}}, func() {
 				t.angles[ranked.index] += direction * magnitude
 			})
 			if err != nil || accepted {
@@ -1612,7 +2159,7 @@ func (t *AOQTSidecarTrainer) acceptTransactionalCoordinateStep(grad, q3GainGrad 
 	for _, ranked := range plan.Order {
 		direction := -aoqtCoordinateSearchPrimaryDirection(q3GainGrad[ranked.index])
 		for _, magnitude := range plan.ReverseMagnitudes {
-			accepted, err := tryProposal(func() {
+			accepted, err := tryProposal(aoqtProposalEvidence{magnitude: magnitude, blockSize: 1, movedAngleIndices: []int{ranked.index}}, func() {
 				t.angles[ranked.index] += direction * magnitude
 			})
 			if err != nil || accepted {
@@ -1728,21 +2275,35 @@ type aoqtCoordinateSearchRank struct {
 }
 
 type aoqtCoordinateSearchPlan struct {
-	Strategy             string
-	LearningRate         float32
-	Order                []aoqtCoordinateSearchRank
-	FullOrder            []aoqtCoordinateSearchRank
-	FullRankSourceCount  int
-	FullRankSourceSHA256 string
-	Magnitudes           []float32
-	BlockMagnitudes      []float32
-	ReverseMagnitudes    []float32
-	MicroTailMagnitudes  []float32
-	BlockSizes           []int
-	ProtectedComponents  []string
+	Strategy                 string
+	LearningRate             float32
+	Order                    []aoqtCoordinateSearchRank
+	FullOrder                []aoqtCoordinateSearchRank
+	FullRankSourceCount      int
+	FullRankSourceSHA256     string
+	Magnitudes               []float32
+	BlockMagnitudes          []float32
+	ReverseMagnitudes        []float32
+	MicroTailMagnitudes      []float32
+	BlockSizes               []int
+	ProtectedComponents      []string
+	TrustRegionRadius        float32
+	DevOnly                  bool
+	ActualDirectionAuthority string
+	GlobalSigns              []int
+	EndpointCount            int
 }
 
 func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRate float32, protectedGradientSets ...[]aoqtProtectedAngleGradient) (aoqtCoordinateSearchPlan, error) {
+	return newAOQTCoordinateSearchPlanForMode(q3GainGrad, aggregateGrad, learningRate, AOQTSidecarDefaultAngleCap, "", protectedGradientSets...)
+}
+
+func newAOQTCoordinateSearchPlanForMode(q3GainGrad, aggregateGrad []float32, learningRate, angleCap float32, optimizerMode string, protectedGradientSets ...[]aoqtProtectedAngleGradient) (aoqtCoordinateSearchPlan, error) {
+	switch optimizerMode {
+	case "", AOQTSidecarOptimizerModeV7DevTrustRegion, AOQTSidecarOptimizerModeV7R2DevTrustRegion, AOQTSidecarOptimizerModeV7R3DevActualDirection, AOQTSidecarOptimizerModeV7R4DevActualCoordinate:
+	default:
+		return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT coordinate search optimizer_mode %q is unsupported", optimizerMode)
+	}
 	protectedGradients, _, err := aoqtParseProtectedGradientSets(protectedGradientSets)
 	if err != nil {
 		return aoqtCoordinateSearchPlan{}, err
@@ -1782,6 +2343,7 @@ func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRa
 	if len(magnitudes) == 0 {
 		return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT coordinate search requires at least one finite positive magnitude")
 	}
+	trustRegionRadius := float32(0)
 	strategy := aoqtCoordinateSearchStrategyLegacyQ3GainPrimary
 	blockMagnitudes := aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateBlockMagnitudeCount)
 	reverseMagnitudes := aoqtCoordinateSearchMagnitudePrefix(magnitudes, aoqtTransactionalCoordinateReverseMagnitudeCount)
@@ -1790,16 +2352,46 @@ func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRa
 		if len(magnitudes) != aoqtTransactionalCoordinateMagnitudeCount {
 			return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT protected coordinate search requires the full intended schedule of %d finite positive magnitudes, got %d", aoqtTransactionalCoordinateMagnitudeCount, len(magnitudes))
 		}
-		strategy = aoqtCoordinateSearchStrategyProtectedConeMicroTail
 		microTailMagnitudes = aoqtCoordinateSearchMicroTail(magnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
 		if len(microTailMagnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
 			return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT protected coordinate search requires exactly %d finite positive micro-tail magnitudes, got %d", aoqtTransactionalCoordinateMicroTailMagnitudeCount, len(microTailMagnitudes))
 		}
-		// The new strategy is deliberately a q3-descent-only tail. Reverse
-		// probes are first-order q3 ascent and therefore cannot be in the
-		// requested q3/protected cone.
-		blockMagnitudes = append([]float32(nil), microTailMagnitudes...)
-		magnitudes = append([]float32(nil), microTailMagnitudes...)
+		if optimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+			strategy = aoqtCoordinateSearchStrategyV7R3ActualDirection
+			trustRegionRadius = learningRate
+			if learningRate != AOQTV7R3ActualDirectionProbeLearningRate {
+				return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT V7-r3 actual-direction search requires learning rate exactly 0.01")
+			}
+			magnitudes = aoqtV7R3ActualDirectionMagnitudes()
+			blockMagnitudes = append([]float32(nil), magnitudes...)
+			microTailMagnitudes = append([]float32(nil), magnitudes...)
+			reverseMagnitudes = nil
+		} else if isAOQTV7DevOptimizerMode(optimizerMode) {
+			if angleCap <= 0 || !isFinite32(angleCap) || angleCap > AOQTSidecarHardMaxAngleCap {
+				return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT dev trust-region angle cap must be finite, positive, and <= hard max %.8g", AOQTSidecarHardMaxAngleCap)
+			}
+			strategy = aoqtCoordinateSearchStrategyV7DevTrustRegion
+			trustRegionRadius = learningRate
+			if trustRegionRadius > angleCap {
+				trustRegionRadius = angleCap
+			}
+			if trustRegionRadius <= 0 || !isFinite32(trustRegionRadius) {
+				return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT dev trust-region radius must be finite and positive")
+			}
+			magnitudes = aoqtCoordinateSearchMagnitudes(trustRegionRadius)
+			if len(magnitudes) != aoqtTransactionalCoordinateMagnitudeCount {
+				return aoqtCoordinateSearchPlan{}, fmt.Errorf("AOQT dev trust-region requires the full intended schedule of %d finite positive magnitudes, got %d", aoqtTransactionalCoordinateMagnitudeCount, len(magnitudes))
+			}
+			microTailMagnitudes = aoqtCoordinateSearchMicroTail(magnitudes, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+			blockMagnitudes = append([]float32(nil), magnitudes...)
+		} else {
+			strategy = aoqtCoordinateSearchStrategyProtectedConeMicroTail
+			// The production protected strategy is deliberately a q3-descent-only
+			// tail. Reverse probes are first-order q3 ascent and therefore cannot
+			// be in the requested q3/protected cone.
+			blockMagnitudes = append([]float32(nil), microTailMagnitudes...)
+			magnitudes = append([]float32(nil), microTailMagnitudes...)
+		}
 		reverseMagnitudes = nil
 	}
 	return aoqtCoordinateSearchPlan{
@@ -1815,6 +2407,26 @@ func newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad []float32, learningRa
 		MicroTailMagnitudes:  microTailMagnitudes,
 		BlockSizes:           aoqtCoordinateSearchBlockSizes(top),
 		ProtectedComponents:  protectedComponents,
+		TrustRegionRadius:    trustRegionRadius,
+		DevOnly:              isAOQTV7DevOptimizerMode(optimizerMode),
+		ActualDirectionAuthority: func() string {
+			if optimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+				return AOQTV7R3ActualDirectionProbeDirectionSource
+			}
+			return ""
+		}(),
+		GlobalSigns: func() []int {
+			if optimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+				return []int{1, -1}
+			}
+			return nil
+		}(),
+		EndpointCount: func() int {
+			if optimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection {
+				return AOQTV7R3ActualDirectionProbeEndpointCount
+			}
+			return 0
+		}(),
 	}, nil
 }
 
@@ -2222,19 +2834,24 @@ type aoqtCoordinateSearchAuditOrder struct {
 }
 
 type aoqtCoordinateSearchAuditPayload struct {
-	Strategy             string                           `json:"strategy"`
-	LearningRate         float32                          `json:"learning_rate"`
-	ProtectedComponents  []string                         `json:"protected_components"`
-	Order                []aoqtCoordinateSearchAuditOrder `json:"order"`
-	FullOrder            []aoqtCoordinateSearchAuditOrder `json:"full_order"`
-	FullOrderSHA256      string                           `json:"full_order_sha256"`
-	FullRankSourceCount  int                              `json:"full_rank_source_count"`
-	FullRankSourceSHA256 string                           `json:"full_rank_source_sha256"`
-	Magnitudes           []float32                        `json:"magnitudes"`
-	BlockMagnitudes      []float32                        `json:"block_magnitudes"`
-	ReverseMagnitudes    []float32                        `json:"reverse_magnitudes"`
-	MicroTailMagnitudes  []float32                        `json:"micro_tail_magnitudes"`
-	BlockSizes           []int                            `json:"block_sizes"`
+	Strategy                 string                           `json:"strategy"`
+	LearningRate             float32                          `json:"learning_rate"`
+	TrustRegionRadius        float32                          `json:"trust_region_radius,omitempty"`
+	DevOnly                  bool                             `json:"dev_only,omitempty"`
+	ProtectedComponents      []string                         `json:"protected_components"`
+	Order                    []aoqtCoordinateSearchAuditOrder `json:"order"`
+	FullOrder                []aoqtCoordinateSearchAuditOrder `json:"full_order"`
+	FullOrderSHA256          string                           `json:"full_order_sha256"`
+	FullRankSourceCount      int                              `json:"full_rank_source_count"`
+	FullRankSourceSHA256     string                           `json:"full_rank_source_sha256"`
+	Magnitudes               []float32                        `json:"magnitudes"`
+	BlockMagnitudes          []float32                        `json:"block_magnitudes"`
+	ReverseMagnitudes        []float32                        `json:"reverse_magnitudes"`
+	MicroTailMagnitudes      []float32                        `json:"micro_tail_magnitudes"`
+	BlockSizes               []int                            `json:"block_sizes"`
+	ActualDirectionAuthority string                           `json:"actual_direction_authority,omitempty"`
+	GlobalSigns              []int                            `json:"global_signs,omitempty"`
+	EndpointCount            int                              `json:"endpoint_count,omitempty"`
 }
 
 func aoqtCoordinateSearchAuditOrderFromRank(item aoqtCoordinateSearchRank) aoqtCoordinateSearchAuditOrder {
@@ -2253,18 +2870,23 @@ func aoqtCoordinateSearchAuditOrderFromRank(item aoqtCoordinateSearchRank) aoqtC
 
 func (plan aoqtCoordinateSearchPlan) coordinateSearchAuditPayload() aoqtCoordinateSearchAuditPayload {
 	payload := aoqtCoordinateSearchAuditPayload{
-		Strategy:             plan.Strategy,
-		LearningRate:         plan.LearningRate,
-		ProtectedComponents:  append([]string(nil), plan.ProtectedComponents...),
-		Order:                make([]aoqtCoordinateSearchAuditOrder, len(plan.Order)),
-		FullOrder:            make([]aoqtCoordinateSearchAuditOrder, len(plan.FullOrder)),
-		FullRankSourceCount:  plan.FullRankSourceCount,
-		FullRankSourceSHA256: plan.FullRankSourceSHA256,
-		Magnitudes:           append([]float32(nil), plan.Magnitudes...),
-		BlockMagnitudes:      append([]float32(nil), plan.BlockMagnitudes...),
-		ReverseMagnitudes:    append([]float32(nil), plan.ReverseMagnitudes...),
-		MicroTailMagnitudes:  append([]float32(nil), plan.MicroTailMagnitudes...),
-		BlockSizes:           append([]int(nil), plan.BlockSizes...),
+		Strategy:                 plan.Strategy,
+		LearningRate:             plan.LearningRate,
+		TrustRegionRadius:        plan.TrustRegionRadius,
+		DevOnly:                  plan.DevOnly,
+		ProtectedComponents:      append([]string(nil), plan.ProtectedComponents...),
+		Order:                    make([]aoqtCoordinateSearchAuditOrder, len(plan.Order)),
+		FullOrder:                make([]aoqtCoordinateSearchAuditOrder, len(plan.FullOrder)),
+		FullRankSourceCount:      plan.FullRankSourceCount,
+		FullRankSourceSHA256:     plan.FullRankSourceSHA256,
+		Magnitudes:               append([]float32(nil), plan.Magnitudes...),
+		BlockMagnitudes:          append([]float32(nil), plan.BlockMagnitudes...),
+		ReverseMagnitudes:        append([]float32(nil), plan.ReverseMagnitudes...),
+		MicroTailMagnitudes:      append([]float32(nil), plan.MicroTailMagnitudes...),
+		BlockSizes:               append([]int(nil), plan.BlockSizes...),
+		ActualDirectionAuthority: plan.ActualDirectionAuthority,
+		GlobalSigns:              append([]int(nil), plan.GlobalSigns...),
+		EndpointCount:            plan.EndpointCount,
 	}
 	for i, item := range plan.Order {
 		payload.Order[i] = aoqtCoordinateSearchAuditOrderFromRank(item)
@@ -2366,6 +2988,34 @@ func aoqtAnglesMoved(before, after []float32) bool {
 		}
 	}
 	return false
+}
+
+func aoqtMovedAngleIndices(direction []float32) []int {
+	indices := make([]int, 0)
+	for i, delta := range direction {
+		if delta != 0 {
+			indices = append(indices, i)
+		}
+	}
+	return indices
+}
+
+func aoqtMaxAbsFloat32(values []float32) float32 {
+	var maxAbs float32
+	for _, value := range values {
+		if abs := float32(math.Abs(float64(value))); abs > maxAbs {
+			maxAbs = abs
+		}
+	}
+	return maxAbs
+}
+
+func aoqtCoordinateRankIndices(order []aoqtCoordinateSearchRank) []int {
+	indices := make([]int, len(order))
+	for i, ranked := range order {
+		indices[i] = ranked.index
+	}
+	return indices
 }
 
 func (t *AOQTSidecarTrainer) snapshotOptimizerState() aoqtOptimizerState {
@@ -2793,6 +3443,135 @@ func validateAOQTSidecarTrainConfig(cfg AOQTSidecarTrainConfig) error {
 	if cfg.WorkplanSeed == 0 {
 		return fmt.Errorf("AOQT train workplan seed is required")
 	}
+	switch cfg.OptimizerMode {
+	case "", AOQTSidecarOptimizerModeV7DevTrustRegion, AOQTSidecarOptimizerModeV7R2DevTrustRegion, AOQTSidecarOptimizerModeV7R3DevActualDirection, AOQTSidecarOptimizerModeV7R4DevActualCoordinate, AOQTSidecarOptimizerModeV7R5DevActualCoordinateTrain:
+	default:
+		return fmt.Errorf("AOQT optimizer_mode %q is unsupported", cfg.OptimizerMode)
+	}
+	r5AuthorizationRequested := cfg.ActualCoordinateTrainRequired || cfg.ActualCoordinateTrainR4Receipt != nil || cfg.CanonicalR4Receipt != nil || strings.TrimSpace(cfg.ActualCoordinateTrainR4ReceiptPath) != "" || strings.TrimSpace(cfg.CanonicalR4ReceiptPath) != "" || strings.TrimSpace(cfg.ActualCoordinateTrainR4ReceiptSHA256) != "" || strings.TrimSpace(cfg.CanonicalR4ReceiptSHA256) != ""
+	if r5AuthorizationRequested && !isAOQTV7R5ActualCoordinateMode(cfg.OptimizerMode) {
+		return fmt.Errorf("AOQT V7-r5 actual-coordinate training authorization requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R5DevActualCoordinateTrain)
+	}
+	if cfg.OptimizerMode == AOQTSidecarOptimizerModeV7R2DevTrustRegion && !cfg.ForwardConsistencyProbeRequired {
+		return fmt.Errorf("AOQT V7-r2 optimizer mode requires the forward-consistency probe")
+	}
+	if cfg.OptimizerMode == AOQTSidecarOptimizerModeV7R3DevActualDirection && cfg.ForwardConsistencyProbeRequired {
+		return fmt.Errorf("AOQT V7-r3 actual-direction mode cannot use the V7-r2 forward-consistency probe")
+	}
+	if cfg.ForwardConsistencyProbeOnly && !cfg.ForwardConsistencyProbeRequired {
+		return fmt.Errorf("AOQT forward-consistency probe-only mode requires the forward-consistency probe")
+	}
+	if cfg.ForwardConsistencyProbeOnly && cfg.OptimizerMode != AOQTSidecarOptimizerModeV7R2DevTrustRegion {
+		return fmt.Errorf("AOQT forward-consistency probe-only mode requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R2DevTrustRegion)
+	}
+	if cfg.ActualDirectionProbeOnly && !cfg.ActualDirectionProbeRequired {
+		return fmt.Errorf("AOQT actual-direction probe-only mode requires the actual-direction probe")
+	}
+	if cfg.ActualDirectionProbeOnly && cfg.OptimizerMode != AOQTSidecarOptimizerModeV7R3DevActualDirection {
+		return fmt.Errorf("AOQT actual-direction probe-only mode requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R3DevActualDirection)
+	}
+	if cfg.ActualDirectionProbeRequired && cfg.OptimizerMode != AOQTSidecarOptimizerModeV7R3DevActualDirection {
+		return fmt.Errorf("AOQT actual-direction probe requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R3DevActualDirection)
+	}
+	if cfg.OptimizerMode == AOQTSidecarOptimizerModeV7R4DevActualCoordinate && !cfg.ActualCoordinateProbeOnly {
+		return fmt.Errorf("AOQT V7-r4 actual-coordinate mode is probe-only until training is authorized")
+	}
+	if cfg.ActualCoordinateProbeOnly && !cfg.ActualCoordinateProbeRequired {
+		return fmt.Errorf("AOQT actual-coordinate probe-only mode requires the actual-coordinate probe")
+	}
+	if cfg.ActualCoordinateProbeOnly && cfg.OptimizerMode != AOQTSidecarOptimizerModeV7R4DevActualCoordinate {
+		return fmt.Errorf("AOQT actual-coordinate probe-only mode requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R4DevActualCoordinate)
+	}
+	if cfg.ActualCoordinateProbeRequired && cfg.OptimizerMode != AOQTSidecarOptimizerModeV7R4DevActualCoordinate {
+		return fmt.Errorf("AOQT actual-coordinate probe requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R4DevActualCoordinate)
+	}
+	if cfg.OptimizerMode == AOQTSidecarOptimizerModeV7R4DevActualCoordinate && (cfg.ForwardConsistencyProbeRequired || cfg.ActualDirectionProbeRequired) {
+		return fmt.Errorf("AOQT V7-r4 actual-coordinate mode cannot combine with an older probe")
+	}
+	if isAOQTV7R5ActualCoordinateMode(cfg.OptimizerMode) {
+		if cfg.PlanOnly {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training is not available in plan-only mode")
+		}
+		if cfg.ActualCoordinateProbeRequired || cfg.ActualCoordinateProbeOnly || cfg.ForwardConsistencyProbeRequired || cfg.ActualDirectionProbeRequired {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training cannot combine with an older probe")
+		}
+		if cfg.MaxSteps != AOQTV7R5ActualCoordinateTrainMaxSteps {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training requires max_steps exactly %d", AOQTV7R5ActualCoordinateTrainMaxSteps)
+		}
+		if cfg.LearningRate != AOQTV7R4ActualCoordinateProbeLearningRate {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training requires learning_rate exactly 0.01")
+		}
+		if cfg.ActualCoordinateTrainR4Receipt == nil && cfg.CanonicalR4Receipt == nil {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training requires a canonical V7-r4 receipt")
+		}
+		if err := validateAOQTR5AliasConsistency("canonical r4 receipt path", cfg.ActualCoordinateTrainR4ReceiptPath, cfg.CanonicalR4ReceiptPath); err != nil {
+			return err
+		}
+		if err := validateAOQTR5AliasConsistency("canonical r4 receipt sha256", cfg.ActualCoordinateTrainR4ReceiptSHA256, cfg.CanonicalR4ReceiptSHA256); err != nil {
+			return err
+		}
+		if strings.TrimSpace(cfg.ActualCoordinateTrainR4ReceiptPath) == "" && strings.TrimSpace(cfg.CanonicalR4ReceiptPath) == "" {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training requires the canonical V7-r4 receipt path")
+		}
+		pinned := cfg.ActualCoordinateTrainR4ReceiptSHA256
+		if pinned == "" {
+			pinned = cfg.CanonicalR4ReceiptSHA256
+		}
+		if pinned != AOQTV7R5CanonicalR4ReceiptSHA256 {
+			return fmt.Errorf("AOQT V7-r5 canonical r4 receipt sha256 must equal pinned authorization")
+		}
+		if strings.TrimSpace(cfg.ActualCoordinateProbeFoldID) == "" {
+			return fmt.Errorf("AOQT V7-r5 actual-coordinate training requires a fold id")
+		}
+		if err := validateAOQTSHA256(cfg.ActualCoordinateProbeSplitManifestSHA256, "AOQT V7-r5 split manifest sha256"); err != nil {
+			return err
+		}
+	}
+	if cfg.ForwardConsistencyProbeRequired {
+		if cfg.OptimizerMode != AOQTSidecarOptimizerModeV7R2DevTrustRegion {
+			return fmt.Errorf("AOQT forward-consistency probe requires optimizer_mode=%s", AOQTSidecarOptimizerModeV7R2DevTrustRegion)
+		}
+		if cfg.PlanOnly {
+			return fmt.Errorf("AOQT forward-consistency probe is not available in plan-only mode")
+		}
+		if cfg.LearningRate != float32(0.01) {
+			return fmt.Errorf("AOQT V7-r2 forward-consistency probe requires learning_rate exactly 0.01")
+		}
+		if strings.TrimSpace(cfg.ForwardConsistencyProbeFoldID) == "" {
+			return fmt.Errorf("AOQT forward-consistency probe requires a fold id")
+		}
+		if err := validateAOQTSHA256(cfg.ForwardConsistencyProbeSplitManifestSHA256, "AOQT forward-consistency probe split manifest sha256"); err != nil {
+			return err
+		}
+	}
+	if cfg.ActualDirectionProbeRequired {
+		if cfg.PlanOnly {
+			return fmt.Errorf("AOQT actual-direction probe is not available in plan-only mode")
+		}
+		if cfg.LearningRate != AOQTV7R3ActualDirectionProbeLearningRate {
+			return fmt.Errorf("AOQT V7-r3 actual-direction probe requires learning_rate exactly 0.01")
+		}
+		if strings.TrimSpace(cfg.ActualDirectionProbeFoldID) == "" {
+			return fmt.Errorf("AOQT actual-direction probe requires a fold id")
+		}
+		if err := validateAOQTSHA256(cfg.ActualDirectionProbeSplitManifestSHA256, "AOQT actual-direction probe split manifest sha256"); err != nil {
+			return err
+		}
+	}
+	if cfg.ActualCoordinateProbeRequired {
+		if cfg.PlanOnly {
+			return fmt.Errorf("AOQT actual-coordinate probe is not available in plan-only mode")
+		}
+		if cfg.LearningRate != AOQTV7R4ActualCoordinateProbeLearningRate {
+			return fmt.Errorf("AOQT V7-r4 actual-coordinate probe requires learning_rate exactly 0.01")
+		}
+		if strings.TrimSpace(cfg.ActualCoordinateProbeFoldID) == "" {
+			return fmt.Errorf("AOQT actual-coordinate probe requires a fold id")
+		}
+		if err := validateAOQTSHA256(cfg.ActualCoordinateProbeSplitManifestSHA256, "AOQT actual-coordinate probe split manifest sha256"); err != nil {
+			return err
+		}
+	}
 	if cfg.AngleCap <= 0 || !isFinite32(cfg.AngleCap) {
 		return fmt.Errorf("AOQT angle cap must be finite and positive")
 	}
@@ -2805,10 +3584,10 @@ func validateAOQTSidecarTrainConfig(cfg AOQTSidecarTrainConfig) error {
 	if cfg.AngleCap > cfg.MaxAngleCap || cfg.MaxAngleCap > AOQTSidecarHardMaxAngleCap {
 		return fmt.Errorf("AOQT angle caps exceed hard max %.8g", AOQTSidecarHardMaxAngleCap)
 	}
-	if !cfg.PlanOnly && cfg.MaxSteps <= 0 {
+	if !cfg.PlanOnly && !cfg.ForwardConsistencyProbeOnly && !cfg.ActualDirectionProbeOnly && !cfg.ActualCoordinateProbeOnly && cfg.MaxSteps <= 0 {
 		return fmt.Errorf("AOQT non-plan training requires max steps")
 	}
-	if cfg.PlanOnly && cfg.MaxSteps < 0 {
+	if (cfg.PlanOnly || cfg.ForwardConsistencyProbeOnly || cfg.ActualDirectionProbeOnly || cfg.ActualCoordinateProbeOnly) && cfg.MaxSteps < 0 {
 		return fmt.Errorf("AOQT plan max steps must be non-negative")
 	}
 	if cfg.LearningRate <= 0 || !isFinite32(cfg.LearningRate) {

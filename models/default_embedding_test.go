@@ -92,6 +92,93 @@ func TestInitDefaultEmbeddingPackageCreatesTrainablePackage(t *testing.T) {
 	}
 }
 
+func TestInitDefaultEmbeddingPackageRejectsMixedBootstrapSources(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "target.mll")
+	_, err := InitDefaultEmbeddingPackage(path, DefaultEmbeddingPackageConfig{
+		BootstrapFrom:          filepath.Join(t.TempDir(), "trainable.mll"),
+		BootstrapFromInference: filepath.Join(t.TempDir(), "sealed.mll"),
+	})
+	if err == nil {
+		t.Fatal("expected mixed bootstrap source rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-from and --bootstrap-from-inference are mutually exclusive") {
+		t.Fatalf("error = %q, want mutual exclusion rejection", got)
+	}
+}
+
+func TestInitDefaultEmbeddingPackageRejectsTailInitWithoutInferenceWiden(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "target.mll")
+	_, err := InitDefaultEmbeddingPackage(path, DefaultEmbeddingPackageConfig{
+		BootstrapTailInit: "zero",
+	})
+	if err == nil {
+		t.Fatal("expected tail-init without widen rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-init requires --bootstrap-from-inference-widen") {
+		t.Fatalf("error = %q, want tail-init/widen rejection", got)
+	}
+}
+
+func TestInitDefaultEmbeddingPackageRejectsTailScaleWithoutInferenceWiden(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "target.mll")
+	_, err := InitDefaultEmbeddingPackage(path, DefaultEmbeddingPackageConfig{
+		BootstrapTailScale: 0.03,
+	})
+	if err == nil {
+		t.Fatal("expected tail-scale without widen rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-scale requires --bootstrap-from-inference-widen") {
+		t.Fatalf("error = %q, want tail-scale/widen rejection", got)
+	}
+}
+
+func TestInitDefaultEmbeddingPackageRejectsUnknownInferenceWidenTailInit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "target.mll")
+	_, err := InitDefaultEmbeddingPackage(path, DefaultEmbeddingPackageConfig{
+		BootstrapFromInference:  "missing.sealed.mll",
+		BootstrapInferenceWiden: true,
+		ModelDim:                3,
+		HiddenDim:               5,
+		BootstrapTailInit:       "gaussian",
+	})
+	if err == nil {
+		t.Fatal("expected unknown tail-init rejection")
+	}
+	if got := err.Error(); !strings.Contains(got, "--bootstrap-tail-init must be zero, random, or projection-tail") {
+		t.Fatalf("error = %q, want tail-init value rejection", got)
+	}
+}
+
+func TestInitDefaultEmbeddingPackageValidatesProjectionTailScale(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		tailInit string
+		scale    float64
+		want     string
+	}{
+		{"zero scale rejected", "zero", 0.03, "--bootstrap-tail-scale requires --bootstrap-tail-init projection-tail"},
+		{"random scale rejected", "random", 0.03, "--bootstrap-tail-scale requires --bootstrap-tail-init projection-tail"},
+		{"too large projection scale", "projection-tail", 0.11, "--bootstrap-tail-scale must be finite and in (0, 0.10]"},
+		{"negative projection scale", "projection-tail", -0.01, "--bootstrap-tail-scale must be finite and in (0, 0.10]"},
+		{"nan projection scale", "projection-tail", math.NaN(), "--bootstrap-tail-scale must be finite and in (0, 0.10]"},
+		{"inf projection scale", "projection-tail", math.Inf(1), "--bootstrap-tail-scale must be finite and in (0, 0.10]"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := InitDefaultEmbeddingPackage(filepath.Join(t.TempDir(), "target.mll"), DefaultEmbeddingPackageConfig{
+				BootstrapFromInference:  "missing.sealed.mll",
+				BootstrapInferenceWiden: true,
+				ModelDim:                3,
+				HiddenDim:               5,
+				BootstrapTailInit:       tc.tailInit,
+				BootstrapTailScale:      tc.scale,
+			})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestInitDefaultEmbeddingPackageDefaultsOutputDimToModelDim(t *testing.T) {
 	manifest := DefaultEmbeddingManifest(DefaultEmbeddingPackageConfig{
 		ModelDim:  6,

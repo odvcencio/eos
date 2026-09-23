@@ -20,6 +20,19 @@ const (
 	ScoreSpectrumLossModeHardSoft         = "hard_soft"
 	ScoreSpectrumLossModeRecovery         = "recovery"
 	ScoreSpectrumLossModeHardSoftRecovery = "hard_soft_recovery"
+
+	TurboQuantRankMarginLossSquaredHinge = "squared_hinge"
+	TurboQuantRankMarginLossSoftplus     = "softplus"
+
+	TurboQuantRankMarginReductionHardest      = "hardest"
+	TurboQuantRankMarginReductionMeanEligible = "mean_eligible"
+
+	TurboQuantTopKLossLambdaNDCG = "lambdandcg"
+
+	TurboQuantTopKNegativeMaskHard = "hard"
+	TurboQuantTopKNegativeMaskAll  = "all"
+	TurboQuantTopKNegativeMaskQ3   = "q3"
+	TurboQuantTopKNegativeMaskBM25 = "bm25"
 )
 
 // EmbeddingPairExample is one supervised pairwise training example.
@@ -34,35 +47,54 @@ type EmbeddingPairExample struct {
 
 // EmbeddingTrainConfig controls the narrow pooled-embedder trainer.
 type EmbeddingTrainConfig struct {
-	LearningRate                   float32
-	WeightDecay                    float32
-	WeightBits                     int
-	Optimizer                      string
-	Beta1                          float32
-	Beta2                          float32
-	Epsilon                        float32
-	ContrastiveLoss                string
-	Temperature                    float32
-	GroupedLossWeight              float32
-	TeacherLossWeight              float32
-	TeacherTemperature             float32
-	TeacherSourceTemperatures      map[string]float32
-	TeacherSourceWeights           map[string]float32
-	MatryoshkaDims                 []int
-	MatryoshkaWeights              []float32
-	TurboQuantPrefixBits           []int
-	TurboQuantPrefixObjectives     []TurboQuantPrefixObjective
-	TurboQuantPrefixWeight         float32
-	TurboQuantPrefixSeed           int64
-	TurboQuantPrefixScoreMode      string
-	TurboQuantCompactObjectives    []TurboQuantPrefixObjective
-	TurboQuantRankMarginObjectives []TurboQuantPrefixObjective
-	TurboQuantRankMargin           float32
-	ScoreSpectrumLossMode          string
-	ScoreSpectrumRecoveryWeight    float32
-	ScoreSpectrumRecoveryMargin    float32
-	ScoreSpectrumRecoveryTopK      int
-	ScoreSpectrumRecoveryTau       float32
+	LearningRate                     float32
+	WeightDecay                      float32
+	WeightBits                       int
+	Optimizer                        string
+	Beta1                            float32
+	Beta2                            float32
+	Epsilon                          float32
+	ContrastiveLoss                  string
+	Temperature                      float32
+	GroupedLossWeight                float32
+	TeacherLossWeight                float32
+	TeacherTemperature               float32
+	TeacherSourceTemperatures        map[string]float32
+	TeacherSourceWeights             map[string]float32
+	MatryoshkaDims                   []int
+	MatryoshkaWeights                []float32
+	TurboQuantPrefixBits             []int
+	TurboQuantPrefixObjectives       []TurboQuantPrefixObjective
+	TurboQuantPrefixWeight           float32
+	TurboQuantPrefixSeed             int64
+	TurboQuantPrefixScoreMode        string
+	TurboQuantCompactObjectives      []TurboQuantPrefixObjective
+	TurboQuantRankMarginObjectives   []TurboQuantPrefixObjective
+	TurboQuantRankMargin             float32
+	TurboQuantRankMarginLoss         string
+	TurboQuantRankMarginReduction    string
+	TurboQuantRankMarginTau          float32
+	TurboQuantTopKObjectives         []TurboQuantPrefixObjective
+	TurboQuantTopKLoss               string
+	TurboQuantTopKCutoff             int
+	TurboQuantTopKTau                float32
+	TurboQuantTopKMargin             float32
+	TurboQuantTopKNegativeMask       string
+	TurboQuantTopKRecallWeight       float32
+	TurboQuantTopKRecallCutoff       int
+	TurboQuantTopKRecallTau          float32
+	TurboQuantTopKRecallMargin       float32
+	TurboQuantTopKRecallNegativeMask string
+	ScoreSpectrumLossMode            string
+	ScoreSpectrumRecoveryWeight      float32
+	ScoreSpectrumRecoveryMargin      float32
+	ScoreSpectrumRecoveryTopK        int
+	ScoreSpectrumRecoveryTau         float32
+	// ScoreSpectrumActivationMicrobatchSize bounds the number of sequence
+	// activations retained by the legacy score-spectrum forward/backward path.
+	// It changes neither row batching nor optimizer-step semantics; zero keeps
+	// the historical full-batch activation path.
+	ScoreSpectrumActivationMicrobatchSize int
 }
 
 // TurboQuantPrefixObjective targets one quantized compact-prefix loss.
@@ -704,6 +736,20 @@ func newCompactEmbeddingTrainerFromTrainState(mod *eosartifact.Module, state *Co
 
 func (t *EmbeddingTrainer) isCompactTrainer() bool {
 	return t != nil && t.compactState != nil
+}
+
+// embeddingTrainerArchitectureVersion returns the architecture identity used
+// by route diagnostics and fail-closed feature gates. Legacy trainers created
+// from pre-architecture manifests have an empty field until normalization, so
+// treat an empty value as the legacy architecture here as well.
+func embeddingTrainerArchitectureVersion(t *EmbeddingTrainer) string {
+	if t == nil {
+		return ""
+	}
+	if architecture := strings.TrimSpace(t.manifest.ArchitectureVersion); architecture != "" {
+		return architecture
+	}
+	return EmbeddingArchitectureLegacyV1
 }
 
 func compactTrainingUnsupportedError() error {
@@ -2578,6 +2624,14 @@ func (t *EmbeddingTrainer) TrainScoreSpectrumStep(batch []EmbeddingScoreSpectrum
 	if t == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("embedding trainer is not initialized")
 	}
+	if compactResidentTrainEnabled() && !t.isCompactTrainer() {
+		return EmbeddingTrainMetrics{}, fmt.Errorf(
+			"unsupported architecture for compact resident score-spectrum training: architecture_version=%q; requires architecture_version=%q (%s=1)",
+			embeddingTrainerArchitectureVersion(t),
+			EmbeddingArchitectureCompactTransformerV1,
+			compactResidentTrainEnv,
+		)
+	}
 	if err := t.failIfOptimizerPoisoned(); err != nil {
 		return EmbeddingTrainMetrics{}, err
 	}
@@ -2589,6 +2643,9 @@ func (t *EmbeddingTrainer) TrainScoreSpectrumStep(batch []EmbeddingScoreSpectrum
 	}
 	if err := validateScoreSpectrumTrainerConfig(t.config); err != nil {
 		return EmbeddingTrainMetrics{}, err
+	}
+	if t.config.ScoreSpectrumActivationMicrobatchSize > 0 {
+		return t.runLegacyScoreSpectrumActivationMicrobatchUpdate(batch, t.config.ScoreSpectrumActivationMicrobatchSize)
 	}
 	canonicalBatch, err := canonicalizeTokenizedScoreSpectrumExamples(batch)
 	if err != nil {
@@ -2707,8 +2764,25 @@ func (t *EmbeddingTrainer) runCompactScoreSpectrumBatchUpdate(batch []EmbeddingS
 	if t == nil || t.compactState == nil {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("compact embedding trainer is not initialized")
 	}
+	// The resident ABI is the memory-bounded compact score-spectrum path. A
+	// backend which was selected for resident training must either complete the
+	// full forward/backward/optimizer transaction or return its error; silently
+	// dropping to packed host activations here would recreate the allocation
+	// spike that this path is intended to prevent.
+	if compactResidentTrainEnabled() {
+		if trainerAcceleratorNil(t.compactTrainAccel) {
+			return EmbeddingTrainMetrics{}, fmt.Errorf(
+				"compact resident score-spectrum training requested via %s=1, but the compact train accelerator is unavailable; packed fallback is disabled",
+				compactResidentTrainEnv,
+			)
+		}
+		return t.runCompactScoreSpectrumBatchUpdateResident(batch)
+	}
 	if len(batch) == 0 {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("score-spectrum training batch is empty")
+	}
+	if err := t.guardCompactScoreSpectrumPackedBatch(batch); err != nil {
+		return EmbeddingTrainMetrics{}, err
 	}
 	if len(t.config.MatryoshkaDims) > 0 {
 		return EmbeddingTrainMetrics{}, fmt.Errorf("compact_transformer_v1 score-spectrum training does not support matryoshka objectives")
@@ -2843,7 +2917,7 @@ func (t *EmbeddingTrainer) TrainListwiseGeometryStepWithDiagnostics(batch []Embe
 		documentGrads[i] = make([]float32, len(documents[i].pooled))
 	}
 
-	totalLoss, totalScore, pairCount, queryCount, err := accumulateListwiseGeometryGrads(queries, documents, spans, batch, t.config.Temperature, queryGrads, documentGrads)
+	totalLoss, totalScore, pairCount, queryCount, err := accumulateListwiseGeometryGrads(queries, documents, spans, batch, t.config, queryGrads, documentGrads)
 	if err != nil {
 		return EmbeddingTrainMetrics{}, err
 	}
@@ -2959,7 +3033,7 @@ func (t *EmbeddingTrainer) runCompactListwiseGeometryBatchUpdate(batch []Embeddi
 		documentGrads[i] = make([]float32, len(documents[i].pooled))
 	}
 
-	totalLoss, totalScore, pairCount, queryCount, err := accumulateListwiseGeometryGrads(queries, documents, spans, batch, t.config.Temperature, queryGrads, documentGrads)
+	totalLoss, totalScore, pairCount, queryCount, err := accumulateListwiseGeometryGrads(queries, documents, spans, batch, t.config, queryGrads, documentGrads)
 	if err != nil {
 		return EmbeddingTrainMetrics{}, err
 	}
@@ -3031,6 +3105,9 @@ func (t *EmbeddingTrainer) EvaluateScoreSpectrumBatched(examples []EmbeddingScor
 	}
 	forward := t.prepareForwardWeights()
 	t.primeForwardWeightResidency(forward.attnQ, forward.attnK, forward.attnV, forward.attnO, forward.hidden, forward.proj)
+	if !t.isCompactTrainer() && t.config.ScoreSpectrumActivationMicrobatchSize > 0 {
+		return t.evaluateLegacyScoreSpectrumActivationMicrobatched(canonicalExamples, batchSize, t.config.ScoreSpectrumActivationMicrobatchSize, forward)
+	}
 	var aggregate EmbeddingScoreSpectrumEvalMetrics
 	for start := 0; start < len(canonicalExamples); start += batchSize {
 		end := start + batchSize
@@ -7075,6 +7152,8 @@ func accumulateScoreSpectrumGrads(queries, candidates []*embeddingEncodedSequenc
 	totalLoss := float32(0)
 	totalScore := float32(0)
 	pairCount := 0
+	topKObjectives := turboQuantTopKObjectivesForConfig(cfg)
+	topKWeightSum := turboQuantTopKWeightSum(cfg)
 	queryMatrix := newContrastivePooledMatrix(queries)
 	candidateMatrix := newContrastivePooledMatrix(candidates)
 	maxCandidates := 0
@@ -7100,6 +7179,27 @@ func accumulateScoreSpectrumGrads(queries, candidates []*embeddingEncodedSequenc
 			hardWeight, softWeight = 0, 0
 		}
 		recoveryWeight := scoreSpectrumEffectiveRecoveryWeightForExample(cfg.ScoreSpectrumRecoveryWeight, example)
+		rowTopKLossWeight := scoreSpectrumEffectiveTurboQuantTopKLossWeight(example.TurboQuantTopKLossWeight)
+		recallActive := turboQuantTopKRecallActive(cfg)
+		rowTopKRecallLossWeight := scoreSpectrumEffectiveTurboQuantTopKRecallLossWeight(example.TurboQuantTopKRecallLossWeight, recallActive)
+		baseLossWeight := scoreSpectrumEffectiveBaseLossWeight(example.BaseLossWeight)
+		if err := validateScoreSpectrumBaseLossWeight(example.BaseLossWeight, example.RowID, example.Source); err != nil {
+			return 0, 0, 0, fmt.Errorf("score-spectrum row %d: %w", i, err)
+		}
+		if err := validateScoreSpectrumTurboQuantTopKLossWeight(example.TurboQuantTopKLossWeight); err != nil {
+			return 0, 0, 0, fmt.Errorf("score-spectrum row %d: %w", i, err)
+		}
+		if err := validateScoreSpectrumTurboQuantTopKRecallLossWeight(example.TurboQuantTopKRecallLossWeight); err != nil {
+			return 0, 0, 0, fmt.Errorf("score-spectrum row %d: %w", i, err)
+		}
+		rowTopKMainWeightSum := topKWeightSum * rowTopKLossWeight
+		rowTopKRecallWeightSum := topKWeightSum * cfg.TurboQuantTopKRecallWeight * rowTopKRecallLossWeight
+		rowTopKWeightSum := rowTopKMainWeightSum + rowTopKRecallWeightSum
+		if baseLossWeight == 0 && rowTopKWeightSum == 0 {
+			return 0, 0, 0, fmt.Errorf("score-spectrum row %d: %sbase_loss_weight=0 leaves no active objective for current score-spectrum config", i, scoreSpectrumRowDiagnostic(example.RowID, example.Source))
+		}
+		blendDenom := float32(1) + rowTopKWeightSum
+		baseScale := baseLossWeight / blendDenom
 		query := queryMatrix.row(i)
 		queryNorm := queryMatrix.norms[i]
 		scores := rowScores[:candidateCount]
@@ -7109,9 +7209,13 @@ func accumulateScoreSpectrumGrads(queries, candidates []*embeddingEncodedSequenc
 			scores[local] = score
 			totalScore += score
 		}
-		loss, err := scoreSpectrumLossAndGrad(scores, example.PositiveIndexes, example.HardNegativeEligible, example.TargetProbabilities, cfg.Temperature, hardWeight, softWeight, scoreSpectrumRecoveryLossOptions{
-			Enabled: scoreSpectrumLossModeIncludesRecovery(cfg.ScoreSpectrumLossMode) && recoveryWeight > 0,
-			Weight:  recoveryWeight,
+		baseHardWeight, baseSoftWeight, baseRecoveryWeight := hardWeight, softWeight, recoveryWeight
+		if baseLossWeight == 0 {
+			baseHardWeight, baseSoftWeight, baseRecoveryWeight = 0, 0, 0
+		}
+		loss, err := scoreSpectrumLossAndGrad(scores, example.PositiveIndexes, example.HardNegativeEligible, example.TargetProbabilities, cfg.Temperature, baseHardWeight, baseSoftWeight, scoreSpectrumRecoveryLossOptions{
+			Enabled: scoreSpectrumLossModeIncludesRecovery(cfg.ScoreSpectrumLossMode) && baseRecoveryWeight > 0,
+			Weight:  baseRecoveryWeight,
 			Margin:  cfg.ScoreSpectrumRecoveryMargin,
 			TopK:    cfg.ScoreSpectrumRecoveryTopK,
 			Tau:     cfg.ScoreSpectrumRecoveryTau,
@@ -7119,26 +7223,152 @@ func accumulateScoreSpectrumGrads(queries, candidates []*embeddingEncodedSequenc
 		if err != nil {
 			return 0, 0, 0, fmt.Errorf("score-spectrum row %d: %w", i, err)
 		}
-		totalLoss += loss.Loss
 		pairCount += candidateCount
+		rowQueryGrad := queryGrads[i]
+		rowCandidateGrads := candidateGrads
+		if rowTopKWeightSum > 0 || baseScale != 1 {
+			rowQueryGrad = make([]float32, len(queryGrads[i]))
+			rowCandidateGrads = newEmbeddingPooledGradBuffers(candidates)
+		}
 		for local, scale := range loss.Grad {
 			if scale == 0 {
 				continue
 			}
 			j := span.Start + local
-			accumulateCosineGradFromScore(query, candidateMatrix.row(j), queryNorm, candidateMatrix.norms[j], scores[local], scale, queryGrads[i], candidateGrads[j])
+			accumulateCosineGradFromScore(query, candidateMatrix.row(j), queryNorm, candidateMatrix.norms[j], scores[local], scale, rowQueryGrad, rowCandidateGrads[j])
 		}
+		if rowTopKWeightSum == 0 && baseScale == 1 {
+			totalLoss += loss.Loss
+			continue
+		}
+		totalLoss += loss.Loss * baseScale
+		if baseScale != 0 {
+			addScaledFloat32Slice(queryGrads[i], rowQueryGrad, baseScale)
+			for j := span.Start; j < span.End; j++ {
+				addScaledFloat32Slice(candidateGrads[j], rowCandidateGrads[j], baseScale)
+			}
+		}
+		auxLoss, auxScore, auxPairs, err := accumulateTurboQuantPreparedIPTopKScoreSpectrumRowGrads(queries, candidates, span, i, example, topKObjectives, cfg, rowTopKLossWeight, 1, cfg.TurboQuantTopKCutoff, cfg.TurboQuantTopKTau, cfg.TurboQuantTopKMargin, cfg.TurboQuantTopKNegativeMask, blendDenom, queryGrads, candidateGrads)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		totalLoss += auxLoss
+		totalScore += auxScore
+		pairCount += auxPairs
+		recallLoss, recallScore, recallPairs, err := accumulateTurboQuantPreparedIPTopKScoreSpectrumRowGrads(queries, candidates, span, i, example, topKObjectives, cfg, rowTopKRecallLossWeight, cfg.TurboQuantTopKRecallWeight, cfg.TurboQuantTopKRecallCutoff, cfg.TurboQuantTopKRecallTau, cfg.TurboQuantTopKRecallMargin, cfg.TurboQuantTopKRecallNegativeMask, blendDenom, queryGrads, candidateGrads)
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		totalLoss += recallLoss
+		totalScore += recallScore
+		pairCount += recallPairs
 	}
 	return totalLoss, totalScore, pairCount, nil
 }
 
-func accumulateListwiseGeometryGrads(queries, documents []*embeddingEncodedSequence, spans []embeddingCandidateSpan, batches []EmbeddingTokenizedListwiseGeometryBatch, temperature float32, queryGrads, documentGrads [][]float32) (float32, float32, int, int, error) {
+func accumulateTurboQuantPreparedIPTopKScoreSpectrumRowGrads(queries, candidates []*embeddingEncodedSequence, span embeddingCandidateSpan, row int, example EmbeddingScoreSpectrumExample, objectives []TurboQuantPrefixObjective, cfg EmbeddingTrainConfig, rowLossWeight, globalLossWeight float32, cutoff int, tau, margin float32, negativeMask string, blendDenom float32, queryGrads, candidateGrads [][]float32) (float32, float32, int, error) {
+	if len(objectives) == 0 {
+		return 0, 0, 0, nil
+	}
+	if rowLossWeight <= 0 || globalLossWeight <= 0 {
+		return 0, 0, 0, nil
+	}
+	if row < 0 || row >= len(queries) {
+		return 0, 0, 0, fmt.Errorf("score-spectrum top-k row %d missing query", row)
+	}
+	count := span.End - span.Start
+	if count <= 1 {
+		return 0, 0, 0, nil
+	}
+	gains := scoreSpectrumTopKGains(example, count)
+	ids := scoreSpectrumTopKCandidateIDs(example, count)
+	mask, staticPairs, err := scoreSpectrumTopKEligiblePairMask(example, gains, negativeMask)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("score-spectrum row %d top-k mask: %w", row, err)
+	}
+	if staticPairs == 0 {
+		return 0, 0, 0, nil
+	}
+	seed := effectiveTurboQuantPrefixSeed(cfg.TurboQuantPrefixSeed)
+	cutoff = effectiveTurboQuantTopKRecallCutoff(cutoff)
+	tau = effectiveTurboQuantTopKRecallTau(tau)
+	if blendDenom <= 0 {
+		blendDenom = 1
+	}
+	totalLoss := float32(0)
+	totalScore := float32(0)
+	totalPairs := 0
+	for _, objective := range objectives {
+		if objective.Weight <= 0 {
+			continue
+		}
+		queryMatrix := newTurboQuantPreparedPrefixMatrix([]*embeddingEncodedSequence{queries[row]}, objective.Dim, objective.BitWidth, seed, true)
+		candidateMatrix := newTurboQuantPreparedPrefixMatrix(candidates[span.Start:span.End], objective.Dim, objective.BitWidth, seed, false)
+		if queryMatrix.width == 0 || candidateMatrix.width != queryMatrix.width {
+			return 0, 0, 0, fmt.Errorf("score-spectrum top-k objective dim=%d bit_width=%d could not build prepared-IP matrices", objective.Dim, objective.BitWidth)
+		}
+		q := turboquant.NewIPWithSeed(objective.Dim, objective.BitWidth, seed)
+		scores := make([]float32, count)
+		for local := 0; local < count; local++ {
+			score := q.InnerProductPrepared(candidateMatrix.quantized[local], queryMatrix.prepared[0])
+			scores[local] = score
+			totalScore += score
+		}
+		loss, err := topkLambdaNDCGLossAndGrad(scores, gains, ids, cutoff, tau, margin, mask)
+		if err != nil {
+			return 0, 0, 0, fmt.Errorf("score-spectrum row %d top-k objective dim=%d bit_width=%d: %w", row, objective.Dim, objective.BitWidth, err)
+		}
+		if loss.EligiblePairs != staticPairs {
+			return 0, 0, 0, fmt.Errorf("score-spectrum row %d top-k eligible pair count changed: metadata=%d loss=%d", row, staticPairs, loss.EligiblePairs)
+		}
+		objectiveScale := objective.Weight * globalLossWeight * rowLossWeight / blendDenom
+		totalLoss += loss.Loss * objectiveScale
+		totalPairs += loss.EligiblePairs
+		queryRaw := queryMatrix.rawRow(0)
+		queryNormalized := queryMatrix.normalizedRow(0)
+		for local, grad := range loss.Grad {
+			if grad == 0 {
+				continue
+			}
+			scale := grad * objectiveScale
+			accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[0], candidateMatrix.dequantizedRow(local), scale, queryGrads[row])
+			accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(local), candidateMatrix.normalizedRow(local), candidateMatrix.rawNorms[local], queryNormalized, scale, candidateGrads[span.Start+local])
+		}
+	}
+	return totalLoss, totalScore, totalPairs, nil
+}
+
+func accumulateListwiseGeometryGrads(queries, documents []*embeddingEncodedSequence, spans []embeddingCandidateSpan, batches []EmbeddingTokenizedListwiseGeometryBatch, cfg EmbeddingTrainConfig, queryGrads, documentGrads [][]float32) (float32, float32, int, int, error) {
+	objectives := turboQuantCompactObjectivesForConfig(cfg)
+	if len(objectives) > 0 {
+		embeddingDim := 0
+		if len(queries) > 0 && queries[0] != nil {
+			embeddingDim = len(queries[0].pooled)
+		} else if len(documents) > 0 && documents[0] != nil {
+			embeddingDim = len(documents[0].pooled)
+		}
+		if err := validateListwiseGeometryCompactObjectives(objectives, embeddingDim); err != nil {
+			return 0, 0, 0, 0, err
+		}
+	}
 	totalLoss := float32(0)
 	totalScore := float32(0)
 	pairCount := 0
 	totalQueryCount := 0
 	queryMatrix := newContrastivePooledMatrix(queries)
 	documentMatrix := newContrastivePooledMatrix(documents)
+	compactWeightSum := turboQuantCompactWeightSum(cfg)
+	compactQueryGrads := make([][]float32, len(queryGrads))
+	compactDocumentGrads := make([][]float32, len(documentGrads))
+	for compactWeightSum > 0 {
+		for i := range compactQueryGrads {
+			compactQueryGrads[i] = make([]float32, len(queryGrads[i]))
+		}
+		for i := range compactDocumentGrads {
+			compactDocumentGrads[i] = make([]float32, len(documentGrads[i]))
+		}
+		break
+	}
 	queryOffset := 0
 	for i, batch := range batches {
 		if i >= len(spans) {
@@ -7166,7 +7396,7 @@ func accumulateListwiseGeometryGrads(queries, documents []*embeddingEncodedSeque
 				totalScore += score
 			}
 		}
-		loss, err := EmbeddingListwiseGeometryLossAndGrad(student, batch.TeacherSimilarity, temperature)
+		loss, err := EmbeddingListwiseGeometryLossAndGrad(student, batch.TeacherSimilarity, cfg.Temperature)
 		if err != nil {
 			return 0, 0, 0, 0, fmt.Errorf("listwise geometry batch %d: %w", i, err)
 		}
@@ -7183,6 +7413,130 @@ func accumulateListwiseGeometryGrads(queries, documents []*embeddingEncodedSeque
 				}
 				globalDoc := span.Start + localDoc
 				accumulateCosineGradFromScore(query, documentMatrix.row(globalDoc), queryNorm, documentMatrix.norms[globalDoc], student[qi][localDoc], scale*float32(queryCount), queryGrads[globalQuery], documentGrads[globalDoc])
+			}
+		}
+		queryOffset += queryCount
+	}
+	if compactWeightSum > 0 {
+		compactLoss, compactScore, compactPairs, compactQueries, err := accumulateTurboQuantCompactListwiseGeometryGrads(queries, documents, spans, batches, cfg, compactQueryGrads, compactDocumentGrads)
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+		if compactPairs > 0 && compactQueries > 0 {
+			denominator := 1 + compactWeightSum
+			denseScale := float32(1) / denominator
+			compactScale := float32(1) / denominator
+			scaleEmbeddingGradBuffers(queryGrads, denseScale)
+			scaleEmbeddingGradBuffers(documentGrads, denseScale)
+			addScaledEmbeddingGradBuffers(queryGrads, compactQueryGrads, compactScale)
+			addScaledEmbeddingGradBuffers(documentGrads, compactDocumentGrads, compactScale)
+			totalLoss = (totalLoss + compactLoss) / denominator
+			totalScore += compactScore
+			pairCount += compactPairs
+		}
+	}
+	return totalLoss, totalScore, pairCount, totalQueryCount, nil
+}
+
+func accumulateTurboQuantCompactListwiseGeometryGrads(queries, documents []*embeddingEncodedSequence, spans []embeddingCandidateSpan, batches []EmbeddingTokenizedListwiseGeometryBatch, cfg EmbeddingTrainConfig, queryGrads, documentGrads [][]float32) (float32, float32, int, int, error) {
+	objectives := turboQuantCompactObjectivesForConfig(cfg)
+	if len(objectives) == 0 {
+		return 0, 0, 0, 0, nil
+	}
+	embeddingDim := 0
+	if len(queries) > 0 && queries[0] != nil {
+		embeddingDim = len(queries[0].pooled)
+	} else if len(documents) > 0 && documents[0] != nil {
+		embeddingDim = len(documents[0].pooled)
+	}
+	if err := validateListwiseGeometryCompactObjectives(objectives, embeddingDim); err != nil {
+		return 0, 0, 0, 0, err
+	}
+	seed := effectiveTurboQuantPrefixSeed(cfg.TurboQuantPrefixSeed)
+	totalLoss := float32(0)
+	totalScore := float32(0)
+	pairCount := 0
+	totalQueryCount := 0
+	for _, objective := range objectives {
+		if objective.Weight <= 0 {
+			continue
+		}
+		dimQueryGrads := newEmbeddingPooledGradBuffers(queries)
+		dimDocumentGrads := newEmbeddingPooledGradBuffers(documents)
+		loss, score, pairs, queries, err := accumulateTurboQuantPreparedIPCompactListwiseGeometryObjectiveGrads(queries, documents, spans, batches, objective.Dim, objective.BitWidth, seed, cfg.Temperature, dimQueryGrads, dimDocumentGrads)
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+		addScaledEmbeddingGradBuffers(queryGrads, dimQueryGrads, objective.Weight)
+		addScaledEmbeddingGradBuffers(documentGrads, dimDocumentGrads, objective.Weight)
+		totalLoss += loss * objective.Weight
+		totalScore += score
+		pairCount += pairs
+		if queries > totalQueryCount {
+			totalQueryCount = queries
+		}
+	}
+	return totalLoss, totalScore, pairCount, totalQueryCount, nil
+}
+
+func accumulateTurboQuantPreparedIPCompactListwiseGeometryObjectiveGrads(queries, documents []*embeddingEncodedSequence, spans []embeddingCandidateSpan, batches []EmbeddingTokenizedListwiseGeometryBatch, dim, bitWidth int, seed int64, temperature float32, queryGrads, documentGrads [][]float32) (float32, float32, int, int, error) {
+	if dim <= 0 {
+		return 0, 0, 0, 0, nil
+	}
+	queryMatrix := newTurboQuantPreparedPrefixMatrix(queries, dim, bitWidth, seed, true)
+	documentMatrix := newTurboQuantPreparedPrefixMatrix(documents, dim, bitWidth, seed, false)
+	if queryMatrix.width == 0 || documentMatrix.width != queryMatrix.width {
+		return 0, 0, 0, 0, nil
+	}
+	q := turboquant.NewIPWithSeed(dim, bitWidth, seed)
+	totalLoss := float32(0)
+	totalScore := float32(0)
+	pairCount := 0
+	totalQueryCount := 0
+	queryOffset := 0
+	for i, batch := range batches {
+		if i >= len(spans) {
+			return 0, 0, 0, 0, fmt.Errorf("listwise geometry batch %d missing document span", i)
+		}
+		span := groupedCandidateSpan(spans, i, len(documents))
+		queryCount := len(batch.QueryTokens)
+		docCount := span.End - span.Start
+		if queryCount <= 0 || docCount <= 0 {
+			return 0, 0, 0, 0, fmt.Errorf("listwise geometry batch %d has empty query/document shape", i)
+		}
+		if queryOffset+queryCount > len(queries) {
+			return 0, 0, 0, 0, fmt.Errorf("listwise geometry batch %d query span exceeds encodings", i)
+		}
+		student := make([][]float32, queryCount)
+		for qi := 0; qi < queryCount; qi++ {
+			globalQuery := queryOffset + qi
+			student[qi] = make([]float32, docCount)
+			for localDoc := 0; localDoc < docCount; localDoc++ {
+				globalDoc := span.Start + localDoc
+				score := q.InnerProductPrepared(documentMatrix.quantized[globalDoc], queryMatrix.prepared[globalQuery])
+				student[qi][localDoc] = score
+				totalScore += score
+			}
+		}
+		loss, err := EmbeddingListwiseGeometryLossAndGrad(student, batch.TeacherSimilarity, temperature)
+		if err != nil {
+			return 0, 0, 0, 0, fmt.Errorf("listwise geometry batch %d: %w", i, err)
+		}
+		totalLoss += loss.Loss * float32(queryCount)
+		pairCount += queryCount * docCount
+		totalQueryCount += queryCount
+		for qi := 0; qi < queryCount; qi++ {
+			globalQuery := queryOffset + qi
+			queryRaw := queryMatrix.rawRow(globalQuery)
+			queryNormalized := queryMatrix.normalizedRow(globalQuery)
+			for localDoc, scale := range loss.Grad[qi] {
+				if scale == 0 {
+					continue
+				}
+				globalDoc := span.Start + localDoc
+				scaled := scale * float32(queryCount)
+				accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[globalQuery], documentMatrix.dequantizedRow(globalDoc), scaled, queryGrads[globalQuery])
+				accumulateNormalizedPrefixSTEGrad(documentMatrix.rawRow(globalDoc), documentMatrix.normalizedRow(globalDoc), documentMatrix.rawNorms[globalDoc], queryNormalized, scaled, documentGrads[globalDoc])
 			}
 		}
 		queryOffset += queryCount
@@ -7389,14 +7743,41 @@ func validateListwiseGeometryTrainerConfig(cfg EmbeddingTrainConfig) error {
 	if len(cfg.TurboQuantPrefixBits) > 0 || len(cfg.TurboQuantPrefixObjectives) > 0 || len(turboQuantPrefixObjectivesForConfig(cfg)) > 0 {
 		return fmt.Errorf("listwise geometry training does not support turboquant prefix objectives in v1")
 	}
-	if len(cfg.TurboQuantCompactObjectives) > 0 || len(turboQuantCompactObjectivesForConfig(cfg)) > 0 {
-		return fmt.Errorf("listwise geometry training does not support turboquant compact objectives in v1")
-	}
 	if len(cfg.TurboQuantRankMarginObjectives) > 0 || len(turboQuantRankMarginObjectivesForConfig(cfg)) > 0 {
 		return fmt.Errorf("listwise geometry training does not support turboquant rank-margin objectives in v1")
 	}
+	if err := validateListwiseGeometryCompactObjectives(turboQuantCompactObjectivesForConfig(cfg), 0); err != nil {
+		return err
+	}
 	if cfg.Temperature <= 0 || math.IsNaN(float64(cfg.Temperature)) || math.IsInf(float64(cfg.Temperature), 0) {
 		return fmt.Errorf("temperature must be finite and positive")
+	}
+	return nil
+}
+
+func validateListwiseGeometryCompactObjectives(objectives []TurboQuantPrefixObjective, embeddingDim int) error {
+	if len(objectives) == 0 {
+		return nil
+	}
+	seen := map[[2]int]bool{}
+	for i, objective := range objectives {
+		if objective.Dim < 2 {
+			return fmt.Errorf("listwise geometry turboquant compact objectives[%d] dim=%d must be at least 2", i, objective.Dim)
+		}
+		if embeddingDim > 0 && objective.Dim != embeddingDim {
+			return fmt.Errorf("listwise geometry turboquant compact objectives[%d] dim=%d must equal full embedding dim %d", i, objective.Dim, embeddingDim)
+		}
+		if objective.BitWidth < 2 || objective.BitWidth > 8 {
+			return fmt.Errorf("listwise geometry turboquant compact objectives[%d] bit_width=%d outside supported range 2..8", i, objective.BitWidth)
+		}
+		if objective.Weight <= 0 || math.IsNaN(float64(objective.Weight)) || math.IsInf(float64(objective.Weight), 0) {
+			return fmt.Errorf("listwise geometry turboquant compact objectives[%d] weight must be finite and positive", i)
+		}
+		key := [2]int{objective.Dim, objective.BitWidth}
+		if seen[key] {
+			return fmt.Errorf("duplicate listwise geometry turboquant compact objective for dim=%d bit_width=%d", objective.Dim, objective.BitWidth)
+		}
+		seen[key] = true
 	}
 	return nil
 }
@@ -7586,7 +7967,27 @@ func scoreSpectrumEffectiveRecoveryWeightForExample(globalWeight float32, exampl
 	return scoreSpectrumEffectiveRecoveryWeight(globalWeight, example.RecoveryLossWeight)
 }
 
+func scoreSpectrumEffectiveTurboQuantTopKLossWeight(weight *float32) float32 {
+	if weight == nil {
+		return 1
+	}
+	return *weight
+}
+
+func scoreSpectrumEffectiveTurboQuantTopKRecallLossWeight(weight *float32, active bool) float32 {
+	if !active {
+		return 0
+	}
+	if weight == nil {
+		return 1
+	}
+	return *weight
+}
+
 func validateScoreSpectrumTrainerConfig(cfg EmbeddingTrainConfig) error {
+	if cfg.ScoreSpectrumActivationMicrobatchSize < 0 {
+		return fmt.Errorf("score_spectrum_activation_microbatch_size must be non-negative")
+	}
 	if len(cfg.MatryoshkaDims) > 0 {
 		return fmt.Errorf("score-spectrum training does not support matryoshka objectives in v1")
 	}
@@ -7599,10 +8000,188 @@ func validateScoreSpectrumTrainerConfig(cfg EmbeddingTrainConfig) error {
 	if len(cfg.TurboQuantRankMarginObjectives) > 0 || len(turboQuantRankMarginObjectivesForConfig(cfg)) > 0 {
 		return fmt.Errorf("score-spectrum training does not support turboquant rank-margin objectives in v1")
 	}
+	if err := validateScoreSpectrumTopKConfig(cfg.TurboQuantTopKObjectives, cfg.TurboQuantTopKLoss, cfg.TurboQuantTopKCutoff, cfg.TurboQuantTopKTau, cfg.TurboQuantTopKMargin, cfg.TurboQuantTopKNegativeMask, cfg.TurboQuantTopKRecallWeight, cfg.TurboQuantTopKRecallCutoff, cfg.TurboQuantTopKRecallTau, cfg.TurboQuantTopKRecallMargin, cfg.TurboQuantTopKRecallNegativeMask, 0); err != nil {
+		return err
+	}
 	if err := validateScoreSpectrumRecoveryConfig(cfg.ScoreSpectrumLossMode, cfg.ScoreSpectrumRecoveryWeight, cfg.ScoreSpectrumRecoveryMargin, cfg.ScoreSpectrumRecoveryTopK, cfg.ScoreSpectrumRecoveryTau); err != nil {
 		return err
 	}
 	return nil
+}
+
+func validateScoreSpectrumTopKConfig(objectives []TurboQuantPrefixObjective, loss string, cutoff int, tau, margin float32, negativeMask string, recallWeight float32, recallCutoff int, recallTau, recallMargin float32, recallNegativeMask string, embeddingDim int) error {
+	active := len(objectives) > 0
+	if !active {
+		if strings.TrimSpace(loss) != "" || cutoff != 0 || tau != 0 || margin != 0 || strings.TrimSpace(negativeMask) != "" || recallWeight != 0 || recallCutoff != 0 || recallTau != 0 || recallMargin != 0 || strings.TrimSpace(recallNegativeMask) != "" {
+			return fmt.Errorf("turboquant top-k loss/cutoff/tau/margin/negative_mask/recall options require turboquant_topk_objectives")
+		}
+		return nil
+	}
+	recallActive := recallWeight > 0
+	normalized, err := normalizeTurboQuantPrefixObjectives(objectives, nil, 0)
+	if err != nil {
+		return err
+	}
+	if embeddingDim > 0 {
+		for i, objective := range normalized {
+			if objective.Dim != embeddingDim {
+				return fmt.Errorf("turboquant_topk_objectives[%d] dim=%d must equal served embedding dimension %d", i, objective.Dim, embeddingDim)
+			}
+		}
+	}
+	if _, err := normalizeTurboQuantTopKLoss(loss); err != nil {
+		return err
+	}
+	if _, err := normalizeTurboQuantTopKNegativeMask(negativeMask); err != nil {
+		return err
+	}
+	if _, err := normalizeTurboQuantTopKNegativeMask(recallNegativeMask); err != nil {
+		return err
+	}
+	if cutoff < 0 {
+		return fmt.Errorf("turboquant_topk_cutoff must be non-negative")
+	}
+	if tau < 0 || math.IsNaN(float64(tau)) || math.IsInf(float64(tau), 0) {
+		return fmt.Errorf("turboquant_topk_tau must be finite and non-negative")
+	}
+	if margin < 0 || math.IsNaN(float64(margin)) || math.IsInf(float64(margin), 0) {
+		return fmt.Errorf("turboquant_topk_margin must be finite and non-negative")
+	}
+	if recallWeight < 0 || math.IsNaN(float64(recallWeight)) || math.IsInf(float64(recallWeight), 0) {
+		return fmt.Errorf("turboquant_topk_recall_weight must be finite and non-negative")
+	}
+	if recallCutoff < 0 {
+		return fmt.Errorf("turboquant_topk_recall_cutoff must be non-negative")
+	}
+	if recallTau < 0 || math.IsNaN(float64(recallTau)) || math.IsInf(float64(recallTau), 0) {
+		return fmt.Errorf("turboquant_topk_recall_tau must be finite and non-negative")
+	}
+	if recallMargin < 0 || math.IsNaN(float64(recallMargin)) || math.IsInf(float64(recallMargin), 0) {
+		return fmt.Errorf("turboquant_topk_recall_margin must be finite and non-negative")
+	}
+	if !recallActive && (recallCutoff != 0 || recallTau != 0 || recallMargin != 0 || strings.TrimSpace(recallNegativeMask) != "") {
+		return fmt.Errorf("turboquant top-k recall cutoff/tau/margin/negative_mask require turboquant_topk_recall_weight")
+	}
+	if recallActive && effectiveTurboQuantTopKRecallCutoff(recallCutoff) <= 0 {
+		return fmt.Errorf("turboquant_topk_recall_cutoff must be positive when turboquant_topk_recall_weight is positive")
+	}
+	return nil
+}
+
+func scoreSpectrumTopKGains(example EmbeddingScoreSpectrumExample, candidateCount int) []float32 {
+	gains := make([]float32, candidateCount)
+	if len(example.QrelGains) == candidateCount {
+		copy(gains, example.QrelGains)
+		return gains
+	}
+	for _, index := range example.PositiveIndexes {
+		if index >= 0 && index < candidateCount {
+			gains[index] = 1
+		}
+	}
+	return gains
+}
+
+func scoreSpectrumTopKCandidateIDs(example EmbeddingScoreSpectrumExample, candidateCount int) []string {
+	ids := make([]string, candidateCount)
+	for i := range ids {
+		if i < len(example.CandidateIDs) && strings.TrimSpace(example.CandidateIDs[i]) != "" {
+			ids[i] = strings.TrimSpace(example.CandidateIDs[i])
+		} else {
+			ids[i] = strconv.Itoa(i)
+		}
+	}
+	return ids
+}
+
+func scoreSpectrumTopKEligiblePairMask(example EmbeddingScoreSpectrumExample, gains []float32, negativeMask string) ([][]bool, int, error) {
+	maskName, err := normalizeTurboQuantTopKNegativeMask(negativeMask)
+	if err != nil {
+		return nil, 0, err
+	}
+	n := len(gains)
+	mask := make([][]bool, n)
+	staticPairs := 0
+	for high := 0; high < n; high++ {
+		mask[high] = make([]bool, n)
+		for low := 0; low < n; low++ {
+			if gains[high] <= gains[low] {
+				continue
+			}
+			if !scoreSpectrumTopKLowerCandidateAllowed(example, gains[low], low, maskName) {
+				continue
+			}
+			mask[high][low] = true
+			staticPairs++
+		}
+	}
+	return mask, staticPairs, nil
+}
+
+func scoreSpectrumTopKLowerCandidateAllowed(example EmbeddingScoreSpectrumExample, gain float32, index int, negativeMask string) bool {
+	if gain > 0 {
+		return true
+	}
+	if index < 0 {
+		return false
+	}
+	if negativeMask == TurboQuantTopKNegativeMaskAll {
+		return true
+	}
+	if index >= len(example.HardNegativeEligible) || !example.HardNegativeEligible[index] {
+		return false
+	}
+	switch negativeMask {
+	case TurboQuantTopKNegativeMaskHard:
+		return true
+	case TurboQuantTopKNegativeMaskQ3:
+		return scoreSpectrumCandidateSourceMatches(example, index, TurboQuantTopKNegativeMaskQ3)
+	case TurboQuantTopKNegativeMaskBM25:
+		return scoreSpectrumCandidateSourceMatches(example, index, TurboQuantTopKNegativeMaskBM25)
+	default:
+		return false
+	}
+}
+
+func scoreSpectrumCandidateSourceMatches(example EmbeddingScoreSpectrumExample, index int, want string) bool {
+	if index < 0 || index >= len(example.CandidateSources) {
+		return false
+	}
+	source := strings.ToLower(strings.TrimSpace(example.CandidateSources[index]))
+	return source == want || strings.Contains(source, want)
+}
+
+func scoreSpectrumTopKStaticEligiblePairCount(example EmbeddingScoreSpectrumExample, negativeMask string) int {
+	if scoreSpectrumEffectiveTurboQuantTopKLossWeight(example.TurboQuantTopKLossWeight) <= 0 {
+		return 0
+	}
+	return scoreSpectrumTopKStaticEligiblePairCountUngated(example, negativeMask)
+}
+
+func scoreSpectrumTopKRecallStaticEligiblePairCount(example EmbeddingScoreSpectrumExample, negativeMask string) int {
+	if example.TurboQuantTopKRecallLossWeight != nil {
+		weight := *example.TurboQuantTopKRecallLossWeight
+		if !isFinite32(weight) || weight <= 0 {
+			return 0
+		}
+	}
+	return scoreSpectrumTopKStaticEligiblePairCountUngated(example, negativeMask)
+}
+
+func scoreSpectrumTopKStaticEligiblePairCountUngated(example EmbeddingScoreSpectrumExample, negativeMask string) int {
+	count := len(example.CandidateTokens)
+	if count == 0 && len(example.CandidateIDs) > 0 {
+		count = len(example.CandidateIDs)
+	}
+	if count == 0 && len(example.QrelGains) > 0 {
+		count = len(example.QrelGains)
+	}
+	gains := scoreSpectrumTopKGains(example, count)
+	_, pairs, err := scoreSpectrumTopKEligiblePairMask(example, gains, negativeMask)
+	if err != nil {
+		return 0
+	}
+	return pairs
 }
 
 func validateTokenizedScoreSpectrumShape(example EmbeddingScoreSpectrumExample) error {
@@ -7630,6 +8209,18 @@ func validateTokenizedScoreSpectrumShape(example EmbeddingScoreSpectrumExample) 
 		}
 	}
 	if err := validateScoreSpectrumRecoveryLossWeight(example.RecoveryLossWeight); err != nil {
+		return err
+	}
+	if err := validateScoreSpectrumBaseLossWeight(example.BaseLossWeight, example.RowID, example.Source); err != nil {
+		return err
+	}
+	if err := validateScoreSpectrumTurboQuantTopKLossWeight(example.TurboQuantTopKLossWeight); err != nil {
+		return err
+	}
+	if err := validateScoreSpectrumTurboQuantTopKRecallLossWeight(example.TurboQuantTopKRecallLossWeight); err != nil {
+		return err
+	}
+	if err := validateScoreSpectrumRowHasActiveObjective(example.BaseLossWeight, example.TurboQuantTopKLossWeight, example.TurboQuantTopKRecallLossWeight, example.RowID, example.Source); err != nil {
 		return err
 	}
 	positiveIndexes, err := canonicalizeScoreSpectrumPositiveIndexes(len(example.CandidateTokens), example.PositiveIndexes, example.SelectedPositiveIndex)
@@ -7933,6 +8524,7 @@ func accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates []*embe
 	seed := effectiveTurboQuantPrefixSeed(cfg.TurboQuantPrefixSeed)
 	scoreMode, _ := normalizeTurboQuantPrefixScoreMode(cfg.TurboQuantPrefixScoreMode)
 	margin := effectiveTurboQuantRankMargin(cfg.TurboQuantRankMargin)
+	lossMode, reduction, tau, _ := normalizeTurboQuantRankMarginShape(cfg.TurboQuantRankMarginLoss, cfg.TurboQuantRankMarginReduction, cfg.TurboQuantRankMarginTau, cfg.Temperature, true)
 	totalLoss := float32(0)
 	totalScore := float32(0)
 	pairCount := 0
@@ -7945,9 +8537,9 @@ func accumulateTurboQuantRankMarginHardNegativeGrads(queries, candidates []*embe
 		var loss, score float32
 		var pairs int
 		if scoreMode == TurboQuantPrefixScoreModePreparedIP {
-			loss, score, pairs = accumulateTurboQuantPreparedIPRankMarginHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, objective.Dim, objective.BitWidth, seed, margin, dimQueryGrads, dimCandidateGrads)
+			loss, score, pairs = accumulateTurboQuantPreparedIPRankMarginHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, objective.Dim, objective.BitWidth, seed, margin, lossMode, reduction, tau, dimQueryGrads, dimCandidateGrads)
 		} else {
-			loss, score, pairs = accumulateTurboQuantRankMarginReconstructCosineHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, objective.Dim, objective.BitWidth, seed, margin, dimQueryGrads, dimCandidateGrads)
+			loss, score, pairs = accumulateTurboQuantRankMarginReconstructCosineHardNegativeGrads(queries, candidates, candidateSpans, teacherScores, objective.Dim, objective.BitWidth, seed, margin, lossMode, reduction, tau, dimQueryGrads, dimCandidateGrads)
 		}
 		addScaledEmbeddingGradBuffers(queryGrads, dimQueryGrads, objective.Weight)
 		addScaledEmbeddingGradBuffers(candidateGrads, dimCandidateGrads, objective.Weight)
@@ -8058,7 +8650,7 @@ func accumulateTurboQuantPreparedIPCompactHardNegativeGrads(queries, candidates 
 	return totalLoss, totalScore, pairCount
 }
 
-func accumulateTurboQuantRankMarginReconstructCosineHardNegativeGrads(queries, candidates []*embeddingEncodedSequence, candidateSpans []embeddingCandidateSpan, teacherScores [][]float32, dim, bitWidth int, seed int64, margin float32, queryGrads, candidateGrads [][]float32) (float32, float32, int) {
+func accumulateTurboQuantRankMarginReconstructCosineHardNegativeGrads(queries, candidates []*embeddingEncodedSequence, candidateSpans []embeddingCandidateSpan, teacherScores [][]float32, dim, bitWidth int, seed int64, margin float32, lossMode, reduction string, tau float32, queryGrads, candidateGrads [][]float32) (float32, float32, int) {
 	totalLoss := float32(0)
 	totalScore := float32(0)
 	pairCount := 0
@@ -8079,36 +8671,50 @@ func accumulateTurboQuantRankMarginReconstructCosineHardNegativeGrads(queries, c
 		queryNorm := queryMatrix.norms[i]
 		posIndex := span.Start
 		posScore := cosineScoreWithNorms(query, candidateMatrix.row(posIndex), queryNorm, candidateMatrix.norms[posIndex])
-		bestIndex := -1
-		bestScore := float32(0)
-		for j := span.Start + 1; j < span.End; j++ {
-			if !turboQuantRankMarginTeacherEligible(teacherScores, i, j-span.Start) {
+		eligibleIndexes := turboQuantRankMarginEligibleIndexes(teacherScores, i, span)
+		if len(eligibleIndexes) == 0 {
+			continue
+		}
+		if reduction == TurboQuantRankMarginReductionHardest {
+			bestIndex := eligibleIndexes[0]
+			bestScore := cosineScoreWithNorms(query, candidateMatrix.row(bestIndex), queryNorm, candidateMatrix.norms[bestIndex])
+			for _, j := range eligibleIndexes[1:] {
+				score := cosineScoreWithNorms(query, candidateMatrix.row(j), queryNorm, candidateMatrix.norms[j])
+				if score > bestScore {
+					bestIndex = j
+					bestScore = score
+				}
+			}
+			loss, score, scale := turboQuantRankMarginLossScoreScale(posScore, bestScore, margin, lossMode, tau)
+			totalLoss += loss
+			totalScore += score
+			pairCount++
+			if scale == 0 {
 				continue
 			}
-			score := cosineScoreWithNorms(query, candidateMatrix.row(j), queryNorm, candidateMatrix.norms[j])
-			if bestIndex < 0 || score > bestScore {
-				bestIndex = j
-				bestScore = score
+			accumulateCosineGradFromScore(query, candidateMatrix.row(posIndex), queryNorm, candidateMatrix.norms[posIndex], posScore, -scale, queryGrads[i], candidateGrads[posIndex])
+			accumulateCosineGradFromScore(query, candidateMatrix.row(bestIndex), queryNorm, candidateMatrix.norms[bestIndex], bestScore, scale, queryGrads[i], candidateGrads[bestIndex])
+			continue
+		}
+		rowScale := float32(1) / float32(len(eligibleIndexes))
+		for _, j := range eligibleIndexes {
+			negScore := cosineScoreWithNorms(query, candidateMatrix.row(j), queryNorm, candidateMatrix.norms[j])
+			loss, score, scale := turboQuantRankMarginLossScoreScale(posScore, negScore, margin, lossMode, tau)
+			totalLoss += loss * rowScale
+			totalScore += score
+			pairCount++
+			scale *= rowScale
+			if scale == 0 {
+				continue
 			}
+			accumulateCosineGradFromScore(query, candidateMatrix.row(posIndex), queryNorm, candidateMatrix.norms[posIndex], posScore, -scale, queryGrads[i], candidateGrads[posIndex])
+			accumulateCosineGradFromScore(query, candidateMatrix.row(j), queryNorm, candidateMatrix.norms[j], negScore, scale, queryGrads[i], candidateGrads[j])
 		}
-		if bestIndex < 0 {
-			continue
-		}
-		qMargin := posScore - bestScore
-		totalScore += qMargin
-		pairCount++
-		violation := margin - qMargin
-		if violation <= 0 {
-			continue
-		}
-		totalLoss += 0.5 * violation * violation
-		accumulateCosineGradFromScore(query, candidateMatrix.row(posIndex), queryNorm, candidateMatrix.norms[posIndex], posScore, -violation, queryGrads[i], candidateGrads[posIndex])
-		accumulateCosineGradFromScore(query, candidateMatrix.row(bestIndex), queryNorm, candidateMatrix.norms[bestIndex], bestScore, violation, queryGrads[i], candidateGrads[bestIndex])
 	}
 	return totalLoss, totalScore, pairCount
 }
 
-func accumulateTurboQuantPreparedIPRankMarginHardNegativeGrads(queries, candidates []*embeddingEncodedSequence, candidateSpans []embeddingCandidateSpan, teacherScores [][]float32, dim, bitWidth int, seed int64, margin float32, queryGrads, candidateGrads [][]float32) (float32, float32, int) {
+func accumulateTurboQuantPreparedIPRankMarginHardNegativeGrads(queries, candidates []*embeddingEncodedSequence, candidateSpans []embeddingCandidateSpan, teacherScores [][]float32, dim, bitWidth int, seed int64, margin float32, lossMode, reduction string, tau float32, queryGrads, candidateGrads [][]float32) (float32, float32, int) {
 	totalLoss := float32(0)
 	totalScore := float32(0)
 	pairCount := 0
@@ -8128,37 +8734,79 @@ func accumulateTurboQuantPreparedIPRankMarginHardNegativeGrads(queries, candidat
 		}
 		posIndex := span.Start
 		posScore := q.InnerProductPrepared(candidateMatrix.quantized[posIndex], queryMatrix.prepared[i])
-		bestIndex := -1
-		bestScore := float32(0)
-		for j := span.Start + 1; j < span.End; j++ {
-			if !turboQuantRankMarginTeacherEligible(teacherScores, i, j-span.Start) {
-				continue
-			}
-			score := q.InnerProductPrepared(candidateMatrix.quantized[j], queryMatrix.prepared[i])
-			if bestIndex < 0 || score > bestScore {
-				bestIndex = j
-				bestScore = score
-			}
-		}
-		if bestIndex < 0 {
+		eligibleIndexes := turboQuantRankMarginEligibleIndexes(teacherScores, i, span)
+		if len(eligibleIndexes) == 0 {
 			continue
 		}
-		qMargin := posScore - bestScore
-		totalScore += qMargin
-		pairCount++
-		violation := margin - qMargin
-		if violation <= 0 {
-			continue
-		}
-		totalLoss += 0.5 * violation * violation
 		queryRaw := queryMatrix.rawRow(i)
 		queryNormalized := queryMatrix.normalizedRow(i)
-		accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[i], candidateMatrix.dequantizedRow(posIndex), -violation, queryGrads[i])
-		accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(posIndex), candidateMatrix.normalizedRow(posIndex), candidateMatrix.rawNorms[posIndex], queryNormalized, -violation, candidateGrads[posIndex])
-		accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[i], candidateMatrix.dequantizedRow(bestIndex), violation, queryGrads[i])
-		accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(bestIndex), candidateMatrix.normalizedRow(bestIndex), candidateMatrix.rawNorms[bestIndex], queryNormalized, violation, candidateGrads[bestIndex])
+		if reduction == TurboQuantRankMarginReductionHardest {
+			bestIndex := eligibleIndexes[0]
+			bestScore := q.InnerProductPrepared(candidateMatrix.quantized[bestIndex], queryMatrix.prepared[i])
+			for _, j := range eligibleIndexes[1:] {
+				score := q.InnerProductPrepared(candidateMatrix.quantized[j], queryMatrix.prepared[i])
+				if score > bestScore {
+					bestIndex = j
+					bestScore = score
+				}
+			}
+			loss, score, scale := turboQuantRankMarginLossScoreScale(posScore, bestScore, margin, lossMode, tau)
+			totalLoss += loss
+			totalScore += score
+			pairCount++
+			if scale == 0 {
+				continue
+			}
+			accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[i], candidateMatrix.dequantizedRow(posIndex), -scale, queryGrads[i])
+			accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(posIndex), candidateMatrix.normalizedRow(posIndex), candidateMatrix.rawNorms[posIndex], queryNormalized, -scale, candidateGrads[posIndex])
+			accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[i], candidateMatrix.dequantizedRow(bestIndex), scale, queryGrads[i])
+			accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(bestIndex), candidateMatrix.normalizedRow(bestIndex), candidateMatrix.rawNorms[bestIndex], queryNormalized, scale, candidateGrads[bestIndex])
+			continue
+		}
+		rowScale := float32(1) / float32(len(eligibleIndexes))
+		for _, j := range eligibleIndexes {
+			negScore := q.InnerProductPrepared(candidateMatrix.quantized[j], queryMatrix.prepared[i])
+			loss, score, scale := turboQuantRankMarginLossScoreScale(posScore, negScore, margin, lossMode, tau)
+			totalLoss += loss * rowScale
+			totalScore += score
+			pairCount++
+			scale *= rowScale
+			if scale == 0 {
+				continue
+			}
+			accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[i], candidateMatrix.dequantizedRow(posIndex), -scale, queryGrads[i])
+			accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(posIndex), candidateMatrix.normalizedRow(posIndex), candidateMatrix.rawNorms[posIndex], queryNormalized, -scale, candidateGrads[posIndex])
+			accumulateNormalizedPrefixSTEGrad(queryRaw, queryNormalized, queryMatrix.rawNorms[i], candidateMatrix.dequantizedRow(j), scale, queryGrads[i])
+			accumulateNormalizedPrefixSTEGrad(candidateMatrix.rawRow(j), candidateMatrix.normalizedRow(j), candidateMatrix.rawNorms[j], queryNormalized, scale, candidateGrads[j])
+		}
 	}
 	return totalLoss, totalScore, pairCount
+}
+
+func turboQuantRankMarginEligibleIndexes(teacherScores [][]float32, row int, span embeddingCandidateSpan) []int {
+	indexes := make([]int, 0, span.End-span.Start-1)
+	for j := span.Start + 1; j < span.End; j++ {
+		if turboQuantRankMarginTeacherEligible(teacherScores, row, j-span.Start) {
+			indexes = append(indexes, j)
+		}
+	}
+	return indexes
+}
+
+func turboQuantRankMarginLossScoreScale(posScore, negScore, margin float32, lossMode string, tau float32) (float32, float32, float32) {
+	qMargin := posScore - negScore
+	violation := margin - qMargin
+	if lossMode == TurboQuantRankMarginLossSoftplus {
+		if tau <= 0 {
+			tau = 0.05
+		}
+		scaled := violation / tau
+		return softplus32(scaled), qMargin, sigmoid32(scaled) / tau
+	}
+	if violation <= 0 {
+		return 0, qMargin, 0
+	}
+	return 0.5 * violation * violation, qMargin, violation
 }
 
 func turboQuantRankMarginTeacherEligible(teacherScores [][]float32, row, localCandidate int) bool {
@@ -9591,6 +10239,19 @@ func addFloat32Slice(dst, src []float32) {
 	}
 }
 
+func addScaledFloat32Slice(dst, src []float32, scale float32) {
+	if scale == 0 {
+		return
+	}
+	limit := len(dst)
+	if len(src) < limit {
+		limit = len(src)
+	}
+	for i := 0; i < limit; i++ {
+		dst[i] += src[i] * scale
+	}
+}
+
 func trainerMatMulShape(lhsRows, lhsCols, rhsRows, rhsCols int, transposeLeft, transposeRight bool) (rows, cols int, ok bool) {
 	rows, _, cols, ok = trainerMatMulDims(lhsRows, lhsCols, rhsRows, rhsCols, transposeLeft, transposeRight)
 	return rows, cols, ok
@@ -9700,10 +10361,35 @@ func normalizedTrainConfig(cfg EmbeddingTrainConfig, params ...eosartifact.Param
 	if objectives, err := normalizeTurboQuantPrefixObjectives(cfg.TurboQuantCompactObjectives, cfg.MatryoshkaDims, 0); err == nil {
 		cfg.TurboQuantCompactObjectives = objectives
 	}
+	if objectives, err := normalizeTurboQuantPrefixObjectives(cfg.TurboQuantTopKObjectives, nil, 0); err == nil {
+		cfg.TurboQuantTopKObjectives = objectives
+	}
 	if len(cfg.TurboQuantRankMarginObjectives) > 0 && cfg.TurboQuantRankMargin == 0 {
 		cfg.TurboQuantRankMargin = effectiveTurboQuantRankMargin(cfg.TurboQuantRankMargin)
 	}
-	if len(cfg.TurboQuantPrefixBits) > 0 || len(cfg.TurboQuantPrefixObjectives) > 0 || len(cfg.TurboQuantCompactObjectives) > 0 || len(cfg.TurboQuantRankMarginObjectives) > 0 {
+	if loss, reduction, tau, err := normalizeTurboQuantRankMarginShape(cfg.TurboQuantRankMarginLoss, cfg.TurboQuantRankMarginReduction, cfg.TurboQuantRankMarginTau, cfg.Temperature, len(cfg.TurboQuantRankMarginObjectives) > 0); err == nil {
+		cfg.TurboQuantRankMarginLoss = loss
+		cfg.TurboQuantRankMarginReduction = reduction
+		cfg.TurboQuantRankMarginTau = tau
+	}
+	if len(cfg.TurboQuantTopKObjectives) > 0 {
+		if loss, err := normalizeTurboQuantTopKLoss(cfg.TurboQuantTopKLoss); err == nil {
+			cfg.TurboQuantTopKLoss = loss
+		}
+		if mask, err := normalizeTurboQuantTopKNegativeMask(cfg.TurboQuantTopKNegativeMask); err == nil {
+			cfg.TurboQuantTopKNegativeMask = mask
+		}
+		cfg.TurboQuantTopKCutoff = effectiveTurboQuantTopKCutoff(cfg.TurboQuantTopKCutoff)
+		cfg.TurboQuantTopKTau = effectiveTurboQuantTopKTau(cfg.TurboQuantTopKTau)
+		if cfg.TurboQuantTopKRecallWeight > 0 {
+			if mask, err := normalizeTurboQuantTopKNegativeMask(cfg.TurboQuantTopKRecallNegativeMask); err == nil {
+				cfg.TurboQuantTopKRecallNegativeMask = mask
+			}
+			cfg.TurboQuantTopKRecallCutoff = effectiveTurboQuantTopKRecallCutoff(cfg.TurboQuantTopKRecallCutoff)
+			cfg.TurboQuantTopKRecallTau = effectiveTurboQuantTopKRecallTau(cfg.TurboQuantTopKRecallTau)
+		}
+	}
+	if len(cfg.TurboQuantPrefixBits) > 0 || len(cfg.TurboQuantPrefixObjectives) > 0 || len(cfg.TurboQuantCompactObjectives) > 0 || len(cfg.TurboQuantRankMarginObjectives) > 0 || len(cfg.TurboQuantTopKObjectives) > 0 {
 		if cfg.TurboQuantPrefixWeight == 0 {
 			if len(cfg.TurboQuantPrefixBits) > 0 {
 				cfg.TurboQuantPrefixWeight = 1
@@ -9800,6 +10486,11 @@ func normalizeMatryoshkaTrainConfig(cfg EmbeddingTrainConfig, embeddingDim int) 
 		return cfg, err
 	}
 	cfg.TurboQuantCompactObjectives = compactObjectives
+	topKObjectives, err := normalizeTurboQuantPrefixObjectives(cfg.TurboQuantTopKObjectives, nil, embeddingDim)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.TurboQuantTopKObjectives = topKObjectives
 	if len(cfg.TurboQuantPrefixBits) > 0 && len(cfg.TurboQuantPrefixObjectives) > 0 {
 		return cfg, fmt.Errorf("turboquant_prefix_objectives is mutually exclusive with turboquant_prefix_bits")
 	}
@@ -9809,7 +10500,31 @@ func normalizeMatryoshkaTrainConfig(cfg EmbeddingTrainConfig, embeddingDim int) 
 	if len(cfg.TurboQuantRankMarginObjectives) > 0 && cfg.TurboQuantRankMargin == 0 {
 		cfg.TurboQuantRankMargin = effectiveTurboQuantRankMargin(cfg.TurboQuantRankMargin)
 	}
-	if len(cfg.TurboQuantPrefixBits) > 0 || len(cfg.TurboQuantPrefixObjectives) > 0 || len(cfg.TurboQuantCompactObjectives) > 0 || len(cfg.TurboQuantRankMarginObjectives) > 0 {
+	cfg.TurboQuantRankMarginLoss, cfg.TurboQuantRankMarginReduction, cfg.TurboQuantRankMarginTau, err = normalizeTurboQuantRankMarginShape(cfg.TurboQuantRankMarginLoss, cfg.TurboQuantRankMarginReduction, cfg.TurboQuantRankMarginTau, cfg.Temperature, len(cfg.TurboQuantRankMarginObjectives) > 0)
+	if err != nil {
+		return cfg, err
+	}
+	if len(cfg.TurboQuantTopKObjectives) > 0 {
+		cfg.TurboQuantTopKLoss, err = normalizeTurboQuantTopKLoss(cfg.TurboQuantTopKLoss)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.TurboQuantTopKNegativeMask, err = normalizeTurboQuantTopKNegativeMask(cfg.TurboQuantTopKNegativeMask)
+		if err != nil {
+			return cfg, err
+		}
+		cfg.TurboQuantTopKCutoff = effectiveTurboQuantTopKCutoff(cfg.TurboQuantTopKCutoff)
+		cfg.TurboQuantTopKTau = effectiveTurboQuantTopKTau(cfg.TurboQuantTopKTau)
+		if cfg.TurboQuantTopKRecallWeight > 0 {
+			cfg.TurboQuantTopKRecallNegativeMask, err = normalizeTurboQuantTopKNegativeMask(cfg.TurboQuantTopKRecallNegativeMask)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.TurboQuantTopKRecallCutoff = effectiveTurboQuantTopKRecallCutoff(cfg.TurboQuantTopKRecallCutoff)
+			cfg.TurboQuantTopKRecallTau = effectiveTurboQuantTopKRecallTau(cfg.TurboQuantTopKRecallTau)
+		}
+	}
+	if len(cfg.TurboQuantPrefixBits) > 0 || len(cfg.TurboQuantPrefixObjectives) > 0 || len(cfg.TurboQuantCompactObjectives) > 0 || len(cfg.TurboQuantRankMarginObjectives) > 0 || len(cfg.TurboQuantTopKObjectives) > 0 {
 		if cfg.TurboQuantPrefixWeight == 0 {
 			if len(cfg.TurboQuantPrefixBits) > 0 {
 				cfg.TurboQuantPrefixWeight = 1
@@ -10096,11 +10811,79 @@ func turboQuantCompactObjectivesForConfig(cfg EmbeddingTrainConfig) []TurboQuant
 	return append([]TurboQuantPrefixObjective(nil), cfg.TurboQuantCompactObjectives...)
 }
 
+func turboQuantTopKObjectivesForConfig(cfg EmbeddingTrainConfig) []TurboQuantPrefixObjective {
+	if len(cfg.TurboQuantTopKObjectives) == 0 {
+		return nil
+	}
+	return append([]TurboQuantPrefixObjective(nil), cfg.TurboQuantTopKObjectives...)
+}
+
 func effectiveTurboQuantRankMargin(margin float32) float32 {
 	if margin == 0 {
 		return 0.02
 	}
 	return margin
+}
+
+func normalizeTurboQuantRankMarginLoss(loss string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(strings.ReplaceAll(loss, "-", "_"))) {
+	case "", TurboQuantRankMarginLossSquaredHinge:
+		return TurboQuantRankMarginLossSquaredHinge, nil
+	case TurboQuantRankMarginLossSoftplus:
+		return TurboQuantRankMarginLossSoftplus, nil
+	default:
+		return "", fmt.Errorf("unsupported turboquant_rank_margin_loss %q (supported: %s, %s)", loss, TurboQuantRankMarginLossSquaredHinge, TurboQuantRankMarginLossSoftplus)
+	}
+}
+
+func NormalizeTurboQuantRankMarginLossForCLI(loss string) (string, error) {
+	return normalizeTurboQuantRankMarginLoss(loss)
+}
+
+func normalizeTurboQuantRankMarginReduction(reduction string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(strings.ReplaceAll(reduction, "-", "_"))) {
+	case "", TurboQuantRankMarginReductionHardest:
+		return TurboQuantRankMarginReductionHardest, nil
+	case TurboQuantRankMarginReductionMeanEligible:
+		return TurboQuantRankMarginReductionMeanEligible, nil
+	default:
+		return "", fmt.Errorf("unsupported turboquant_rank_margin_reduction %q (supported: %s, %s)", reduction, TurboQuantRankMarginReductionHardest, TurboQuantRankMarginReductionMeanEligible)
+	}
+}
+
+func NormalizeTurboQuantRankMarginReductionForCLI(reduction string) (string, error) {
+	return normalizeTurboQuantRankMarginReduction(reduction)
+}
+
+func normalizeTurboQuantRankMarginShape(loss, reduction string, tau, fallbackTau float32, active bool) (string, string, float32, error) {
+	normalizedLoss, err := normalizeTurboQuantRankMarginLoss(loss)
+	if err != nil {
+		return "", "", 0, err
+	}
+	normalizedReduction, err := normalizeTurboQuantRankMarginReduction(reduction)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if !active && strings.TrimSpace(loss) == "" && strings.TrimSpace(reduction) == "" && tau == 0 {
+		return "", "", 0, nil
+	}
+	if normalizedLoss == TurboQuantRankMarginLossSoftplus {
+		if tau == 0 {
+			if fallbackTau > 0 {
+				tau = fallbackTau
+			} else {
+				tau = 0.05
+			}
+		}
+		if tau <= 0 || math.IsNaN(float64(tau)) || math.IsInf(float64(tau), 0) {
+			return "", "", 0, fmt.Errorf("turboquant_rank_margin_tau must be finite and positive when turboquant_rank_margin_loss=%s", TurboQuantRankMarginLossSoftplus)
+		}
+	} else {
+		if tau < 0 || math.IsNaN(float64(tau)) || math.IsInf(float64(tau), 0) {
+			return "", "", 0, fmt.Errorf("turboquant_rank_margin_tau must be finite and non-negative")
+		}
+	}
+	return normalizedLoss, normalizedReduction, tau, nil
 }
 
 func effectiveTurboQuantPrefixWeight(cfg EmbeddingTrainConfig) float32 {
@@ -10172,6 +10955,80 @@ func turboQuantCompactWeightSum(cfg EmbeddingTrainConfig) float32 {
 		}
 	}
 	return sum
+}
+
+func turboQuantTopKWeightSum(cfg EmbeddingTrainConfig) float32 {
+	sum := float32(0)
+	for _, objective := range turboQuantTopKObjectivesForConfig(cfg) {
+		if objective.Weight > 0 {
+			sum += objective.Weight
+		}
+	}
+	return sum
+}
+
+func effectiveTurboQuantTopKCutoff(cutoff int) int {
+	if cutoff == 0 {
+		return 10
+	}
+	return cutoff
+}
+
+func effectiveTurboQuantTopKTau(tau float32) float32 {
+	if tau == 0 {
+		return 0.05
+	}
+	return tau
+}
+
+func turboQuantTopKRecallActive(cfg EmbeddingTrainConfig) bool {
+	return len(cfg.TurboQuantTopKObjectives) > 0 && cfg.TurboQuantTopKRecallWeight > 0
+}
+
+func effectiveTurboQuantTopKRecallCutoff(cutoff int) int {
+	if cutoff == 0 {
+		return 100
+	}
+	return cutoff
+}
+
+func effectiveTurboQuantTopKRecallTau(tau float32) float32 {
+	if tau == 0 {
+		return 0.05
+	}
+	return tau
+}
+
+func normalizeTurboQuantTopKLoss(loss string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(strings.ReplaceAll(loss, "-", "_"))) {
+	case "", TurboQuantTopKLossLambdaNDCG:
+		return TurboQuantTopKLossLambdaNDCG, nil
+	default:
+		return "", fmt.Errorf("unsupported turboquant_topk_loss %q (supported: %s)", loss, TurboQuantTopKLossLambdaNDCG)
+	}
+}
+
+func NormalizeTurboQuantTopKLossForCLI(loss string) (string, error) {
+	return normalizeTurboQuantTopKLoss(loss)
+}
+
+func normalizeTurboQuantTopKNegativeMask(mask string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(strings.ReplaceAll(mask, "-", "_"))) {
+	case "", TurboQuantTopKNegativeMaskHard:
+		return TurboQuantTopKNegativeMaskHard, nil
+	case TurboQuantTopKNegativeMaskAll:
+		return TurboQuantTopKNegativeMaskAll, nil
+	case TurboQuantTopKNegativeMaskQ3:
+		return TurboQuantTopKNegativeMaskQ3, nil
+	case TurboQuantTopKNegativeMaskBM25:
+		return TurboQuantTopKNegativeMaskBM25, nil
+	default:
+		return "", fmt.Errorf("unsupported turboquant_topk_negative_mask %q (supported: %s, %s, %s, %s)", mask, TurboQuantTopKNegativeMaskHard, TurboQuantTopKNegativeMaskAll, TurboQuantTopKNegativeMaskQ3, TurboQuantTopKNegativeMaskBM25)
+	}
+}
+
+func NormalizeTurboQuantTopKNegativeMaskForCLI(mask string) (string, error) {
+	return normalizeTurboQuantTopKNegativeMask(mask)
 }
 
 // embedHostMatryoshkaLossEnv is the S2 rollback flag. The accelerated
@@ -10273,6 +11130,9 @@ func validateTrainConfig(cfg EmbeddingTrainConfig) error {
 	if cfg.TeacherTemperature <= 0 {
 		return fmt.Errorf("teacher_temperature must be positive")
 	}
+	if cfg.ScoreSpectrumActivationMicrobatchSize < 0 {
+		return fmt.Errorf("score_spectrum_activation_microbatch_size must be non-negative")
+	}
 	for source, temp := range cfg.TeacherSourceTemperatures {
 		if strings.TrimSpace(source) == "" {
 			return fmt.Errorf("teacher_source_temperatures has an empty source")
@@ -10349,9 +11209,14 @@ func validateTrainConfig(cfg EmbeddingTrainConfig) error {
 		if cfg.TurboQuantRankMargin < 0 || math.IsNaN(float64(cfg.TurboQuantRankMargin)) || math.IsInf(float64(cfg.TurboQuantRankMargin), 0) {
 			return fmt.Errorf("turboquant_rank_margin must be finite and non-negative")
 		}
+		if _, _, _, err := normalizeTurboQuantRankMarginShape(cfg.TurboQuantRankMarginLoss, cfg.TurboQuantRankMarginReduction, cfg.TurboQuantRankMarginTau, cfg.Temperature, true); err != nil {
+			return err
+		}
 		if _, err := normalizeTurboQuantPrefixScoreMode(cfg.TurboQuantPrefixScoreMode); err != nil {
 			return err
 		}
+	} else if strings.TrimSpace(cfg.TurboQuantRankMarginLoss) != "" || strings.TrimSpace(cfg.TurboQuantRankMarginReduction) != "" || cfg.TurboQuantRankMarginTau != 0 {
+		return fmt.Errorf("turboquant rank-margin loss/reduction/tau require turboquant_rank_margin_objectives")
 	}
 	if len(cfg.TurboQuantCompactObjectives) > 0 {
 		if _, err := normalizeTurboQuantPrefixObjectives(cfg.TurboQuantCompactObjectives, cfg.MatryoshkaDims, 0); err != nil {
@@ -10360,6 +11225,9 @@ func validateTrainConfig(cfg EmbeddingTrainConfig) error {
 		if _, err := normalizeTurboQuantPrefixScoreMode(TurboQuantPrefixScoreModePreparedIP); err != nil {
 			return err
 		}
+	}
+	if err := validateScoreSpectrumTopKConfig(cfg.TurboQuantTopKObjectives, cfg.TurboQuantTopKLoss, cfg.TurboQuantTopKCutoff, cfg.TurboQuantTopKTau, cfg.TurboQuantTopKMargin, cfg.TurboQuantTopKNegativeMask, cfg.TurboQuantTopKRecallWeight, cfg.TurboQuantTopKRecallCutoff, cfg.TurboQuantTopKRecallTau, cfg.TurboQuantTopKRecallMargin, cfg.TurboQuantTopKRecallNegativeMask, 0); err != nil {
+		return err
 	}
 	if err := validateScoreSpectrumRecoveryConfig(cfg.ScoreSpectrumLossMode, cfg.ScoreSpectrumRecoveryWeight, cfg.ScoreSpectrumRecoveryMargin, cfg.ScoreSpectrumRecoveryTopK, cfg.ScoreSpectrumRecoveryTau); err != nil {
 		return err

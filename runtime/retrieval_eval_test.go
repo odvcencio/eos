@@ -884,6 +884,56 @@ func TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankCorrectsSameBitsMisord
 	}
 }
 
+func TestEvaluateTurboQuantVectorRetrievalPerQueryUsesMixedWidthRerankSidecar(t *testing.T) {
+	docs := mixedWidthRerankCorpus(250)
+	queries := []retrievalVectorRecord{{ID: "q1", Vector: mixedWidthRerankQuery}}
+	qrels := retrievalQrels{"q1": {"doc_a": 1}}
+	dir := t.TempDir()
+
+	sameBitsPath := filepath.Join(dir, "same-bits.per-query.jsonl")
+	_, err := evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName:       "mixed-width-per-query",
+		TopK:              100,
+		PerQueryTopK:      2,
+		PerQueryJSONLPath: sameBitsPath,
+	}, []int{4}, []int{200}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err != nil {
+		t.Fatalf("same-bits evaluate: %v", err)
+	}
+	sameBitsRows := readTurboQuantPerQueryRowsByMethod(t, sameBitsPath, "turboquant_ip_b4_overfetch200_reconstruct_rerank")
+	if len(sameBitsRows) != 1 {
+		t.Fatalf("same-bits per-query rows = %d, want 1", len(sameBitsRows))
+	}
+	if sameBitsRows[0].TopK[0].DocID != "doc_b" {
+		t.Fatalf("same-bits per-query top doc = %+v, want doc_b from primary-code reconstruct rerank", sameBitsRows[0].TopK)
+	}
+
+	mixedWidthPath := filepath.Join(dir, "mixed-width.per-query.jsonl")
+	_, err = evaluateTurboQuantVectorRetrievalWithRerankStorage(context.Background(), RetrievalEvalConfig{
+		DatasetName:       "mixed-width-per-query",
+		TopK:              100,
+		PerQueryTopK:      2,
+		PerQueryJSONLPath: mixedWidthPath,
+		RerankBits:        8,
+	}, []int{4}, []int{200}, TurboQuantRerankStorageCompactReconstruct, docs, queries, qrels)
+	if err != nil {
+		t.Fatalf("mixed-width evaluate: %v", err)
+	}
+	if stale := readTurboQuantPerQueryRowsByMethod(t, mixedWidthPath, "turboquant_ip_b4_overfetch200_reconstruct_rerank"); len(stale) != 0 {
+		t.Fatalf("mixed-width per-query emitted stale unsuffixed method rows: %+v", stale)
+	}
+	mixedRows := readTurboQuantPerQueryRowsByMethod(t, mixedWidthPath, "turboquant_ip_b4_overfetch200_reconstruct_rerank_b8")
+	if len(mixedRows) != 1 {
+		t.Fatalf("mixed-width per-query rows = %d, want 1", len(mixedRows))
+	}
+	if mixedRows[0].TopK[0].DocID != "doc_a" {
+		t.Fatalf("mixed-width per-query top doc = %+v, want doc_a from b8 sidecar rerank", mixedRows[0].TopK)
+	}
+	if mixedRows[0].RerankBits != 8 {
+		t.Fatalf("mixed-width per-query rerank_bits = %d, want 8", mixedRows[0].RerankBits)
+	}
+}
+
 // TestEvaluateTurboQuantVectorRetrievalMixedWidthRerankAccountsSidecarBytes
 // proves requirement (b): the sidecar byte cost is the corpus size times
 // turboquantVectorBytes(dim, rerankBits) (the same helper every other
@@ -1238,12 +1288,14 @@ func assertStableTurboQuantMetricRowsEqual(t *testing.T, left, right TurboQuantR
 	left.RerankScoreSeconds = 0
 	left.ScoresPerSecond = 0
 	left.DocsPerSecond = 0
+	left.CandidateDecisionsPerSecond = 0
 	left.QueryLatency = RetrievalEvalLatencyMetrics{}
 	right.QuantizeSeconds = 0
 	right.ScoreSeconds = 0
 	right.RerankScoreSeconds = 0
 	right.ScoresPerSecond = 0
 	right.DocsPerSecond = 0
+	right.CandidateDecisionsPerSecond = 0
 	right.QueryLatency = RetrievalEvalLatencyMetrics{}
 	leftData, err := json.Marshal(left)
 	if err != nil {

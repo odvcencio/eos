@@ -1321,6 +1321,39 @@ func TestAOQTCoordinateSearchPlanKeepsLegacyProvenanceWithoutProtectedSet(t *tes
 	}
 }
 
+func TestAOQTV7DevTrustRegionPlanExploresFullProtectedSchedule(t *testing.T) {
+	q3GainGrad := []float32{3, -2, 2, -1, 1, -4, 0, 0}
+	aggregateGrad := []float32{3, -2, -8, -1, 5, -4, 0, 0}
+	protected := []aoqtProtectedAngleGradient{{Name: "q3_score_distill", Grad: []float32{-1, -1, 1, -1, 1, -1, 0, 0}}}
+
+	production, err := newAOQTCoordinateSearchPlan(q3GainGrad, aggregateGrad, 0.01, protected)
+	if err != nil {
+		t.Fatalf("production plan: %v", err)
+	}
+	dev, err := newAOQTCoordinateSearchPlanForMode(q3GainGrad, aggregateGrad, 0.01, AOQTSidecarDefaultAngleCap, AOQTSidecarOptimizerModeV7DevTrustRegion, protected)
+	if err != nil {
+		t.Fatalf("dev plan: %v", err)
+	}
+
+	if production.Strategy != aoqtCoordinateSearchStrategyProtectedConeMicroTail || len(production.Magnitudes) != aoqtTransactionalCoordinateMicroTailMagnitudeCount {
+		t.Fatalf("production protected plan changed: %+v", production)
+	}
+	if dev.Strategy != aoqtCoordinateSearchStrategyV7DevTrustRegion || !dev.DevOnly {
+		t.Fatalf("dev strategy/audit = %+v, want explicit dev trust-region mode", dev)
+	}
+	full := aoqtCoordinateSearchMagnitudes(0.01)
+	tail := aoqtCoordinateSearchMicroTail(full, aoqtTransactionalCoordinateMicroTailMagnitudeCount)
+	if !float32SlicesEqual(dev.Magnitudes, full) || !float32SlicesEqual(dev.BlockMagnitudes, full) {
+		t.Fatalf("dev magnitudes = %v/%v, want full trust-region schedule %v", dev.Magnitudes, dev.BlockMagnitudes, full)
+	}
+	if !float32SlicesEqual(dev.MicroTailMagnitudes, tail) || dev.Magnitudes[0] <= production.Magnitudes[0] {
+		t.Fatalf("dev tail/full schedule = %v/%v, want larger-than-micro-tail exploration", dev.MicroTailMagnitudes, dev.Magnitudes)
+	}
+	if dev.TrustRegionRadius != 0.01 || len(dev.ReverseMagnitudes) != 0 {
+		t.Fatalf("dev radius/reverse = %.9g/%v, want bounded q3/protected trust-region descent", dev.TrustRegionRadius, dev.ReverseMagnitudes)
+	}
+}
+
 func TestAOQTProtectedConeMicroTailRequiresThreeFiniteMagnitudes(t *testing.T) {
 	protected := []aoqtProtectedAngleGradient{{Name: "q3_score_distill", Grad: []float32{-1}}}
 	for name, learningRate := range map[string]float32{
@@ -1630,6 +1663,105 @@ func TestAOQTPreparedIPProtectedBalancedBlockCanBeAccepted(t *testing.T) {
 	}
 	if !aoqtCoordinateBlockDirectionInCone(plan.Order[:2], q3GainGrad, protected) {
 		t.Fatalf("balanced block plan was not in protected cone")
+	}
+}
+
+func TestAOQTV7DevTrustRegionAcceptsProtectedBlockAndRecordsMovement(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 104)
+	trainer := newTinyAOQTV7DevTrustRegionTrainer(t, false, 104)
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = 1
+	q3GainGrad[1] = -1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)))
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		gradient := make([]float32, AOQTSidecarAngleCount)
+		gradient[0] = -1
+		gradient[1] = -1
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: gradient})
+	}
+	receipts := make(AOQTSidecarOptimizerProposalReceipts, 0)
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		OptimizerMode:      AOQTSidecarOptimizerModeV7DevTrustRegion,
+		DevOnly:            true,
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+		ProposalReceipts:   &receipts,
+	}
+	callbackCalls := 0
+
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		callbackCalls++
+		if callbackCalls > aoqtTransactionalAdamMaxAttemptsPerStep && trainer.angles[0] < 0 && trainer.angles[1] > 0 {
+			return aoqtSafeStepEvaluation(0.5, set.Manifest.ObjectiveContract.WeightSums), nil
+		}
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+	if err != nil {
+		t.Fatalf("dev trust-region step: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("dev trust-region block was not accepted")
+	}
+	if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyV7DevTrustRegion || !diagnostics.DevOnly {
+		t.Fatalf("dev diagnostics strategy = %+v, want explicit dev trust-region", diagnostics)
+	}
+	if diagnostics.CoordinateProposalAttempts != 1 || diagnostics.TrustRegionProposalAttempts != 1 || diagnostics.TrustRegionAcceptedBlocks != 1 || diagnostics.TrustRegionAcceptedSingles != 0 {
+		t.Fatalf("dev trust-region accounting = %+v, want one accepted block proposal", diagnostics)
+	}
+	if diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMagnitudeCount || diagnostics.TrustRegionMaxMagnitude != 0.01 || diagnostics.TrustRegionAcceptedMagnitude != 0.01 {
+		t.Fatalf("dev trust-region magnitude evidence = %+v, want first full-schedule magnitude", diagnostics)
+	}
+	if diagnostics.TrustRegionMovedAngleIndices == nil || fmt.Sprint(*diagnostics.TrustRegionMovedAngleIndices) != fmt.Sprint([]int{0, 1}) || diagnostics.TrustRegionMaxMovedAngles < 2 {
+		t.Fatalf("dev moved angles = %v max=%d, want two-coordinate movement canary", diagnostics.TrustRegionMovedAngleIndices, diagnostics.TrustRegionMaxMovedAngles)
+	}
+	if len(*diagnostics.ProposalReceipts) != aoqtTransactionalAdamMaxAttemptsPerStep+1 {
+		t.Fatalf("proposal receipts = %d, want Adam rejects plus accepted block", len(*diagnostics.ProposalReceipts))
+	}
+	blockReceipt := (*diagnostics.ProposalReceipts)[len(*diagnostics.ProposalReceipts)-1]
+	if !blockReceipt.Accepted || blockReceipt.ProposalBlockSize != 2 || blockReceipt.ProposalMagnitude != 0.01 || fmt.Sprint(blockReceipt.MovedAngleIndices) != fmt.Sprint([]int{0, 1}) {
+		t.Fatalf("accepted block receipt = %+v, want audited two-angle trust-region proposal", blockReceipt)
+	}
+}
+
+func TestAOQTV7DevTrustRegionRejectsClippedProtectedProposalBeforeEvaluation(t *testing.T) {
+	set := tinyAOQTCalibrationSet(t, 105)
+	trainer := newTinyAOQTV7DevTrustRegionTrainer(t, false, 105)
+	angles := make([]float32, AOQTSidecarAngleCount)
+	angles[0] = AOQTSidecarDefaultAngleCap
+	if err := trainer.SetAnglesForTest(angles); err != nil {
+		t.Fatalf("set capped angle: %v", err)
+	}
+	q3GainGrad := make([]float32, AOQTSidecarAngleCount)
+	q3GainGrad[0] = -1
+	aggregateGrad := append([]float32(nil), q3GainGrad...)
+	protected := make([]aoqtProtectedAngleGradient, 0, len(aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums)))
+	for _, name := range aoqtActiveProtectedComponentNames(set.Manifest.ObjectiveContract.WeightSums) {
+		protected = append(protected, aoqtProtectedAngleGradient{Name: name, Grad: make([]float32, AOQTSidecarAngleCount)})
+	}
+	diagnostics := AOQTSidecarOptimizerDiagnostics{
+		OptimizerMode:      AOQTSidecarOptimizerModeV7DevTrustRegion,
+		DevOnly:            true,
+		PlannedSteps:       1,
+		MaxAttemptsPerStep: aoqtTransactionalMaxAttemptsPerStep,
+	}
+	evaluateCalls := 0
+
+	accepted, err := trainer.acceptTransactionalAdamStep(aggregateGrad, q3GainGrad, aoqtSafeStepEvaluation(1, set.Manifest.ObjectiveContract.WeightSums), func() (aoqtStepEvaluation, error) {
+		evaluateCalls++
+		return aoqtSafeStepEvaluation(2, set.Manifest.ObjectiveContract.WeightSums), nil
+	}, set.Manifest.ObjectiveContract.WeightSums, &diagnostics, protected)
+	if err != nil {
+		t.Fatalf("dev clipped trust-region step: %v", err)
+	}
+	if accepted {
+		t.Fatalf("clipped dev trust-region proposal unexpectedly accepted")
+	}
+	if evaluateCalls != aoqtTransactionalAdamMaxAttemptsPerStep || diagnostics.CoordinateProposalAttempts != 0 || diagnostics.TrustRegionProposalAttempts != 0 {
+		t.Fatalf("dev clipped diagnostics calls=%d %+v, want coordinate proposals rejected before evaluation", evaluateCalls, diagnostics)
+	}
+	if diagnostics.CoordinateSearchStrategy != aoqtCoordinateSearchStrategyV7DevTrustRegion || diagnostics.CoordinateMagnitudeCount != aoqtTransactionalCoordinateMagnitudeCount {
+		t.Fatalf("dev clipped audited plan = %+v, want full trust-region schedule despite safety skip", diagnostics)
 	}
 }
 
@@ -2022,6 +2154,22 @@ func newTinyAOQTTrainer(t *testing.T, planOnly bool, seed int64) *AOQTSidecarTra
 	})
 	if err != nil {
 		t.Fatalf("new trainer: %v", err)
+	}
+	return trainer
+}
+
+func newTinyAOQTV7DevTrustRegionTrainer(t *testing.T, planOnly bool, seed int64) *AOQTSidecarTrainer {
+	t.Helper()
+	trainer, err := NewAOQTSidecarTrainer(AOQTSidecarTrainConfig{
+		PairingSeed:   seed,
+		WorkplanSeed:  seed + 1000,
+		OptimizerMode: AOQTSidecarOptimizerModeV7DevTrustRegion,
+		PlanOnly:      planOnly,
+		MaxSteps:      2,
+		LearningRate:  0.01,
+	})
+	if err != nil {
+		t.Fatalf("new dev trust-region trainer: %v", err)
 	}
 	return trainer
 }
