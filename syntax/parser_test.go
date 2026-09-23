@@ -337,3 +337,95 @@ pipeline rerank_candidates_packed(query: f16[D], docs: q4[N, D], candidate_ids: 
 		t.Fatalf("pipeline result rank = %d, want 2", got)
 	}
 }
+
+func TestParseRejectsInvalidWeightEscape(t *testing.T) {
+	src := []byte("param p: f32 @weight(\"a\\qb\")\n")
+
+	file, diags := Parse("invalid_weight_escape", src)
+	requireInvalidStringDiagnostic(t, src, diags, "\"a\\qb\"")
+	if got := len(file.Decls); got != 0 {
+		t.Fatalf("declarations = %#v, want malformed param omitted", file.Decls)
+	}
+}
+
+func TestParseRejectsInvalidExpressionEscape(t *testing.T) {
+	src := []byte("pipeline invalid() -> f32 {\n" +
+		"    \"a\\q\"\n" +
+		"    return 0\n" +
+		"}\n")
+
+	file, diags := Parse("invalid_expression_escape", src)
+	requireInvalidStringDiagnostic(t, src, diags, "\"a\\q\"")
+	if got := len(file.Decls); got != 1 {
+		t.Fatalf("declarations = %#v, want one pipeline", file.Decls)
+	}
+	callable, ok := file.Decls[0].(*CallableDecl)
+	if !ok {
+		t.Fatalf("declaration = %#v, want *CallableDecl", file.Decls[0])
+	}
+	if got := len(callable.Body); got != 1 {
+		t.Fatalf("body = %#v, want only the valid return statement", callable.Body)
+	}
+	if _, ok := callable.Body[0].(*ReturnStmt); !ok {
+		t.Fatalf("body[0] = %#v, want *ReturnStmt", callable.Body[0])
+	}
+}
+
+func TestParseDecodesValidStringEscapes(t *testing.T) {
+	src := []byte("param p: f32 @weight(\"a\\\"b\\\\c\")\n" +
+		"pipeline valid() -> f32 {\n" +
+		"    \"a\\\"b\\\\c\"\n" +
+		"    return 0\n" +
+		"}\n")
+
+	file, diags := Parse("valid_string_escapes", src)
+	if len(diags) != 0 {
+		t.Fatalf("unexpected diagnostics:\n%s", DebugString(diags))
+	}
+	if got := len(file.Decls); got != 2 {
+		t.Fatalf("declarations = %#v, want param and pipeline", file.Decls)
+	}
+	param, ok := file.Decls[0].(*ParamDecl)
+	if !ok {
+		t.Fatalf("declaration[0] = %#v, want *ParamDecl", file.Decls[0])
+	}
+	if got, want := param.Binding, "a\"b\\c"; got != want {
+		t.Fatalf("binding = %q, want %q", got, want)
+	}
+	callable, ok := file.Decls[1].(*CallableDecl)
+	if !ok {
+		t.Fatalf("declaration[1] = %#v, want *CallableDecl", file.Decls[1])
+	}
+	if got := len(callable.Body); got != 2 {
+		t.Fatalf("body = %#v, want expression and return statements", callable.Body)
+	}
+	exprStmt, ok := callable.Body[0].(*ExprStmt)
+	if !ok {
+		t.Fatalf("body[0] = %#v, want *ExprStmt", callable.Body[0])
+	}
+	stringExpr, ok := exprStmt.Expr.(*StringExpr)
+	if !ok {
+		t.Fatalf("expression = %#v, want *StringExpr", exprStmt.Expr)
+	}
+	if got, want := stringExpr.Value, "a\"b\\c"; got != want {
+		t.Fatalf("string value = %q, want %q", got, want)
+	}
+}
+
+func requireInvalidStringDiagnostic(t *testing.T, src []byte, diags []Diagnostic, literal string) {
+	t.Helper()
+	start := strings.Index(string(src), literal)
+	if start < 0 {
+		t.Fatalf("literal %q not found in source", literal)
+	}
+	for _, diag := range diags {
+		if diag.Severity != SeverityError || !strings.Contains(diag.Message, "invalid Eos string literal") {
+			continue
+		}
+		if diag.Span.Start != start || diag.Span.End != start+len(literal) {
+			t.Fatalf("diagnostic span = %+v, want exact literal bytes [%d,%d)", diag.Span, start, start+len(literal))
+		}
+		return
+	}
+	t.Fatalf("missing invalid string diagnostic:\n%s", DebugString(diags))
+}

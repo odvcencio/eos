@@ -363,11 +363,20 @@ func (m *Module) Validate() error {
 		if entry.Name == "" {
 			return fmt.Errorf("entrypoint name is required")
 		}
+		if _, exists := entryByName[entry.Name]; exists {
+			return fmt.Errorf("duplicate entrypoint %q", entry.Name)
+		}
 		entryByName[entry.Name] = entry
+		entryInputNames := map[string]bool{}
+		entryOutputNames := map[string]bool{}
 		for _, input := range entry.Inputs {
 			if input.Name == "" {
 				return fmt.Errorf("entrypoint %q input name is required", entry.Name)
 			}
+			if entryInputNames[input.Name] {
+				return fmt.Errorf("duplicate entrypoint %q input value binding name %q", entry.Name, input.Name)
+			}
+			entryInputNames[input.Name] = true
 			if err := validateValueType(input.Type); err != nil {
 				return fmt.Errorf("entrypoint %q input %q: %w", entry.Name, input.Name, err)
 			}
@@ -376,6 +385,10 @@ func (m *Module) Validate() error {
 			if output.Name == "" {
 				return fmt.Errorf("entrypoint %q output name is required", entry.Name)
 			}
+			if entryOutputNames[output.Name] {
+				return fmt.Errorf("duplicate entrypoint %q output value binding name %q", entry.Name, output.Name)
+			}
+			entryOutputNames[output.Name] = true
 			if err := validateValueType(output.Type); err != nil {
 				return fmt.Errorf("entrypoint %q output %q: %w", entry.Name, output.Name, err)
 			}
@@ -389,6 +402,9 @@ func (m *Module) Validate() error {
 		if buf.DType == "" {
 			return fmt.Errorf("buffer %q dtype is required", buf.Name)
 		}
+		if _, exists := bufferByName[buf.Name]; exists {
+			return fmt.Errorf("duplicate buffer %q", buf.Name)
+		}
 		bufferByName[buf.Name] = buf
 	}
 	kernelByName := map[string]Kernel{}
@@ -396,11 +412,20 @@ func (m *Module) Validate() error {
 		if kernel.Name == "" {
 			return fmt.Errorf("kernel name is required")
 		}
+		if _, exists := kernelByName[kernel.Name]; exists {
+			return fmt.Errorf("duplicate kernel %q", kernel.Name)
+		}
 		kernelByName[kernel.Name] = kernel
+		kernelInputNames := map[string]bool{}
+		kernelOutputNames := map[string]bool{}
 		for _, input := range kernel.Inputs {
 			if input.Name == "" {
 				return fmt.Errorf("kernel %q input name is required", kernel.Name)
 			}
+			if kernelInputNames[input.Name] {
+				return fmt.Errorf("duplicate kernel %q input value binding name %q", kernel.Name, input.Name)
+			}
+			kernelInputNames[input.Name] = true
 			if err := validateValueType(input.Type); err != nil {
 				return fmt.Errorf("kernel %q input %q: %w", kernel.Name, input.Name, err)
 			}
@@ -409,6 +434,10 @@ func (m *Module) Validate() error {
 			if output.Name == "" {
 				return fmt.Errorf("kernel %q output name is required", kernel.Name)
 			}
+			if kernelOutputNames[output.Name] {
+				return fmt.Errorf("duplicate kernel %q output value binding name %q", kernel.Name, output.Name)
+			}
+			kernelOutputNames[output.Name] = true
 			if err := validateValueType(output.Type); err != nil {
 				return fmt.Errorf("kernel %q output %q: %w", kernel.Name, output.Name, err)
 			}
@@ -424,6 +453,9 @@ func (m *Module) Validate() error {
 	}
 	paramByName := map[string]Param{}
 	for _, param := range m.Params {
+		if _, exists := paramByName[param.Name]; exists {
+			return fmt.Errorf("duplicate param %q", param.Name)
+		}
 		paramByName[param.Name] = param
 	}
 	knownByEntry := map[string]map[string]bool{}
