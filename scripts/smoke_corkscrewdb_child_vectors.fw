@@ -11,7 +11,9 @@ import (
 	"time"
 )
 
-const defaultCorkScrewDBRepo = "/home/draco/work/corkscrewdb"
+// defaultCorkScrewDBRepo is the CorkScrewDB checkout, relative to the eos repository
+// root (a sibling checkout). Override it with the environment variable named in usage.
+const defaultCorkScrewDBRepo = "../corkscrewdb"
 const defaultQuantizerSeed int64 = 5581486560434873699
 const layoutSeparateChildVectors = "separate_child_vectors"
 const layoutPackedParentMultivectors = "packed_parent_multivectors"
@@ -147,7 +149,7 @@ CorkScrewDB collection with PutVector and queries it with SearchVector.
 Environment:
   EOS_CORKSCREW_SMOKE_RUN_ROOT=runs
   EOS_CORKSCREW_SMOKE_RUN_DIR=runs/eos-corkscrewdb-child-vector-smoke-<timestamp>
-  EOS_CORKSCREW_SMOKE_CORKSCREWDB_REPO=/home/draco/work/corkscrewdb
+  EOS_CORKSCREW_SMOKE_CORKSCREWDB_REPO=/path/to/corkscrewdb
   EOS_CORKSCREW_SMOKE_CHILD_VECTORS=/path/to/child-doc-vectors.jsonl
   EOS_CORKSCREW_SMOKE_QUERY_VECTORS=/path/to/query-vectors.jsonl
   EOS_CORKSCREW_SMOKE_QRELS=/path/to/qrels.tsv
@@ -502,7 +504,7 @@ func main() {
 		}
 	}
 
-	corkscrewRepo := getenv("EOS_CORKSCREW_SMOKE_CORKSCREWDB_REPO", defaultCorkScrewDBRepo)
+	corkscrewRepo := getenv("EOS_CORKSCREW_SMOKE_CORKSCREWDB_REPO", filepath.Join(root, defaultCorkScrewDBRepo))
 	corkscrewRepo, err = filepath.Abs(corkscrewRepo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

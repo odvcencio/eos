@@ -12,7 +12,9 @@ import (
 	"time"
 )
 
-const defaultCorkScrewDBRepo = "/home/draco/work/corkscrewdb"
+// defaultCorkScrewDBRepo is the CorkScrewDB checkout, relative to the eos repository
+// root (a sibling checkout). Override it with the environment variable named in usage.
+const defaultCorkScrewDBRepo = "../corkscrewdb"
 const defaultHybridArtifact = "assets/corkscrewdb-default-embedder/corkscrewdb-default-embedder.mll"
 const defaultPolicyLabel = "current-default-minmax-blend-alpha0.5-top100"
 const defaultFusionAlpha = 0.5
@@ -142,7 +144,7 @@ Environment:
   EOS_CORKSCREW_HYBRID_SMOKE_DATASET=scifact
   EOS_CORKSCREW_HYBRID_SMOKE_SPLIT=test
   EOS_CORKSCREW_HYBRID_SMOKE_RUN_DIR=runs/eos-corkscrewdb-hybrid-policy-smoke-<timestamp>
-  EOS_CORKSCREW_HYBRID_SMOKE_CORKSCREWDB_REPO=/home/draco/work/corkscrewdb
+  EOS_CORKSCREW_HYBRID_SMOKE_CORKSCREWDB_REPO=/path/to/corkscrewdb
   EOS_CORKSCREW_HYBRID_SMOKE_DOC_VECTORS=/path/to/doc-vectors.jsonl
   EOS_CORKSCREW_HYBRID_SMOKE_QUERY_VECTORS=/path/to/query-vectors.jsonl
   EOS_CORKSCREW_HYBRID_SMOKE_EXPORT_DIR=/path/to/vector-cache
@@ -381,7 +383,7 @@ func main() {
 		}
 	}
 
-	corkscrewRepo := getenv("EOS_CORKSCREW_HYBRID_SMOKE_CORKSCREWDB_REPO", defaultCorkScrewDBRepo)
+	corkscrewRepo := getenv("EOS_CORKSCREW_HYBRID_SMOKE_CORKSCREWDB_REPO", filepath.Join(root, defaultCorkScrewDBRepo))
 	corkscrewRepo, err = filepath.Abs(corkscrewRepo)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)

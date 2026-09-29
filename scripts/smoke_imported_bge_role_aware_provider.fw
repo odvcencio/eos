@@ -23,7 +23,7 @@ checks that CorkScrewDB text writes use document-role embeddings while text
 searches use query-role embeddings.
 
 Run:
-  EOS_REPO_ROOT=$PWD EOS_IMPORTED_BGE_PROVIDER_SMOKE_PACKAGE=/path/to/bge-small-en-v1.5.imported.mll EOS_IMPORTED_BGE_PROVIDER_SMOKE_CORKSCREWDB_REPO=/home/draco/work/corkscrewdb ferrous-wheel run scripts/smoke_imported_bge_role_aware_provider.fw
+  EOS_REPO_ROOT=$PWD EOS_IMPORTED_BGE_PROVIDER_SMOKE_PACKAGE=/path/to/bge-small-en-v1.5.imported.mll EOS_IMPORTED_BGE_PROVIDER_SMOKE_CORKSCREWDB_REPO=/path/to/corkscrewdb ferrous-wheel run scripts/smoke_imported_bge_role_aware_provider.fw
 
 Environment:
   EOS_IMPORTED_BGE_PROVIDER_SMOKE_PACKAGE=/path/to/bge-small-en-v1.5.imported.mll
@@ -699,7 +699,8 @@ func main() {
 	}
 	corkscrewdbRoot := rootedPath(root, os.Getenv("EOS_IMPORTED_BGE_PROVIDER_SMOKE_CORKSCREWDB_REPO"))
 	if corkscrewdbRoot == "" {
-		corkscrewdbRoot = "/home/draco/work/corkscrewdb"
+		// Default to a sibling checkout next to the eos repository.
+		corkscrewdbRoot = filepath.Join(root, "..", "corkscrewdb")
 	}
 	if err := requireFile("candidate package", packagePath); err != nil {
 		fmt.Fprintln(os.Stderr, err)

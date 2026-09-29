@@ -11,7 +11,9 @@ import (
 	"time"
 )
 
-const defaultCorkScrewDBRepo = "/home/draco/work/corkscrewdb"
+// defaultCorkScrewDBRepo is the CorkScrewDB checkout, relative to the eos repository
+// root (a sibling checkout). Override it with the environment variable named in usage.
+const defaultCorkScrewDBRepo = "../corkscrewdb"
 const scenarioDefault = "default"
 const scenarioContrastiveNeedle = "contrastive_needle"
 
@@ -217,7 +219,7 @@ Environment:
   EOS_CORKSCREW_TS_WINDOW_RUN_ROOT=runs
   EOS_CORKSCREW_TS_WINDOW_RUN_DIR=runs/eos-corkscrewdb-timeseries-window-smoke-<timestamp>
   EOS_CORKSCREW_TS_WINDOW_ARTIFACT=/path/to/manta-embed-v1.sealed.mll
-  EOS_CORKSCREW_TS_WINDOW_CORKSCREWDB_REPO=/home/draco/work/corkscrewdb
+  EOS_CORKSCREW_TS_WINDOW_CORKSCREWDB_REPO=/path/to/corkscrewdb
   EOS_CORKSCREW_TS_WINDOW_SCENARIO=default # default|contrastive_needle
   EOS_CORKSCREW_TS_WINDOW_BITS=4,8
   EOS_CORKSCREW_TS_WINDOW_OVERFETCH=100

@@ -13,7 +13,9 @@ import (
 )
 
 const defaultCacheRun = "runs/eos-128d-child-cache-quality-20260615T000000Z"
-const defaultCorkScrewDBRepo = "/home/draco/work/corkscrewdb"
+// defaultCorkScrewDBRepo is the CorkScrewDB checkout, relative to the eos repository
+// root (a sibling checkout). Override it with the environment variable named in usage.
+const defaultCorkScrewDBRepo = "../corkscrewdb"
 
 type latencyMetrics struct {
 	P50MS float64 `json:"p50_ms"`
@@ -197,7 +199,7 @@ metrics to the overhead-aware multivector storage planner.
 Environment:
   EOS_CORKSCREW_BUDGET_QUALITY_RUN_ROOT=runs
   EOS_CORKSCREW_BUDGET_QUALITY_RUN_DIR=runs/eos-corkscrewdb-budget-quality-smoke-<timestamp>
-  EOS_CORKSCREW_BUDGET_QUALITY_CORKSCREWDB_REPO=/home/draco/work/corkscrewdb
+  EOS_CORKSCREW_BUDGET_QUALITY_CORKSCREWDB_REPO=/path/to/corkscrewdb
   EOS_CORKSCREW_BUDGET_QUALITY_DATASET_DIR=datasets/manta-embed-v1/raw/scifact/scifact
   EOS_CORKSCREW_BUDGET_QUALITY_QRELS=datasets/manta-embed-v1/raw/scifact/scifact/qrels/test.tsv
   EOS_CORKSCREW_BUDGET_QUALITY_CHILD_VECTORS=runs/eos-128d-child-cache-quality-20260615T000000Z/scifact/child-doc-vectors.jsonl
