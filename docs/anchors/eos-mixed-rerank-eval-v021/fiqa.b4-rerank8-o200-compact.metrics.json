@@ -1,12 +1,12 @@
 {
   "schema": "manta.embedding_turboquant_retrieval_metrics.v1",
   "dataset": "fiqa",
-  "artifact": "/home/draco/work/eos/assets/corkscrewdb-default-embedder/corkscrewdb-default-embedder.mll",
+  "artifact": "assets/corkscrewdb-default-embedder/corkscrewdb-default-embedder.mll",
   "backend": "cuda",
   "inputs": {
-    "corpus_path": "/home/draco/work/eos/datasets/manta-embed-v1/raw/fiqa/fiqa/corpus.jsonl",
-    "queries_path": "/home/draco/work/eos/datasets/manta-embed-v1/raw/fiqa/fiqa/queries.jsonl",
-    "qrels_path": "/home/draco/work/eos/datasets/manta-embed-v1/raw/fiqa/fiqa/qrels/test.tsv",
+    "corpus_path": "datasets/manta-embed-v1/raw/fiqa/fiqa/corpus.jsonl",
+    "queries_path": "datasets/manta-embed-v1/raw/fiqa/fiqa/queries.jsonl",
+    "qrels_path": "datasets/manta-embed-v1/raw/fiqa/fiqa/qrels/test.tsv",
     "documents": 57600,
     "queries": 648,
     "relevant_pairs": 1705,

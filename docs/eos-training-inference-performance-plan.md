@@ -310,7 +310,7 @@ Measured or reported training-efficiency progress:
 - S1a GEMM contrastive loss reports `1.72x` on the compact lane and about `33%` less device memory.
 - S7 tokenizer training dropped from about 40 minutes to `5.07s`.
 - Boundary: Hyphae spec progress notes; remeasure S2 and S1a at release shape before promotion. S7 closes tokenizer training gate G5, not model quality.
-- Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/specs/eos-embedder-v1-upgrade.md`; `runtime/tokenizer_train_incremental_test.go` references S7.
+- Evidence: `hypha://m31labs/eos/specs/eos-embedder-v1-upgrade`; `runtime/tokenizer_train_incremental_test.go` references S7.
 
 Measured or reported residency progress:
 
@@ -340,7 +340,7 @@ Durable implementation lessons:
   measured warm-gate delta is `0/1`).
 - K6 makes packed readback equally explicit: three Go/C/context boundaries
  become one, but three device copies and all readback bytes remain. Status is copied first and a nonzero status publishes no handle; deterministic D2H fault injection for pooled/active copies remains a coverage gap.
-- Evidence: `/home/draco/.hyphae/spaces/m31labs-eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons.md`; `.tiller/scratch/codex/eos-k4-gradient-slab-review.md`; `.tiller/scratch/codex/eos-k4-ffi-hotspot-analysis.md`; `.tiller/scratch/codex/eos-k5-live-gate.md`; `.tiller/scratch/codex/eos-k6-forward-readback-report.md`; `.tiller/scratch/codex/eos-k6-live-gate.md`.
+- Evidence: `hypha://m31labs/eos/inbox/agents/2026-08-12-sequoia-s3-residency-lessons`; `.tiller/scratch/codex/eos-k4-gradient-slab-review.md`; `.tiller/scratch/codex/eos-k4-ffi-hotspot-analysis.md`; `.tiller/scratch/codex/eos-k5-live-gate.md`; `.tiller/scratch/codex/eos-k6-forward-readback-report.md`; `.tiller/scratch/codex/eos-k6-live-gate.md`.
 
 External current-docs facts:
 

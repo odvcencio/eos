@@ -80,7 +80,7 @@ Run:
   EOS_REPO_ROOT=$PWD ferrous-wheel run scripts/smoke_eos_default_embedder_release.fw
 
 Optional CorkScrewDB consuming-db startup smoke:
-  EOS_DEFAULT_EMBEDDER_RELEASE_CORKSCREWDB_ROOT=/home/draco/work/corkscrewdb \
+  EOS_DEFAULT_EMBEDDER_RELEASE_CORKSCREWDB_ROOT=/path/to/corkscrewdb \
   ferrous-wheel run scripts/smoke_eos_default_embedder_release.fw
 
 Environment:

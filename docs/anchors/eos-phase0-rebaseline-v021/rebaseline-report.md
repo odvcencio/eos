@@ -1,7 +1,7 @@
 # Eos Phase 0 Quantized-Retrieval Anchor Re-Baseline (C0, turboquant v0.2.1)
 
 Run directory: `runs/eos-phase0-rebaseline-v021-20260810T040706Z/`
-Branch: `feat/eos-v0.2.0-phase0-c0` (worktree `/home/draco/work/eos-c0-baseline`)
+Branch: `feat/eos-v0.2.0-phase0-c0` (a separate worktree named `eos-c0-baseline`)
 Binary: `/tmp/eos-c0` (built from this worktree, `go.mod` pins `m31labs.dev/turboquant v0.2.1`)
 Backend: `cuda` (RTX 5070 Ti), quantizer seed `5581486560434873699`
 nDCG = normalized Discounted Cumulative Gain. BEIR = the standard IR benchmark corpus/query/qrels format used by these three datasets.
@@ -228,7 +228,7 @@ the source-code-verified wire header size.
 
 ```bash
 export GOFLAGS=-mod=mod GONOSUMDB='m31labs.dev/*' GOPRIVATE='m31labs.dev/*'
-cd /home/draco/work/eos-c0-baseline
+cd path/to/eos-c0-baseline
 go build -o /tmp/eos-c0 ./cmd/eos/
 
 # Dataset dir must be the doubly-nested BEIR layout the local dataset cache
@@ -253,7 +253,7 @@ done
 `datasets/manta-embed-v1/raw/{scifact,nfcorpus,fiqa}` did not exist in this
 worktree at run start (`datasets/` is gitignored local cache). I copied the
 extracted dataset trees read-only from the sibling worktree
-`/home/draco/work/eos/datasets/manta-embed-v1/raw/` into this worktree
+`datasets/manta-embed-v1/raw/` of the main checkout into this worktree
 (~65MB total) without modifying the source worktree. Document/query/qrels
 counts match the task's expected FiQA scale (57,600/57,638 docs) and BEIR
 standard splits for SciFact and NFCorpus.

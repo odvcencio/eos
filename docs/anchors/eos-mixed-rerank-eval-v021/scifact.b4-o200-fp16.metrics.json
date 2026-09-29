@@ -1,12 +1,12 @@
 {
   "schema": "manta.embedding_turboquant_retrieval_metrics.v1",
   "dataset": "scifact",
-  "artifact": "/home/draco/work/eos/assets/corkscrewdb-default-embedder/corkscrewdb-default-embedder.mll",
+  "artifact": "assets/corkscrewdb-default-embedder/corkscrewdb-default-embedder.mll",
   "backend": "cuda",
   "inputs": {
-    "corpus_path": "/home/draco/work/eos/datasets/manta-embed-v1/raw/scifact/scifact/corpus.jsonl",
-    "queries_path": "/home/draco/work/eos/datasets/manta-embed-v1/raw/scifact/scifact/queries.jsonl",
-    "qrels_path": "/home/draco/work/eos/datasets/manta-embed-v1/raw/scifact/scifact/qrels/test.tsv",
+    "corpus_path": "datasets/manta-embed-v1/raw/scifact/scifact/corpus.jsonl",
+    "queries_path": "datasets/manta-embed-v1/raw/scifact/scifact/queries.jsonl",
+    "qrels_path": "datasets/manta-embed-v1/raw/scifact/scifact/qrels/test.tsv",
     "documents": 5183,
     "queries": 300,
     "relevant_pairs": 339,
